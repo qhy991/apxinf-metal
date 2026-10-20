@@ -5,6 +5,11 @@ pub use crate::gate_swiglu::F16GateSwiglu;
 pub use crate::gated_delta::{GatedDeltaLayout, GatedDeltaRecurrence};
 pub use crate::half_split_rope::HalfSplitRope;
 pub use crate::interleaved_qk_norm_rope::InterleavedQkNormRope;
+pub use crate::layer_norm_modulate::{GatedResidualLayerNormModulate, LayerNormModulate};
+pub use crate::mpp_epilogues::{
+    MppGemmDecodeQ4Rows, MppGemmGatedResidual, MppGemmHeadRmsRope, MppGemmHeadsWithPrefix,
+    MppGemmSwigluPairs,
+};
 pub use crate::mpp_f16_gemm::{MppF16Gemm, SplitMppF16Gemm};
 pub use crate::mpp_gemm::MppBf16GemmNt;
 pub use crate::q4_f16::{

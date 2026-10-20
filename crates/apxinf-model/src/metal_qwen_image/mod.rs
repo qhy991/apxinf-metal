@@ -27,6 +27,8 @@ use weights::{Decoder, TextEncoderFiles, Transformer, LATENT, MLP};
 
 /// The only schedule this family has validated: 40 linear steps, guidance 1.
 pub const STEPS: usize = 40;
+/// mflux `--low-ram` caps the process-wide MLX allocator cache at 1 GB.
+const CACHE_LIMIT_BYTES: usize = 1_000_000_000;
 /// Pixels per latent; the RoPE tables cover 2048 latent rows or columns.
 const SCALE: usize = 16;
 const MAX_SIDE: usize = 2048 * SCALE;
@@ -42,6 +44,9 @@ pub struct QwenImage {
     ops: Ops,
     /// Present in auto mode when the synthetic MPP probe matches quantized matmul.
     gemm: Option<Rc<MppBf16GemmNt>>,
+    /// Present in auto mode on an architecture where the fused image blocks
+    /// were qualified; image-token counts in `dit::FUSED_TOKENS` use them.
+    fused: Option<Rc<dit::Fused>>,
     /// `Qwen21Rope` cos/sin tables for the 16- and 56-wide axes.
     rope16: (Vec<f32>, Vec<f32>),
     rope56: (Vec<f32>, Vec<f32>),
@@ -99,10 +104,15 @@ pub fn load(
         return Err(Error::Contract("Qwen-Image loads a checkpoint directory"));
     }
     let stream = native.stream().clone();
+    // As the mflux memory saver does when `--low-ram` registers it, before any
+    // weight is read. The limit is process-wide.
+    apxinf_mlx::set_cache_limit(CACHE_LIMIT_BYTES)?;
+    apxinf_mlx::clear_cache()?;
     let tokenizer = Tokenizer::from_file(path.join("processor/tokenizer.json"))?;
     let text = TextEncoderFiles::open(&path.join("text_encoder"))?;
     let transformer = Transformer::load(&stream, &path.join("transformer"))?;
     let decoder = Decoder::load(&stream, &path.join("vae"))?;
+    let reference = options.model_variant.as_deref() == Some("reference");
     Ok(LoadedModel::Image(Box::new(QwenImage {
         dir: path.to_path_buf(),
         tokenizer,
@@ -110,14 +120,34 @@ pub fn load(
         transformer: Some(transformer),
         decoder,
         ops: Ops::new(&stream)?,
-        gemm: if options.model_variant.as_deref() == Some("reference") {
+        gemm: if reference {
             None
         } else {
             probed_gemm(&stream).map(Rc::new)
         },
+        fused: if reference {
+            None
+        } else {
+            fused_blocks(&stream)?.map(Rc::new)
+        },
         rope16: tables::rope_axis(16, 10000.0),
         rope56: tables::rope_axis(56, 10000.0),
     })))
+}
+
+/// MLX architectures where the fused image blocks were qualified against
+/// their reference implementation (pixels, memory, paired whole-image
+/// timing): the M4. They do not reproduce mflux bit for bit (see the README).
+const FUSED_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g16g"];
+
+fn fused_blocks(stream: &Stream) -> Result<Option<dit::Fused>> {
+    let architecture = stream
+        .metal_caps()
+        .map_or("", |caps| caps.architecture.as_str());
+    if !FUSED_QUALIFIED_ARCHITECTURES.contains(&architecture) {
+        return Ok(None);
+    }
+    dit::Fused::new(stream).map(Some)
 }
 
 /// MLX architectures where MPP image projections were measured faster than
@@ -289,7 +319,7 @@ impl ImageRuntime for QwenImage {
             Some(t) => t,
             None => Transformer::load(stream, &self.dir.join("transformer"))?,
         };
-        let dit = dit::Dit::new(transformer, ops, self.gemm.clone())?;
+        let dit = dit::Dit::new(transformer, ops, self.gemm.clone(), self.fused.clone())?;
         let cache = dit.text_cache(
             &prompt,
             &table(&cos[..split], text_len)?,
