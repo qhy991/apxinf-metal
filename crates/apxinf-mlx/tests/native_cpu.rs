@@ -541,3 +541,11 @@ fn ready_downloads_wait_for_their_own_array_and_need_row_contiguity() -> Result<
     assert!(a.transpose(&[1, 0])?.to_bytes_ready().is_err());
     Ok(())
 }
+
+#[test]
+fn cache_limit_reports_the_previous_limit() -> Result<()> {
+    let original = apxinf_mlx::set_cache_limit(1 << 30)?;
+    assert_eq!(apxinf_mlx::set_cache_limit(2 << 30)?, 1 << 30);
+    assert_eq!(apxinf_mlx::set_cache_limit(original)?, 2 << 30);
+    Ok(())
+}
