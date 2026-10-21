@@ -640,9 +640,9 @@ impl AneMlp {
         ])
     }
 
-    /// BF16 `[1, T, 4096]` as FP16 channel-first tiles `[1, 4096, 1, 512]`,
-    /// zero-padded to whole tiles. Evaluates `h`.
-    pub fn tiles(h: &Array) -> Result<Vec<Vec<f16>>> {
+    /// BF16 `[1, T, 4096]` as the little-endian bytes of FP16 channel-first
+    /// tiles `[tiles, 4096, 512]`, zero-padded to whole tiles. Evaluates `h`.
+    pub fn tiles(h: &Array) -> Result<Vec<u8>> {
         let [1, tokens, channels] = *h.shape() else {
             return Err(Error::Contract("Clef GPU+ANE tiles take [1, T, 4096]"));
         };
@@ -657,23 +657,31 @@ impl AneMlp {
             .reshape(&[tiles, TILE, channels])?
             .transpose(&[0, 2, 1])?
             .cast(MlxDType::F16)?;
-        let values: Vec<f16> = packed
-            .to_bytes()?
-            .chunks_exact(2)
-            .map(|b| f16::from_le_bytes([b[0], b[1]]))
-            .collect();
-        Ok(values
-            .chunks_exact(channels * TILE)
-            .map(<[f16]>::to_vec)
-            .collect())
+        packed.to_bytes()
     }
 
-    /// Predicts every tile and restores BF16 `[1, T, 4096]` on `stream`: rows
-    /// times both scales in FP32.
-    pub fn predict(&self, stream: &Stream, tiles: &[Vec<f16>], tokens: usize) -> Result<Array> {
-        let bytes = |v: &[f16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-        let mut parts = Vec::with_capacity(tiles.len());
-        for (i, tile) in tiles.iter().enumerate() {
+    /// Predicts every tile of [`tiles`](Self::tiles) and restores BF16
+    /// `[1, T, 4096]` on `stream`: rows times both scales in FP32.
+    pub fn predict(&self, stream: &Stream, tiles: &[u8], tokens: usize) -> Result<Array> {
+        // SAFETY: every bit pattern is a valid f16; `align_to` returns only the aligned middle.
+        let (head, aligned, tail) = unsafe { tiles.align_to::<f16>() };
+        let copied: Vec<f16>;
+        let values: &[f16] = if head.is_empty() && tail.is_empty() {
+            aligned
+        } else {
+            copied = tiles
+                .chunks_exact(2)
+                .map(|b| f16::from_le_bytes([b[0], b[1]]))
+                .collect();
+            &copied
+        };
+        if values.is_empty() || values.len() % (HIDDEN * TILE) != 0 {
+            return Err(Error::Contract(
+                "Clef GPU+ANE tiles must be whole [4096, 512] tiles",
+            ));
+        }
+        let mut parts = Vec::with_capacity(values.len() / (HIDDEN * TILE));
+        for (i, tile) in values.chunks_exact(HIDDEN * TILE).enumerate() {
             let rows = TILE.min(tokens - i * TILE);
             let out = self.model.predict(
                 &[("x", tile, &[1, HIDDEN, 1, TILE])],
@@ -684,11 +692,11 @@ impl AneMlp {
                 ],
             )?;
             let scale = |v: &[f16]| -> Result<Array> {
-                Array::from_bytes(stream, &[TILE, 1], MlxDType::F16, &bytes(v))?
+                Array::from_bytes(stream, &[TILE, 1], MlxDType::F16, f16_bytes(v))?
                     .slice_axis(0, 0, rows)?
                     .cast(MlxDType::F32)
             };
-            let y = Array::from_bytes(stream, &[HIDDEN, TILE], MlxDType::F16, &bytes(&out[0]))?
+            let y = Array::from_bytes(stream, &[HIDDEN, TILE], MlxDType::F16, f16_bytes(&out[0]))?
                 .transpose(&[1, 0])?
                 .slice_axis(0, 0, rows)?
                 .cast(MlxDType::F32)?;

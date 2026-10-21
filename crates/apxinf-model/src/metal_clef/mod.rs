@@ -35,10 +35,12 @@ pub struct ClefRunner {
 const GPU_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
 
 /// MLX architectures where the GPU composition with MLP columns on the Neural
-/// Engine passed its gates; `auto` prefers it there. None yet: its fidelity,
-/// quality, memory and paired latency gates on the M1 Pro are pending.
+/// Engine passed its gates; `auto` prefers it there: the M1 Pro (2026-10-20;
+/// programs equal to the reference build, at-risk decisions bit-identical to
+/// it, quality against stock, memory, and paired latency against the
+/// reference implementation).
 #[cfg(feature = "coreml")]
-const GPU_ANE_COLUMNS_QUALIFIED_ARCHITECTURES: &[&str] = &[];
+const GPU_ANE_COLUMNS_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
 
 /// MLX architectures where the GPU composition with MLP neurons split onto the
 /// Neural Engine passed its gates; `auto` prefers it there: the M4 (2026-10-18;
@@ -47,6 +49,9 @@ const GPU_ANE_COLUMNS_QUALIFIED_ARCHITECTURES: &[&str] = &[];
 /// 0.997x the reference implementation).
 #[cfg(feature = "coreml")]
 const GPU_ANE_NEURONS_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g16g"];
+
+/// MLX allocator cache limit set when Clef loads (bytes).
+const CACHE_LIMIT: usize = 1 << 30;
 
 /// Device-independent option admission, checked before the checkpoint is read.
 /// Returns the requested composition; `None` is `auto`, which picks the
@@ -140,6 +145,9 @@ pub fn load(
             "Clef: no optimized composition is qualified on {architecture:?}; using the reference composition"
         );
     }
+    // Process-wide, as the reference engine sets it: an unbounded allocator cache grew to 4 GiB and slowed
+    // requests under memory pressure on a 16 GB M1 Pro.
+    apxinf_mlx::set_cache_limit(CACHE_LIMIT)?;
     let backbone = weights::Backbone::load(&config, &stream, path)?;
     let head = weights::Head::load(&config, &stream, &path.join("joint_head.safetensors"))?;
     Ok(LoadedModel::Decision(Box::new(ClefRunner {
@@ -257,6 +265,9 @@ mod tests {
 
     #[test]
     fn auto_runs_each_composition_only_on_its_qualified_architectures() {
+        #[cfg(feature = "coreml")]
+        assert_eq!(select(None, "applegpu_g13s"), Composition::GpuAneColumns);
+        #[cfg(not(feature = "coreml"))]
         assert_eq!(select(None, "applegpu_g13s"), Composition::Gpu);
         #[cfg(feature = "coreml")]
         assert_eq!(select(None, "applegpu_g16g"), Composition::GpuAneNeurons);
