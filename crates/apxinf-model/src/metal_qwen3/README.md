@@ -76,6 +76,10 @@ releases old state handles before evaluation so native buffer reuse is possible.
 The qualification runs enforce a 12 GiB physical process limit, leaving room
 for macOS and the other jobs; the context limit is not a reservation of that RAM.
 
+The [M4 long-context report](../../../../doc/qwen3-long-context-m4-20261023.md)
+records five paired MLX comparisons at 1K, 4K, 16K, 32K and 40832 input tokens,
+short-token parity, memory peaks and the remaining performance gap.
+
 Load through `AutoModel` with `model_name=metal_qwen3` (or checkpoint detection),
 `Device::Metal(0)`, BF16, and the desired `model_variant`. The native CLI uses:
 
