@@ -286,6 +286,21 @@ fn dtype_name(descr: &str) -> &'static str {
 }
 
 fn main_inner(job_path: &Path) -> Fallible<()> {
+    let cache_limit = match std::env::var("APXINF_MLX_CACHE_LIMIT_BYTES") {
+        Ok(raw) => {
+            if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(
+                    "APXINF_MLX_CACHE_LIMIT_BYTES must be a nonnegative decimal byte count".into(),
+                );
+            }
+            Some(
+                raw.parse::<usize>()
+                    .map_err(|e| format!("APXINF_MLX_CACHE_LIMIT_BYTES: {e}"))?,
+            )
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(format!("APXINF_MLX_CACHE_LIMIT_BYTES: {error}")),
+    };
     let job: Value = serde_json::from_str(
         &std::fs::read_to_string(job_path).map_err(|e| format!("read job: {e}"))?,
     )
@@ -336,6 +351,10 @@ fn main_inner(job_path: &Path) -> Fallible<()> {
         model_variant: model_variant.clone(),
         ..LoadOptions::default()
     };
+    let previous_cache_limit = cache_limit
+        .map(apxinf_mlx::set_cache_limit)
+        .transpose()
+        .map_err(|error| format!("set APXINF_MLX_CACHE_LIMIT_BYTES={cache_limit:?}: {error}"))?;
     let started = Instant::now();
     let mut model = AutoModel::load_model(Device::Metal(0), &snapshot, &options)
         .map_err(|e| format!("load: {e}"))?;
@@ -351,7 +370,9 @@ fn main_inner(job_path: &Path) -> Fallible<()> {
         "process_policy": "one resident model, serial fresh requests",
         "identity": {"commit": option_env!("APXINF_LATENCY_WORKER_COMMIT"),
                      "features": option_env!("APXINF_LATENCY_WORKER_FEATURES"),
-                     "model_name": model_name, "model_variant": model_variant, "checks": checks},
+                     "model_name": model_name, "model_variant": model_variant, "checks": checks,
+                     "allocator_cache_limit_bytes": cache_limit,
+                     "previous_allocator_cache_limit_bytes": previous_cache_limit},
         "load_ms": load_ms,
     }))?;
 
