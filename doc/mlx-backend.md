@@ -152,6 +152,13 @@ paired 4K blocks show lower TTFT. The full long-context performance matrix
 remains pending. Preparation retains checked compiled replay and the existing
 length plan. MiniCPM5 does not select it.
 
+MiniCPM5's private `APXINF_MINICPM5_LAST_PREFILL_ROW=1` switch reduces only
+the final layer's O/MLP rows on an eligible final Compiled generation-prefill
+chunk. Full attention and K/V remain intact. The default is off; Public, DSpark
+and ordinary forward are unchanged. Short outputs, per-language teachers and
+retained-state checks pass. BF16 logits can differ, and the recorded five-block
+4K TTFT improvement does not qualify the full context matrix.
+
 The standalone `apxinf-latency-worker` accepts `APXINF_MLX_CACHE_LIMIT_BYTES`.
 It applies this process-wide allocator cache budget once before model loading
 and records the requested and previous values in its ready identity. Unset

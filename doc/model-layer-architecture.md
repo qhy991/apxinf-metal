@@ -201,6 +201,13 @@ preparation preserves live KV; the backend only executes the selected arrays.
 Compiled attention remains bucketed by default. Public and MixedW8 keep their
 existing attention paths.
 
+MiniCPM5's private `APXINF_MINICPM5_LAST_PREFILL_ROW=1` switch belongs to
+`model.rs`. On the final multirow Compiled generation-prefill chunk, the final
+layer keeps full Q, attention and K/V, then selects one residual/attention row
+before O and MLP. The head reads the resulting row extent. Ordinary forward,
+Public, DSpark and one-row chunks retain their paths. This default-off shape
+optimization can change BF16 logits and requires separate numerical gates.
+
 MiniCPM5 owns initial KV allocation in `model.rs`. Public, Compiled and DSpark
 initialize their 84 slots from one immutable BF16 zero array. Functional updates
 produce the per-layer KV values. Reset retains current KV and resets the

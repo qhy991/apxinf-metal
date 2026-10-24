@@ -132,6 +132,16 @@ BF16 defaults to 1024 above 4096 prompt tokens. Other variants retain their
 512-token default. Family environment overrides remain captured at construction.
 Derive preparation, row admission and execution from the same family plan.
 
+MiniCPM5's default-off `APXINF_MINICPM5_LAST_PREFILL_ROW=1` experiment narrows
+only the final layer's output rows after full attention on the final multirow
+Compiled generation-prefill chunk. Keep full Q and K/V, original position
+advancement and all ordinary-forward rows. Preserve Public, DSpark, one-row
+chunks and cache-only intermediate chunks. A smaller GEMM can change BF16
+rounding. Check short outputs, per-language teachers, forced continuation logits,
+retained state and hot callbacks across whole prompts, exact chunk multiples,
+multirow tails and one-row tails. Include cold-request cost and strict decimal
+12 GB physical memory. The recorded 4K TTFT win does not qualify other lengths.
+
 MiniCPM5 shares one initial zero array across its 84 KV slots. Preserve separate
 changing compiled arguments and per-layer outputs. Validate replay with different
 nonzero KV after aliased preparation, retained outputs, reset/reprepare and

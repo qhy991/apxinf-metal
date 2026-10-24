@@ -544,6 +544,22 @@ impl MiniCpm5 {
                 )?
                 .transpose(&[0, 2, 1, 3])?
                 .reshape(&[1, rows, 2048])?;
+            let last_output_only = self.variant == Variant::Compiled
+                && last_only
+                && rows > 1
+                && i + 1 == self.weights.layers.len()
+                && self
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|p| p.prefill.prompt == end)
+                && std::env::var("APXINF_MINICPM5_LAST_PREFILL_ROW")
+                    .is_ok_and(|value| value == "1");
+            let attention = if last_output_only {
+                x = x.slice_axis(1, rows - 1, rows)?;
+                attention.slice_axis(1, rows - 1, rows)?
+            } else {
+                attention
+            };
             x = x.add(&attention.matmul(&w.o)?)?;
             let n = self.norm(&x, &w.post_norm)?;
             let gate = n.matmul(&w.gate)?;
@@ -557,7 +573,8 @@ impl MiniCpm5 {
         }
         let normalized = self.norm(&x, &self.weights.norm)?;
         let head_input = if last_only {
-            normalized.slice_axis(1, rows - 1, rows)?
+            let output_rows = normalized.shape()[1];
+            normalized.slice_axis(1, output_rows - 1, output_rows)?
         } else {
             normalized
         };

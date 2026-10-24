@@ -36,6 +36,15 @@ decode with the fixed packed residual/norm kernel. Every new KV array and output
 is evaluated before the request state is published; failed preparation cannot
 be reported ready. Changing prepared capacity requires a reset.
 
+The private `APXINF_MINICPM5_LAST_PREFILL_ROW=1` experiment reduces the final
+layer's O projection and MLP to one output row on the final multirow generation
+prefill chunk. It retains full Q, attention and K/V computation. Ordinary
+`forward`, one-row chunks, Public and DSpark keep their existing behavior.
+The switch defaults off. The shape change can alter BF16 logits even when
+greedy tokens match. Recorded short-output, per-language teacher and retained
+state checks pass; five paired 4K blocks show a TTFT ratio of 0.979675 against
+the preceding path. Full-context performance qualification remains pending.
+
 Initial allocation gives all 84 K/V slots one shared immutable BF16 zero array.
 This applies to Public, Compiled and DSpark. Each layer's functional update
 returns its own K/V values; compiled inputs and outputs keep separate slots.
@@ -92,15 +101,16 @@ adds 10.5 MiB, allowing the 64K-input context-sweep case to reserve output.
 At the 65792-token limit, the two RoPE tables total 32.125 MiB.
 Weights, allocator cache and temporary arrays are additional.
 Execution releases prior state handles before evaluation; qualification runs
-enforce a 12 GiB physical process limit. The full checkpoint context is not
-admitted by this memory budget.
+enforce a decimal 12 GB physical process limit (12,000,000,000 bytes). The full
+checkpoint context is not admitted by this memory budget.
 
-For 64K on the 16 GiB M4, set `APXINF_MLX_CACHE_LIMIT_BYTES=2147483648` on
-`apxinf-latency-worker`. With the default allocator cache policy, the initial
-65408-input/128-output diagnostic run exceeded the 12 GiB physical-process guard.
-The explicit 2 GiB cache budget completed that request in the diagnostic worker.
-Applications embedding the family must set their own process-wide MLX cache
-policy; the model does not silently change it for other resident models.
+The current paired M4 campaign sets `APXINF_MLX_CACHE_LIMIT_BYTES=134217728`
+on `apxinf-latency-worker` and the same 128 MiB budget on MLX. A complete 64K
+cold request with shared initial KV passed the strict physical-memory guard.
+Earlier 2 GiB cache diagnostics used a 12 GiB guard and do not qualify that
+configuration under the stricter limit. Applications embedding the family must
+set their own process-wide MLX cache policy; the model does not change it for
+other resident models.
 
 DSpark retains its separate 4096-total-token limit and 1–256 output-token
 budget. Requests beyond these limits fail with an explicit DSpark error.
