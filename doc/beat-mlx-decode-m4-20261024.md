@@ -225,3 +225,5 @@ MLX async_eval在同一调用中执行图遍历与Metal编码，活跃任务超�
 - 2026-10-24，token-only 提交的 Qwen/Mini 各五个 1K block 均无 paging 污染。Qwen 对 MLX 比值中位数 1.086641 → 1.039506；Mini 1.019054 → 1.003824，仍未达成全部不慢于 MLX。两模型短文本各 1024 token 完全一致，外部 teacher 不退化。新组合诊断在 Qwen bucket、Mini bucket/exact 各 300 输出中检查 299 次，每次追加 eval 全部保留 KV 的直接 compute dispatch 增量为零，计数器跨步严格增加，避免恒零假通过。此探针含逐步同步，只证明已覆盖的直接计算依赖，不作计时证据。
 - 2026-10-24，实际 retained-prefix 检查全部通过。上述三条路径分别在发布 0、3、257 token 后丢弃额外一步，保留位置为 1024、1026、1280；不 reset 继续五步，异步与同步的完整 logits 字节摘要、token、position 及拒绝错误 position 后的状态均相同。接口清理后的四项 CPU EOS/budget/position/cancel/error 测试再次通过。接受 token-only 提交，删除无用 KV-root 回调，并在 DeviceDecode 保留 logits 必须依赖全部新状态的契约。
 - 2026-10-24，Qwen native norm 的 40K 同 512 分块干净单 block 总时间 82.918 → 82.430 秒，比值 0.994113，TTFT 74.799 → 73.776 秒；decode 则由 15.643 降至 14.675 tok/s。此反向 decode 结果不删除，不以总时间的小幅收益掩盖。最终长档仍须五 block MLX 配对。
+
+- 2026-10-24，接受 Qwen compiled 的 prepared BF16 权重及 native weighted RMSNorm。依据为各语言 teacher 不退化、原 tiny/lifecycle 断言和全部 339 个准备权重检查通过，以及五个干净 1K block 全部快于 ordered 对照。222/1024 短文本差异为已披露的舍入变化，不声称逐 token 等价；40K decode 的反向单 block 保留，最终全档目标尚未完成。

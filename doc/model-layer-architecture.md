@@ -168,9 +168,17 @@ That guard checks PI0.5 only; a new family must enforce its own declared boundar
 | WallOSS / `VlaRuntime` | Existing `bf16_runtime.rs`, `bf16_executor.rs`, `fp8.rs` and weight files; not migrated to PI0.5's runner/variant or explicit preparation contract |
 | GR00T / `VlaRuntime` | Existing `vla_runtime.rs`, `executor.rs`, precision runtime/executor files and private `backbone/`; not migrated to PI0.5's explicit preparation contract |
 | Llama, Qwen3-VL / `LlmTrait` | Existing `general.rs` and family-specific state/decode graph paths; shared autoregressive generation remains in `LlmTrait`, not the VLA runner |
-| Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/total context 40960, request-sized KV/RoPE and 256-token decode attention buckets; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
+| Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/total context 40960, request-sized KV/RoPE and 256-token decode attention buckets; `bf16-public`, `bf16-compiled` (native weighted BF16 RMSNorm, local functions and decoder blocks; changed BF16 rounding), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
 | MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/ordinary total context 65792, admitting 65536 prompt tokens plus 256 output tokens; request-sized KV/RoPE and 512-token long prefill, with compiled non-final chunks evaluating only KV; the prepared request owns bucketed/exact decode selection and profiles; DSpark total context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
 | Clef Flash / `DecisionRuntime`, MLX | Independent `metal_clef/{config,encode,weights,model}.rs`; affine Q4 Qwen3.5 hybrid backbone and BF16 joint schema head, up to 4096 tokens; on `applegpu_g13s`, `auto` selects the optimized GPU composition with source-labelled quality and paired latency evidence; elsewhere the reference. With `coreml`, `auto` on `applegpu_g16g` selects the neuron split: Metal 4 MPP projections, 5632 INT8 plus 1248 FP16 ANE neurons per MLP in 128-token tiles, and 5408 GPU neurons. This dispatch is implemented, not evidence that every heterogeneous-port gate passed. The column split requires separate qualification. `reference` retains stock MLX-VLM composition. All compositions prepare the local shapeless decay/beta callable at load for lengths 1, 2 and 4096; this is not whole-backbone/head or Core ML preparation. |
+
+Qwen3's `weights.rs` prepares one norm array per site. The array dtype selects
+the private arithmetic in `model.rs`, including the final norm. BF16 weights
+select native weighted RMSNorm with BF16 activations for `bf16-compiled`.
+FP32 weights preserve ordered FP32 normalization for `bf16-public` and
+`mixed-w8`. The existing compiled array slots carry this representation without
+another mode argument or an unused alternate weight array. A second arithmetic
+contract using BF16 weights would require a richer private representation.
 
 New VLA code should use `Model` for forward computation and `ModelRunner` for
 execution ownership. Existing family symbols remain their actual names until
