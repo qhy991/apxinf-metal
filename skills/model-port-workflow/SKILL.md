@@ -93,6 +93,14 @@ strided inputs, changed-operand compiled replay and retained outputs. Check
 full-model parity against the current norm path before interpreting performance.
 Prefill, fresh first-token, Public and MixedW8 paths retain their own RoPE.
 
+Qwen3's exact-decode opt-in keeps a separate prepared exact window alongside
+capacity buckets. Cover output budgets 0, 1, 128 and the 129-token bucket
+fallback. Exercise actual final-prefill dispatch for zero/one budgets,
+same-capacity re-preparation followed by continuation with retained KV, calls
+beyond the exact window, failed preparation and reset recovery. Do not infer
+native pipeline warmup from the absence of Rust trace callbacks. The default
+remains bucketed because short-context gains were inconsistent.
+
 MiniCPM5 compiled prefill uses native weighted RMSNorm with existing BF16
 weights. In pinned MLX 0.32.3, the Metal kernel rounds the normalized value to
 BF16 before multiplying the BF16 weight, preserving this family's rounding

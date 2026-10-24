@@ -255,3 +255,4 @@ MLX async_eval在同一调用中执行图遍历与Metal编码，活跃任务超�
 
 - 2026-10-24，共享初始 KV 的剩余门禁收齐。5 组同容量 attention 模式转换及失败容量恢复、非零 offset 改请求恢复、单行 prefill 尾块均通过。DSpark target 使用现有官方 target 权重，改动前后各跑 8 组 API/输入序列，共 40 次 logits/taps 观测与 4 个保留输出，全部 JSON 相同；两臂物理峰值 7.634 / 7.541 GB。未下载缺失 drafter，完整推测接受循环未复跑。冻结 worker SHA 为 `02241f9ec8d73ce8584dd91f641032594d1e4fd89faa0c00363d8e8d7e76568e`，全部记录源码与当前一致，接受为 64K 准备阶段的资源修复，尚无最终全档性能结论。
 - 2026-10-24，最终矩阵改用独立 `mini-shared-zero-v1` 标签，MLX、b2d、候选三臂统一 128 MiB allocator cache，均低于 2 GiB 上限。此前 b2d 同 256 MiB 的峰值接近 12 GB，缩小共同 cache 是为资源留余量，不预设速度收益。每档五 block、每臂独立进程内 warmup 一次和测量一次，轮换臂顺序，固定 128 输出；12 GB、1190 秒、固定 swap 基线和双锁不变。
+- 2026-10-25，保留Qwen精确长度decode为默认关闭的本地opt-in。已完成逐token/分语言teacher及准备、保留KV、失效恢复门禁；16K/40K五干净block候选/MLX总时间比中位0.994341/0.989877，短文本exact/bucket中位1.017102，故保持默认bucket。零/一输出预算的实际final-prefill和热路径断言已补齐并通过，现有源审查中的对应测试覆盖缺口关闭。此提交不代表最终全档矩阵完成。

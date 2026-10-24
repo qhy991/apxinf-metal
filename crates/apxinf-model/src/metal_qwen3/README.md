@@ -66,6 +66,15 @@ Compiled decode slices attention to the next 256-token boundary of the active
 prefix and masks unwritten positions. Requests with capacity at most 2048 keep
 their original attention shape. Preparation warms every admitted one-row
 attention bucket, including bucket crossings in direct `forward` calls.
+`APXINF_QWEN3_EXACT_DECODE=1` opts `bf16-compiled` into exact effective KV
+lengths for prepared output budgets up to 128. It removes the padding mask
+within that prepared window. A zero-output preparation still admits its final
+prefill row; larger budgets and calls outside the exact window use the prepared
+buckets. Compiled attention remains bucketed by default; other variants keep
+their existing attention. Replacing a
+same-capacity request preserves live KV and position; preparation failures
+clear decoder readiness. Short contexts did not show a consistent gain, so
+the exact path remains opt-in despite measured 16K and 40K improvements.
 `LlmTrait::prewarm_decode` invokes this preparation for the shared generation
 driver; failures invalidate the next fallible operation. Direct callers must
 prepare every sequence length they use. `reset` returns to

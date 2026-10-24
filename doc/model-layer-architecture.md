@@ -186,6 +186,14 @@ rotation, shape validation and device indexing. The family still supplies
 explicit Q/K and table operands and owns normalization, positions and KV updates.
 Prefill and the fresh first-token path keep their local RoPE composition.
 
+Qwen3 also owns the private `APXINF_QWEN3_EXACT_DECODE=1` request policy.
+Its prepared decoder retains capacity buckets and an optional exact-width
+window for compiled output budgets up to 128. The family owns window
+replacement, position coverage and failure invalidation. Same-capacity
+preparation preserves live KV; the backend only executes the selected arrays.
+Compiled attention remains bucketed by default. Public and MixedW8 keep their
+existing attention paths.
+
 MiniCPM5 owns initial KV allocation in `model.rs`. Public, Compiled and DSpark
 initialize their 84 slots from one immutable BF16 zero array. Functional updates
 produce the per-layer KV values. Reset retains current KV and resets the

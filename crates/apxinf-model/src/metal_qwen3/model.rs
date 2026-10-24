@@ -5,7 +5,9 @@
 //! enginetailor/models/mlx/m4/kernels.py. See README.md and LICENSE.engine-tailor.
 
 use super::{
-    config::{attention_width, PrefillChunk, PrefillPlan, Qwen3Config, Variant},
+    config::{
+        attention_width, exact_decode_enabled, PrefillChunk, PrefillPlan, Qwen3Config, Variant,
+    },
     weights::{LayerWeights, Weights},
 };
 use crate::llm_trait::{
@@ -70,11 +72,10 @@ struct KvState {
 struct Seams {
     norm: Compiled,
     rope: Compiled,
-    block: Option<Compiled>,
 }
 
 impl Seams {
-    fn new(stream: &Stream, config: &Qwen3Config, decoder: bool) -> Result<Self> {
+    fn new(stream: &Stream, config: &Qwen3Config) -> Result<Self> {
         let eps = config.rms_norm_eps;
         let dims = config.head_dim;
         let norm = Compiled::new(stream, 1, move |a| {
@@ -89,22 +90,149 @@ impl Seams {
             }
             Ok(vec![rotate(&a[0], &a[1], &a[2], dims)?])
         })?;
-        let c = config.clone();
-        let block = if decoder {
-            let table_rope = Bf16QkTableRope::new(stream)?;
-            Some(Compiled::new(stream, 3, move |a| {
-                decoder_block(a, &c, &table_rope)
-            })?)
-        } else {
-            None
-        };
-        Ok(Self { norm, rope, block })
+        Ok(Self { norm, rope })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttentionMode {
+    Bucketed,
+    Exact,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DecodeRequest {
+    prompt: usize,
+    output: usize,
+    attention: AttentionMode,
+}
+
+impl DecodeRequest {
+    fn new(prompt: usize, output: usize, variant: Variant, exact: bool) -> Self {
+        Self {
+            prompt,
+            output,
+            attention: if exact && variant == Variant::Bf16Compiled && output <= 128 {
+                AttentionMode::Exact
+            } else {
+                AttentionMode::Bucketed
+            },
+        }
+    }
+
+    fn exact_count(self) -> usize {
+        if self.attention == AttentionMode::Exact {
+            self.output.max(1)
+        } else {
+            0
+        }
+    }
+
+    fn exact_offset(self, end: usize) -> Option<usize> {
+        end.checked_sub(self.prompt)
+            .filter(|&offset| offset < self.exact_count())
+    }
+}
+
+struct ExactWindow {
+    first: usize,
+    block: Compiled,
+    positions: Vec<Array>,
+}
+
+struct PreparedDecoder {
+    capacity: usize,
+    request: DecodeRequest,
+    bucket: Compiled,
+    bucket_positions: HashMap<usize, Array>,
+    exact: Option<ExactWindow>,
+}
+
+struct DecoderProfile<'a> {
+    block: &'a Compiled,
+    positions: &'a Array,
+}
+
+impl PreparedDecoder {
+    fn ready(&self, capacity: usize) -> bool {
+        if self.capacity != capacity || capacity == 0 {
+            return false;
+        }
+        let buckets_ready = (1..=capacity).step_by(256).all(|end| {
+            let width = attention_width(end, capacity);
+            self.bucket_positions
+                .get(&width)
+                .is_some_and(|positions| positions.shape() == [width])
+        });
+        let exact_ready = match (&self.exact, self.request.attention) {
+            (None, AttentionMode::Bucketed) => true,
+            (Some(exact), AttentionMode::Exact) => {
+                exact.first == self.request.prompt
+                    && exact.positions.len() == self.request.exact_count()
+                    && exact
+                        .positions
+                        .iter()
+                        .enumerate()
+                        .all(|(offset, positions)| {
+                            positions.shape() == [self.request.prompt + offset]
+                        })
+            }
+            _ => false,
+        };
+        buckets_ready && exact_ready
+    }
+
+    fn profile(&self, end: usize) -> Result<DecoderProfile<'_>> {
+        if end == 0 || end > self.capacity {
+            return Err(err("Qwen3 decoder end exceeds prepared capacity"));
+        }
+        if let Some(offset) = self.request.exact_offset(end) {
+            let exact = self
+                .exact
+                .as_ref()
+                .ok_or_else(|| err("Qwen3 exact decoder was not prepared"))?;
+            let positions = exact
+                .positions
+                .get(offset)
+                .ok_or_else(|| err("Qwen3 exact decoder width was not prepared"))?;
+            Ok(DecoderProfile {
+                block: &exact.block,
+                positions,
+            })
+        } else {
+            let width = attention_width(end, self.capacity);
+            let positions = self
+                .bucket_positions
+                .get(&width)
+                .ok_or_else(|| err("Qwen3 bucket decoder width was not prepared"))?;
+            Ok(DecoderProfile {
+                block: &self.bucket,
+                positions,
+            })
+        }
+    }
+}
+
+fn compile_decoder(
+    stream: &Stream,
+    config: &Qwen3Config,
+    attention: AttentionMode,
+) -> Result<Compiled> {
+    let config = config.clone();
+    let table_rope = Bf16QkTableRope::new(stream)?;
+    Compiled::new(stream, 3, move |arrays| {
+        decoder_block(arrays, &config, &table_rope, attention)
+    })
 }
 
 /// Pure B=1/L=1 block. Weights, index, table row and KV state are explicit inputs.
 /// No mutable request state, host readback, or model object is captured.
-fn decoder_block(a: &[Array], c: &Qwen3Config, table_rope: &Bf16QkTableRope) -> Result<Vec<Array>> {
+fn decoder_block(
+    a: &[Array],
+    c: &Qwen3Config,
+    table_rope: &Bf16QkTableRope,
+    attention: AttentionMode,
+) -> Result<Vec<Array>> {
     if a.len() != 18 {
         return Err(err("Qwen3 decoder block expects 18 arrays"));
     }
@@ -135,14 +263,17 @@ fn decoder_block(a: &[Array], c: &Qwen3Config, table_rope: &Bf16QkTableRope) -> 
     let keys = keys.slice_update(&k, index, &[2])?;
     let values = values.slice_update(&v, index, &[2])?;
     let width = a[17].shape()[0];
-    let mask = decode_mask(&a[17], index)?;
+    let mask = match attention {
+        AttentionMode::Bucketed => Some(decode_mask(&a[17], index)?),
+        AttentionMode::Exact => None,
+    };
     let attention = q
         .sdpa(
             &keys.slice_axis(2, 0, width)?,
             &values.slice_axis(2, 0, width)?,
             (c.head_dim as f64).powf(-0.5) as f32,
             false,
-            Some(&mask),
+            mask.as_ref(),
         )?
         .transpose(&[0, 2, 1, 3])?
         .reshape(&[1, 1, c.num_attention_heads * c.head_dim])?
@@ -157,6 +288,7 @@ pub struct Qwen3Model {
     config: Qwen3Config,
     variant: Variant,
     prefill_chunk: Option<PrefillChunk>,
+    exact_decode: bool,
     backend: MlxBackend,
     weights: Weights,
     seams: Option<Seams>,
@@ -169,7 +301,7 @@ pub struct Qwen3Model {
     capacity: usize,
     position: usize,
     prepared_lengths: HashSet<usize>,
-    decode_positions: HashMap<usize, Array>,
+    decoder: Option<PreparedDecoder>,
     invalid: Option<String>,
 }
 
@@ -192,6 +324,7 @@ impl Qwen3Model {
     ) -> Result<Self> {
         config.validate()?;
         let prefill_chunk = PrefillChunk::from_env()?;
+        let exact_decode = exact_decode_enabled();
         if variant == Variant::MixedW8 {
             config.validate_checkpoint_scope()?;
         }
@@ -202,11 +335,7 @@ impl Qwen3Model {
             .clone();
         let weights = Weights::load(&config, tensors, backend.stream(), variant)?;
         let seams = if variant != Variant::Bf16Public {
-            Some(Seams::new(
-                backend.stream(),
-                &config,
-                variant == Variant::Bf16Compiled,
-            )?)
+            Some(Seams::new(backend.stream(), &config)?)
         } else {
             None
         };
@@ -227,6 +356,7 @@ impl Qwen3Model {
             config,
             variant,
             prefill_chunk,
+            exact_decode,
             backend,
             weights,
             seams,
@@ -239,7 +369,7 @@ impl Qwen3Model {
             capacity: 0,
             position: 0,
             prepared_lengths: HashSet::new(),
-            decode_positions: HashMap::new(),
+            decoder: None,
             invalid: None,
         };
         model.prepare(1, 0)?;
@@ -261,7 +391,7 @@ impl Qwen3Model {
     pub fn prepare(&mut self, prompt_len: usize, max_new_tokens: usize) -> Result<()> {
         if let Err(error) = self.prepare_inner(prompt_len, max_new_tokens) {
             self.prepared_lengths.clear();
-            self.decode_positions.clear();
+            self.decoder = None;
             self.invalid = Some(error.to_string());
             return Err(error);
         }
@@ -284,7 +414,7 @@ impl Qwen3Model {
             self.initial_kv.clear();
             self.capacity = 0;
             self.prepared_lengths.clear();
-            self.decode_positions.clear();
+            self.decoder = None;
             let shape = [
                 1,
                 self.config.num_key_value_heads,
@@ -338,8 +468,15 @@ impl Qwen3Model {
         for rows in self.prefill_plan(prompt_len)?.required_rows() {
             self.warm_length(rows)?;
         }
-        self.warm_decoder()?;
-        self.backend.stream().synchronize()?;
+        self.warm_decoder(DecodeRequest::new(
+            prompt_len,
+            max_new_tokens,
+            self.variant,
+            self.exact_decode,
+        ))?;
+        if self.variant != Variant::Bf16Compiled {
+            self.backend.stream().synchronize()?;
+        }
         Ok(())
     }
 
@@ -415,29 +552,91 @@ impl Qwen3Model {
         Ok(())
     }
 
-    fn warm_decoder(&mut self) -> Result<()> {
-        let Some(block) = self.seams.as_ref().and_then(|seams| seams.block.as_ref()) else {
+    fn warm_decoder(&mut self, request: DecodeRequest) -> Result<()> {
+        if self.variant != Variant::Bf16Compiled {
             return Ok(());
-        };
+        }
         let stream = self.backend.stream();
+        let mut decoder = match self.decoder.take() {
+            Some(decoder) if decoder.capacity == self.capacity => decoder,
+            _ => PreparedDecoder {
+                capacity: self.capacity,
+                request,
+                bucket: compile_decoder(stream, &self.config, AttentionMode::Bucketed)?,
+                bucket_positions: HashMap::new(),
+                exact: None,
+            },
+        };
+        if decoder.request != request || !decoder.ready(self.capacity) {
+            decoder.exact = None;
+        }
         for end in (1..=self.capacity).step_by(256) {
             let width = attention_width(end, self.capacity);
-            if self.decode_positions.contains_key(&width) {
+            if decoder.bucket_positions.contains_key(&width) {
                 continue;
             }
             let positions = Array::arange(stream, 0., width as f32, 1., MlxDType::I32)?;
-            let mut args = vec![
-                Array::zeros(stream, &[1, 1, self.config.hidden_size], MlxDType::BF16)?,
-                self.initial_kv[0].keys.clone(),
-                self.initial_kv[0].values.clone(),
-                Array::from_i32(stream, &[1], &[0])?,
-                self.cos.as_ref().unwrap().slice_axis(2, 0, 1)?,
-                self.sin.as_ref().unwrap().slice_axis(2, 0, 1)?,
-            ];
-            args.extend(self.weights.layers[0].block_arrays()?);
-            args.push(positions.clone());
+            self.warm_decoder_profile(&decoder.bucket, &positions, 0, false)?;
+            decoder.bucket_positions.insert(width, positions);
+        }
+        if request.attention == AttentionMode::Exact && decoder.exact.is_none() {
+            let count = request.exact_count();
+            let last = request
+                .prompt
+                .checked_add(count - 1)
+                .filter(|&last| last <= self.capacity)
+                .ok_or_else(|| err("Qwen3 exact window exceeds prepared capacity"))?;
+            let block = compile_decoder(stream, &self.config, AttentionMode::Exact)?;
+            let base = Array::arange(stream, 0., last as f32, 1., MlxDType::I32)?;
+            let mut positions = Vec::with_capacity(count);
+            for offset in 0..count {
+                let width = request.prompt + offset;
+                let prefix = base.slice_axis(0, 0, width)?;
+                self.warm_decoder_profile(
+                    &block,
+                    &prefix,
+                    width - 1,
+                    offset != 0 && offset != count - 1,
+                )?;
+                positions.push(prefix);
+            }
+            decoder.exact = Some(ExactWindow {
+                first: request.prompt,
+                block,
+                positions,
+            });
+        }
+        decoder.request = request;
+        if !decoder.ready(self.capacity) {
+            return Err(err("Qwen3 decoder preparation is incomplete"));
+        }
+        stream.synchronize()?;
+        self.decoder = Some(decoder);
+        Ok(())
+    }
+
+    fn warm_decoder_profile(
+        &self,
+        block: &Compiled,
+        positions: &Array,
+        index: usize,
+        trace_only: bool,
+    ) -> Result<()> {
+        let stream = self.backend.stream();
+        let mut args = vec![
+            Array::zeros(stream, &[1, 1, self.config.hidden_size], MlxDType::BF16)?,
+            self.initial_kv[0].keys.clone(),
+            self.initial_kv[0].values.clone(),
+            Array::from_i32(stream, &[1], &[index as i32])?,
+            self.cos.as_ref().unwrap().slice_axis(2, index, index + 1)?,
+            self.sin.as_ref().unwrap().slice_axis(2, index, index + 1)?,
+        ];
+        args.extend(self.weights.layers[0].block_arrays()?);
+        args.push(positions.clone());
+        if trace_only {
+            block.prepare_trace(&args)?;
+        } else {
             block.prepare(&args)?;
-            self.decode_positions.insert(width, positions);
         }
         Ok(())
     }
@@ -569,13 +768,23 @@ impl Qwen3Model {
             .as_ref()
             .unwrap()
             .slice_axis(2, self.position, end)?;
+        let profile = if len == 1 && self.position > 0 && self.variant == Variant::Bf16Compiled {
+            Some(
+                self.decoder
+                    .as_ref()
+                    .ok_or_else(|| err("Qwen3 decoder was not prepared"))?
+                    .profile(end)?,
+            )
+        } else {
+            None
+        };
         let mut pending = Vec::with_capacity(self.kv.len());
         let previous = std::mem::take(&mut self.kv);
         for (layer, kv) in self.weights.layers.iter().zip(previous) {
             // The inherited block replacement applies only after prefill has
             // established request KV. A fresh single-token prompt keeps the
             // public attention boundary, just like a source KVCache with no keys.
-            if len == 1 && self.position > 0 && self.variant == Variant::Bf16Compiled {
+            if let Some(profile) = &profile {
                 let mut args = vec![
                     x,
                     kv.keys.clone(),
@@ -585,16 +794,8 @@ impl Qwen3Model {
                     sin.clone(),
                 ];
                 args.extend(layer.block_arrays()?);
-                args.push(self.decode_positions[&attention_width(end, self.capacity)].clone());
-                let mut values = self
-                    .seams
-                    .as_ref()
-                    .unwrap()
-                    .block
-                    .as_ref()
-                    .unwrap()
-                    .call(&args)?
-                    .into_iter();
+                args.push(profile.positions.clone());
+                let mut values = profile.block.call(&args)?.into_iter();
                 x = values.next().unwrap();
                 pending.push(KvState {
                     keys: values.next().unwrap(),
@@ -736,7 +937,13 @@ impl LlmTrait for Qwen3Model {
     fn preparation_status(&self) -> TextPreparationStatus {
         let implementation_ready = match self.variant {
             Variant::Bf16Public => true,
-            Variant::Bf16Compiled => self.seams.as_ref().is_some_and(|s| s.block.is_some()),
+            Variant::Bf16Compiled => {
+                self.seams.is_some()
+                    && self
+                        .decoder
+                        .as_ref()
+                        .is_some_and(|decoder| decoder.ready(self.capacity))
+            }
             Variant::MixedW8 => self.seams.is_some() && self.qk_fusion.is_some(),
         };
         let ready = self.invalid.is_none()
@@ -862,6 +1069,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exact_request_policy_bounds_and_fallback() {
+        for output in [0, 1, 128] {
+            let request = DecodeRequest::new(2050, output, Variant::Bf16Compiled, true);
+            assert_eq!(request.attention, AttentionMode::Exact);
+            assert_eq!(request.exact_count(), output.max(1));
+            assert_eq!(request.exact_offset(2049), None);
+            assert_eq!(request.exact_offset(2050), Some(0));
+            let last = 2050 + output.saturating_sub(1);
+            assert_eq!(request.exact_offset(last), Some(output.saturating_sub(1)));
+            assert_eq!(request.exact_offset(last + 1), None);
+        }
+        for (variant, enabled, output) in [
+            (Variant::Bf16Compiled, false, 128),
+            (Variant::Bf16Compiled, true, 129),
+            (Variant::Bf16Public, true, 128),
+            (Variant::MixedW8, true, 128),
+        ] {
+            let request = DecodeRequest::new(1, output, variant, enabled);
+            assert_eq!(request.attention, AttentionMode::Bucketed);
+            assert_eq!(request.exact_count(), 0);
+            assert_eq!(request.exact_offset(1), None);
+        }
+        let request = DecodeRequest::new(1, 128, Variant::Bf16Compiled, true);
+        assert_eq!(request.exact_offset(1), Some(0));
+        assert_eq!(request.exact_offset(128), Some(127));
+        assert_eq!(request.exact_offset(129), None);
+    }
+
     fn tiny(variant: Variant) -> Qwen3Model {
         let config = Qwen3Config::from_json(
             r#"{
@@ -920,6 +1156,166 @@ mod tests {
 
     fn values(model: &Qwen3Model, tensor: &Tensor) -> Vec<f32> {
         model.backend.to_cpu(tensor).unwrap().to_f32_vec().unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires exclusive Apple Silicon Metal test slot and pinned MLX SDK"]
+    fn exact_window_lifecycle_dispatch_and_no_hot_retraces() {
+        let mut model = tiny(Variant::Bf16Compiled);
+        model.exact_decode = true;
+        model.prefill_chunk = Some(PrefillChunk::Tokens2048);
+        for output in [0, 1, 128, 129] {
+            model.reset();
+            model.prepare(1, output).unwrap();
+            let decoder = model.decoder.as_ref().unwrap();
+            assert!(decoder.ready(model.capacity()));
+            assert_eq!(decoder.exact.is_some(), output <= 128);
+            if let Some(exact) = &decoder.exact {
+                assert_eq!(exact.positions.len(), output.max(1));
+            }
+            let traces = model.backend.stream().counters().trace_callbacks;
+            model.prepare(1, output).unwrap();
+            assert_eq!(model.backend.stream().counters().trace_callbacks, traces);
+            model.prefill(LlmInput::text(&[1])).unwrap();
+            if output == 128 {
+                for position in 1..128 {
+                    model.forward(&[7], position).unwrap();
+                }
+                model.forward(&[3], 128).unwrap();
+            } else if output == 129 {
+                model.forward(&[3], 1).unwrap();
+            }
+            assert_eq!(model.backend.stream().counters().trace_callbacks, traces);
+        }
+
+        for output in [0, 1] {
+            model.reset();
+            model.prepare(3, output).unwrap();
+            let traces = model.backend.stream().counters().trace_callbacks;
+            model.prefill(LlmInput::text(&[1, 2, 3])).unwrap();
+            assert_eq!(model.position(), 3);
+            assert_eq!(model.backend.stream().counters().trace_callbacks, traces);
+        }
+
+        model.reset();
+        model.prepare(2050, 128).unwrap();
+        let capacity = model.capacity();
+        let decoder = model.decoder.as_ref().unwrap();
+        let fallback = decoder.profile(2049).unwrap();
+        assert!(std::ptr::eq(fallback.block, &decoder.bucket));
+        assert_eq!(
+            fallback.positions.shape(),
+            [attention_width(2049, capacity)]
+        );
+        assert_eq!(decoder.profile(2050).unwrap().positions.shape(), [2050]);
+        assert!(std::ptr::eq(
+            decoder.profile(2178).unwrap().block,
+            &decoder.bucket
+        ));
+        let traces = model.backend.stream().counters().trace_callbacks;
+        model.prefill(LlmInput::text(&vec![7; 2050])).unwrap();
+        for position in 2050..2178 {
+            model.forward(&[3], position).unwrap();
+        }
+        assert_eq!(model.backend.stream().counters().trace_callbacks, traces);
+
+        let mut control = tiny(Variant::Bf16Compiled);
+        control.exact_decode = true;
+        control.prefill_chunk = Some(PrefillChunk::Tokens2048);
+        control.prepare(2050, 128).unwrap();
+        control.prefill(LlmInput::text(&vec![7; 2050])).unwrap();
+        for position in 2050..2178 {
+            control.forward(&[3], position).unwrap();
+        }
+        let expected = control.forward(&[3], 2178).unwrap();
+
+        let position = model.position();
+        model.prepare(2051, 127).unwrap();
+        assert_eq!(model.position(), position);
+        assert_eq!(model.capacity(), capacity);
+        assert_eq!(model.decoder.as_ref().unwrap().request.prompt, 2051);
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Ready
+        );
+        let traces = model.backend.stream().counters().trace_callbacks;
+        let continued = model.forward(&[3], position as u32).unwrap();
+        assert_eq!(values(&model, &continued), values(&control, &expected));
+        assert_eq!(model.position(), position + 1);
+        assert_eq!(model.backend.stream().counters().trace_callbacks, traces);
+        model.reset();
+        model.prefill(LlmInput::text(&vec![7; 2051])).unwrap();
+        model.forward(&[3], 2051).unwrap();
+        assert_eq!(model.backend.stream().counters().trace_callbacks, traces);
+
+        model
+            .decoder
+            .as_mut()
+            .unwrap()
+            .exact
+            .as_mut()
+            .unwrap()
+            .positions
+            .clear();
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Unprepared
+        );
+        let kv_count = model.kv.len();
+        assert!(model.forward(&[3], 2052).is_err());
+        assert_eq!(model.kv.len(), kv_count);
+        model.reset();
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Unprepared
+        );
+        model.prepare(2051, 127).unwrap();
+        model.forward(&[1], 0).unwrap();
+        model.decoder.as_mut().unwrap().bucket_positions.clear();
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Unprepared
+        );
+        let kv_count = model.kv.len();
+        assert!(model.forward(&[3], 1).is_err());
+        assert_eq!(model.kv.len(), kv_count);
+        model.reset();
+        model.prepare(2051, 127).unwrap();
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Ready
+        );
+
+        model.forward(&[1], 0).unwrap();
+        assert!(model.prepare(3, 1).is_err());
+        assert!(model.decoder.is_none());
+        assert!(model.prepared_lengths.is_empty());
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Invalidated
+        );
+        model.reset();
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Unprepared
+        );
+        model.prepare(3, 1).unwrap();
+        assert_eq!(model.capacity(), 256);
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Ready
+        );
+        model.reset();
+        assert!(model.prepare(MAX_CONTEXT + 1, 0).is_err());
+        assert!(model.decoder.is_none());
+        assert!(model.prepare(3, 1).is_err());
+        model.reset();
+        model.prepare(3, 1).unwrap();
+        model.reset();
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Ready
+        );
     }
 
     #[test]

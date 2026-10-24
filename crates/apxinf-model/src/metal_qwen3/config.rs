@@ -6,6 +6,10 @@ use serde::Deserialize;
 /// Maximum total positions in the Qwen3-0.6B checkpoint.
 pub const MAX_CONTEXT: usize = 40960;
 
+pub(super) fn exact_decode_enabled() -> bool {
+    std::env::var("APXINF_QWEN3_EXACT_DECODE").is_ok_and(|value| value == "1")
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum PrefillChunk {
     Tokens512 = 512,

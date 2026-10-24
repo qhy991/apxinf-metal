@@ -427,6 +427,14 @@ the presence of `MLX_DISABLE_COMPILE`, even when its value is `0`; that MLX
 setting otherwise disables compilation silently. The reuse check observes
 Rust tracing, not all native shader compilation.
 
+Qwen3's `APXINF_QWEN3_EXACT_DECODE=1` prepares a separate exact-width decoder
+window for `bf16-compiled` output budgets through 128, including one profile
+for a zero-output request. Buckets remain prepared for calls outside that
+window and for larger budgets. Changing the exact request replaces its
+callable and positions; identical preparation reuses them. Same-capacity
+preparation retains live KV. Failed preparation clears readiness. This opt-in
+does not change Public or MixedW8, and default attention remains bucketed.
+
 `LlmTrait::preparation_status()` returns a pure-data `TextPreparationStatus`:
 `RuntimeManaged`, `Unprepared`, `Ready` or `Invalidated`, implementation/variant,
 successfully prepared compilation scopes and sequence lengths, optional prompt
