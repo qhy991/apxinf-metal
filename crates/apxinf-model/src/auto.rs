@@ -242,6 +242,32 @@ impl LoadedModel {
         }
     }
 
+    /// Stop at the next token boundary and return the published prefix.
+    pub fn generate_streaming_cancellable(
+        &mut self,
+        input: LlmInput<'_>,
+        options: &GenerationOptions,
+        cancel: &crate::GenerationCancellation,
+        mut on_token: impl FnMut(GeneratedToken),
+    ) -> Result<GenerationOutput> {
+        let effective = GenerationOptions::apxinf_defaults()
+            .overlay(self.generation_defaults()?)
+            .overlay(options);
+        match self {
+            Self::Text { model, .. } => model.generate_streaming_cancellable_dyn(
+                GenerationRequest {
+                    input,
+                    options: &effective,
+                },
+                cancel,
+                &mut on_token,
+            ),
+            _ => Err(Error::Other(
+                "loaded model does not support text generation".into(),
+            )),
+        }
+    }
+
     pub fn image_mut(&mut self) -> Result<&mut dyn ImageRuntime> {
         match self {
             Self::Image(model) => Ok(&mut **model),
