@@ -84,10 +84,15 @@ short-token differences and enforce each language's external teacher floor
 before accepting full-model performance results. Compare frozen reference and
 candidate binaries with the same inputs and policies.
 
-MiniCPM5 compiled prefill uses unweighted native RMSNorm and rounds its result
-to BF16 before BF16 weight multiplication. Preserve this family-specific
-boundary when replacing its ordered expression; weighted native RMSNorm is
-not an interchangeable numerical contract.
+MiniCPM5 compiled prefill uses native weighted RMSNorm with existing BF16
+weights. In pinned MLX 0.32.3, the Metal kernel rounds the normalized value to
+BF16 before multiplying the BF16 weight, preserving this family's rounding
+boundary. Check the pinned implementation and operand dtypes before replacing
+an ordered norm. Operator naming alone does not establish interchangeability.
+Keep Public and DSpark ordered normalization and packed decode normalization
+unchanged. Require full-model numerical checks and paired performance gates
+for such replacements. Check real short and long outputs,
+external-teacher agreement, and request-state behavior before accepting results.
 
 Long-context preparation distinguishes total request capacity from active
 attention width. Qwen3 admits 40960 total positions, ordinary MiniCPM5 65792,

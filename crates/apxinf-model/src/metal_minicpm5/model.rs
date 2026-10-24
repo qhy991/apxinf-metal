@@ -157,11 +157,7 @@ impl MiniCpm5 {
             Some(LocalMath {
                 norm: Compiled::with_shapeless(stream, 1, true, move |a| {
                     let normalized = if native_norm {
-                        a[1].mul(
-                            &a[0]
-                                .fast_rms_norm_unweighted(rms_norm_eps)?
-                                .cast(a[0].dtype())?,
-                        )?
+                        a[0].fast_rms_norm(&a[1], rms_norm_eps)?
                     } else {
                         math::norm(&a[0], &a[1], &eps)?
                     };

@@ -227,3 +227,5 @@ MLX async_eval在同一调用中执行图遍历与Metal编码，活跃任务超�
 - 2026-10-24，Qwen native norm 的 40K 同 512 分块干净单 block 总时间 82.918 → 82.430 秒，比值 0.994113，TTFT 74.799 → 73.776 秒；decode 则由 15.643 降至 14.675 tok/s。此反向 decode 结果不删除，不以总时间的小幅收益掩盖。最终长档仍须五 block MLX 配对。
 
 - 2026-10-24，接受 Qwen compiled 的 prepared BF16 权重及 native weighted RMSNorm。依据为各语言 teacher 不退化、原 tiny/lifecycle 断言和全部 339 个准备权重检查通过，以及五个干净 1K block 全部快于 ordered 对照。222/1024 短文本差异为已披露的舍入变化，不声称逐 token 等价；40K decode 的反向单 block 保留，最终全档目标尚未完成。
+
+- 2026-10-24，接受 Mini compiled prefill 的 weighted native RMSNorm。新增五个干净 1K block 对照中，weighted/unweighted 配对比值中位为 0.996139，三块更快、两块略慢；相对 MLX 中位为 0.995757，范围 0.977647–1.003247。TTFT 中位 1251.856 → 1240.704 ms，decode 20.521 → 20.552 tok/s。数值及八组长状态检查均通过，16K 的干净单 block 比值 0.986981；64K 污染反向结果保留。该局部接受不替代最终全档五 block。

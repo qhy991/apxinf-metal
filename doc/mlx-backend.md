@@ -118,7 +118,7 @@ selectors remain aliases on Metal; Qwen3 checkpoint detection still works.
 | Qwen3 `bf16-compiled` (default) | Same profile | Native weighted RMSNorm with prepared BF16 weights; local norm/RoPE compilation plus explicit-state B1/L1 decoder blocks after prefix state exists; no whole-step callable |
 | Qwen3 `mixed-w8` | Same profile; affine W8/group 64 | Transformer projections use W8 at M1 and BF16 for larger M; fused gate/up; the tied input/output table is packed at every M; local norm/RoPE and fixed Q/K norm-to-RoPE Metal fusion; no BF16 decoder-block callable |
 | MiniCPM5 `bf16-public` | Official 2B BF16 geometry, B1, up to 65792 total positions, including 65536 prompt + 256 output | Ordered device composition; source public SwiGLU remains locally compiled |
-| MiniCPM5 `bf16-compiled` (default) | Same profile | KV-only evaluation of non-final prefill chunks, native unweighted prefill RMSNorm with BF16 rounding before weight multiplication, local RoPE and complete decode-step compilation with packed residual/RMSNorm |
+| MiniCPM5 `bf16-compiled` (default) | Same profile | KV-only evaluation of non-final prefill chunks, native weighted prefill RMSNorm with BF16 rounding before weight multiplication, local RoPE and complete decode-step compilation with packed residual/RMSNorm |
 | MiniCPM5 `dspark` | Same target plus the pinned official BF16 drafter; 1–256 output tokens within a separate 4096-total-position limit | Compiled five-layer draft and sequential Markov-head proposal chain, plus compiled target verification for up to eight rows; explicit accept/trim/pending-token schedule |
 
 These rows describe implemented scopes, not qualified targets. The maintained
@@ -373,6 +373,14 @@ FP32 expression used by `bf16-public` and `mixed-w8`. This changes 222 of 1024
 text-fixed tokens relative to b2d58ea. External-teacher agreement is 221/222
 with no per-language regression. Five clean 1K blocks improve total time
 against ordered normalization; the full MLX matrix remains pending.
+
+MiniCPM5 compiled prefill uses native weighted RMSNorm with its existing BF16
+weights. The pinned MLX 0.32.3 Metal kernel casts the normalized value to BF16
+before multiplying the weight. Public and DSpark retain ordered normalization,
+and compiled decode retains packed residual/RMSNorm. Short-token, teacher and
+eight long logits/state checks match the unweighted path. Five clean 1K blocks
+give a median total-time ratio of 0.9961 against that path; the full matrix
+remains pending.
 
 MLX-format affine checkpoints store packed weights as U32, which core `DType`
 does not represent. Load them with `apxinf_mlx::load_safetensors` over
