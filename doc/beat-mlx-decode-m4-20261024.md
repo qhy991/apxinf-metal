@@ -229,3 +229,9 @@ MLX async_eval在同一调用中执行图遍历与Metal编码，活跃任务超�
 - 2026-10-24，接受 Qwen compiled 的 prepared BF16 权重及 native weighted RMSNorm。依据为各语言 teacher 不退化、原 tiny/lifecycle 断言和全部 339 个准备权重检查通过，以及五个干净 1K block 全部快于 ordered 对照。222/1024 短文本差异为已披露的舍入变化，不声称逐 token 等价；40K decode 的反向单 block 保留，最终全档目标尚未完成。
 
 - 2026-10-24，接受 Mini compiled prefill 的 weighted native RMSNorm。新增五个干净 1K block 对照中，weighted/unweighted 配对比值中位为 0.996139，三块更快、两块略慢；相对 MLX 中位为 0.995757，范围 0.977647–1.003247。TTFT 中位 1251.856 → 1240.704 ms，decode 20.521 → 20.552 tok/s。数值及八组长状态检查均通过，16K 的干净单 block 比值 0.986981；64K 污染反向结果保留。该局部接受不替代最终全档五 block。
+
+- 2026-10-24，分块策略选择进入组合验证。Qwen compiled 默认 2048，Mini compiled 长于 4096 时默认 1024；其他 variant 保留 512，环境覆盖及同一准备/执行计划保持。Qwen native norm 的新三块对照在 4K 总时间比 2048/512 为 0.990962、0.992121、0.987214，128 token 全同；1K 中位比 0.995207，但同算术的 1024/2048 单块出现 11.7% 离群值，不把短档微小差别当稳定收益。长档沿用先前分块与峰值证据，默认策略仍须短文本、teacher 和最终全矩阵验证。
+
+- 2026-10-24，资源门禁纠正。早期脚本把物理上限写成 12 GiB（12,884,901,888 bytes），宽于用户字面 12 GB。后续构建、数值检查和最终性能计划收紧为 12,000,000,000 bytes；既有 guard JSON 不改写，超过 12 GB 的旧实验仅作诊断，不作字面 12 GB 合规证据。固定 swap 基线仍为 7483.06 MiB，增量上限及磁盘门禁不放宽。将试测两臂一致的 512 MiB allocator cache（仍低于 2 GiB 上限），检查 64K 是否可避免 swap-out 污染，再决定最终配对计划。
+
+- 2026-10-24，默认分块组合的两模型短文本各 1024 token 与前一 native/weighted 候选全同；相对 b2d 仍仅有 Qwen 已披露的 222 处差异。teacher 保持 Qwen 221/222、Mini 430/433，各语言不退化。两项原有 prefill-plan CPU 测试通过，独立源码及注释审查无问题。保存选择为当前候选，完整长档性能与资源资格仍待最终矩阵，不宣称 Mini 1024 已证明稳定最快。提交前仅撤回无关 rustfmt 布局变化，两版本格式化输出相同。
