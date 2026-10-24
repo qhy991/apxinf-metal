@@ -53,6 +53,8 @@ MLX-LM 0.32.0 的 `generate_step` 在读取当前 token 前提交下一步。它
 
 M4 查询结果不支持 dispatch-boundary counter sampling，只支持 stage boundary。当前记录了实际 kernel 名称和 dispatch 数量；原始 trace 无法给出可靠逐 kernel 时间。将每 command buffer 的 MLX op 上限改为 1 的补充实验仍有多 kernel，属于改变调度后的诊断，未把其 buffer 时间冒充单 kernel 时间。
 
+当前 CommandLineTools 环境的 `xcrun --find xctrace` 返回72，未安装可用的 Instruments CLI。因此本次完整模型的GPU时间仍以command-buffer区间为粒度，逐算子探针另列；没有用估算填充逐kernel实测。
+
 | 模型/输入/实现 | prefill eval 次数 | eval 合计 ms |
 | --- | ---: | ---: |
 | minicpm5-1024-apxinf | 1 | 1392.253 |
@@ -124,7 +126,7 @@ MLX 64K 另有已完成首个 warmup 的局部诊断（同一进程后来在第�
 
 - 2026-10-24，4K精确attention单block总时间比 exact/pipeline 为0.9982，收益不足以抵消短请求准备风险。先将此路径以默认关闭的实验模式独立提交，后续默认选择等待prefill和最终矩阵；未将16K基线轨迹97.66%描述为通过。接口注释审查无删除项，澄清端点/内部profile预热范围；模型边界检查通过。
 
-Prefill补充隔离诊断：MiniCPM5几何、42层独立随机BF16输入，在16K/64K有效KV、512/1024/2048 query rows下，causal SDPA相对显式bool mask的GPU调用墙钟中位比例为16384/512 0.9694, 16384/1024 0.9664, 16384/2048 0.9248, 65536/512 0.9701, 65536/1024 0.9650, 65536/2048 0.9422。所测输出逐元素一致，但这不是完整模型或质量门禁。mask构造在计时外，峰值同时保留两种路径对照，不能据此直接推断模型内存节省。将其列入分块实验之后的候选。
+Prefill补充隔离诊断：MiniCPM5几何、42层独立随机BF16输入，在16K/64K有效KV、512/1024/2048 query rows下，causal SDPA相对显式bool mask的GPU调用墙钟中位比例为16384/512 0.9694, 16384/1024 0.9664, 16384/2048 0.9248, 65536/512 0.9701, 65536/1024 0.9650, 65536/2048 0.9422。探针仅对每组第一层输出作逐元素比较，结果一致；其余41层只计时，没有作数值比较。这不是完整模型或质量门禁。mask构造在计时外，峰值同时保留两种路径对照，不能据此直接推断模型内存节省。将其列入分块实验之后的候选。
 
 Qwen3 bucket准备成本补测（独立新模型、每档单次，不含完整prefill/decode）：256→1024使1K/16K/40K准备时间由28.51/311.29/1418.17ms变为27.82/96.03/394.92ms。40K graph trace数170→50、eval数360→120，准备后MLX活跃内存约减少10.41MiB。这些固定128输出档的最终decode视图相同，未宣称稳定decode加速；实验代码恢复为256，二进制和精确diff留存。Mini同档256/1024粒度的准备宽度集合也相同，只有exact需要逐宽度图profile。
 
@@ -145,3 +147,15 @@ Mini unweighted fast RMSNorm隔离探针保留先归一化到BF16、再乘BF16�
 - 2026-10-24，prefill实验的计划、准备与执行使用同一分块范围，512/1024/2048由构造时私有开关选择。短文本两模型1024 token全一致，现有teacher不退化，2项CPU计划测试及实际4097-token尾块/重准备检查通过。此次仅提交可复现实验的分块选择，默认值不变，长BF16差异及单block限制保留。
 
 - 2026-10-24，Qwen fast RMSNorm的现有teacher为221/222（en113/113、zh108/109），高于基线220/222；Mini保持430/433，tiny public/compiled轨迹检查通过。Qwen1K单block候选/原路径总时间比0.9957，差距很小；16K/40K继续测量，尚不作收益结论。
+
+- 2026-10-24，分块选择以`1bf1af5`提交到本地分支，未推送。Qwen RMSNorm的16K单block总时间比为1.0011，无明确收益；40K尚在运行。Mini causal prefill开始独立构建/数值验证，Public与DSpark保留原mask路径。
+
+- 2026-10-24，Qwen1K的5-block四臂比较完成且全部无paging污染。b2d58ea、流水线/ordered norm、fast norm相对MLX的总时间比中位数为1.1251、1.0914、1.0875，decode分别59.03、61.42、61.36 token/s，MLX66.99。fast norm未改善decode，16K单block也无收益；40K单block比例1.0162且被paging污染。该候选不进入当前源码，数值差异和冻结二进制保留。短文本5-block补充仍在完成。
+
+- 2026-10-24，Mini causal prefill候选在text-fixed1024 token上与b2d58ea完全一致，现有teacher保持430/433且各语言计数不退化。该阶段Qwen仍带此前norm实验，复现207处短token差异及221/222 teacher；不是causal改动导致的Qwen差异。随后已恢复Qwen ordered norm，独立验证Mini unweighted prefill norm。
+
+- 2026-10-24，Qwen现有Q/K norm-RoPE融合核的28层几何探针完成。批量调用墙钟中位0.948→0.530ms，全部86016个Q/K元素一致。此为合成算子证据，不是模型速度或质量门禁；下一步仅评估其在BF16 compiled decode中的复用。
+
+- 2026-10-24，Mini causal prefill的16K单block对照无paging污染，TTFT37.094→36.358s，总时间44.659→44.035s，比例0.9860，128输出一致。1K/4K比例0.9669/0.8754，但两档均有paging污染，不据此宣称稳定收益。结合独立算子和数值证据，接受该局部实现，最终收益仍由5-block矩阵决定。
+
+- 2026-10-24，Mini unweighted prefill norm候选的两模型各1024-token短文本全一致，teacher保持Qwen220/222、Mini430/433且各语言不退化，独立源码审查无问题。自动attention策略的3项CPU边界/override测试通过；实际模型同capacity切换及失败恢复仍待运行。
