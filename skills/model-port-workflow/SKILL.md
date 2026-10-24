@@ -73,6 +73,11 @@ its explicit `dspark` variant adds the compiled draft chain and target
 verification schedule. Use the exact scope/profile table in `doc/mlx-backend.md`.
 None of these is CUDA Graph replay or evidence for an unrelated model family.
 
+MiniCPM5 compiled prefill uses unweighted native RMSNorm and rounds its result
+to BF16 before BF16 weight multiplication. Preserve this family-specific
+boundary when replacing its ordered expression; weighted native RMSNorm is
+not an interchangeable numerical contract.
+
 Long-context preparation distinguishes total request capacity from active
 attention width. Qwen3 admits 40960 total positions, ordinary MiniCPM5 65792,
 and DSpark retains 4096. Keep short BF16 shapes and rounding boundaries intact;

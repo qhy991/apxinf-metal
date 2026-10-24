@@ -21,6 +21,10 @@ value is cast to BF16 before multiplication by the BF16 affine weight. NeoX RoPE
 retains the separate BF16 products and sum. Public SwiGLU remains compiled as in
 the source runtime, including the `bf16-public` selection.
 
+Compiled prefill uses native unweighted RMSNorm, then multiplies the BF16
+weight after the normalized value has been rounded to BF16. Public and DSpark
+keep the ordered expression; compiled decode keeps its packed residual/norm.
+
 `model.rs` owns the forward order, per-request position/KV, precomputed position
 tables, and pure compiled decode function. `bf16-public` is the ordered reference
 composition. `bf16-compiled` selects local norm/RoPE compilation and whole-step
