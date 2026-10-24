@@ -1,6 +1,6 @@
 # Qwen3 与 MiniCPM5 decode 优化，M4，2026-10-24
 
-本任务以 `b2d58ea0656732af69922dc95f75b46cdae0b484` 为参考实现，工作分支为 `perf/beat-mlx-decode`。目标为 Qwen3-0.6B 与 MiniCPM5-2B 各档配对总时间比不超过 MLX 的 1.00。当前尚未完成测量或优化，不作达标声明。
+本任务以 `b2d58ea0656732af69922dc95f75b46cdae0b484` 为参考实现，工作分支为 `perf/beat-mlx-decode`。目标为 Qwen3-0.6B 与 MiniCPM5-2B 各档配对总时间比不超过 MLX 的 1.00。已完成若干独立优化和数值验证，最终五 block 矩阵尚未开始，不作全档达标声明。
 
 ## 实验约定
 
@@ -195,3 +195,33 @@ Mini unweighted fast RMSNorm隔离探针保留先归一化到BF16、再乘BF16�
 MLX 0.32.3源码确认RMSNorm按输入和权重共同类型提升，FP32权重会将BF16输入提升为FP32。这解释此前weighted-fast实验与MLX native BF16路径仍有差别，属于源码事实；是否影响模型性能需另测。[pinned fast.cpp](https://github.com/ml-explore/mlx/blob/v0.32.3/mlx/fast.cpp#L75)。首轮合成dtype探针中BF16权重路径约四分之一元素有舍入差异，不能当作数值等价替换。
 
 - 2026-10-24，Mini cache-only的16K同1024分块配对无paging污染，TTFT35.765→34.821s，总时间43.673→42.480s，比例0.9727，128输出一致。完整模型支持接受此局部裁剪；64K及最终五block仍在后续验证，不能把单block当作全档达标。模块边界和diff检查通过。
+
+- 2026-10-24，cache-only以`170d67b`独立本地提交。下一阶段只在Compiled长prefill块求值完成后清allocator cache，含末块；源码独立审查确认live KV仍有owner，失败会在position发布前失效。构建完成，数值和长摘要检查排队，尚未声称内存或速度收益。
+
+MLX async_eval在同一调用中执行图遍历与Metal编码，活跃任务超限时会等待GPU队列释放，支持将上述submit span解释为包含设备背压的墙钟，而非纯CPU开销。[pinned transforms.cpp](https://github.com/ml-explore/mlx/blob/v0.32.3/mlx/transforms.cpp#L260)。当前两模型的KV更新均为logits依赖，单checked-token根在源码上覆盖完整状态更新；去掉额外KV根只可能改变遍历/生命周期，性能与donation效果仍待独立实验。
+## 后续进度补记
+
+- 2026-10-24，MiniCPM5 cache-only 的 64K 单 block 配对完成。总时间 341.741 → 336.129 秒，比值 0.983577；TTFT 330.741 → 325.132 秒，decode 11.5448 → 11.5488 tok/s；128 token 全同。两臂物理峰值分别 10.15 / 11.29 GiB，固定基线 swap 增长均为 0，但驱动将该 block 标为污染。该数值只作观察，不计为清洁性能证据。JSON 位于 `devlocal/beat-mlx-decode/results/mini-cache-v1-minicpm5-65536-pair/metrics-summary.json`。
+- 2026-10-24，Qwen BF16 native RMSNorm 的独立设计比较完成，选择加载时准备单一精度权重并复用现有 norm 接口。尚未修改产品实现；现有 tiny、逐 token 差异披露和分语言 teacher 门禁保持不变。
+- 2026-10-24，Mini clear 候选的两模型 text-fixed 各 1024 token 全同，teacher Qwen 220/222、Mini 430/433，各语言均未退化。长输入 digest 与性能仍在运行。Mini weighted native norm 的独立算子探针在 1/512/1024/2048/4096 行全部逐元素相同，完整模型尚未验证。
+- 2026-10-24，Mini clear 八组长输入的完整 logits 字节摘要、后续 decode token 和状态断言全部与修改前一致；16K/64K 配对性能运行中。token-only 提交候选四项 CPU 测试通过，覆盖 EOS 多算丢弃、budget、position、cancel 与错误失效；完整数值门禁和性能尚未结束。
+- 2026-10-24，Mini clear 在 16K 的干净单 block 总时间由 41.866 增至 42.153 秒，比值 1.006873，没有提速证据。64K 尚在运行，候选仍未接受；较低缓存占用本身不代表完整模型更快。
+- 2026-10-24，token-only 提交通过两模型各 1024 短 token 一致性和分语言 teacher 门禁，进入五 block 性能比较。Qwen BF16 native norm 实验单独应用并通过独立源码审查，原有 tiny 数值测试、真实 113 权重检查和完整模型门禁排队；尚未接受该算术修改。
+- 2026-10-24，Qwen BF16 native norm 通过原有 tiny 数值断言，未改容差。独立临时程序直接编译当前 weights.rs，实际加载三个 variant，各 113 个 norm 数组的形状、准备精度和 checkpoint 数值全部匹配；完整短文本、teacher 和五 block 性能继续验证。
+- 2026-10-24，拒绝 Mini clear 性能候选，待当前构建冻结后撤回。64K 单 block 总时间 338.886 → 336.668 秒，比值 0.993457，但有 paging 污染；TTFT 327.718 → 325.767 秒，decode 11.3718 → 11.6504 tok/s，128 输出一致。物理峰值 12.170 / 12.179 GB，均低于 12 GiB guard，未降低峰值。请求结束 allocator cache 确实由约 2.14 降至 0.27 GB，然而 16K 干净配对略慢，现有数据不足以接受为完整模型性能优化。保留 JSON 证据，不保留三行产品逻辑。
+- 2026-10-24，Qwen native BF16 norm 的 text-fixed 出现 222/1024 处差异。history-zh 20 处、首次 108；code-zh 15 处、首次 111；code-en 116 处、首次 11；retrieve-en 71 处、首次 54。各位置、双方 token 和完整数组保存于候选 parity JSON，属于已披露的舍入变化。原有四项设备生命周期测试全部通过，分语言 teacher 门禁尚待完成，候选未接受。
+- 2026-10-24，Qwen native BF16 norm 的 teacher 达 221/222，英文 113/113、中文 108/109，各语言不退化；Mini 短文本 1024 token 全同、teacher 保持 430/433。开始五 block 完整模型性能比较。Mini clear 三行逻辑及能力说明已实际撤回；Mini weighted norm 以撤回后的冻结 worker 为配对对照，独立验证开始。
+
+- 2026-10-24，Qwen native BF16 norm 的五个干净 1K block 完成。对 MLX 的总时间比中位数从 ordered 1.041775 降至 native 1.012977，native 全部五块更快于 ordered，但全部仍慢于 MLX。总时间中位 2290.634 → 2222.678 ms，TTFT 375.213 → 349.554 ms，decode 66.304 → 67.883 tok/s；完整比值按 block 配对计算。此前披露的 222/1024 短文本差异保持，teacher 为 221/222；不能称为数值等价或全档达标。
+
+- 2026-10-24，Mini weighted prefill norm 的两模型短文本和外部 teacher 门禁通过。Mini 1024 token 全同、teacher 430/433；Qwen 保持 native norm 的 222 处已披露差异及 221/222 teacher。八组长输入的完整 logits 摘要、后续 decode 和状态断言全部与基线相同。16K 同 1024 分块的干净单 block 总时间 41.766 → 41.223 秒，比值 0.986981，TTFT 34.630 → 34.135 秒；64K 与最终五 block 尚未完成。
+
+- 2026-10-24，Qwen native norm 的 16K 同 512 分块配对完成且无 paging 污染，总时间 19.215 → 18.375 秒，比值 0.956309。此为单 block 局部收益，40K 与最终五 block 尚在后续验证。组合候选的 1K 新 profile 测得 Qwen GPU CB union 14.507 ms/token、Mini 48.367 ms/token，均是带 observer 的诊断；未将其与早期不同状态的 profile 比值当作性能门禁。
+
+- 2026-10-24，Mini weighted norm 的 64K 单 block 为反向结果。总时间 324.782 → 326.122 秒，比值 1.004127；TTFT 314.899 → 316.174 秒，decode 12.851 → 12.766 tok/s。128 输出全同，两臂固定基线 swap 增长为 0，但该 block 被标记为 paging 污染，不作加速或退化的确定结论。候选物理峰值 11.849 GB，对照 12.132 GB，均在当前 12 GiB guard 内；16K 的干净单 block 收益不能替代最终长档五 block。
+
+- 2026-10-24，纯 BF16 table RoPE 隔离探针完成。独立与合并 Q/K 两候选各检查 1,032,192 个 BF16 元素，覆盖 normal、大值、正负零和 0/1024/16384/40959 位置，全部位模式一致。28 层独立调用在位置 1024 的 30 次交错采样墙钟中位为原 compiled 0.489896 ms、独立 kernel 0.336063 ms、合并 Q/K 0.297625 ms。该数值含构图、提交和完成等待，不是单 kernel 时间，也不构成完整模型收益；开始比较安全封装和集成边界。首个调度因命令行参数误用在参数解析阶段失败，原错误 JSON 保留，第二次独立运行通过。
+
+- 2026-10-24，token-only 提交的 Qwen/Mini 各五个 1K block 均无 paging 污染。Qwen 对 MLX 比值中位数 1.086641 → 1.039506；Mini 1.019054 → 1.003824，仍未达成全部不慢于 MLX。两模型短文本各 1024 token 完全一致，外部 teacher 不退化。新组合诊断在 Qwen bucket、Mini bucket/exact 各 300 输出中检查 299 次，每次追加 eval 全部保留 KV 的直接 compute dispatch 增量为零，计数器跨步严格增加，避免恒零假通过。此探针含逐步同步，只证明已覆盖的直接计算依赖，不作计时证据。
+- 2026-10-24，实际 retained-prefix 检查全部通过。上述三条路径分别在发布 0、3、257 token 后丢弃额外一步，保留位置为 1024、1026、1280；不 reset 继续五步，异步与同步的完整 logits 字节摘要、token、position 及拒绝错误 position 后的状态均相同。接口清理后的四项 CPU EOS/budget/position/cancel/error 测试再次通过。接受 token-only 提交，删除无用 KV-root 回调，并在 DeviceDecode 保留 logits 必须依赖全部新状态的契约。
+- 2026-10-24，Qwen native norm 的 40K 同 512 分块干净单 block 总时间 82.918 → 82.430 秒，比值 0.994113，TTFT 74.799 → 73.776 秒；decode 则由 15.643 降至 14.675 tok/s。此反向 decode 结果不删除，不以总时间的小幅收益掩盖。最终长档仍须五 block MLX 配对。
