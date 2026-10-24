@@ -38,6 +38,20 @@ unchanged. Prefill and the fresh first-token path retain local compiled RoPE.
 Prefill uses the same layer composition with compiled local seams. Whole
 decode-step compilation is not implemented or claimed by this selection.
 
+`APXINF_QWEN3_MULTIROW_TABLE_ROPE=1` is a private opt-in for
+`bf16-compiled`. Construction reads this setting once. Only the exact value
+`1` enables it; unset and every other value preserve the existing path.
+For more than one row, the existing compiled RoPE seam captures a
+`Bf16TableRope` that accepts the normalized, transposed Q or K view and explicit
+BF16 table slices. It rounds negation, each product and each sum separately.
+Preparation uses the existing admitted lengths and both configured head counts
+through the same checked compiled seam. Single-row execution and all other
+variants keep their existing operations. On M4, device and actual-operand bit
+checks, short-output and teacher gates, and retained state through 40K pass.
+Five paired 4K blocks show lower TTFT; 1K shows no measurable total-time gain.
+The full long-context performance matrix remains pending. See the
+[measurement report](../../../../doc/beat-mlx-decode-m4-20261024.md).
+
 The private norm weight dtype selects the arithmetic. BF16 weights require BF16
 activations and select native weighted RMSNorm. FP32 weights select the ordered
 FP32 expression. The loader prepares one representation for every norm site,

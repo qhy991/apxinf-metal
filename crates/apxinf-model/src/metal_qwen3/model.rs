@@ -15,7 +15,7 @@ use crate::llm_trait::{
 };
 use apxinf_core::{Backend, Device, Error, Result, Tensor};
 use apxinf_loader::ModelConfig;
-use apxinf_mlx::fusions::{Bf16QkTableRope, QkNormRope};
+use apxinf_mlx::fusions::{Bf16QkTableRope, Bf16TableRope, QkNormRope};
 use apxinf_mlx::{Array, Compiled, MlxBackend, MlxDType, Stream};
 use std::{
     collections::{HashMap, HashSet},
@@ -69,13 +69,19 @@ struct KvState {
     values: Array,
 }
 
+fn multirow_table_rope_enabled(variant: Variant, value: Option<&std::ffi::OsStr>) -> bool {
+    variant == Variant::Bf16Compiled && value.is_some_and(|v| v == "1")
+}
+
 struct Seams {
     norm: Compiled,
     rope: Compiled,
+    multirow_table_rope: bool,
 }
 
 impl Seams {
-    fn new(stream: &Stream, config: &Qwen3Config) -> Result<Self> {
+    fn new(stream: &Stream, config: &Qwen3Config, multirow: Option<Bf16TableRope>) -> Result<Self> {
+        let multirow_table_rope = multirow.is_some();
         let eps = config.rms_norm_eps;
         let dims = config.head_dim;
         let norm = Compiled::new(stream, 1, move |a| {
@@ -88,9 +94,19 @@ impl Seams {
             if a.len() != 3 {
                 return Err(err("RoPE trace requires x, cos, sin"));
             }
-            Ok(vec![rotate(&a[0], &a[1], &a[2], dims)?])
+            let rotated = match &multirow {
+                Some(kernel) if a[0].shape().get(2).is_some_and(|&rows| rows > 1) => {
+                    kernel.call(&a[0], &a[1], &a[2])?
+                }
+                _ => rotate(&a[0], &a[1], &a[2], dims)?,
+            };
+            Ok(vec![rotated])
         })?;
-        Ok(Self { norm, rope })
+        Ok(Self {
+            norm,
+            rope,
+            multirow_table_rope,
+        })
     }
 }
 
@@ -334,8 +350,14 @@ impl Qwen3Model {
             .ok_or_else(|| err("Qwen3 native implementation requires an MLX backend"))?
             .clone();
         let weights = Weights::load(&config, tensors, backend.stream(), variant)?;
+        let multirow_value = std::env::var_os("APXINF_QWEN3_MULTIROW_TABLE_ROPE");
+        let multirow = if multirow_table_rope_enabled(variant, multirow_value.as_deref()) {
+            Some(Bf16TableRope::new(backend.stream())?)
+        } else {
+            None
+        };
         let seams = if variant != Variant::Bf16Public {
-            Some(Seams::new(backend.stream(), &config)?)
+            Some(Seams::new(backend.stream(), &config, multirow)?)
         } else {
             None
         };
@@ -516,12 +538,22 @@ impl Qwen3Model {
                 (c.num_key_value_heads, &layer.k_norm),
             ] {
                 let n = Array::zeros(s, &[1, len, heads, c.head_dim], MlxDType::BF16)?;
-                warm.extend(seams.norm.prepare(&[n.clone(), weight.clone()])?);
-                warm.extend(seams.rope.prepare(&[
-                    n.transpose(&[0, 2, 1, 3])?,
-                    cos.clone(),
-                    sin.clone(),
-                ])?);
+                if seams.multirow_table_rope && len > 1 {
+                    let normalized = seams.norm.prepare(&[n, weight.clone()])?.remove(0);
+                    warm.extend(seams.rope.prepare(&[
+                        normalized.transpose(&[0, 2, 1, 3])?,
+                        cos.clone(),
+                        sin.clone(),
+                    ])?);
+                    warm.push(normalized);
+                } else {
+                    warm.extend(seams.norm.prepare(&[n.clone(), weight.clone()])?);
+                    warm.extend(seams.rope.prepare(&[
+                        n.transpose(&[0, 2, 1, 3])?,
+                        cos.clone(),
+                        sin.clone(),
+                    ])?);
+                }
             }
             if len == 1 {
                 if let Some(fusion) = &self.qk_fusion {
@@ -1465,5 +1497,156 @@ mod tests {
                 assert!(x.is_finite() && y.is_finite() && (x - y).abs() <= 0.05 + 0.03 * x.abs());
             }
         }
+    }
+
+    #[test]
+    fn multirow_table_opt_in_requires_exact_value_and_compiled_variant() {
+        use std::ffi::OsStr;
+        for variant in [Variant::Bf16Public, Variant::Bf16Compiled, Variant::MixedW8] {
+            assert!(!multirow_table_rope_enabled(variant, None));
+            for value in ["", "0", "true", "01", "1 ", " 1", "2"] {
+                assert!(!multirow_table_rope_enabled(
+                    variant,
+                    Some(OsStr::new(value))
+                ));
+            }
+            assert_eq!(
+                multirow_table_rope_enabled(variant, Some(OsStr::new("1"))),
+                variant == Variant::Bf16Compiled
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(!multirow_table_rope_enabled(
+                Variant::Bf16Compiled,
+                Some(OsStr::from_bytes(&[0xff]))
+            ));
+        }
+    }
+
+    fn tiny_multirow(enabled: bool) -> Qwen3Model {
+        let mut model = tiny(Variant::Bf16Compiled);
+        let multirow = if enabled {
+            Some(Bf16TableRope::new(model.backend.stream()).unwrap())
+        } else {
+            None
+        };
+        model.seams = Some(Seams::new(model.backend.stream(), &model.config, multirow).unwrap());
+        model.prepared_lengths.clear();
+        model.prepare(1, 0).unwrap();
+        model
+    }
+
+    fn assert_same_multirow_state(a: &Qwen3Model, b: &Qwen3Model) {
+        assert_eq!(a.position(), b.position());
+        for (a, b) in a.kv.iter().zip(&b.kv) {
+            assert_eq!(a.keys.to_bytes().unwrap(), b.keys.to_bytes().unwrap());
+            assert_eq!(a.values.to_bytes().unwrap(), b.values.to_bytes().unwrap());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires exclusive Apple Silicon Metal test slot and pinned MLX SDK"]
+    fn multirow_table_forward_prefill_and_retained_outputs_match_existing_seam() {
+        let mut reference = tiny_multirow(false);
+        let mut candidate = tiny_multirow(true);
+        assert!(!reference.seams.as_ref().unwrap().multirow_table_rope);
+        assert!(candidate.seams.as_ref().unwrap().multirow_table_rope);
+        for model in [&mut reference, &mut candidate] {
+            model.prepare(3, 4).unwrap();
+            assert_eq!(
+                model.preparation_status().prepared_sequence_lengths,
+                vec![1, 2, 3]
+            );
+        }
+        let traces = candidate.backend.stream().counters().trace_callbacks;
+        let a = reference.forward(&[1, 7, 3], 0).unwrap();
+        let retained = candidate.forward(&[1, 7, 3], 0).unwrap();
+        let first = values(&candidate, &retained);
+        assert_eq!(values(&reference, &a), first);
+        assert_same_multirow_state(&reference, &candidate);
+        for (tokens, position) in [(vec![2, 5], 3), (vec![4], 5)] {
+            let a = reference.forward(&tokens, position).unwrap();
+            let b = candidate.forward(&tokens, position).unwrap();
+            assert_eq!(values(&reference, &a), values(&candidate, &b));
+            assert_same_multirow_state(&reference, &candidate);
+        }
+        assert_eq!(
+            candidate.backend.stream().counters().trace_callbacks,
+            traces
+        );
+        assert_eq!(values(&candidate, &retained), first);
+        reference.reset();
+        candidate.reset();
+        let a = reference.prefill(LlmInput::text(&[1, 7, 3])).unwrap();
+        let b = candidate.prefill(LlmInput::text(&[1, 7, 3])).unwrap();
+        assert_eq!(b.shape().dims(), &[1, 16]);
+        assert_eq!(values(&reference, &a), values(&candidate, &b));
+        assert_same_multirow_state(&reference, &candidate);
+        assert_eq!(
+            candidate.backend.stream().counters().trace_callbacks,
+            traces
+        );
+        assert_eq!(values(&candidate, &retained), first);
+    }
+
+    #[test]
+    #[ignore = "requires exclusive Apple Silicon Metal test slot and pinned MLX SDK"]
+    fn multirow_table_preparation_capacity_reset_and_failure_keep_readiness_contract() {
+        let mut candidate = tiny_multirow(true);
+        let constructed = candidate.preparation_status();
+        assert_eq!(constructed.state, TextPreparationState::Ready);
+        assert_eq!(constructed.prepared_sequence_lengths, vec![1]);
+        assert_eq!(constructed.kv_capacity, Some(256));
+        assert_eq!(
+            constructed.compiled_scopes,
+            vec![
+                TextCompilationScope::LocalSubgraphs,
+                TextCompilationScope::DecoderBlock
+            ]
+        );
+        assert_eq!(candidate.position(), 0);
+        candidate.prepare(3, 4).unwrap();
+        let initial = candidate.prefill(LlmInput::text(&[1, 7, 3])).unwrap();
+        let expected = values(&candidate, &initial);
+        candidate.reset();
+        candidate.prepare(257, 4).unwrap();
+        assert_eq!(candidate.capacity(), 512);
+        assert_eq!(
+            candidate.preparation_status().state,
+            TextPreparationState::Ready
+        );
+        assert!(candidate.prepared_lengths.contains(&257));
+        assert!(candidate.prepared_lengths.contains(&256));
+        candidate.reset();
+        candidate.prepare(3, 4).unwrap();
+        assert_eq!(candidate.capacity(), 256);
+        assert_eq!(
+            candidate.preparation_status().prepared_sequence_lengths,
+            vec![1, 2, 3]
+        );
+        let traces = candidate.backend.stream().counters().trace_callbacks;
+        let repeated = candidate.prefill(LlmInput::text(&[1, 7, 3])).unwrap();
+        assert_eq!(values(&candidate, &repeated), expected);
+        assert_eq!(
+            candidate.backend.stream().counters().trace_callbacks,
+            traces
+        );
+        candidate.reset();
+        assert!(candidate.prepare(MAX_CONTEXT + 1, 0).is_err());
+        let invalid = candidate.preparation_status();
+        assert_eq!(invalid.state, TextPreparationState::Invalidated);
+        assert!(invalid.compiled_scopes.is_empty());
+        assert!(invalid.prepared_sequence_lengths.is_empty());
+        assert!(candidate.forward(&[1], 0).is_err());
+        candidate.reset();
+        assert_eq!(
+            candidate.preparation_status().state,
+            TextPreparationState::Unprepared
+        );
+        candidate.prepare(3, 4).unwrap();
+        let repeated = candidate.prefill(LlmInput::text(&[1, 7, 3])).unwrap();
+        assert_eq!(values(&candidate, &repeated), expected);
     }
 }

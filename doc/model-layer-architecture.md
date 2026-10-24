@@ -185,6 +185,13 @@ Qwen3's compiled decoder block captures an immutable `Bf16QkTableRope` from
 rotation, shape validation and device indexing. The family still supplies
 explicit Q/K and table operands and owns normalization, positions and KV updates.
 Prefill and the fresh first-token path keep their local RoPE composition.
+The private `APXINF_QWEN3_MULTIROW_TABLE_ROPE=1` experiment captures the
+model-neutral `Bf16TableRope` inside the existing local compiled seam for
+multirow `bf16-compiled` inputs. Qwen3 retains selection, table preparation and
+the prepared-length plan. The backend owns validated strided rotation with
+separately rounded BF16 arithmetic. Other values preserve the existing path.
+M4 bit, short-output, teacher and long-state gates pass, with a measured 4K
+TTFT improvement. The full long-context performance matrix remains pending.
 
 Qwen3 also owns the private `APXINF_QWEN3_EXACT_DECODE=1` request policy.
 Its prepared decoder retains capacity buckets and an optional exact-width

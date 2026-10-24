@@ -1,6 +1,7 @@
 //! Safe, shape-bound device fusions with explicit rounding contracts.
 pub use crate::ane_tiles::{AneTileHandoff, AneTileMerge};
 pub use crate::bf16_qk_table_rope::Bf16QkTableRope;
+pub use crate::bf16_table_rope::Bf16TableRope;
 pub use crate::causal_conv::CausalDepthwiseConv;
 pub use crate::gate_swiglu::F16GateSwiglu;
 pub use crate::gated_delta::{GatedDeltaLayout, GatedDeltaRecurrence};

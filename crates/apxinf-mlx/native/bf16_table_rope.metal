@@ -1,0 +1,24 @@
+const uint pair = thread_position_in_grid.x;
+const uint half_dim = DIM / 2;
+if (pair >= HEADS * ROWS * half_dim) return;
+const uint column = pair % half_dim;
+const uint row = (pair / half_dim) % ROWS;
+const uint head = pair / (half_dim * ROWS);
+const int64_t x_base = static_cast<int64_t>(head) * static_cast<int64_t>(x_strides[1])
+    + static_cast<int64_t>(row) * static_cast<int64_t>(x_strides[2]);
+const int64_t cos_base = static_cast<int64_t>(row) * static_cast<int64_t>(cos_strides[2]);
+const int64_t sin_base = static_cast<int64_t>(row) * static_cast<int64_t>(sin_strides[2]);
+const int64_t first_column = static_cast<int64_t>(column);
+const int64_t second_column = static_cast<int64_t>(column + half_dim);
+const T first = x[x_base + first_column * static_cast<int64_t>(x_strides[3])];
+const T second = x[x_base + second_column * static_cast<int64_t>(x_strides[3])];
+const T negative_second = static_cast<T>(-second);
+const T first_left = static_cast<T>(first * cos[cos_base + first_column * static_cast<int64_t>(cos_strides[3])]);
+const T first_right = static_cast<T>(negative_second * sin[sin_base + first_column * static_cast<int64_t>(sin_strides[3])]);
+const T second_left = static_cast<T>(second * cos[cos_base + second_column * static_cast<int64_t>(cos_strides[3])]);
+const T second_right = static_cast<T>(first * sin[sin_base + second_column * static_cast<int64_t>(sin_strides[3])]);
+const T first_result = static_cast<T>(first_left + first_right);
+const T second_result = static_cast<T>(second_left + second_right);
+const uint offset = (head * ROWS + row) * DIM + column;
+out[offset] = first_result;
+out[offset + half_dim] = second_result;

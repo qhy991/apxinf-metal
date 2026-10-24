@@ -93,6 +93,22 @@ strided inputs, changed-operand compiled replay and retained outputs. Check
 full-model parity against the current norm path before interpreting performance.
 Prefill, fresh first-token, Public and MixedW8 paths retain their own RoPE.
 
+Qwen3's private `APXINF_QWEN3_MULTIROW_TABLE_ROPE=1` experiment captures the
+safe `Bf16TableRope` in the existing compiled RoPE seam for multirow
+`bf16-compiled` inputs. Construction reads the setting once; only exact `1`
+enables it. Keep table values explicit, Q and K as separate calls, and warm
+normalized transposed producers through checked `Compiled::prepare` for the
+existing admitted lengths and configured head counts. Preserve off-path and
+single-row preparation. Require exact BF16 host and ordered-expression bits,
+the `0x3b00` versus delayed-rounding `0x3b02` fixture, independent table strides
+and halves, offset views, changed-stride compiled replay and callable lifetime
+checks. Reject invalid geometry and unsigned product overflow before dispatch.
+Qualify captured Qwen operands, short outputs, per-language teacher floors,
+long retained logits and state before paired full-worker performance trials.
+Those gates pass on the recorded M4 candidate, with lower TTFT in five 4K
+blocks; the full long-context performance matrix remains pending. Do not infer
+MiniCPM5 integration or a speedup from the operator alone.
+
 Qwen3's exact-decode opt-in keeps a separate prepared exact window alongside
 capacity buckets. Cover output budgets 0, 1, 128 and the 129-token bucket
 fallback. Exercise actual final-prefill dispatch for zero/one budgets,

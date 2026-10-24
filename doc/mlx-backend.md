@@ -138,6 +138,20 @@ after native Q/K normalization. Local prefill RoPE, `bf16-public`, and
 `mixed-w8` retain their existing operations. The backend owns launch geometry
 and bounds checks; Qwen3 owns table preparation, position and KV updates.
 
+`Bf16TableRope` accepts BF16 X `[1,H,L,D]` and independently strided BF16
+tables `[1,1,L,D]`. H and L are positive, D is positive and even, and the logical
+element count must fit i32. It returns fresh contiguous X-shaped output and
+rounds negation, four products and two sums separately to BF16. The backend
+validates geometry and indexes views with signed int64 coordinate/stride
+products. View data pointers already include slice offsets.
+Qwen3 can capture this operation inside its existing compiled RoPE seam for
+multirow `bf16-compiled` execution with `APXINF_QWEN3_MULTIROW_TABLE_ROPE=1`.
+The exact value `1` is the only opt-in and construction reads it once. Device,
+actual-operand, short-output, teacher and long-state gates pass on M4; five
+paired 4K blocks show lower TTFT. The full long-context performance matrix
+remains pending. Preparation retains checked compiled replay and the existing
+length plan. MiniCPM5 does not select it.
+
 The standalone `apxinf-latency-worker` accepts `APXINF_MLX_CACHE_LIMIT_BYTES`.
 It applies this process-wide allocator cache budget once before model loading
 and records the requested and previous values in its ready identity. Unset
