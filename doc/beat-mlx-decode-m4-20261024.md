@@ -1,6 +1,6 @@
 # Qwen3 与 MiniCPM5 decode 优化，M4，2026-10-24
 
-本任务以 `b2d58ea0656732af69922dc95f75b46cdae0b484` 为参考实现，工作分支为 `perf/beat-mlx-decode`。目标为 Qwen3-0.6B 与 MiniCPM5-2B 各档配对总时间比不超过 MLX 的 1.00。已完成若干独立优化和数值验证，当前先解决组合候选的 64K 内存门禁失败，再运行最终五 block 矩阵，不作全档达标声明。
+本任务以 `b2d58ea0656732af69922dc95f75b46cdae0b484` 为参考实现，工作分支为 `perf/beat-mlx-decode`。目标为 Qwen3-0.6B 与 MiniCPM5-2B 各档配对总时间比不超过 MLX 的 1.00。已完成若干独立优化和数值验证，组合候选已通过完整 64K 冷请求的严格内存门禁和当前数值/状态验证，正在运行最终五 block 矩阵，不作全档达标声明。
 
 ## 实验约定
 
@@ -249,3 +249,9 @@ MLX async_eval在同一调用中执行图遍历与Metal编码，活跃任务超�
 - 2026-10-24，新边界状态检查收齐。Qwen bucket、Mini bucket/exact 各在 4095 prompt 后发布 0/3/259 token，保留位置 4095/4097/4353；9 组同步/异步续写五步的完整 logits 摘要、token、position 及错误位置拒绝均相同。依赖诊断三条路径各 299 次追加 KV 求值无新增直接 dispatch，300 输出全同；bucket 宽度 4352→4608 是源码几何推导，未直接遥测宽度。
 - 2026-10-24，同 256 MiB cache 的 b2d 64K profile 完成，物理峰值 11.980 GB。测量总时间 364.242 秒、TTFT 349.279 秒；forward 中位 116.688 ms、其中 eval 114.706 ms、sample/read 0.741 ms；GPU CB 并集 113.589 ms/token、host commit 1.156 ms/token，prefill 128 次 eval 合计 348.892 秒。对应 MLX 为 32 次 eval、317.902 秒及 GPU CB 并集 79.215 ms/token。该观察支持长 attention 与 prefill 是主要差距，但含 observer、区间重叠，不能充作最终无插桩比值。
 - 2026-10-24，阶段内存探针复现候选 64K 越限。零 allocator cache 下，prepare 入口 active 5.034 GB，初始 KV 求值后 7.897 GB；第一次 85 输出 decode 端点的 eval 尚未返回时，guard 在 7.322 秒采到 12.068 GB 并终止，尚未进入 prefill。首个 runner 漏设 Mini family 名称，已归档为加载前失败并另开正确运行。新进程的零数组隔离实验确认 84 个独立 backing 占 2,829,582,336 active bytes，共享单个 backing 为 33,685,504 bytes；这只证明初始存储差异，完整模型峰值和后续非零 KV replay 仍需验证。下一候选为共享不可变初始 KV。
+- 2026-10-24，补充真正不同宽度的 attention 隔离实验。共同 backing 改为按 1024 对齐并受模型上限截断，1K/16K 的有效长度为 1025/16385，256 bucket 宽 1280/16640，1024 bucket 宽 2048/17408。Mini 的 256/1024/exact 七次中位为 1K 1.846/2.045/1.810 ms、16K 11.181/11.751/8.506 ms；Qwen 为 1.871/1.847/1.808 ms、22.023/21.850/20.637 ms。最高档两种 bucket 仍相同，Mini 为 56.923/57.854/29.217 ms，Qwen 为 55.662/56.943/53.480 ms。此实验不改变产品 capacity 策略，各几何按顺序测量，微小差异不作稳定赢家依据。若产品也扩大 backing，1K/16K 的额外 768 位置按形状推算分别增加 Qwen 88.080 MB、Mini 33.030 MB KV；这是计算值，非实测物理峰值。完整 JSON 位于 `attention-width-v2-{qwen3,minicpm5}/attention.json`。
+- 2026-10-24，共享初始 KV 的完整 64K 冷请求通过严格门禁，物理峰值 9,896,417,472 bytes，固定基线 swap 增长为 0，单次租约 346.866 秒。零 cache 下，初始 KV 后 active 5.101 GB，两个预热端点峰值 7.932 GB，完整 prefill 阶段 allocator 峰值 8.158 GB；实际请求 active KV 仍为约 2.830 GB，没有缩减执行中的 KV 容量。128 token 与修改前 weighted、1024 分块的两次记录均全同。冷请求总时间 335.786 秒含准备及阶段标记，不能和不同状态的热测直接计算加速比。独立源码/注释审查无问题；两模型短文本、teacher、长 logits/state 与生命周期门禁继续。旧 DSpark draft 路径已不存在，后续使用现有 target checkpoint 做前后 target 验证，完整 drafter 测试未复跑。
+- 2026-10-24，共享初始 KV 的两模型 text-fixed 各 1024 token 与 RoPE 候选全同，Qwen 相对 b2d 仍只有已披露的 222 处差异；teacher 保持 221/222 与 430/433，各语言未退化。八组长输入 full-logits SHA、后续 decode、非法位置及 reset/reprepare 对照全部通过，含 Public 4097-token 请求。原有两项 Mini checkpoint 生命周期测试通过，覆盖容量增减、非零 KV 续写、不同真实 prompt、保留输出和释放。首个检查调度在确认 draft 资产缺失后停止，已改用普通生命周期续跑；attention 模式切换与独立 DSpark target 回放尚未结束。
+
+- 2026-10-24，共享初始 KV 的剩余门禁收齐。5 组同容量 attention 模式转换及失败容量恢复、非零 offset 改请求恢复、单行 prefill 尾块均通过。DSpark target 使用现有官方 target 权重，改动前后各跑 8 组 API/输入序列，共 40 次 logits/taps 观测与 4 个保留输出，全部 JSON 相同；两臂物理峰值 7.634 / 7.541 GB。未下载缺失 drafter，完整推测接受循环未复跑。冻结 worker SHA 为 `02241f9ec8d73ce8584dd91f641032594d1e4fd89faa0c00363d8e8d7e76568e`，全部记录源码与当前一致，接受为 64K 准备阶段的资源修复，尚无最终全档性能结论。
+- 2026-10-24，最终矩阵改用独立 `mini-shared-zero-v1` 标签，MLX、b2d、候选三臂统一 128 MiB allocator cache，均低于 2 GiB 上限。此前 b2d 同 256 MiB 的峰值接近 12 GB，缩小共同 cache 是为资源留余量，不预设速度收益。每档五 block、每臂独立进程内 warmup 一次和测量一次，轮换臂顺序，固定 128 输出；12 GB、1190 秒、固定 swap 基线和双锁不变。
