@@ -171,3 +171,27 @@ Mini unweighted fast RMSNorm隔离探针保留先归一化到BF16、再乘BF16�
 - 2026-10-24，Mini unweighted norm独立提交为`4c19950`，提交中的模型源码与已过门禁的mini-norm-v1哈希完全一致。自动attention的真实模型五次同capacity模式/预算切换、重复prepare不重trace、越界拒绝、非法capacity及非零offset变更后的恢复全部通过；显式exact的output2→3→0和一行尾块也通过。Q/K fusion两模型各1024短token全一致，teacher仍为220/222与430/433，完整模型配对开始。
 
 补充隔离结果：Qwen Q/K/V和gate/up分组合并的28层单行调用墙钟比约0.9944/0.9948，512/2048行也仅约0.9865–1.0039，所测输出逐元素全一致。没有足够收益证据支持新增权重布局与接口，暂不集成。Mini合成末层加最终行head在16K有效KV、512/1024/2048行时，求值全输出为40.78/74.46/143.02ms，只求值KV为1.09/1.95/2.52ms；64K为109.54/214.97/414.83ms对2.36/2.92/3.68ms，KV全一致。这是单末层随机输入的调用墙钟，不能相加充当完整模型收益；支持进一步做非末块cache-only实验。
+
+- 2026-10-24，自动attention策略独立提交为`fc35ffe`。Q/K融合五个干净1K block全部慢于原路径，原路径/融合相对MLX总时间比中位数1.0911/1.1041；融合相对原路径中位1.0119，已撤回源码和能力说明，保留冻结二进制及数值证据。Qwen短文本ordered路径五block相对MLX中位1.0490，目标尚未达到。
+
+- 2026-10-24，提高command buffer上限160/640在Qwen1K三个干净block的总时间比为1.0717/1.1206，均更慢；Mini中位1.0053/1.0087，且仅一个干净block，没有稳定收益，保留默认。Qwen4K分块2048相对512在三个干净block均较快，中位0.9914；1K无明确分块收益。
+
+- 2026-10-24，Mini cache-only修改前的实际8192/8193 prompt、512/1024/2048分块、4097单行尾块零预算和Public对照共八组摘要完成，保存完整logits字节SHA及后续decode token。非法prompt与过时position拒绝不破坏状态，越宽执行失效及reset重准备恢复均通过。准备按独立设计裁决只裁剪Compiled非末块的求值根。
+
+- 2026-10-24，Mini cache-only两模型各1024短token全一致，teacher保持220/222、430/433，各语言无退化；八组实际长输入的所有logits SHA、后续decode token及状态断言与修改前一致。独立源码及注释审查无问题，未新增注释或抑制。16K/64K同1024分块性能对照开始。
+
+当前流水线1K再profile（真实完整请求，含observer开销，非最终配对成绩）：
+
+|模型/路径|graph ms/token|async提交含等待 ms/token|token读取 ms/token|GPU CB union ms/token|host commit ms/token|CB/token|
+|---|---:|---:|---:|---:|---:|---:|
+|qwen3/ordered|0.3217|16.0732|0.0018|16.6023|0.1875|55.0079|
+|qwen3/qk|0.3965|15.8191|0.0019|16.4826|0.1687|36.0000|
+|qwen3/mlx|1.4782|13.2012|0.0032|14.8438|0.1712|26.9055|
+|minicpm5/ordered|1.5237|48.5336|0.0029|50.1390|0.6057|84.3071|
+|minicpm5/mlx|2.1730|47.2527|0.0040|50.1950|0.5669|84.2677|
+
+实测token读取已降至微秒级，主要主机阻塞在async_eval内部；不能将其视为纯命令提交CPU成本。各列区间重叠，不可相加，GPU CB union不是逐kernel时间。Q/K融合将CB/token从55降至36，但五block完整性能仍不受益，已拒绝。此次observer能记录真实kernel名称；Qwen原路径出现F32 cast/reduce，MLX使用rmsbfloat16。日志交错按完整嵌套JSON无损重组，全部256次token读取和254次graph/submit保留，原始SHA及重组次数保存后删除raw。
+
+MLX 0.32.3源码确认RMSNorm按输入和权重共同类型提升，FP32权重会将BF16输入提升为FP32。这解释此前weighted-fast实验与MLX native BF16路径仍有差别，属于源码事实；是否影响模型性能需另测。[pinned fast.cpp](https://github.com/ml-explore/mlx/blob/v0.32.3/mlx/fast.cpp#L75)。首轮合成dtype探针中BF16权重路径约四分之一元素有舍入差异，不能当作数值等价替换。
+
+- 2026-10-24，Mini cache-only的16K同1024分块配对无paging污染，TTFT35.765→34.821s，总时间43.673→42.480s，比例0.9727，128输出一致。完整模型支持接受此局部裁剪；64K及最终五block仍在后续验证，不能把单block当作全档达标。模块边界和diff检查通过。
