@@ -95,3 +95,31 @@ M4 查询结果不支持 dispatch-boundary counter sampling，只支持 stage bo
 - 2026-10-24，提交前审查将内部清理参数改成显式 `DecodeFinish`，移除 5 行内部叙述注释；重跑 16 项 CPU/接口测试和两模型各 1024-token 对照均通过。pipeline-v2 的 1K documents 单 block 配对总时间比为 Qwen3 0.9931、MiniCPM5 1.0111；后者有 paging 污染，均仅作阶段诊断，最终仍按 5 blocks 验收。
 
 - 2026-10-24，MLX 64K 的两个单请求重试仍在约 115/125 秒时触发同一 swap 门禁，低水位起跑未解决。停止原样重试，采用“检验共同前提”原则，下一次运行移除 observer 和 host instrumentation，隔离诊断工具是否影响内存。流水线额外通过 MLX greedy 无穷值/NaN/tie 语义测试。
+
+- 2026-10-24，流水线作为独立变更提交到本地 `5306ec3`；两个模型各 1024 token 精确一致，16 项 CPU/接口测试及 greedy 特殊值测试通过。精确 attention 继续作为未接受的实验，采用有界请求宽度预热并单独计入冷准备成本。
+
+- 2026-10-24，无 observer/host instrumentation 的 MLX 64K 对照仍于 240.2 秒触发 swap guard，进程峰值 10.06 GB、累计 swap 增长 4108.25 MiB。诊断包装不是失败的必要条件；不能用该运行补齐 64K 性能结论。全机其他进程的物理占用明显，继续保留原始 swap 基准与 12 GB 门槛。
+
+Attention kernel 名称实测补充：MiniCPM5 16K/64K 的 bucket+mask 使用 `sdpa_vector_2pass_1_bfloat16_t_128_128_boolmask_qnt_nc_nosinks_64`，精确无 mask 切到 `sdpa_vector_2pass_1_gqa_8_bfloat16_t_128_128_nomask_qnt_nc_nosinks_64`；两者都另有 pass-2。Qwen3 对应两路均为普通 two-pass，仅 mask 专项不同。推断 MiniCPM5 的主要收益来自 GQA kernel 选择，不只是少扫最多 255 个位置；已留存逐 case/粒度名称 JSON。
+
+- 2026-10-24，512 MiB allocator cache 的 MLX 64K 控制运行仍在 202.8 秒触发 swap guard，进程峰值 8.24 GB、累计 swap 增长 4241.88 MiB。cache 降低不足以解决当前全机内存约束；64K 配对继续留空。精确 attention 实验已编译通过，开始数值对照。
+
+- 2026-10-24，attention-v1（实验开关开启）在两模型 text-fixed 各 1024 token 上与 b2d58ea 完全一致。MiniCPM5 冷请求汇总约 21.92 秒，流水线基线约 6.81 秒，逐精确宽度预热带来的成本必须继续拆分，不能仅凭稳定 decode 收益推广。
+
+额外的 MiniCPM5 几何合成 attention 使用 CPU float64 稳定 softmax 参考，长度 1025/16385/65537，Q/K 尺度 0.2/1/4。bucket 与 exact 的相对 L2 误差均约 0.14%–0.25%；exact 对 bucket 的误差有增有减，长序列两者最大差随输入尺度可达 0.0078125。此证据只衡量所测合成算子的舍入误差，不能替代模型 teacher 门禁。
+
+- 2026-10-24，attention-v1 的现有 teacher-forced 门禁通过且计数不退化：Qwen3 220/222（en112/113、zh108/109），MiniCPM5 430/433（en262/262、zh168/171），均与冻结基线相同。该短轨迹检查仍不覆盖 64K 的 GQA 舍入变化。
+
+- 2026-10-24，加入锁外资源恢复后，MiniCPM5 16K 三臂单 block 完成且无 swap-out 污染。总时间 MLX41.42s、pipeline45.04s、exact44.27s，比例由1.0873降至1.0689，仍未达标；此为单 block 阶段诊断。exact 冷 warmup64.85s对 pipeline46.08s，须继续解决准备成本。
+
+16K 同 block 的实测 decode 为 pipeline15.34、exact16.88、MLX17.58 token/s；prefill 约445.75/445.87/479.15 token/s。pipeline 与 exact 的128-token 输出从下标59（第60个）开始分歧，共68个位置不同。该差异已单独保存，不能标为长文本精确一致；现有短 teacher 门禁通过不等于证明长文本轨迹不变。
+
+- 2026-10-24，attention-v2 采用首尾 profile 实际执行、中间 profile 仅验证计算图复用。两模型 text-fixed 各1024 token仍全一致；teacher计数保持220/222与430/433。Mini冷短请求汇总降至7.081s，16题teacher准备合计由53.344s降至5.898s（基线0.747s）。2项CPU准备语义测试通过，真实Mini4609-token prompt覆盖单行尾块、同capacity输出预算2→3→0、越界拒绝/Invalidated及执行不重trace。中间长度的设备JIT/分配仍计入首次请求，未宣称全Metal预热。
+
+MLX 64K 另有已完成首个 warmup 的局部诊断（同一进程后来在第二个请求触发 guard，不能作为完成的配对性能数据）。该首请求 GPU command-buffer 区间并集为82.91ms/token，command submit CPU0.860ms/token，scalar read中位0.003625ms；32次prefill eval合计320.65s。它支持长decode GPU差距这一方向，但热身状态与完整运行失败的限制必须保留。
+
+- 2026-10-24，attention-v2 的16K单block配对总时间比为 exact/pipeline 1.0005，decode由15.27增至17.01 token/s；冷请求44.86s对43.09s。追加的基线轨迹teacher对照为125/128，未通过该诊断设置的98%阈值；它衡量对b2d轨迹的一致性，不是外部质量teacher，原有两模型数值门禁仍无计数退化。64K对照继续运行。
+
+- 2026-10-24，64K精确attention的基线轨迹teacher检查完成，127/128（99.22%）通过该诊断98%阈值，物理峰值10.51GiB、累计swap增长1053.50MiB，均在门禁内。16K/64K逐步差异另存JSON，不能称长输出逐token一致；64K MLX配对性能仍缺。
+
+- 2026-10-24，4K精确attention单block总时间比 exact/pipeline 为0.9982，收益不足以抵消短请求准备风险。先将此路径以默认关闭的实验模式独立提交，后续默认选择等待prefill和最终矩阵；未将16K基线轨迹97.66%描述为通过。接口注释审查无删除项，澄清端点/内部profile预热范围；模型边界检查通过。
