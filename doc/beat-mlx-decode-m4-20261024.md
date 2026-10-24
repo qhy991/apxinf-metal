@@ -1,12 +1,12 @@
 # Qwen3 与 MiniCPM5 decode 优化，M4，2026-10-24
 
-本任务以 `b2d58ea0656732af69922dc95f75b46cdae0b484` 为参考实现，工作分支为 `perf/beat-mlx-decode`。目标为 Qwen3-0.6B 与 MiniCPM5-2B 各档配对总时间比不超过 MLX 的 1.00。已完成若干独立优化和数值验证，最终五 block 矩阵尚未开始，不作全档达标声明。
+本任务以 `b2d58ea0656732af69922dc95f75b46cdae0b484` 为参考实现，工作分支为 `perf/beat-mlx-decode`。目标为 Qwen3-0.6B 与 MiniCPM5-2B 各档配对总时间比不超过 MLX 的 1.00。已完成若干独立优化和数值验证，当前先解决组合候选的 64K 内存门禁失败，再运行最终五 block 矩阵，不作全档达标声明。
 
 ## 实验约定
 
 按 profiling、greedy 流水线、attention 长度、prefill 分块、剩余热点的顺序执行。每个改动分别验证两模型 text-fixed 的 8 题、每题 128 token，与参考实现逐 token 比较。数值差异单列并运行已有数值检查。最终 documents 扫描使用每档 5 block，固定输出 128 token，另有 text-fixed 短输入档。
 
-每次编译和设备运行同时持有两把 Metal 锁，单次最多 1190 秒。物理进程组上限 12 GiB，swap 相对本任务初始值最多增长 4 GiB，磁盘至少剩余 8 GiB。构建使用 4 jobs、MacOSX15.4.sdk 和独立 target。动态库固定 MLX 0.32.3。原始捕获解析后删除，只保留 JSON。
+每次编译和设备运行同时持有两把 Metal 锁，单次最多 1190 秒。后续物理进程组上限按字面 12 GB，即 12,000,000,000 bytes 执行。早期 12 GiB 设置保留在各原始 guard JSON，超过 12 GB 的旧实验不作合规证据。swap 相对本任务初始值最多增长 4 GiB，磁盘至少剩余 8 GiB。构建使用 4 jobs、MacOSX15.4.sdk 和独立 target。动态库固定 MLX 0.32.3。原始捕获解析后删除，只保留 JSON。
 
 中间证据和待办位于 `devlocal/beat-mlx-decode/`。既有外部 checkpoint、baseline 仓库和长上下文结果原地只读复用。
 
@@ -235,3 +235,17 @@ MLX async_eval在同一调用中执行图遍历与Metal编码，活跃任务超�
 - 2026-10-24，资源门禁纠正。早期脚本把物理上限写成 12 GiB（12,884,901,888 bytes），宽于用户字面 12 GB。后续构建、数值检查和最终性能计划收紧为 12,000,000,000 bytes；既有 guard JSON 不改写，超过 12 GB 的旧实验仅作诊断，不作字面 12 GB 合规证据。固定 swap 基线仍为 7483.06 MiB，增量上限及磁盘门禁不放宽。将试测两臂一致的 512 MiB allocator cache（仍低于 2 GiB 上限），检查 64K 是否可避免 swap-out 污染，再决定最终配对计划。
 
 - 2026-10-24，默认分块组合的两模型短文本各 1024 token 与前一 native/weighted 候选全同；相对 b2d 仍仅有 Qwen 已披露的 222 处差异。teacher 保持 Qwen 221/222、Mini 430/433，各语言不退化。两项原有 prefill-plan CPU 测试通过，独立源码及注释审查无问题。保存选择为当前候选，完整长档性能与资源资格仍待最终矩阵，不宣称 Mini 1024 已证明稳定最快。提交前仅撤回无关 rustfmt 布局变化，两版本格式化输出相同。
+
+- 2026-10-24，RoPE 候选的真实 Rust/Metal 三项设备测试通过，覆盖 D8/D128 位模式、strided/sliced 输入、不同表格半部、正负零、变化输入的 compiled replay、保留/延迟输出和非法形状。原有四项 Qwen 模型设备测试亦通过。两模型各 1024 短 token 与分块策略冻结对照全同，teacher 和五 block 性能尚在运行；独立源码及注释审查无问题。
+- 2026-10-24，补正根依赖探针的边界描述。原 1024+300 请求容量仅 1536，低于两模型的小容量阈值，虽然位置越过 1280，attention 实际使用固定宽度，不能称为活动 bucket 切换覆盖。旧 JSON 保留，另加 4096+300 的依赖诊断，以及 4095 prompt、发布 0/3/259 后继续五步的状态检查，覆盖大容量下 4096/4352 边界；新检查仍在等待设备锁。
+- 2026-10-24，RoPE 的完整外部 teacher 门禁通过，Qwen 221/222、Mini 430/433，各语言保持；两模型短文本相对前一候选均全同。五 block 性能仍待收齐。严格 12 GB、512 MiB allocator cache 的 64K 预检中，MLX 完成且物理峰值 9.053 GB、无 swap-out；b2d 在模型加载 ready 后、首请求完成前触发 12.112 GB 峰值，8.3 秒即被 guard 停止。该失败保留，不计性能结果，改用三臂相同 256 MiB cache 继续资源诊断。
+- 2026-10-24，新增 copy dispatch 几何观测。Qwen 4K bucket 的 299 次 decode 编码中，显式 KV 根路径出现 5962 次 `vn_copybfloat16bfloat16`，grid 为 1179648；token-only 检查路径该几何计数为零。Mini bucket 对应为 5378 次、grid 294912，token-only 同样为零。MLX 0.32.3 的 `copy_v` 每线程处理 4 个 BF16，两个 grid 分别与各模型完整 KV 数组元素数吻合，属于结合源码的归因推断，未直接观测 buffer 身份。其余小 copy 和动态单行更新仍存在。两条诊断的同步方式不同，不将 dispatch 数量差换算成完整性能收益；证据存于 `decode-copy-shapes-v2.json`。
+- 2026-10-24，启动冻结组合 `qwen-rope-v1` 的完整 12 档五 block 矩阵，三臂为 MLX、b2d 和候选，同用 256 MiB allocator cache、12,000,000,000-byte 物理上限、固定 swap 基线和双锁。RoPE 独立选择仍待五 block 收齐，完整矩阵属于候选验证，不代表已接受或全档达标。256 MiB 的 b2d 64K 资源预检已越过先前早期失败点，完整资格尚待完成。
+- 2026-10-24，256 MiB 的 b2d 64K 两次请求完成，物理峰值 11.842 GB，但期间有 14768 次系统 swap-out，不能作干净性能证据。候选在 7.610 秒触发 12.123 GB guard；其加载 ready 为 5.144 秒。ready 仅表示模型加载完成，不能据此断言失败就在 prepare 内部，先前进度中的阶段归因修正为推断。零保留 allocator cache 的候选检查排队，同时复核初始 KV 与预热输出的存活关系。`Compiled::prepare` 的第一次输出在分号处已释放，不能从两次 eval 推断同时存活三份 KV。
+- 2026-10-24，零保留 allocator cache 的候选 64K 检查仍失败，12.584 秒时物理峰值 12.067 GB，固定基线 swap 增长为 0。仅缩小闲置 cache 不足以满足该请求的严格门禁，开始增加阶段内存观测，尚未改变模型分配逻辑。Mini bucket/exact 与 Qwen bucket 的新 4096+300 依赖检查均完成，每条路径 299 次追加 KV 求值没有新增直接 compute dispatch，全部 300 个 token 与显式根对照相同。Mini exact 显式根的 observer 文本有交叉写入，仅保存带 SHA 的未解析 JSON transcript，不用于时间或 dispatch 结论；其独立 token 记录完好。
+- 2026-10-24，补齐 256 MiB cache 下的 MLX 64K 完整 profile，warmup 和测量各一次均完成，物理峰值 8.792 GB。测量总时间 328.379 秒、TTFT 318.288 秒；decode GPU CB 区间并集 79.215 ms/token，host graph 中位 2.716 ms、async 提交含背压 75.846 ms、token 读取 0.004167 ms、host commit 1.058 ms/token，prefill 32 次 eval 合计 317.902 秒。以上区间重叠且含 observer 开销，不能相加或作为最终速度门禁。host 与 Metal 事件改为独立写入并在解析时合并，125390 个事件无交错修复；同 cache 的 b2d 诊断仍在运行。
+- 2026-10-24，终止未成组的首次最终矩阵启动。只完成 Qwen 1K block 0 的 MLX 臂，baseline 仍在等锁且未创建设备进程；两个本任务调度进程均已停止，原始 driver receipt 与单臂 JSON 保留，另写取消原因。候选 64K 内存资格尚未通过，不把这次启动当作最终成绩；阶段诊断结束后以最终候选重跑，避免长诊断穿插配对臂。
+- 2026-10-24，接受纯 BF16 table RoPE。五个干净 1K block 的 paired/composed 总时间比分别为 0.992101、0.995771、0.985394、0.995030、0.989903，中位 0.992101，五块均改善。相对 MLX 中位 0.999906，范围 0.995535–1.004385，三块更快，仍处于持平附近。总时间中位 2236.038 → 2216.573 ms，decode 67.040 → 67.974 tok/s；各块 documents 128 输出与前一候选全同。原有设备测试、两模型短文本相对一致性和分语言 teacher 均通过，Qwen 相对 b2d 的 222 处历史舍入差异保持披露。完整矩阵尚未完成。
+- 2026-10-24，新边界状态检查收齐。Qwen bucket、Mini bucket/exact 各在 4095 prompt 后发布 0/3/259 token，保留位置 4095/4097/4353；9 组同步/异步续写五步的完整 logits 摘要、token、position 及错误位置拒绝均相同。依赖诊断三条路径各 299 次追加 KV 求值无新增直接 dispatch，300 输出全同；bucket 宽度 4352→4608 是源码几何推导，未直接遥测宽度。
+- 2026-10-24，同 256 MiB cache 的 b2d 64K profile 完成，物理峰值 11.980 GB。测量总时间 364.242 秒、TTFT 349.279 秒；forward 中位 116.688 ms、其中 eval 114.706 ms、sample/read 0.741 ms；GPU CB 并集 113.589 ms/token、host commit 1.156 ms/token，prefill 128 次 eval 合计 348.892 秒。对应 MLX 为 32 次 eval、317.902 秒及 GPU CB 并集 79.215 ms/token。该观察支持长 attention 与 prefill 是主要差距，但含 observer、区间重叠，不能充作最终无插桩比值。
+- 2026-10-24，阶段内存探针复现候选 64K 越限。零 allocator cache 下，prepare 入口 active 5.034 GB，初始 KV 求值后 7.897 GB；第一次 85 输出 decode 端点的 eval 尚未返回时，guard 在 7.322 秒采到 12.068 GB 并终止，尚未进入 prefill。首个 runner 漏设 Mini family 名称，已归档为加载前失败并另开正确运行。新进程的零数组隔离实验确认 84 个独立 backing 占 2,829,582,336 active bytes，共享单个 backing 为 33,685,504 bytes；这只证明初始存储差异，完整模型峰值和后续非零 KV replay 仍需验证。下一候选为共享不可变初始 KV。
