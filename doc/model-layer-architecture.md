@@ -65,6 +65,10 @@ shared driver retains publication, EOS, budget and cancellation. Its default is
 synchronous. `mlx_decode.rs` owns the one-step greedy cursor used by compiled
 Qwen3 and MiniCPM5; each family builds its own lazy step and drains/trims its KV.
 The backend owns array operations and greedy selection, not the request schedule.
+The private `CheckedGreedy` in `mlx_decode.rs` retains optional compiled sampling
+for each eligible family instance. It invokes the backend's existing numerical
+helper. The family owns preparation and readiness; the cursor requests arrays
+through `DeviceDecode::greedy_arrays` and retains the returned token arrays.
 `LoadedModel::generate_streaming_cancellable` accepts a sticky
 `GenerationCancellation` handle. Cancellation is cooperative at token boundaries;
 DSpark's specialized schedule rejects this new entry explicitly.

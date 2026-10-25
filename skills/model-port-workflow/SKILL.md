@@ -182,6 +182,20 @@ admission before reset, and test one-step lookahead, discarded EOS work, real
 cancellation, position restoration, cleanup and synchronous fallback through
 `LoadedModel`. Never move generation scheduling into the array backend.
 
+The private `APXINF_MLX_COMPILED_GREEDY=1` experiment belongs to each compiled
+Qwen3 or ordinary MiniCPM5 model. Keep backend greedy numerical semantics in
+`greedy_token_arrays` and sampler preparation in `mlx_decode::CheckedGreedy`.
+Prepare a fresh temporary callable with evaluated `[1, vocab]` inputs and
+validate both U32 outputs plus checked ready-read layout before installation.
+Drain any attempted evaluation before dropping a failed temporary callable.
+Retain family invalidation and require fresh preparation for recovery. Include selected
+sampler readiness in every successful family preparation path. Test special
+values, safe invalid feed, first ties, actual final-row layouts, retained outputs,
+independent instances, failed preparation/retry, hot retrace rejection and
+initial/successor sampling cleanup on CPU and target Metal. Keep the selector
+default off until numerical and paired full-model gates qualify it. Report
+preparation, cold request and warm request costs separately.
+
 ## Workflow
 
 1. During preflight, reuse the task's confirmed inputs and execution mode; use

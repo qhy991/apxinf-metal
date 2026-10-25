@@ -83,6 +83,30 @@ snapshot is retained. `APXINF_MLX_SYNC_DECODE=1` selects the synchronous fallbac
 Async generation profiles include callback wall time and the final drain, since
 callbacks can overlap GPU execution. Other variants keep their existing schedule.
 
+The private default-off `APXINF_MLX_COMPILED_GREEDY=1` experiment compiles the
+existing checked sampler for Qwen3 and ordinary MiniCPM5 `bf16-compiled`.
+Construction reads the setting once; only exact `1` selects it. Public,
+MixedW8 and DSpark do not read this setting. The family retains one private
+`CheckedGreedy`; no backend API or global callable cache is added.
+
+Family preparation evaluates a temporary callable twice for `[1, vocab]` BF16
+logits, validates two `[1]` U32 outputs and checks ready-read layout before
+installing it. Evaluation or output-validation failure drains the stream,
+drops that callable and leaves sampling unprepared. The family error path retains the error.
+Reset and later preparation may retry with a fresh callable. Model readiness
+includes the selected sampler, including MiniCPM5's compatible-request return.
+Successful preparation survives reset and changed request geometry because
+the sampler captures no request state.
+
+Sampling validates dtype and vocabulary, selects the final row and invokes the
+retained callable lazily. A hot Rust trace callback fails the request. This
+check does not prove absence of native shader compilation or a copy for an
+arbitrary strided input. The backend still owns special-value normalization,
+first-tie selection, safe speculative feed and contiguous checked output.
+Non-greedy admission and synchronous generation keep their existing paths.
+This experimental implementation needs independent semantic, target-Metal and
+paired full-model qualification; the flag is not a performance claim.
+
 Keep `LlmTrait` and `VlaRuntime` distinct. A small text model may retain the
 existing `config.rs`, `weights.rs`, `general.rs` organization. A VLA uses its
 own Model and ModelRunner responsibilities. Do not import another family's

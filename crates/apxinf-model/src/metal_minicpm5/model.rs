@@ -122,6 +122,7 @@ pub struct MiniCpm5 {
     sin: Array,
     local: Option<LocalMath>,
     swiglu: Compiled,
+    checked_greedy: crate::mlx_decode::CheckedGreedy,
     step: Option<Compiled>,
     attention_policy: DecodeAttentionPolicy,
     prepared: Option<PreparedRequest>,
@@ -171,6 +172,11 @@ impl MiniCpm5 {
         let attention_policy = DecodeAttentionPolicy::from_override(
             std::env::var_os("APXINF_MINICPM5_EXACT_ATTN").as_deref(),
         );
+        let checked_greedy = crate::mlx_decode::CheckedGreedy::for_model(
+            config.vocab_size,
+            MlxDType::BF16,
+            variant == Variant::Compiled,
+        )?;
         Ok(Self {
             backend,
             weights: Rc::new(weights),
@@ -182,6 +188,7 @@ impl MiniCpm5 {
             sin,
             local,
             swiglu,
+            checked_greedy,
             step: None,
             attention_policy,
             prepared: None,
@@ -214,6 +221,7 @@ impl MiniCpm5 {
     fn prepare_inner(&mut self, prompt: usize, output: usize) -> Result<()> {
         let capacity = self.config.request_capacity(self.variant, prompt, output)?;
         let attention = self.attention_policy.resolve(self.variant, prompt, output);
+        self.checked_greedy.prepare(self.backend.stream())?;
         if self.capacity == capacity
             && self
                 .prepared
@@ -738,6 +746,9 @@ impl crate::mlx_decode::DeviceDecode for MiniCpm5 {
     fn stream(&self) -> &apxinf_mlx::Stream {
         self.backend.stream()
     }
+    fn greedy_arrays(&self, logits: &Array) -> Result<(Array, Array)> {
+        self.checked_greedy.arrays(logits)
+    }
     fn decode(&mut self, token: &Array) -> Result<Array> {
         if self.failure.is_some() || self.offset >= self.capacity || self.prepared.is_none() {
             return Err(Error::Contract(
@@ -804,7 +815,10 @@ impl LlmTrait for MiniCpm5 {
     }
 
     fn preparation_status(&self) -> TextPreparationStatus {
-        let ready = self.failure.is_none() && self.prepared.is_some() && !self.states.is_empty();
+        let ready = self.failure.is_none()
+            && self.prepared.is_some()
+            && !self.states.is_empty()
+            && self.checked_greedy.is_ready();
         let mut scopes = Vec::new();
         let mut lengths = Vec::new();
         let max_rows = if self.variant == Variant::DSpark {
@@ -907,5 +921,91 @@ impl LlmTrait for MiniCpm5 {
         let logits = logits.expect("the final prefill chunk requires logits");
         self.backend
             .from_array(logits.reshape(&[1, self.vocab_size()])?)
+    }
+}
+
+#[cfg(test)]
+mod compiled_greedy_tests {
+    use super::*;
+    use crate::mlx_decode::{CheckedGreedy, DecodeFinish, DeviceDecode};
+
+    #[test]
+    #[ignore = "requires APXINF_MLX_COMPILED_GREEDY=1, APXINF_MINICPM_CHECKPOINT and exclusive shared Metal locks"]
+    fn compiled_greedy_model_rows_readiness_and_recovery() -> Result<()> {
+        assert_eq!(
+            std::env::var_os("APXINF_MLX_COMPILED_GREEDY").as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        let path = std::path::PathBuf::from(
+            std::env::var_os("APXINF_MINICPM_CHECKPOINT")
+                .ok_or(Error::Contract("set APXINF_MINICPM_CHECKPOINT"))?,
+        );
+        let config = Config::from_json(&std::fs::read_to_string(path.join("config.json"))?)?;
+        let backend = MlxBackend::new(0)?;
+        let (map, _) = apxinf_loader::safetensors::load_native_path(&path).map_err(Error::Other)?;
+        let weights = Weights::load(&config, backend.stream(), map)?;
+        let mut model = MiniCpm5::new(config, weights, backend.clone(), Variant::Compiled)?;
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Unprepared
+        );
+        model.prepare(3, 4)?;
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Ready
+        );
+        let first = model.prefill(LlmInput::text(&[1, 7, 3]))?;
+        let first = backend.array(&first)?;
+        assert_eq!(first.shape(), [1, model.vocab_size()]);
+        assert_eq!(first.dtype(), MlxDType::BF16);
+        let traces = backend.stream().counters().trace_callbacks;
+        let retained = model.greedy_arrays(&first)?;
+        let (_, expected) = apxinf_mlx::greedy_token_arrays(&first)?;
+        backend
+            .stream()
+            .eval(&[retained.1.clone(), expected.clone()])?;
+        let expected = expected.to_bytes_ready()?;
+        assert_eq!(retained.1.to_bytes_ready()?, expected);
+        let next = model.decode(&retained.0)?;
+        assert_eq!(next.shape(), [1, 1, model.vocab_size()]);
+        assert_eq!(next.dtype(), MlxDType::BF16);
+        let (_, sampled) = model.greedy_arrays(&next)?;
+        let (_, reference) = apxinf_mlx::greedy_token_arrays(&next)?;
+        backend
+            .stream()
+            .eval(&[sampled.clone(), reference.clone()])?;
+        assert_eq!(sampled.to_bytes_ready()?, reference.to_bytes_ready()?);
+        assert_eq!(backend.stream().counters().trace_callbacks, traces);
+        model.finish_decode(DecodeFinish::PublishedPosition(3))?;
+        assert_eq!(model.offset, 3);
+        model.reset();
+        model.checked_greedy = CheckedGreedy::for_model(model.vocab_size(), MlxDType::BF16, true)?;
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Unprepared
+        );
+        model.prepare(3, 4)?;
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Ready
+        );
+        let prepared = backend.stream().counters();
+        model.prepare(3, 4)?;
+        assert_eq!(backend.stream().counters(), prepared);
+        model.prewarm_decode(super::super::config::CONTEXT_CAPACITY + 1, 0);
+        let failed = model.preparation_status();
+        assert_eq!(failed.state, TextPreparationState::Invalidated);
+        assert!(failed.error.is_some());
+        assert!(failed.compiled_scopes.is_empty());
+        assert!(model.forward(&[1], 0).is_err());
+        model.reset();
+        model.prepare(3, 4)?;
+        let repeated = model.prefill(LlmInput::text(&[1, 7, 3]))?;
+        let repeated = backend.array(&repeated)?;
+        let (_, sampled) = model.greedy_arrays(&repeated)?;
+        backend.stream().eval(&[sampled.clone()])?;
+        assert_eq!(sampled.to_bytes_ready()?, expected);
+        assert_eq!(retained.1.to_bytes_ready()?, expected);
+        Ok(())
     }
 }

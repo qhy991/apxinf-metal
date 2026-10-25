@@ -310,6 +310,7 @@ pub struct Qwen3Model {
     seams: Option<Seams>,
     qk_fusion: Option<QkNormRope>,
     activation: Compiled,
+    checked_greedy: crate::mlx_decode::CheckedGreedy,
     initial_kv: Vec<KvState>,
     kv: Vec<KvState>,
     cos: Option<Array>,
@@ -374,6 +375,11 @@ impl Qwen3Model {
             }
             Ok(vec![swiglu(&a[0], &a[1])?])
         })?;
+        let checked_greedy = crate::mlx_decode::CheckedGreedy::for_model(
+            config.vocab_size,
+            MlxDType::BF16,
+            variant == Variant::Bf16Compiled,
+        )?;
         let mut model = Self {
             config,
             variant,
@@ -384,6 +390,7 @@ impl Qwen3Model {
             seams,
             qk_fusion,
             activation,
+            checked_greedy,
             initial_kv: Vec::new(),
             kv: Vec::new(),
             cos: None,
@@ -428,6 +435,7 @@ impl Qwen3Model {
             )));
         }
         let stream = self.backend.stream();
+        self.checked_greedy.prepare(stream)?;
         if capacity != self.capacity || self.kv.is_empty() {
             if self.position != 0 {
                 return Err(err("reset Qwen3 before changing its prepared KV capacity"));
@@ -901,6 +909,9 @@ impl crate::mlx_decode::DeviceDecode for Qwen3Model {
     fn stream(&self) -> &Stream {
         self.backend.stream()
     }
+    fn greedy_arrays(&self, logits: &Array) -> Result<(Array, Array)> {
+        self.checked_greedy.arrays(logits)
+    }
     fn decode(&mut self, token: &Array) -> Result<Array> {
         if self.invalid.is_some() || self.position >= self.capacity {
             return Err(err("Qwen3 decode requires valid prepared capacity"));
@@ -980,6 +991,7 @@ impl LlmTrait for Qwen3Model {
         };
         let ready = self.invalid.is_none()
             && implementation_ready
+            && self.checked_greedy.is_ready()
             && self.capacity > 0
             && self.kv.len() == self.config.num_hidden_layers
             && self.initial_kv.len() == self.config.num_hidden_layers
@@ -1188,6 +1200,80 @@ mod tests {
 
     fn values(model: &Qwen3Model, tensor: &Tensor) -> Vec<f32> {
         model.backend.to_cpu(tensor).unwrap().to_f32_vec().unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires APXINF_MLX_COMPILED_GREEDY=1, exclusive shared Metal locks and pinned MLX runtime"]
+    fn compiled_greedy_model_rows_readiness_and_recovery() -> Result<()> {
+        use crate::mlx_decode::{CheckedGreedy, DecodeFinish, DeviceDecode};
+        assert_eq!(
+            std::env::var_os("APXINF_MLX_COMPILED_GREEDY").as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        let mut model = tiny(Variant::Bf16Compiled);
+        model.prepare(3, 4)?;
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Ready
+        );
+        let first = model.prefill(LlmInput::text(&[1, 7, 3]))?;
+        let first = model.backend.array(&first)?;
+        assert_eq!(first.shape(), [1, 16]);
+        assert_eq!(first.dtype(), MlxDType::BF16);
+        let traces = model.backend.stream().counters().trace_callbacks;
+        let retained = model.greedy_arrays(&first)?;
+        let (_, expected) = apxinf_mlx::greedy_token_arrays(&first)?;
+        model
+            .backend
+            .stream()
+            .eval(&[retained.1.clone(), expected.clone()])?;
+        let expected = expected.to_bytes_ready()?;
+        assert_eq!(retained.1.to_bytes_ready()?, expected);
+        let next = model.decode(&retained.0)?;
+        assert_eq!(next.shape(), [1, 16]);
+        assert_eq!(next.dtype(), MlxDType::BF16);
+        let (_, sampled) = model.greedy_arrays(&next)?;
+        let (_, reference) = apxinf_mlx::greedy_token_arrays(&next)?;
+        model
+            .backend
+            .stream()
+            .eval(&[sampled.clone(), reference.clone()])?;
+        assert_eq!(sampled.to_bytes_ready()?, reference.to_bytes_ready()?);
+        assert_eq!(model.backend.stream().counters().trace_callbacks, traces);
+        model.finish_decode(DecodeFinish::PublishedPosition(3))?;
+        assert_eq!(model.position(), 3);
+        model.reset();
+        model.checked_greedy = CheckedGreedy::for_model(16, MlxDType::BF16, true)?;
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Unprepared
+        );
+        model.prepare(3, 4)?;
+        assert_eq!(
+            model.preparation_status().state,
+            TextPreparationState::Ready
+        );
+        let traces = model.backend.stream().counters().trace_callbacks;
+        model.prepare(3, 4)?;
+        assert_eq!(model.backend.stream().counters().trace_callbacks, traces);
+        model.prewarm_decode(MAX_CONTEXT + 1, 0);
+        let failed = model.preparation_status();
+        assert_eq!(failed.state, TextPreparationState::Invalidated);
+        assert!(failed.error.is_some());
+        assert!(failed.compiled_scopes.is_empty());
+        assert!(model.forward(&[1], 0).is_err());
+        model.reset();
+        model.prepare(3, 4)?;
+        let repeated = model.prefill(LlmInput::text(&[1, 7, 3]))?;
+        let repeated = model.backend.array(&repeated)?;
+        let (_, sampled) = model.greedy_arrays(&repeated)?;
+        model.backend.stream().eval(&[sampled.clone()])?;
+        assert_eq!(sampled.to_bytes_ready()?, expected);
+        assert_eq!(retained.1.to_bytes_ready()?, expected);
+        let public = tiny(Variant::Bf16Public);
+        let other = Array::from_f32(public.backend.stream(), &[1, 2], &[0., 1.])?;
+        assert_eq!(public.greedy_arrays(&other)?.1.to_u32_scalar()?, 1);
+        Ok(())
     }
 
     #[test]

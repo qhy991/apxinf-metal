@@ -125,6 +125,13 @@ lookahead. `APXINF_MLX_SYNC_DECODE=1` selects the synchronous fallback; public
 the new cancellation entry is unsupported for DSpark. Async failures invalidate
 state and require reset/preparation.
 
+`APXINF_MLX_COMPILED_GREEDY=1` selects the private compiled checked-sampling
+experiment for ordinary `bf16-compiled` at construction. It is off by default.
+Family preparation includes its fixed BF16 vocabulary row before returning a
+compatible prepared request. Public and DSpark retain their sampling paths.
+See the [MLX sampling contract](../../../../doc/mlx-backend.md) for transactional
+preparation, failure recovery and required qualification.
+
 Source adaptations and MIT notices are recorded in the repository `NOTICE`.
 Select the target and drafter explicitly through the public CLI:
 

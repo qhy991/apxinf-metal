@@ -151,6 +151,12 @@ and require no tracing on the second invocation. The presence of
 `MLX_DISABLE_COMPILE`, including value `0`, rejects callable construction.
 This proves reuse of the Rust tracing path, not absence of all native shader JIT.
 
+`APXINF_MLX_COMPILED_GREEDY=1` selects the private compiled checked-sampling
+experiment for `bf16-compiled` at construction. It is off by default. Family
+preparation and readiness include its fixed BF16 vocabulary row. Public and
+MixedW8 retain eager sampling. See the [MLX sampling contract](../../../../doc/mlx-backend.md)
+for transactional preparation, failure recovery and required qualification.
+
 Source attribution is retained in the repository [NOTICE](../../../../NOTICE)
 and [LICENSE.engine-tailor](LICENSE.engine-tailor).
 
