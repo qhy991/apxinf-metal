@@ -7,13 +7,21 @@ mod ane;
 mod ane_admission;
 mod config;
 mod encode;
+#[cfg(test)]
+pub mod host_probe;
 mod model;
+mod preprocess;
+#[cfg_attr(not(feature = "coreml"), allow(dead_code))]
+mod trace_json;
+mod vision;
+mod vision_ane;
 mod weights;
 
 pub use config::{Config, MAX_INPUT_TOKENS};
 
 use crate::decision::{
-    DecisionAnswer, DecisionInput, DecisionOutput, DecisionRuntime, DecisionSchema, DecisionScore,
+    DecisionAnswer, DecisionImage, DecisionInput, DecisionOutput, DecisionRuntime, DecisionSchema,
+    DecisionScore,
 };
 use crate::llm_trait::LlmCapabilities;
 use crate::{LoadOptions, LoadedModel, ModelPrecision};
@@ -27,6 +35,10 @@ use std::sync::Arc;
 pub struct ClefRunner {
     tokenizer: Tokenizer,
     network: Network,
+    /// Placeholder token the processor writes per merged image row.
+    image_token_id: u32,
+    /// Prompt IDs encoded for the most recent request, for parity evidence.
+    last_input_ids: Vec<u32>,
 }
 
 /// MLX architectures where the optimized GPU composition passed its quality
@@ -150,22 +162,100 @@ pub fn load(
     apxinf_mlx::set_cache_limit(CACHE_LIMIT)?;
     let backbone = weights::Backbone::load(&config, &stream, path)?;
     let head = weights::Head::load(&config, &stream, &path.join("joint_head.safetensors"))?;
+    let vision = vision::Vision::load(&config, &stream, path)?;
+    let image_token_id = config.image_token_id;
     Ok(LoadedModel::Decision(Box::new(ClefRunner {
         tokenizer,
-        network: Network::new(config, stream, backbone, head, composition)?,
+        network: Network::new(config, stream, backbone, head, vision, composition)?,
+        image_token_id,
+        last_input_ids: Vec::new(),
     })))
 }
 
 impl ClefRunner {
-    fn decide_schema(&self, schema: &DecisionSchema) -> Result<DecisionOutput> {
-        let encoded = encode::encode(&self.tokenizer, schema)?;
-        let logits = self.network.logits(&encoded)?;
-        self.network.stream().eval(&logits)?;
+    fn decide_schema(
+        &mut self,
+        schema: &DecisionSchema,
+        images: &[DecisionImage<'_>],
+    ) -> Result<DecisionOutput> {
+        // Decode and preprocess inside the request, as the MLX reference does:
+        // the caller's timer covers this cost on both sides.
+        let chrome = trace_json::enabled();
+        let request_start = std::time::Instant::now();
+        let ts_request = if chrome { trace_json::to_us(request_start) } else { None };
+        let prepared = if images.is_empty() {
+            None
+        } else {
+            let t = std::time::Instant::now();
+            let prepared = Some(preprocess::prepare(images)?);
+            if let Some(ts0) = ts_request {
+                trace_json::record(
+                    "preprocess",
+                    "host",
+                    "cpu",
+                    ts0,
+                    t.elapsed().as_secs_f64() * 1_000_000.0,
+                    serde_json::json!({"images": images.len()}),
+                );
+            }
+            prepared
+        };
+        let enc_start = std::time::Instant::now();
+        let encoded = match &prepared {
+            None => encode::encode(&self.tokenizer, schema)?,
+            Some(prepared) => encode::encode_with_images(
+                &self.tokenizer,
+                schema,
+                &prepared.grids,
+                self.image_token_id,
+            )?,
+        };
+        if let Some(ts0) = trace_json::to_us(enc_start) {
+            trace_json::record(
+                "encode",
+                "host",
+                "cpu",
+                ts0,
+                enc_start.elapsed().as_secs_f64() * 1_000_000.0,
+                serde_json::json!({"tokens": encoded.input_ids.len()}),
+            );
+        }
+        let logits = match &prepared {
+            None => self.network.logits(&encoded)?,
+            Some(prepared) => {
+                let pixels = Array::from_f32(
+                    self.network.stream(),
+                    &[prepared.rows(), preprocess::PATCH_WIDTH],
+                    &prepared.pixels,
+                )?;
+                self.network
+                    .logits_with_vision(&encoded, Some((&pixels, &prepared.grids)))?
+            }
+        };
+        self.last_input_ids.clone_from(&encoded.input_ids);
+        // No eager eval here: the softmax chain below ends in
+        // `to_f32_vec` -> `to_bytes`, which synchronizes the full stream and
+        // materializes the same logits. Evaluating logits first would drain
+        // and refill the queue for the same data (redundant ~0.1-1ms).
         let probabilities = logits
             .iter()
             .map(|l| l.cast(MlxDType::F32)?.softmax_with(-1, false))
             .collect::<Result<Vec<_>>>()?;
+        let sync_start = std::time::Instant::now();
         let values = Array::concat(&probabilities.iter().collect::<Vec<_>>(), 0)?.to_f32_vec()?;
+        if let Some(ts0) = trace_json::to_us(sync_start) {
+            // This is the `to_f32_vec` -> `to_bytes` stream-sync (mod.rs:209);
+            // it sits inside W1's gap0 (head+sync+preprocess ~110ms) and is
+            // the Q21 attack surface.
+            trace_json::record(
+                "logits_sync",
+                "gpu",
+                "stream",
+                ts0,
+                sync_start.elapsed().as_secs_f64() * 1_000_000.0,
+                serde_json::json!({"logits": logits.len()}),
+            );
+        }
         let mut offset = 0;
         let mut answers = Vec::with_capacity(encoded.questions.len());
         for question in encoded.questions {
@@ -199,22 +289,43 @@ impl ClefRunner {
                     .collect(),
             });
         }
+        if let Some(ts0) = ts_request {
+            trace_json::record(
+                "request",
+                "timeline",
+                "req",
+                ts0,
+                request_start.elapsed().as_secs_f64() * 1_000_000.0,
+                serde_json::json!({"images": images.len(), "tokens": encoded.input_ids.len()}),
+            );
+        }
         Ok(DecisionOutput { answers })
     }
 }
 
 impl DecisionRuntime for ClefRunner {
     fn capabilities(&self) -> LlmCapabilities {
-        LlmCapabilities::TEXT_ONLY
+        LlmCapabilities::VISION
     }
 
     fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput> {
-        match input {
-            DecisionInput::Schema(schema) => self.decide_schema(schema),
+        // Flush on every exit path (including `?` errors) so the Chrome
+        // Tracing file is always valid JSON for Perfetto / chrome://tracing.
+        let result = match input {
+            DecisionInput::Schema(schema) => self.decide_schema(schema, &[]),
+            DecisionInput::SchemaWithImages { schema, images } => {
+                self.decide_schema(schema, images)
+            }
             DecisionInput::Encoded { .. } => Err(Error::Other(
                 "Clef encodes its own prompt; pass a schema request".into(),
             )),
-        }
+        };
+        trace_json::flush_request();
+        result
+    }
+
+    fn encoded_input_ids(&self) -> Option<&[u32]> {
+        (!self.last_input_ids.is_empty()).then_some(self.last_input_ids.as_slice())
     }
 
     fn code_names(&self) -> &[String] {

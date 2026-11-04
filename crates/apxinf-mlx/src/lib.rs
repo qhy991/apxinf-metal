@@ -6,6 +6,8 @@ mod array;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod backend;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+pub use causal_conv::CausalDepthwiseConv;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod causal_conv;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod device_caps;
@@ -38,6 +40,8 @@ mod mpp_epilogues;
 mod mpp_f16_gemm;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod mpp_gemm;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod mrope_rope;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod q4_f16;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]

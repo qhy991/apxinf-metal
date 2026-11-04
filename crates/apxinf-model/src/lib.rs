@@ -42,8 +42,8 @@ pub use d3::{
     D3_DEFAULT_TEXT_PROFILE_LIMIT, D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
 };
 pub use decision::{
-    DecisionAnswer, DecisionInput, DecisionOutput, DecisionQuestion, DecisionRuntime,
-    DecisionSchema, DecisionScore,
+    DecisionAnswer, DecisionImage, DecisionInput, DecisionOutput, DecisionQuestion,
+    DecisionRuntime, DecisionSchema, DecisionScore,
 };
 pub use debug::{DebugCapture, DebugConfig};
 pub use image::{GeneratedImage, ImageRequest, ImageRuntime};

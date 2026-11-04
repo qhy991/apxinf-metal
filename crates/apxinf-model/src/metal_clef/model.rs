@@ -10,31 +10,67 @@
 //! graph evaluated once; no state survives between requests.
 use super::config::{Config, MAX_INPUT_TOKENS};
 use super::encode::{Encoded, EncodedQuestion};
+use super::vision::{mrope_position_ids, Vision};
 use super::weights::{
     Attention, Backbone, DecoderLayer, EvidenceLayer, GatedDelta, Head, Linear, Mha, Mixer, Mlp,
     Norm, Q4,
 };
-use apxinf_core::Result;
+use apxinf_core::{Error, Result};
 use apxinf_mlx::fusions::{
     padded_rows, CausalDepthwiseConv, F16GateSwiglu, F16Gemm, GatedDeltaLayout,
-    GatedDeltaRecurrence, HalfSplitRope, PadRowsF16, Q4DecodeArithmetic, Q4RowDecodeF16,
-    Q4TransposeDecode, SplitF16Gemm,
+    GatedDeltaRecurrence, GdnConvSplit, MropeHalfSplitRope, PadRowsF16, Q4DecodeArithmetic,
+    Q4RowDecodeF16, Q4TransposeDecode, RmsNormScale, SplitF16Gemm,
 };
 #[cfg(feature = "coreml")]
 use apxinf_mlx::fusions::{AneTileHandoff, AneTileMerge, MppF16Gemm, SplitMppF16Gemm};
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
 
 const EPS: f32 = 1e-6;
 const HEAD_EPS: f32 = 1e-5;
 const G_BETA_WARM_LENGTHS: [usize; 3] = [1, 2, MAX_INPUT_TOKENS];
 
+/// `APXINF_CLEF_FUSION=1` enables the gated-delta q/k RMSNorm+scale fusion.
+/// Default (unset) keeps the unfused `fast_rms_norm_unweighted` + `mul` path.
+fn fusion_enabled() -> bool {
+    fusion_flag(std::env::var("APXINF_CLEF_FUSION").ok())
+}
+
+/// The gate's value semantics, kept pure so the unit test can cover the
+/// default and the enable spelling without mutating process env (which would
+/// race across parallel tests).
+fn fusion_flag(value: Option<String>) -> bool {
+    value.as_deref() == Some("1")
+}
+
+/// The Tier-1 prefix-cache env gate (`APXINF_CLEF_PREFIX_CACHE`), default ON
+/// (D20): unset fills and reuses the Tier-1 cache; only the explicit spelling
+/// `0` disables it. The shared pure form keeps the unit test free of
+/// process-env mutation (which would race across parallel tests), same as
+/// [`fusion_flag`].
+fn prefix_cache_flag(value: Option<String>) -> bool {
+    value.as_deref() != Some("0")
+}
+
+fn prefix_cache_enabled() -> bool {
+    prefix_cache_flag(std::env::var("APXINF_CLEF_PREFIX_CACHE").ok())
+}
+
 struct Kernels {
     recurrence: GatedDeltaRecurrence,
-    rope: HalfSplitRope,
+    /// Three-axis interleaved mRoPE; a text-only request has equal axes and
+    /// degenerates to the previous half-split rotary exactly.
+    rope: MropeHalfSplitRope,
     /// MLX-VLM `_compute_g_beta`, compiled shapeless as there: the fused
     /// kernel rounds exp/logaddexp differently from eager operations on some
     /// devices (one decay ulp per layer on the M1 Pro).
     g_beta: Compiled,
+    /// Gated-delta q/k RMSNorm+scale; built only when `APXINF_CLEF_FUSION=1`.
+    rms_norm_scale: Option<RmsNormScale>,
+    /// Fusion #1: split the conv output into q/k/v in one pass; built only
+    /// when `APXINF_CLEF_FUSION=1`.
+    gdn_conv_split: Option<GdnConvSplit>,
 }
 
 /// Backbone composition.
@@ -293,6 +329,61 @@ pub struct Network {
     tiles: Option<(AneTileHandoff, AneTileMerge)>,
     /// MRoPE inverse frequencies, computed on the device as MLX-VLM does.
     inv_freq: Array,
+    /// Which mRoPE axis feeds each frequency (`_interleaved_position_selector`).
+    rope_selector: Array,
+    /// Qwen3.5 vision tower, resident in every composition.
+    vision: Vision,
+    /// Tier-1 system/chat prefix cache (Q23/D18). Built lazily on the first
+    /// request when `APXINF_CLEF_PREFIX_CACHE=1`; otherwise `None`, which is
+    /// bit-identical to the pre-cache path. `RefCell` because the request
+    /// network methods take `&self` while the first request must publish the
+    /// fill. Single-threaded callers only (the worker and decide-server are
+    /// serial), so no synchronization is needed.
+    prefix_cache: RefCell<Option<PrefixCache>>,
+    /// Prompt token IDs for the current request, kept so `backbone_cached`
+    /// can hash and slice the prefix without re-reading device memory.
+    last_prefix_ids: RefCell<Option<Vec<u32>>>,
+}
+
+/// Per-layer state saved for the Tier-1 prefix cache (Q23): the F32 gated-delta
+/// recurrence state and, for full-attention layers, the RoPE'd BF16 keys and
+/// values. Both mixers also re-read the convolution state saved alongside it.
+#[derive(Clone)]
+struct CachedLayer {
+    state: Array,
+    conv: Array,
+    keys: Option<Array>,
+    values: Option<Array>,
+}
+
+/// Tier-1 system/chat prefix cache: the constant `<|im_start|>system ... STATE:\n`
+/// plus the image start marker, whose inputs are identical across requests
+/// (system prompt is a code constant, image content lives in later rows).
+/// Layer-indexed to the full backbone; attention layers carry keys/values,
+/// gated-delta layers leave them `None`.
+#[derive(Clone)]
+struct PrefixCache {
+    prefix_tokens: usize,
+    /// Bit-mix of the prefix token IDs; checked before reuse.
+    hash: u64,
+    /// The chunk-0 backbone output `[P, width]`, kept so a cache-hit request
+    /// can still run `head_forward` over the full sequence: question/option
+    /// spans, `memory`, `global` and the lexical rows are all indexed into the
+    /// concatenated `[tokens, width]` hidden.
+    prefix_hidden: Array,
+    layers: Vec<CachedLayer>,
+}
+
+/// Stable-order bit-mix of the prefix token IDs. The prefix is a code
+/// constant (`SYSTEM_PROMPT`, one image start marker), so this is enough to
+/// decide a Tier-1 hit: a change to the prompt changes the hash.
+fn prefix_hash(ids: &[u32]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    ids.len().hash(&mut hasher);
+    for &id in ids {
+        id.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Python scalars combine with arrays in the array's dtype.
@@ -355,18 +446,37 @@ fn l2_normalize(x: &Array) -> Result<Array> {
     x.div(&norm.maximum(&scalar(&norm, 1e-12)?)?)
 }
 
+/// `_interleaved_position_selector(mrope_section, freq_dim)`: frequency `i`
+/// takes axis 0 unless the interleaved pattern of the later sections assigns
+/// it (`i % 3 == axis` within that section's span).
+fn mrope_selector(section: &[usize], frequencies: usize) -> Vec<i32> {
+    let mut selector = vec![0i32; frequencies];
+    let stride = section.len().max(1);
+    for axis in 1..section.len() {
+        let mut index = axis;
+        while index < (section[axis] * stride).min(frequencies) {
+            selector[index] = axis as i32;
+            index += stride;
+        }
+    }
+    selector
+}
+
 impl Network {
     pub fn new(
         config: Config,
         stream: Stream,
         #[cfg_attr(not(feature = "coreml"), allow(unused_mut))] mut backbone: Backbone,
         head: Head,
+        vision: Vision,
         composition: Composition,
     ) -> Result<Self> {
         let kernels = Kernels {
             recurrence: GatedDeltaRecurrence::new(&stream)?,
-            rope: HalfSplitRope::new(&stream, config.rotary_dim())?,
+            rope: MropeHalfSplitRope::new(&stream, config.rotary_dim())?,
             g_beta: prepared_g_beta(&stream, config.text.linear_num_value_heads)?,
+            rms_norm_scale: fusion_enabled().then(|| RmsNormScale::new(&stream, EPS)).transpose()?,
+            gdn_conv_split: fusion_enabled().then(|| GdnConvSplit::new(&stream)).transpose()?,
         };
         #[cfg_attr(not(feature = "coreml"), allow(unused_mut))]
         let mut gpu = match composition {
@@ -374,14 +484,16 @@ impl Network {
             _ => Some(GpuKernels::new(&stream)?),
         };
         // Column split: build each layer's program from the full MLP, then
-        // keep only the GPU share's weights.
+        // keep only the GPU share's weights. The Neural Engine depth comes
+        // from APXINF_CLEF_ANE_COLUMNS (unset: the qualified 6656).
         #[cfg(feature = "coreml")]
         let ane = if composition == Composition::GpuAneColumns {
+            let columns = super::ane::gpu_columns()?;
             let cache = apxinf_coreml::ProgramCache::new(super::ane::cache_dir());
             let mut ane = Vec::with_capacity(backbone.layers.len());
             for layer in &mut backbone.layers {
-                ane.push(super::ane::AneMlp::load(&cache, &layer.mlp)?);
-                layer.mlp = super::ane::gpu_share(&layer.mlp)?;
+                ane.push(super::ane::AneMlp::load_split(&cache, &layer.mlp, columns)?);
+                layer.mlp = super::ane::gpu_share_with_columns(&layer.mlp, columns)?;
             }
             ane
         } else {
@@ -418,6 +530,20 @@ impl Network {
         )?;
         let inv_freq = Array::scalar(&stream, 1.0, MlxDType::F32)?.div(&base.pow(&exponents)?)?;
         stream.eval(&[inv_freq.clone()])?;
+        // Interleaved 3-axis selector, from the admitted `mrope_section`.
+        let frequencies = dim / 2;
+        let section = config
+            .text
+            .rope_parameters
+            .mrope_section
+            .clone()
+            .unwrap_or_else(|| vec![11, 11, 10]);
+        let rope_selector = Array::from_i32(
+            &stream,
+            &[frequencies],
+            &mrope_selector(&section, frequencies),
+        )?;
+        stream.eval(&[rope_selector.clone()])?;
         #[cfg(feature = "coreml")]
         for _ in 0..2 {
             for model in ane.iter().chain(neurons.iter().map(|layer| &layer.ane)) {
@@ -438,6 +564,10 @@ impl Network {
             #[cfg(feature = "coreml")]
             tiles,
             inv_freq,
+            rope_selector,
+            vision,
+            prefix_cache: RefCell::new(None),
+            last_prefix_ids: RefCell::new(None),
         })
     }
 
@@ -445,47 +575,386 @@ impl Network {
         &self.stream
     }
 
-    /// Per-question logits, lazily; the caller evaluates them once.
+    /// Per-question logits for a text-only request, lazily; the caller
+    /// evaluates them once.
     pub fn logits(&self, encoded: &Encoded) -> Result<Vec<Array>> {
+        self.logits_with_vision(encoded, None)
+    }
+
+    /// Per-question logits for a request with optional image patches, lazily.
+    ///
+    /// The vision tower runs first, its features replace the prompt's image
+    /// placeholder rows in order, and every attention layer uses the prompt's
+    /// three-axis mRoPE positions. A request without images takes the same path
+    /// with equal axes, so the text result is unchanged.
+    pub fn logits_with_vision(
+        &self,
+        encoded: &Encoded,
+        vision: Option<(&Array, &[[u32; 3]])>,
+    ) -> Result<Vec<Array>> {
         let tokens = encoded.input_ids.len();
-        let ids = Array::from_i32(
-            &self.stream,
-            &[tokens],
-            &encoded
+        let width = self.config.text.hidden_size;
+        let flat: Vec<i32> = encoded.input_ids.iter().map(|&id| id as i32).collect();
+        if prefix_cache_enabled() && vision.is_some() {
+            *self.last_prefix_ids.borrow_mut() = Some(encoded.input_ids.clone());
+        }
+        let ids = Array::from_i32(&self.stream, &[tokens], &flat)?;
+        let e = &self.backbone.embedding;
+        let mut hidden = e.weight.take(&ids, 0)?.dequantize(
+            &e.scales.take(&ids, 0)?,
+            &e.biases.take(&ids, 0)?,
+            64,
+            4,
+        )?;
+        let positions = match vision {
+            None => Self::text_positions(&self.stream, tokens)?,
+            Some((pixels, grids)) => {
+                // `grids` are `image_grid_thw` in patch units
+                // (`[1, height / 16, width / 16]`), the unit `preprocess` and
+                // the processor use; `Vision::forward` asserts that the grids
+                // cover exactly `pixels.shape()[0]` patch rows.
+                let features = self.vision.forward(pixels, grids)?;
+                hidden = self.splice_vision(&encoded.input_ids, &hidden, &features)?;
+                let positions = mrope_position_ids(
+                    &encoded.input_ids,
+                    grids,
+                    self.config.image_token_id,
+                )?;
+                let mut flat = Vec::with_capacity(tokens * 3);
+                for axis in 0..3 {
+                    flat.extend(positions.iter().map(|position| position[axis]));
+                }
+                Array::from_i32(&self.stream, &[3, 1, tokens], &flat)?
+            }
+        };
+        let hidden = if prefix_cache_enabled() && vision.is_some() {
+            let prefix_end = encoded
                 .input_ids
                 .iter()
-                .map(|&id| id as i32)
-                .collect::<Vec<_>>(),
-        )?;
-        let hidden = self.backbone_forward(&ids.reshape(&[1, tokens])?, tokens)?;
+                .position(|&id| id == self.config.image_token_id)
+                .unwrap_or(tokens);
+            if prefix_end < tokens {
+                self.backbone_cached(
+                    &hidden.reshape(&[1, tokens, width])?,
+                    &positions,
+                    tokens,
+                    prefix_end,
+                )?
+            } else {
+                self.backbone_forward(&hidden.reshape(&[1, tokens, width])?, &positions, tokens, None)?
+            }
+        } else {
+            self.backbone_forward(&hidden.reshape(&[1, tokens, width])?, &positions, tokens, None)?
+        };
         self.head_forward(
-            &hidden.reshape(&[tokens, self.config.text.hidden_size])?,
+            &hidden.reshape(&[tokens, width])?,
             &ids,
             &encoded.questions,
         )
     }
 
-    fn backbone_forward(&self, ids: &Array, tokens: usize) -> Result<Array> {
-        let e = &self.backbone.embedding;
-        let mut h = e.weight.take(ids, 0)?.dequantize(
-            &e.scales.take(ids, 0)?,
-            &e.biases.take(ids, 0)?,
-            64,
-            4,
-        )?;
-        let positions = Array::arange(&self.stream, 0.0, tokens as f32, 1.0, MlxDType::I32)?
-            .reshape(&[1, tokens])?;
+    /// Chunked backbone with a Tier-1 prefix cache: on a miss the constant
+    /// system/chat prefix (everything up to the first image placeholder) is
+    /// run once, its per-layer gated-delta/attention/conv state is retained,
+    /// and the remaining tokens continue from that state; on a hit the prefix
+    /// chunk is skipped entirely. The two chunk outputs are concatenated so
+    /// `head_forward` still sees one `[tokens, width]` hidden with the
+    /// original absolute indexing.
+    fn backbone_cached(
+        &self,
+        embeds: &Array,
+        positions: &Array,
+        tokens: usize,
+        prefix_end: usize,
+    ) -> Result<Array> {
+        let width = embeds.shape()[2];
+        // Keep both chunks rank 3: the mixers shape their intermediates from
+        // `[1, tokens, ...]`, and `prefix_hidden` is the same rank so the two
+        // chunk outputs concat on the token axis before `head_forward` flattens.
+        let prefix = embeds.slice_axis(1, 0, prefix_end)?;
+        let cached = self.prefix_cache.borrow().clone();
+        let hit = matches!(
+            &cached,
+            Some(cache)
+                if cache.prefix_tokens == prefix_end
+                    && cache.hash == prefix_hash(&self.prefix_ids(prefix_end))
+        );
+        // `chunk0` = the constant system/chat prefix: on a hit it is skipped
+        // entirely (zero duration, the Q23 saving), on a miss it is the 32-layer
+        // fill. `chunk1` = the dynamic rest, which always runs.
+        let chunk0_start = std::time::Instant::now();
+        let cache = match cached {
+            Some(cache)
+                if cache.prefix_tokens == prefix_end
+                    && cache.hash == prefix_hash(&self.prefix_ids(prefix_end)) =>
+            {
+                cache
+            }
+            _ => self.fill_prefix_cache(&prefix, positions, prefix_end)?,
+        };
+        if let Some(ts0) = super::trace_json::to_us(chunk0_start) {
+            super::trace_json::record(
+                "chunk0",
+                "chunk0",
+                "prefix",
+                ts0,
+                chunk0_start.elapsed().as_secs_f64() * 1_000_000.0,
+                serde_json::json!({"cache_hit": hit, "prefix_tokens": prefix_end}),
+            );
+        }
+        let rest = embeds.slice_axis(1, prefix_end, tokens)?;
+        let rest_positions = positions.slice_axis(2, prefix_end, tokens)?;
+        let chunk1_start = std::time::Instant::now();
+        let rest_hidden =
+            self.backbone_forward(&rest, &rest_positions, tokens - prefix_end, Some(&cache))?;
+        if let Some(ts0) = super::trace_json::to_us(chunk1_start) {
+            super::trace_json::record(
+                "chunk1",
+                "chunk1",
+                "rest",
+                ts0,
+                chunk1_start.elapsed().as_secs_f64() * 1_000_000.0,
+                serde_json::json!({
+                    "cache_hit": hit,
+                    "prefix_tokens": prefix_end,
+                    "rest_tokens": tokens - prefix_end,
+                }),
+            );
+        }
+        Array::concat(&[&cache.prefix_hidden, &rest_hidden], 1)?.reshape(&[tokens, width])
+    }
+
+    /// Token IDs of the cached prefix (the same `input_ids` that fed the
+    /// fill), read back from the resident ids array of the current request.
+    fn prefix_ids(&self, prefix_end: usize) -> Vec<u32> {
+        self.last_prefix_ids
+            .borrow()
+            .as_ref()
+            .map(|ids| ids[..prefix_end.min(ids.len())].to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Run the constant prefix through the backbone once, capturing every
+    /// layer's recurrence state, conv history and attention KV, plus the
+    /// prefix's final hidden for `head_forward` on later hits.
+    fn fill_prefix_cache(
+        &self,
+        prefix: &Array,
+        positions: &Array,
+        prefix_end: usize,
+    ) -> Result<PrefixCache> {
+        let prefix_positions = positions.slice_axis(2, 0, prefix_end)?;
+        let mut layers = Vec::with_capacity(self.backbone.layers.len());
+        let mut h = prefix.clone();
         for (index, layer) in self.backbone.layers.iter().enumerate() {
+            // Same env-gated layer spans as `backbone_forward`, tagged
+            // `chunk0` so the prefix-fill pass shows up on the layer lanes.
+            let layer_start = std::time::Instant::now();
+            let mixer = match &layer.mixer {
+                Mixer::GatedDelta(_) => "gated_delta",
+                Mixer::Attention(_) => "attention",
+            };
             let x = h.fast_rms_norm(&layer.input_norm, EPS)?;
-            let r = match &layer.mixer {
-                Mixer::GatedDelta(g) => self.gated_delta(&x, g, tokens)?,
-                Mixer::Attention(a) => self.attention(&x, a, &positions, tokens)?,
+            let (r, state, conv, keys, values) = match &layer.mixer {
+                Mixer::GatedDelta(g) => {
+                    let mut conv = None;
+                    let mut state = None;
+                    // `gated_delta(save)` publishes the conv history first,
+                    // then the recurrence's final state.
+                    let r = self.gated_delta(&x, g, prefix_end, None, true, |a| {
+                        if conv.is_none() {
+                            conv = Some(a.clone());
+                        } else {
+                            state = Some(a.clone());
+                        }
+                        Ok(())
+                    })?;
+                    (
+                        r,
+                        state.expect("gated-delta state"),
+                        conv.expect("conv history"),
+                        None,
+                        None,
+                    )
+                }
+                Mixer::Attention(a) => {
+                    let mut keys = None;
+                    let mut values = None;
+                    let r = self.attention(
+                        &x,
+                        a,
+                        &prefix_positions,
+                        prefix_end,
+                        None,
+                        true,
+                        |a| {
+                            if keys.is_none() {
+                                keys = Some(a.clone());
+                            } else {
+                                values = Some(a.clone());
+                            }
+                            Ok(())
+                        },
+                    )?;
+                    // Attention layers never read `state`/`conv`; these valid
+                    // placeholders only satisfy the `CachedLayer` shape.
+                    (
+                        r,
+                        Array::zeros(&self.stream, &[1, 1, 1, 1], MlxDType::F32)?,
+                        Array::zeros(&self.stream, &[1, 1, 1], MlxDType::BF16)?,
+                        Some(keys.expect("attention keys")),
+                        Some(values.expect("attention values")),
+                    )
+                }
             };
             let h1 = h.add(&r)?;
             let m = self.mlp(&h1.fast_rms_norm(&layer.post_norm, EPS)?, &layer.mlp, index)?;
             h = h1.add(&m)?;
+            layers.push(CachedLayer { state, conv, keys, values });
+            if let Some(ts0) = super::trace_json::to_us(layer_start) {
+                super::trace_json::record(
+                    "layer",
+                    &format!("layer_{index}"),
+                    mixer,
+                    ts0,
+                    layer_start.elapsed().as_secs_f64() * 1_000_000.0,
+                    serde_json::json!({
+                        "index": index,
+                        "mixer": mixer,
+                        "tokens": prefix_end,
+                        "chunk": "chunk0",
+                        "fill": true,
+                    }),
+                );
+            }
         }
-        h.fast_rms_norm(&self.backbone.norm, EPS)
+        let prefix_hidden = h.fast_rms_norm(&self.backbone.norm, EPS)?;
+        let prefix_ids = self.last_prefix_ids.borrow().clone().unwrap_or_default();
+        let cache = PrefixCache {
+            prefix_tokens: prefix_end,
+            hash: prefix_hash(&prefix_ids[..prefix_end.min(prefix_ids.len())]),
+            prefix_hidden,
+            layers,
+        };
+        *self.prefix_cache.borrow_mut() = Some(cache.clone());
+        Ok(cache)
+    }
+
+    /// Equal-axis positions of a text-only prompt.
+    fn text_positions(stream: &Stream, tokens: usize) -> Result<Array> {
+        let row = Array::arange(stream, 0.0, tokens as f32, 1.0, MlxDType::I32)?
+            .reshape(&[1, 1, tokens])?;
+        Array::concat(&[&row, &row, &row], 0)
+    }
+
+    /// Replace image placeholder rows with vision features, in prompt order.
+    fn splice_vision(
+        &self,
+        input_ids: &[u32],
+        hidden: &Array,
+        features: &Array,
+    ) -> Result<Array> {
+        let tokens = hidden.shape()[0];
+        let width = hidden.shape()[1];
+        let rows = features.shape()[0];
+        if features.shape() != [rows, width] {
+            return Err(Error::Other(format!(
+                "Clef vision features must be [{rows}, {width}], got {:?}",
+                features.shape()
+            )));
+        }
+        let mut index = Vec::with_capacity(tokens);
+        let mut source = 0i32;
+        let image = self.config.image_token_id;
+        for (position, &id) in input_ids.iter().enumerate() {
+            if id == image {
+                index.push((tokens + source as usize) as i32);
+                source += 1;
+            } else {
+                index.push(position as i32);
+            }
+        }
+        if source as usize != rows {
+            return Err(Error::Other(format!(
+                "Clef prompt has {source} image placeholders for {rows} vision rows"
+            )));
+        }
+        let combined = Array::concat(
+            &[&hidden.reshape(&[1, tokens, width])?, &features.reshape(&[1, rows, width])?],
+            1,
+        )?;
+        let index = Array::from_i32(&self.stream, &[tokens], &index)?;
+        combined.take(&index, 1)?.reshape(&[tokens, width])
+    }
+
+    fn backbone_forward(
+        &self,
+        embeds: &Array,
+        positions: &Array,
+        tokens: usize,
+        cache: Option<&PrefixCache>,
+    ) -> Result<Array> {
+        let mut h = embeds.clone();
+        // Env-gated per-layer spans (same flag as the rest of the trace).
+        // These are host wall times of the lazy graph *build* per layer —
+        // queue order plus mixer type/layer args, not GPU compute. The GPU
+        // work lands in `logits_sync`; Perfetto overlays the layer lanes.
+        let chrome = super::trace_json::enabled();
+        let embed_start = std::time::Instant::now();
+        let embed_ts = if chrome {
+            super::trace_json::to_us(embed_start)
+        } else {
+            None
+        };
+        for (index, layer) in self.backbone.layers.iter().enumerate() {
+            let layer_start = std::time::Instant::now();
+            let x = h.fast_rms_norm(&layer.input_norm, EPS)?;
+            let cached = cache.and_then(|c| c.layers.get(index));
+            let mixer = match &layer.mixer {
+                Mixer::GatedDelta(_) => "gated_delta",
+                Mixer::Attention(_) => "attention",
+            };
+            let r = match &layer.mixer {
+                Mixer::GatedDelta(g) => {
+                    self.gated_delta(&x, g, tokens, cached, false, |_| Ok(()))?
+                }
+                Mixer::Attention(a) => {
+                    self.attention(&x, a, &positions, tokens, cached, false, |_| Ok(()))?
+                }
+            };
+            let h1 = h.add(&r)?;
+            let m = self.mlp(&h1.fast_rms_norm(&layer.post_norm, EPS)?, &layer.mlp, index)?;
+            h = h1.add(&m)?;
+            if let Some(ts0) = super::trace_json::to_us(layer_start) {
+                super::trace_json::record(
+                    "layer",
+                    &format!("layer_{index}"),
+                    mixer,
+                    ts0,
+                    layer_start.elapsed().as_secs_f64() * 1_000_000.0,
+                    serde_json::json!({
+                        "index": index,
+                        "mixer": mixer,
+                        "tokens": tokens,
+                        "cached": cached.is_some(),
+                    }),
+                );
+            }
+        }
+        let h = h.fast_rms_norm(&self.backbone.norm, EPS)?;
+        if let Some(ts0) = embed_ts {
+            // The `embed` span covers the whole backbone (norm + 32 layer
+            // builds); the per-layer spans above sit on their own lanes.
+            super::trace_json::record(
+                "embed",
+                "gpu",
+                "backbone",
+                ts0,
+                embed_start.elapsed().as_secs_f64() * 1_000_000.0,
+                serde_json::json!({"tokens": tokens, "layers": self.backbone.layers.len()}),
+            );
+        }
+        Ok(h)
     }
 
     /// `Qwen3_5MLP`: `down(swiglu(gate(x), up(x)))` on Q4, or the GPU
@@ -521,10 +990,19 @@ impl Network {
         }
         #[cfg(feature = "coreml")]
         if let (Some(c), Some(ane)) = (&self.gpu, self.ane.get(index)) {
+            // The tile pack and the GPU share are both lazy graphs over `h`.
+            // Queue the pack, then the GPU share, and block only on the pack:
+            // the `to_bytes_ready` wait then leaves the GPU share running, so
+            // the GPU and the Neural Engine overlap. Arithmetic and rounding points are
+            // unchanged; only the issue order differs from the previous
+            // (tiles read before any GPU work was queued) schedule.
+            let tokens = h.shape()[1];
+            let packed = super::ane::AneMlp::pack(h)?;
             let gpu = c.mlp(h, m)?;
-            let tiles = super::ane::AneMlp::tiles(h)?;
+            self.stream.async_eval(std::slice::from_ref(&packed))?;
             self.stream.async_eval(std::slice::from_ref(&gpu))?;
-            return gpu.add(&ane.predict(&self.stream, &tiles, h.shape()[1])?);
+            let share = ane.predict(&self.stream, &packed, tokens, index)?;
+            return gpu.add(&share);
         }
         match &self.gpu {
             Some(c) => c.mlp(h, m),
@@ -549,7 +1027,19 @@ impl Network {
         }
     }
 
-    fn gated_delta(&self, x: &Array, g: &GatedDelta, tokens: usize) -> Result<Array> {
+    /// `save` publishes the recurrence's final F32 state and the convolution's
+    /// trailing `taps - 1` rows for the prefix fill. Both are lazy graph
+    /// outputs; `save` receives them synchronously after the recurrence
+    /// returns, and the caller evaluates them when it materializes the cache.
+    fn gated_delta(
+        &self,
+        x: &Array,
+        g: &GatedDelta,
+        tokens: usize,
+        cached: Option<&CachedLayer>,
+        save: bool,
+        mut publish: impl FnMut(&Array) -> Result<()>,
+    ) -> Result<Array> {
         let t = &self.config.text;
         let (hk, hv) = (t.linear_num_key_heads, t.linear_num_value_heads);
         let (dk, dv) = (t.linear_key_head_dim, t.linear_value_head_dim);
@@ -560,33 +1050,51 @@ impl Network {
             .split_projection(x, &g.z)?
             .reshape(&[1, tokens, hv, dv])?;
         let (b, a) = (qmm(x, &g.b)?, qmm(x, &g.a)?);
+        if save {
+            let keep = t.linear_conv_kernel_dim - 1;
+            publish(&mixed.slice_axis(1, tokens - keep, tokens)?)?;
+        }
         let conv = match &self.gpu {
-            Some(c) => silu(&c.conv.call(&mixed, &g.conv)?)?,
+            Some(c) => silu(&c.conv.call_with_history(&mixed, &g.conv, cached.map(|c| &c.conv))?)?,
             None => {
-                let state = Array::zeros(
-                    &self.stream,
-                    &[1, t.linear_conv_kernel_dim - 1, conv_dim],
-                    MlxDType::BF16,
-                )?;
+                let state = match cached {
+                    Some(c) => c.conv.clone(),
+                    None => Array::zeros(
+                        &self.stream,
+                        &[1, t.linear_conv_kernel_dim - 1, conv_dim],
+                        MlxDType::BF16,
+                    )?,
+                };
                 silu(&Array::concat(&[&state, &mixed], 1)?.conv1d(&g.conv, 1, 0, 1, conv_dim)?)?
             }
         };
-        let q = conv
-            .slice_axis(2, 0, key_dim)?
-            .reshape(&[1, tokens, hk, dk])?;
-        let k = conv
-            .slice_axis(2, key_dim, 2 * key_dim)?
-            .reshape(&[1, tokens, hk, dk])?;
-        let v = conv
-            .slice_axis(2, 2 * key_dim, conv_dim)?
-            .reshape(&[1, tokens, hv, dv])?;
+        // Fusion #1 part A: one kernel splits the conv output into the three
+        // contiguous q/k/v tensors (bit-preserving). Otherwise the three
+        // slice+reshape pairs, whose consumers each force a row-contiguous
+        // gather. Same values either way.
+        let (q, k, v) = match &self.kernels.gdn_conv_split {
+            Some(split) => split.call(&conv, hk, dk, hv, dv)?,
+            None => (
+                conv.slice_axis(2, 0, key_dim)?
+                    .reshape(&[1, tokens, hk, dk])?,
+                conv.slice_axis(2, key_dim, 2 * key_dim)?
+                    .reshape(&[1, tokens, hk, dk])?,
+                conv.slice_axis(2, 2 * key_dim, conv_dim)?
+                    .reshape(&[1, tokens, hv, dv])?,
+            ),
+        };
         let inv_scale = (dk as f64).powf(-0.5);
-        let q = q
-            .fast_rms_norm_unweighted(1e-6)?
-            .mul(&scalar(&q, inv_scale * inv_scale)?)?;
-        let k = k
-            .fast_rms_norm_unweighted(1e-6)?
-            .mul(&scalar(&k, inv_scale)?)?;
+        let norm_scale = |t: &Array, scale: f64| -> Result<Array> {
+            let scale = scalar(t, scale)?;
+            match &self.kernels.rms_norm_scale {
+                Some(fused) => fused.call(t, &scale),
+                // Unfused reference path: RMSNorm rounds to BF16, then the
+                // BF16 * BF16 scalar multiply rounds to BF16.
+                None => t.fast_rms_norm_unweighted(EPS)?.mul(&scale),
+            }
+        };
+        let q = norm_scale(&q, inv_scale * inv_scale)?;
+        let k = norm_scale(&k, inv_scale)?;
         let [decay, beta] = <[Array; 2]>::try_from(self.kernels.g_beta.call(&[
             g.a_log.clone(),
             a,
@@ -594,12 +1102,18 @@ impl Network {
             g.dt_bias.clone(),
         ])?)
         .unwrap();
-        let state = Array::zeros(&self.stream, &[1, hv, dv, dk], MlxDType::F32)?;
+        let state = match cached {
+            Some(c) => c.state.clone(),
+            None => Array::zeros(&self.stream, &[1, hv, dv, dk], MlxDType::F32)?,
+        };
         let recurrence = match &self.gpu {
             Some(c) => &c.recurrence,
             None => &self.kernels.recurrence,
         };
-        let (y, _) = recurrence.call(&q, &k, &v, &decay, &beta, &state)?;
+        let (y, next_state) = recurrence.call(&q, &k, &v, &decay, &beta, &state)?;
+        if save {
+            publish(&next_state)?;
+        }
         // Gated RMSNorm: (silu(z) in FP32) * norm(y) in FP32, rounded to BF16.
         let normed = y.fast_rms_norm(&g.norm, EPS)?;
         let gated = silu(&z.cast(MlxDType::F32)?)?
@@ -608,12 +1122,17 @@ impl Network {
         self.split_projection(&gated.reshape(&[1, tokens, value_dim])?, &g.out)
     }
 
+    /// `save` publishes the RoPE'd keys and values of the current chunk for
+    /// the prefix fill; `publish` receives them in key-then-value order.
     fn attention(
         &self,
         x: &Array,
         a: &Attention,
         positions: &Array,
         tokens: usize,
+        cached: Option<&CachedLayer>,
+        save: bool,
+        mut publish: impl FnMut(&Array) -> Result<()>,
     ) -> Result<Array> {
         let t = &self.config.text;
         let (heads, kv, d) = (t.num_attention_heads, t.num_key_value_heads, t.head_dim);
@@ -639,8 +1158,19 @@ impl Network {
             .reshape(&[1, tokens, kv, d])?
             .transpose(&[0, 2, 1, 3])?;
         let rope = &self.kernels.rope;
-        let queries = rope.call(&queries, positions, &self.inv_freq)?;
-        let keys = rope.call(&keys, positions, &self.inv_freq)?;
+        let queries = rope.call(&queries, positions, &self.inv_freq, &self.rope_selector)?;
+        let keys = rope.call(&keys, positions, &self.inv_freq, &self.rope_selector)?;
+        if save {
+            publish(&keys)?;
+            publish(&values)?;
+        }
+        let (keys, values) = match cached.and_then(|c| c.keys.as_ref().zip(c.values.as_ref())) {
+            Some((cached_keys, cached_values)) => (
+                Array::concat(&[cached_keys, &keys], 2)?,
+                Array::concat(&[cached_values, &values], 2)?,
+            ),
+            None => (keys, values),
+        };
         let out = queries
             .sdpa(&keys, &values, (d as f32).powf(-0.5), tokens > 1, None)?
             .transpose(&[0, 2, 1, 3])?
@@ -721,6 +1251,9 @@ impl Network {
         ids: &Array,
         questions: &[EncodedQuestion],
     ) -> Result<Vec<Array>> {
+        // Production head span (previously only test instrumentation). Host
+        // wall time of the lazy head build; the GPU drain is in `logits_sync`.
+        let head_start = std::time::Instant::now();
         let hd = &self.head;
         let lm = &self.backbone.lm_head;
         let lexical = |span: (usize, usize)| -> Result<Array> {
@@ -835,6 +1368,20 @@ impl Network {
             let residual =
                 linear(&gelu(&linear(&features, &hd.scorer1)?)?, &hd.scorer2)?.reshape(&[n])?;
             logits.push(prior.add(&gate.mul(&joint_scale.mul(&cosine)?.add(&residual)?)?)?);
+        }
+        if let Some(ts0) = super::trace_json::to_us(head_start) {
+            super::trace_json::record(
+                "head",
+                "head",
+                "schema",
+                ts0,
+                head_start.elapsed().as_secs_f64() * 1_000_000.0,
+                serde_json::json!({
+                    "tokens": hidden.shape()[0],
+                    "questions": questions.len(),
+                    "options": questions.iter().map(|q| q.option_spans.len()).sum::<usize>(),
+                }),
+            );
         }
         Ok(logits)
     }
@@ -952,5 +1499,130 @@ mod tests {
     #[ignore = "requires an Apple Metal GPU and the shared device lease"]
     fn g_beta_preparation_preserves_metal_values_and_replays_without_host_io() -> Result<()> {
         check_g_beta_preparation(Stream::metal(0)?)
+    }
+
+    /// The W1 column-split issue order (`pack → async_eval(packed) →
+    /// async_eval(gpu) → host(packed)`) yields the same tile bytes as the
+    /// eager read the previous (`tiles` before any GPU queueing) schedule used.
+    /// The fixture is a stand-in for `GpuKernels::mlp` (an `Array` operand,
+    /// constructed once as a fresh graph, queued second), since that kernel
+    /// needs no checkpoint.
+    #[cfg(feature = "coreml")]
+    #[test]
+    fn w1_column_issue_order_is_bit_equal() -> Result<()> {
+        use super::super::ane::AneMlp;
+        let stream = Stream::cpu()?;
+        let hidden = 4096;
+        for tokens in [1, 127, 128, 129, 323, 512, 513] {
+            let h = Array::from_f32(
+                &stream,
+                &[1, tokens, hidden],
+                &(0..tokens * hidden)
+                    .map(|index| (index % 251) as f32 / 16.0)
+                    .collect::<Vec<_>>(),
+            )?
+            .cast(MlxDType::BF16)?;
+            // Previous schedule: read the pack before any other work is queued.
+            let old = AneMlp::host(&AneMlp::pack(&h)?)?;
+            // W1 schedule: queue both, then wait only for the pack.
+            let packed = AneMlp::pack(&h)?;
+            let gpu = h.mul(&scalar(&h, 0.0)?)?; // fresh graph, queues second
+            stream.async_eval(std::slice::from_ref(&packed))?;
+            stream.async_eval(std::slice::from_ref(&gpu))?;
+            let new = AneMlp::host(&packed)?;
+            assert_eq!(new, old, "tokens={tokens}");
+            // The outstanding GPU share must still be evaluable afterwards;
+            // BF16 (`h.mul` preserves the dtype) is 2 bytes per element.
+            assert_eq!(gpu.to_bytes()?.len(), tokens * hidden * 2, "tokens={tokens}");
+        }
+        Ok(())
+    }
+
+    /// Fusion #2 env gate semantics: the documented default (variable unset)
+    /// is off, only the exact spelling `1` turns it on, and lookalikes stay
+    /// off. Pure, no process-env mutation, so it is safe under parallel test
+    /// execution. The byte-for-byte fused==unfused comparison is in
+    /// `apxinf-mlx/tests/metal_fusions.rs` (needs a Metal stream).
+    #[test]
+    fn fusion_env_gate_defaults_to_off() {
+        assert!(!fusion_flag(None), "unset must default to the unfused path");
+        assert!(fusion_flag(Some("1".to_owned())));
+        for off in ["", "0", "true", "yes", "2", "1 ", "01"] {
+            assert!(
+                !fusion_flag(Some(off.to_owned())),
+                "{off:?} must not enable the fusion"
+            );
+        }
+    }
+
+    /// Q23 prefix-cache env gate (D20) defaults ON: unset or any lookalike
+    /// fills and reuses the Tier-1 cache; only explicit `0` disables it.
+    #[test]
+    fn prefix_cache_env_gate_defaults_to_on() {
+        assert!(prefix_cache_flag(None), "unset must enable the cache");
+        assert!(!prefix_cache_flag(Some("0".to_owned())), "0 disables it");
+        for on in ["", "1", "true", "yes", "2", "1 ", "01", "fill"] {
+            assert!(
+                prefix_cache_flag(Some(on.to_owned())),
+                "{on:?} must not disable the prefix cache"
+            );
+        }
+    }
+
+    /// The full MLP call (column-split branch) is bit-identical before and
+    /// after W1: the new issue order against a replay of the previous
+    /// (`tiles` read before the GPU share is queued) order, same `Network`,
+    /// same tile bytes. Needs the checkpoint, a Metal GPU and the column-split
+    /// programs (`APXINF_CLEF_CHECKPOINT`; `APXINF_COREML_CACHE` should point
+    /// at a fresh directory in the measurement window).
+    #[cfg(feature = "coreml")]
+    #[test]
+    #[ignore = "requires the Clef checkpoint, compiled ANE programs and a Metal device"]
+    fn w1_column_split_mlp_is_bit_equal() -> Result<()> {
+        use super::super::ane::AneMlp;
+        let var = |name: &str| {
+            std::path::PathBuf::from(
+                std::env::var(name).unwrap_or_else(|_| panic!("set {name}")),
+            )
+        };
+        let checkpoint = var("APXINF_CLEF_CHECKPOINT");
+        let read = |name: &str| {
+            std::fs::read_to_string(checkpoint.join(name))
+                .map_err(|error| Error::Other(format!("cannot read {name}: {error}")))
+        };
+        let stream = Stream::metal(0)?;
+        let config = Config::from_json(&read("config.json")?, &read("joint_head_config.json")?)?;
+        let tokens = 323;
+        let hidden = config.text.hidden_size;
+        let backbone = Backbone::load(&config, &stream, &checkpoint)?;
+        let head = Head::load(&config, &stream, &checkpoint.join("joint_head.safetensors"))?;
+        let vision = Vision::load(&config, &stream, &checkpoint)?;
+        let net = Network::new(
+            config,
+            stream.clone(),
+            backbone,
+            head,
+            vision,
+            Composition::GpuAneColumns,
+        )?;
+        let values = (0..tokens * hidden)
+            .map(|index| (index % 251) as f32 / 16.0)
+            .collect::<Vec<_>>();
+        let h = Array::from_f32(&stream, &[1, tokens, hidden], &values)?
+            .cast(MlxDType::BF16)?;
+        let m = &net.backbone.layers[0].mlp;
+        // W1 order, as `mlp` now runs it.
+        let new = net.mlp(&h, m, 0)?.to_bytes()?;
+        // The previous order: read the tiles before any GPU work is queued,
+        // then evaluate the GPU share, then predict.
+        let c = net.gpu.as_ref().expect("GpuAneColumns has the GPU kernels");
+        let ane = net.ane.first().expect("GpuAneColumns has column programs");
+        let packed = AneMlp::pack(&h)?;
+        let gpu = c.mlp(&h, m)?;
+        stream.async_eval(std::slice::from_ref(&gpu))?;
+        let share = ane.predict(&stream, &packed, tokens, 0)?;
+        let old = gpu.add(&share)?.to_bytes()?;
+        assert_eq!(new, old, "W1 changed the column-split MLP's bytes");
+        Ok(())
     }
 }

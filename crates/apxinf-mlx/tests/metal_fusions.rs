@@ -69,6 +69,101 @@ fn packed_residual_norm_keeps_epsilon_per_kernel_instance() -> Result<()> {
     Ok(())
 }
 
+/// Fusion #2: the fused RMSNorm+scale must be byte-for-byte identical to the
+/// unfused `fast_rms_norm_unweighted(...).mul(scalar)` path (the hard
+/// acceptance gate for the gated-delta q/k norm+scale fusion).
+/// Fusion #1: the fused conv-output split must be byte-for-byte identical to
+/// the three `slice_axis + reshape` pairs for q, k and v.
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn gdn_conv_split_matches_slice_reshape_bytes_exactly() -> Result<()> {
+    use apxinf_mlx::fusions::GdnConvSplit;
+    let s = Stream::metal(0)?;
+    let split = GdnConvSplit::new(&s)?;
+    let (hk, dk, hv, dv) = (16usize, 128usize, 32usize, 128usize);
+    let (key_dim, value_dim) = (hk * dk, hv * dv);
+    let conv_dim = 2 * key_dim + value_dim;
+    for tokens in [1usize, 7, 128, 323] {
+        let conv = Array::from_f32(&s, &[1, tokens, conv_dim], &data(tokens * conv_dim, 23, 0.03))?
+            .cast(D::BF16)?;
+        let (q, k, v) = split.call(&conv, hk, dk, hv, dv)?;
+        let eq_q = conv.slice_axis(2, 0, key_dim)?.reshape(&[1, tokens, hk, dk])?;
+        let eq_k = conv.slice_axis(2, key_dim, 2 * key_dim)?.reshape(&[1, tokens, hk, dk])?;
+        let eq_v = conv.slice_axis(2, 2 * key_dim, conv_dim)?.reshape(&[1, tokens, hv, dv])?;
+        assert_eq!(q.to_bytes()?, eq_q.to_bytes()?, "q tokens={tokens}");
+        assert_eq!(k.to_bytes()?, eq_k.to_bytes()?, "k tokens={tokens}");
+        assert_eq!(v.to_bytes()?, eq_v.to_bytes()?, "v tokens={tokens}");
+        assert_eq!(q.shape(), [1, tokens, hk, dk]);
+        assert_eq!(k.shape(), [1, tokens, hk, dk]);
+        assert_eq!(v.shape(), [1, tokens, hv, dv]);
+    }
+    // Contract guards.
+    assert!(split.call(&Array::zeros(&s, &[1, 3, conv_dim + 1], D::BF16)?, hk, dk, hv, dv).is_err());
+    assert!(split.call(&Array::zeros(&s, &[3, 3, conv_dim], D::BF16)?, hk, dk, hv, dv).is_err());
+    assert!(split.call(&Array::zeros(&s, &[1, 0, conv_dim], D::BF16)?, hk, dk, hv, dv).is_err());
+    assert!(split.call(&Array::zeros(&s, &[1, 3, conv_dim], D::F16)?, hk, dk, hv, dv).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn rms_norm_scale_matches_unfused_bytes_exactly() -> Result<()> {
+    use apxinf_mlx::fusions::RmsNormScale;
+    let s = Stream::metal(0)?;
+    let fused = RmsNormScale::new(&s, 1e-6)?;
+    let (hk, dk) = (16usize, 128usize);
+    let tokens_list = [1usize, 7, 128, 323];
+    for &tokens in &tokens_list {
+        let q = Array::from_f32(&s, &[1, tokens, hk, dk], &data(tokens * hk * dk, 17, 0.02))?
+            .cast(D::BF16)?;
+        let k = Array::from_f32(&s, &[1, tokens, hk, dk], &data(tokens * hk * dk, 19, 0.02))?
+            .cast(D::BF16)?;
+        let inv_scale = (dk as f64).powf(-0.5);
+        // q: RMSNorm then mul(scalar(inv_scale^2)); k: RMSNorm then mul(scalar(inv_scale)).
+        let scalar_of = |like: &Array, value: f64| -> Result<Array> {
+            Array::scalar(like.stream(), value as f32, like.dtype())
+        };
+        let unfused_q = q
+            .fast_rms_norm_unweighted(1e-6)?
+            .mul(&scalar_of(&q, inv_scale * inv_scale)?)?;
+        let unfused_k = k
+            .fast_rms_norm_unweighted(1e-6)?
+            .mul(&scalar_of(&k, inv_scale)?)?;
+        let fused_q = fused.call(&q, &scalar_of(&q, inv_scale * inv_scale)?)?;
+        let fused_k = fused.call(&k, &scalar_of(&k, inv_scale)?)?;
+        assert_eq!(fused_q.shape(), unfused_q.shape());
+        assert_eq!(fused_q.dtype(), unfused_q.dtype());
+        assert_eq!(
+            fused_q.to_bytes()?,
+            unfused_q.to_bytes()?,
+            "fused q norm+scale differs from unfused at tokens={tokens}"
+        );
+        assert_eq!(
+            fused_k.to_bytes()?,
+            unfused_k.to_bytes()?,
+            "fused k norm+scale differs from unfused at tokens={tokens}"
+        );
+    }
+    // Contract guards: wrong axis, non-BF16 input, non-BF16 or non-scalar scale.
+    let bad_axis = Array::from_f32(&s, &[1, 3, 96], &vec![0.5f32; 3 * 96])?.cast(D::BF16)?;
+    let one = Array::scalar(&s, 0.5, D::BF16)?;
+    assert!(fused.call(&bad_axis, &one).is_err());
+    assert!(fused
+        .call(
+            &Array::from_f32(&s, &[1, 3, 128], &vec![0.5f32; 384])?,
+            &one
+        )
+        .is_err());
+    assert!(fused.call(&bad_axis.cast(D::F32)?, &one).is_err());
+    assert!(fused.call(&bad_axis, &one.cast(D::F32)?).is_err());
+    assert!(fused
+        .call(&bad_axis, &Array::zeros(&s, &[2], D::BF16)?)
+        .is_err());
+    assert!(RmsNormScale::new(&s, 0.0).is_err());
+    assert!(RmsNormScale::new(&s, f32::NAN).is_err());
+    Ok(())
+}
+
 fn data(n: usize, period: usize, scale: f32) -> Vec<f32> {
     (0..n)
         .map(|i| ((i * 7 + 3) % period) as f32 * scale - (period as f32 * scale / 2.))

@@ -16,8 +16,8 @@ use std::time::Instant;
 
 use apxinf_core::Device;
 use apxinf_model::{
-    AutoModel, DecisionInput, DecisionSchema, GenerationOptions, ImageRequest, LlmInput,
-    LoadOptions, SamplingMode, SpeechRequest,
+    AutoModel, DecisionImage, DecisionInput, DecisionSchema, GenerationOptions, ImageRequest,
+    LlmInput, LoadOptions, SamplingMode, SpeechRequest,
 };
 use apxinf_tokenizer::{ChatMessage, Tokenizer};
 use serde_json::{json, Map, Value};
@@ -72,6 +72,9 @@ fn check_speech_settings(snapshot: &Path, settings: &Value) -> Fallible<Value> {
 struct Request {
     payload: Value,
     arrays: Vec<(&'static str, &'static str, Vec<usize>, Vec<u8>)>,
+    /// Diagnostics outside `payload`, so the baseline payload shape is untouched.
+    /// Only populated for `classification` with `APXINF_CLEF_DEBUG=1`.
+    debug: Option<Value>,
 }
 
 /// Exactly `fixed_output_tokens` greedy tokens: EOS does not stop generation,
@@ -149,6 +152,7 @@ fn generate_fixed(
         Request {
             payload,
             arrays: vec![],
+            debug: None,
         },
     ))
 }
@@ -169,12 +173,32 @@ fn run(
             settings,
         ),
         "classification" => {
+            // The clock covers media decoding and preprocessing: the MLX
+            // baseline worker opens and preprocesses the same PNGs inside its
+            // request too (mlx_baselines.adapters.Clef.run).
             let started = Instant::now();
-            let schema = DecisionSchema::from_json(&field(case, "record")?.to_string())
-                .map_err(|e| e.to_string())?;
-            let output = model
-                .decide(DecisionInput::Schema(&schema))
-                .map_err(|e| e.to_string())?;
+            let schema = classification_schema(field(case, "record")?)?;
+            let (paths, bytes) = classification_images(field(case, "record")?)?;
+            let mut images = Vec::with_capacity(paths.len());
+            for path in &paths {
+                images.push(DecisionImage::Path(path.as_path()));
+            }
+            for png in &bytes {
+                images.push(DecisionImage::Png(png.as_slice()));
+            }
+            let input = if images.is_empty() {
+                DecisionInput::Schema(&schema)
+            } else {
+                DecisionInput::SchemaWithImages {
+                    schema: &schema,
+                    images: &images,
+                }
+            };
+            let output = model.decide(input).map_err(|e| e.to_string())?;
+            let input_ids = model
+                .decision_input_ids()
+                .map_err(|e| e.to_string())?
+                .map(|ids| ids.to_vec());
             let elapsed = started.elapsed().as_secs_f64() * 1000.0;
             let (mut probabilities, mut decisions) = (Map::new(), Map::new());
             for answer in &output.answers {
@@ -194,11 +218,19 @@ fn run(
                         .into(),
                 );
             }
+            let debug = std::env::var_os("APXINF_CLEF_DEBUG").map(|_| {
+                json!({
+                    "input_ids": input_ids,
+                    "input_tokens": input_ids.as_ref().map_or(0, Vec::len),
+                    "images": images.len(),
+                })
+            });
             Ok((
                 elapsed,
                 Request {
                     payload: json!({"probabilities": probabilities, "decisions": decisions}),
                     arrays: vec![],
+                    debug,
                 },
             ))
         }
@@ -237,6 +269,7 @@ fn run(
                 Request {
                     payload,
                     arrays: vec![("audio", "<f4", vec![samples], bytes)],
+                    debug: None,
                 },
             ))
         }
@@ -271,11 +304,122 @@ fn run(
                         vec![image.height, image.width, 3],
                         image.rgb,
                     )],
+                    debug: None,
                 },
             ))
         }
         other => Err(format!("no ApxInf latency worker for task {other}")),
     }
+}
+
+/// The schema part of a classification record: `state` + `questions`. The
+/// record may also carry `images`, which `DecisionSchema` rejects as an unknown
+/// field, and `videos`, which this family does not support.
+fn classification_schema(record: &Value) -> Fallible<DecisionSchema> {
+    if let Some(videos) = record.get("videos") {
+        if videos.as_array().is_some_and(|items| !items.is_empty()) {
+            return Err("the Clef worker supports images, not video".into());
+        }
+    }
+    let schema = json!({
+        "state": field(record, "state")?,
+        "questions": field(record, "questions")?,
+    });
+    DecisionSchema::from_json(&schema.to_string()).map_err(|e| e.to_string())
+}
+
+/// Images of a classification record, in request order: local PNG paths and
+/// inline `data:image/...;base64,` payloads (the two forms the baseline accepts).
+fn classification_images(record: &Value) -> Fallible<(Vec<PathBuf>, Vec<Vec<u8>>)> {
+    let Some(value) = record.get("images") else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let Some(items) = value.as_array() else {
+        return Err("record.images must be an array".into());
+    };
+    if items.len() > 4 {
+        return Err("the Clef worker supports at most four images per request".into());
+    }
+    let mut paths = Vec::new();
+    let mut bytes = Vec::new();
+    for item in items {
+        let Some(item) = item.as_str() else {
+            return Err("record.images entries must be strings".into());
+        };
+        if let Some(rest) = item.strip_prefix("data:image/") {
+            let Some((meta, data)) = rest.split_once(',') else {
+                return Err("malformed data URL in record.images".into());
+            };
+            if !meta.ends_with(";base64") {
+                return Err("record.images data URLs must be base64".into());
+            }
+            bytes.push(decode_base64(data)?);
+        } else if item.is_empty() {
+            return Err("record.images entry is empty".into());
+        } else {
+            paths.push(PathBuf::from(item));
+        }
+    }
+    Ok((paths, bytes))
+}
+
+/// Standard-alphabet padded base64, so the worker needs no image or encoding
+/// dependency to accept the demo's inline PNGs.
+fn decode_base64(text: &str) -> Fallible<Vec<u8>> {
+    fn value(byte: u8) -> Fallible<u32> {
+        match byte {
+            b'A'..=b'Z' => Ok((byte - b'A') as u32),
+            b'a'..=b'z' => Ok((byte - b'a' + 26) as u32),
+            b'0'..=b'9' => Ok((byte - b'0' + 52) as u32),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            other => Err(format!("invalid base64 byte {other:?}")),
+        }
+    }
+    let bytes = text.trim().as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut chunk = [0u8; 4];
+    let mut filled = 0;
+    let mut padding = 0;
+    for &byte in bytes {
+        if byte == b'=' {
+            padding += 1;
+            continue;
+        }
+        if padding > 0 {
+            return Err("base64 padding is not at the end".into());
+        }
+        chunk[filled] = byte;
+        filled += 1;
+        if filled == 4 {
+            let mut packed = 0u32;
+            for &part in &chunk {
+                packed = (packed << 6) | value(part)?;
+            }
+            out.extend_from_slice(&packed.to_be_bytes()[1..]);
+            filled = 0;
+        }
+    }
+    // Unpadded tails are legal base64 (`aGVsbG8` == `aGVsbG8=`); a padded
+    // alphabet must still end with the right number of `=`.
+    match (filled, padding) {
+        (0, 0) => {}
+        (2, 2) | (2, 0) => {
+            let packed = (value(chunk[0])? << 6) | value(chunk[1])?;
+            out.push((packed >> 4) as u8);
+        }
+        (3, 1) | (3, 0) => {
+            let mut packed = 0u32;
+            for &part in &chunk[..3] {
+                packed = (packed << 6) | value(part)?;
+            }
+            // Three sextets are 18 bits; align them as the top 18 of 24.
+            let bytes = (packed << 6).to_be_bytes();
+            out.extend_from_slice(&bytes[1..3]);
+        }
+        _ => return Err("base64 has a ragged tail".into()),
+    }
+    Ok(out)
 }
 
 fn dtype_name(descr: &str) -> &'static str {
@@ -367,8 +511,13 @@ fn main_inner(job_path: &Path) -> Fallible<()> {
         let seed = unsigned(item, "seed")?;
         let (latency_ms, request) =
             run(&mut model, tokenizer.as_ref(), &task, case, &settings, seed)?;
+        let Request {
+            payload,
+            arrays: request_arrays,
+            debug,
+        } = request;
         let mut arrays = Map::new();
-        for (key, descr, shape, bytes) in request.arrays {
+        for (key, descr, shape, bytes) in request_arrays {
             let name = format!("{index:05}-{key}.bin");
             File::create(output.join(&name))
                 .and_then(|mut f| f.write_all(&bytes))
@@ -392,11 +541,15 @@ fn main_inner(job_path: &Path) -> Fallible<()> {
         record.insert("peak_bytes".into(), json!(memory.peak_bytes));
         record.insert("active_bytes".into(), json!(memory.active_bytes));
         record.insert("cache_bytes".into(), json!(memory.cache_bytes));
-        record.insert("payload".into(), request.payload);
+        record.insert("payload".into(), payload);
         record.insert("arrays".into(), arrays.into());
+        if let Some(debug) = debug {
+            record.insert("debug".into(), debug);
+        }
         emit(record.into())?;
     }
-    emit(json!({"type": "done"}))
+    emit(json!({"type": "done"}))?;
+    Ok(())
 }
 
 fn main() {
@@ -408,5 +561,50 @@ fn main() {
     if let Err(error) = main_inner(Path::new(&args[1])) {
         eprintln!("{error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_decodes_padded_and_unpadded_inputs() {
+        // PNG signature, and "hello" with and without padding.
+        assert_eq!(
+            decode_base64("iVBORw0KGgo=").unwrap(),
+            [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+        );
+        assert_eq!(decode_base64("aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(decode_base64("aGVsbG8").unwrap(), b"hello");
+        assert_eq!(decode_base64("aGVsbA==").unwrap(), b"hell");
+        assert!(decode_base64("a").is_err());
+        assert!(decode_base64("!").is_err());
+    }
+
+    #[test]
+    fn classification_records_split_paths_and_inline_pngs() {
+        let record = json!({
+            "state": "s",
+            "images": ["/tmp/a.png", "data:image/png;base64,iVBORw0KGgo="],
+            "questions": {"q": {"type": "noul"}},
+        });
+        let (paths, bytes) = classification_images(&record).unwrap();
+        assert_eq!(paths, vec![PathBuf::from("/tmp/a.png")]);
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes[0][..4], [0x89, 0x50, 0x4e, 0x47]);
+
+        let schema = classification_schema(&record).unwrap();
+        assert_eq!(schema.questions.len(), 1);
+        assert_eq!(schema.state, json!("s"));
+
+        assert!(classification_images(&json!({"images": ["data:image/png,abc"]})).is_err());
+        assert!(classification_images(&json!({"images": [1]})).is_err());
+        assert!(classification_images(&json!({"images": ["a", "b", "c", "d", "e"]})).is_err());
+        assert!(
+            classification_schema(&json!({"state": "s", "videos": ["v.mp4"],
+                "questions": {"q": {"type": "noul"}}}))
+            .is_err()
+        );
     }
 }

@@ -1,12 +1,22 @@
 //! Model-neutral decision API, shared by decision families (d3, metal_clef).
 
 use std::fmt;
+use std::path::Path;
 
 use apxinf_core::{Error, Result};
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
 
 use crate::llm_trait::{ImageInput, LlmCapabilities};
+
+/// One media item of a schema request, as it arrives from the caller: a PNG
+/// path or the PNG bytes themselves. A family that accepts this form decodes and
+/// preprocesses it inside the timed request; no caller-side tensor is needed.
+#[derive(Clone, Copy, Debug)]
+pub enum DecisionImage<'a> {
+    Path(&'a Path),
+    Png(&'a [u8]),
+}
 
 /// One complete request. A runtime accepts the forms it documents and returns
 /// an error for the others.
@@ -23,6 +33,12 @@ pub enum DecisionInput<'a> {
     },
     /// A state with named, typed questions that the family encodes itself.
     Schema(&'a DecisionSchema),
+    /// A schema request with media attached, in request order. The family owns
+    /// decoding and preprocessing (including its cost) for these items.
+    SchemaWithImages {
+        schema: &'a DecisionSchema,
+        images: &'a [DecisionImage<'a>],
+    },
 }
 
 impl<'a> DecisionInput<'a> {
@@ -193,6 +209,13 @@ pub trait DecisionRuntime {
     fn code_names(&self) -> &[String];
     /// Token IDs for each package code; empty without a package code table.
     fn token_ids(&self) -> &[u32];
+    /// Prompt token IDs the runtime encoded for its most recent request, when it
+    /// encodes the prompt itself. Callers compare these against the reference
+    /// implementation instead of guessing the layout; `None` means the caller
+    /// supplied the IDs.
+    fn encoded_input_ids(&self) -> Option<&[u32]> {
+        None
+    }
 }
 
 #[cfg(test)]

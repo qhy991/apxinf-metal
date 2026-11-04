@@ -162,6 +162,18 @@ impl LoadedModel {
         }
     }
 
+    /// Prompt IDs the decision family encoded for its most recent request, when
+    /// it encodes the prompt itself.
+    pub fn decision_input_ids(&self) -> Result<Option<&[u32]>> {
+        match self {
+            Self::Decision(model) => Ok(model.encoded_input_ids()),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
+        }
+    }
+
     pub fn forward(&mut self, token_ids: &[u32], start_pos: u32) -> Result<Tensor> {
         self.text_mut()?.forward(token_ids, start_pos)
     }

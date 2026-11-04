@@ -20,6 +20,52 @@ const INTERMEDIATE: usize = 12288;
 /// `12288 - round(12288 * 5632 / 12288 / 256) * 256`: the GPU keeps the first
 /// 6656 columns, the Neural Engine runs the other 5632.
 pub const GPU_COLUMNS: usize = 6656;
+/// Column depths the campaign may run on the Neural Engine: the GPU keeps the
+/// first `C` of 12288 intermediate columns, the Neural Engine runs the rest.
+/// Each is a multiple of 64 so the packed Q4 down columns
+/// (`weight` axis 1 length `C / 8`, scales/biases `C / 64`) stay whole.
+const ANE_DEEPER_COLUMNS: &[usize] = &[6656, 5632, 4608];
+
+/// The Neural Engine deeper-column split: `APXINF_CLEF_ANE_COLUMNS` overrides
+/// the GPU's column share for the GPU+ANE column composition. Unset (or empty)
+/// keeps [`GPU_COLUMNS`], the qualified default. Only a whole campaign-qualified
+/// depth is accepted, so an arbitrary value cannot reach an unverified program.
+/// Applies only to the GPU+ANE column composition; other compositions ignore it.
+pub fn gpu_columns() -> Result<usize> {
+    match std::env::var("APXINF_CLEF_ANE_COLUMNS").ok().as_deref() {
+        None | Some("") => Ok(GPU_COLUMNS),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|columns| ANE_DEEPER_COLUMNS.contains(columns))
+            .ok_or_else(|| {
+                Error::Contract(
+                    "APXINF_CLEF_ANE_COLUMNS must be one of 6656, 5632 or 4608",
+                )
+            }),
+    }
+}
+
+/// `(ane columns, down parts, down part width)` for a GPU column share. The
+/// Neural Engine runs `[gpu, 12288)`; the down weight is K-split into at most
+/// [`DOWN_PART`]-wide parts that are convolved and summed. All campaign depths
+/// give two parts of a 128-multiple width, which the quantized layout needs.
+pub fn ane_split_geometry(gpu: usize) -> Result<(usize, usize, usize)> {
+    if gpu >= INTERMEDIATE || gpu % 64 != 0 {
+        return Err(Error::Contract(
+            "Clef GPU+ANE columns need a 64-multiple below 12288",
+        ));
+    }
+    let n = INTERMEDIATE - gpu;
+    let parts = n.div_ceil(DOWN_PART);
+    if n % parts != 0 {
+        return Err(Error::Contract(
+            "Clef GPU+ANE down parts must divide the Neural Engine columns",
+        ));
+    }
+    Ok((n, parts, n / parts))
+}
+
 const TILE: usize = 512;
 const FACTOR_SCALE: f64 = 16.0;
 const DOWN_ABS_SUM_LIMIT: f64 = 8192.0;
@@ -70,25 +116,24 @@ fn columns(w: &[f16], cols: usize, start: usize, width: usize) -> Vec<f16> {
         .collect()
 }
 
-/// One layer's Core ML program for the Neural Engine share of `mlp`.
-pub fn program(mlp: &Mlp) -> Result<Package> {
-    let n = INTERMEDIATE - GPU_COLUMNS;
+/// One layer's Core ML program for the Neural Engine share of `mlp`, the
+/// intermediate columns `[gpu_columns, 12288)`.
+pub fn program_with_columns(mlp: &Mlp, gpu_columns: usize) -> Result<Package> {
+    let (n, parts, width) = ane_split_geometry(gpu_columns)?;
     if mlp.gate.rows() != INTERMEDIATE || mlp.down.rows() != HIDDEN {
         return Err(Error::Contract(
             "Clef GPU+ANE needs the 4096 x 12288 MLP geometry",
         ));
     }
     let (qg, sg) = int8_per_row(
-        &dense(&mlp.gate, (GPU_COLUMNS, INTERMEDIATE), (0, HIDDEN))?,
+        &dense(&mlp.gate, (gpu_columns, INTERMEDIATE), (0, HIDDEN))?,
         HIDDEN,
     );
     let (qu, su) = int8_per_row(
-        &dense(&mlp.up, (GPU_COLUMNS, INTERMEDIATE), (0, HIDDEN))?,
+        &dense(&mlp.up, (gpu_columns, INTERMEDIATE), (0, HIDDEN))?,
         HIDDEN,
     );
-    let wd = dense(&mlp.down, (0, HIDDEN), (GPU_COLUMNS, INTERMEDIATE))?;
-    let parts = n.div_ceil(DOWN_PART);
-    let width = n / parts;
+    let wd = dense(&mlp.down, (0, HIDDEN), (gpu_columns, INTERMEDIATE))?;
     let down: Vec<(Vec<i8>, Vec<f16>)> = (0..parts)
         .map(|p| int8_per_row(&columns(&wd, n, p * width, width), width))
         .collect();
@@ -161,6 +206,12 @@ pub fn program(mlp: &Mlp) -> Result<Package> {
     }
     let y = b.identity(&y.expect("at least one down part"), Some("y"));
     b.finish(&[&y, &s_scale, &u_scale])
+}
+
+/// One layer's Core ML program for the Neural Engine share of `mlp` at the
+/// qualified [`GPU_COLUMNS`] depth.
+pub fn program(mlp: &Mlp) -> Result<Package> {
+    program_with_columns(mlp, GPU_COLUMNS)
 }
 
 /// The neuron split: per MLP, the `NEURON_INT8` neurons whose int8 encoding
@@ -471,14 +522,20 @@ impl DenseMlp {
     }
 }
 
-/// The GPU share of `mlp`: gate and up rows and down columns `[0, GPU_COLUMNS)`,
-/// as contiguous Q4 copies.
-pub fn gpu_share(mlp: &Mlp) -> Result<Mlp> {
+/// The GPU share of `mlp`: gate and up rows and down columns
+/// `[0, gpu_columns)`, as contiguous Q4 copies. The down packed layout needs
+/// `gpu_columns` to be a multiple of 64.
+pub fn gpu_share_with_columns(mlp: &Mlp, gpu_columns: usize) -> Result<Mlp> {
+    if gpu_columns >= INTERMEDIATE || gpu_columns % 64 != 0 {
+        return Err(Error::Contract(
+            "Clef GPU+ANE columns need a 64-multiple below 12288",
+        ));
+    }
     let rows = |q: &Q4| -> Result<Q4> {
         Ok(Q4 {
-            weight: q.weight.slice_axis(0, 0, GPU_COLUMNS)?.contiguous()?,
-            scales: q.scales.slice_axis(0, 0, GPU_COLUMNS)?.contiguous()?,
-            biases: q.biases.slice_axis(0, 0, GPU_COLUMNS)?.contiguous()?,
+            weight: q.weight.slice_axis(0, 0, gpu_columns)?.contiguous()?,
+            scales: q.scales.slice_axis(0, 0, gpu_columns)?.contiguous()?,
+            biases: q.biases.slice_axis(0, 0, gpu_columns)?.contiguous()?,
         })
     };
     let d = &mlp.down;
@@ -486,9 +543,9 @@ pub fn gpu_share(mlp: &Mlp) -> Result<Mlp> {
         gate: rows(&mlp.gate)?,
         up: rows(&mlp.up)?,
         down: Q4 {
-            weight: d.weight.slice_axis(1, 0, GPU_COLUMNS / 8)?.contiguous()?,
-            scales: d.scales.slice_axis(1, 0, GPU_COLUMNS / 64)?.contiguous()?,
-            biases: d.biases.slice_axis(1, 0, GPU_COLUMNS / 64)?.contiguous()?,
+            weight: d.weight.slice_axis(1, 0, gpu_columns / 8)?.contiguous()?,
+            scales: d.scales.slice_axis(1, 0, gpu_columns / 64)?.contiguous()?,
+            biases: d.biases.slice_axis(1, 0, gpu_columns / 64)?.contiguous()?,
         },
     };
     let s = share.gate.weight.stream();
@@ -504,6 +561,11 @@ pub fn gpu_share(mlp: &Mlp) -> Result<Mlp> {
         share.down.biases.clone(),
     ])?;
     Ok(share)
+}
+
+/// The GPU share of `mlp` at the qualified [`GPU_COLUMNS`] depth.
+pub fn gpu_share(mlp: &Mlp) -> Result<Mlp> {
+    gpu_share_with_columns(mlp, GPU_COLUMNS)
 }
 
 /// Compiled-program cache: `APXINF_COREML_CACHE`, else
@@ -526,6 +588,73 @@ fn f16_bytes(values: &[f16]) -> &[u8] {
     }
 }
 
+thread_local! {
+    /// Wall-clock stamp of the last traced column-split predict return on
+    /// this thread: the Neural Engine service's idle-gap clock. Deliberately
+    /// not a field of [`AneMlp`]: the gap that costs (G3: >=30 ms idle roughly
+    /// doubles the next predict) is between any two predicts of the *service*,
+    /// whichever program ran. A per-layer clock would only ever see the
+    /// inter-request interval (it hides the cross-layer gap the wavefront
+    /// exists to close). `Model` is `!Send`, so per thread is per owner.
+    static LAST_PREDICT_END: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `APXINF_CLEF_ANE_TRACE` enables the per-predict trace line.
+fn trace_enabled() -> bool {
+    std::env::var_os("APXINF_CLEF_ANE_TRACE").is_some()
+}
+
+/// The ms since the previous traced predict returned on this thread (`None`
+/// on the first call). Advances nothing; the caller stamps the return.
+fn trace_gap(started: std::time::Instant) -> Option<f64> {
+    LAST_PREDICT_END.with(|cell| {
+        cell.get()
+            .map(|last| started.saturating_duration_since(last).as_secs_f64() * 1000.0)
+    })
+}
+
+/// Stamps a predict return on the service clock without a trace line (`warm`
+/// has no layer index, but it is ANE activity and must advance the clock).
+fn trace_stamp() {
+    LAST_PREDICT_END.with(|cell| cell.set(Some(std::time::Instant::now())));
+}
+
+/// Retries for the transient `MLComputePlan` races documented on
+/// [`AneMlp::package`]. Deliberately bounded: a genuine admission bug
+/// (`not ANE-preferred`, bad ports) is not in the transient set and fails on
+/// attempt 1, so a wrong candidate still fails loudly.
+const PLACEMENT_RETRIES: usize = 3;
+
+/// `load_with_placement` performs compile/cache-hit → canonicalise → plan
+/// inspect → `Model::load` → admission, in that order. A transient failure
+/// therefore always carries an inspection-step marker; an error before the
+/// inspect (compile, path) or at a non-transient admission predicate is not
+/// retried. The markers are also the observed `MLComputePlan` races under ANE
+/// service load (`usage = None` is reported by admission as
+/// `placement is unknown`).
+fn is_transient_placement_error(error: &Error) -> bool {
+    let message = error.to_string();
+    message.contains("placement is unknown")
+        || message.contains("plan wait timed out")
+        || message.contains("cannot inspect the Core ML compute plan")
+}
+
+/// Attempts per layer (1 disables the retry). Env-gated so a demo or another
+/// campaign can force the original single-shot behaviour.
+fn placement_attempts() -> usize {
+    match std::env::var("APXINF_CLEF_PLACEMENT_RETRIES").ok().as_deref() {
+        None | Some("") => PLACEMENT_RETRIES,
+        Some(value) => value.parse::<usize>().unwrap_or(PLACEMENT_RETRIES).clamp(1, 6),
+    }
+}
+
+fn placement_retry_delay(attempt: usize) -> std::time::Duration {
+    // 200ms then 400ms: enough for the planner's busy window, short enough
+    // that a full 32-layer load is not noticeably delayed.
+    std::time::Duration::from_millis(200 << attempt.min(2))
+}
+
 /// One layer's loaded Neural Engine program.
 pub struct AneMlp {
     model: Model,
@@ -533,6 +662,12 @@ pub struct AneMlp {
 }
 
 impl AneMlp {
+    /// Loads the Neural Engine program for `mlp`'s columns
+    /// `[gpu_columns, 12288)`, quantizing and compiling it on a cache miss.
+    pub fn load_split(cache: &ProgramCache, mlp: &Mlp, gpu_columns: usize) -> Result<Self> {
+        Self::load_package(cache, &program_with_columns(mlp, gpu_columns)?)
+    }
+
     pub fn load(cache: &ProgramCache, mlp: &Mlp) -> Result<Self> {
         Self::load_package(cache, &program(mlp)?)
     }
@@ -556,13 +691,32 @@ impl AneMlp {
             ));
         };
         let admission = super::ane_admission::Admission::new(package, [1, HIDDEN, 1, tile])?;
+        let units = ComputeUnits::CpuAndNeuralEngine;
+        let timeout = std::time::Duration::from_secs(60);
+        // A placement-inspect race under ANE service load is transient (the
+        // same compiled directory loads cleanly on a retry); a bad
+        // placement/port/admission is not and must fail on the first attempt.
+        let attempts = placement_attempts();
+        let mut result = Err(Error::Other(
+            "Core ML placement retry did not run".into(),
+        ));
+        for attempt in 0..attempts {
+            let checked = cache.load_with_placement(package, units, timeout, |facts| {
+                admission.check(facts)
+            });
+            match checked {
+                Ok(model) => { result = Ok(model); break; }
+                Err(error) => {
+                    let transient = attempt + 1 < attempts
+                        && is_transient_placement_error(&error);
+                    result = Err(error);
+                    if !transient { break; }
+                }
+            }
+            std::thread::sleep(placement_retry_delay(attempt));
+        }
         Ok(Self {
-            model: cache.load_with_placement(
-                package,
-                ComputeUnits::CpuAndNeuralEngine,
-                std::time::Duration::from_secs(60),
-                |facts| admission.check(facts),
-            )?,
+            model: result?,
             tile,
         })
     }
@@ -585,6 +739,12 @@ impl AneMlp {
             );
         } else {
             drop(self.model.predict(&[("x", &input, &shape)], &outputs)?);
+        }
+        if trace_enabled() {
+            // Warm-up ANE activity closes the clock's first open interval; it
+            // is not a trace row (no layer), but the first layer row after it
+            // should not read as a multi-second gap.
+            trace_stamp();
         }
         Ok(())
     }
@@ -640,9 +800,10 @@ impl AneMlp {
         ])
     }
 
-    /// BF16 `[1, T, 4096]` as the little-endian bytes of FP16 channel-first
-    /// tiles `[tiles, 4096, 512]`, zero-padded to whole tiles. Evaluates `h`.
-    pub fn tiles(h: &Array) -> Result<Vec<u8>> {
+    /// BF16 `[1, T, 4096]` lazily as the little-endian bytes of FP16
+    /// channel-first tiles `[tiles, 4096, 512]`, zero-padded to whole tiles.
+    /// The caller may queue other GPU work between this and [`host`](Self::host).
+    pub fn pack(h: &Array) -> Result<Array> {
         let [1, tokens, channels] = *h.shape() else {
             return Err(Error::Contract("Clef GPU+ANE tiles take [1, T, 4096]"));
         };
@@ -653,16 +814,59 @@ impl AneMlp {
         } else {
             h.clone()
         };
-        let packed = padded
+        padded
             .reshape(&[tiles, TILE, channels])?
             .transpose(&[0, 2, 1])?
-            .cast(MlxDType::F16)?;
-        packed.to_bytes()
+            .cast(MlxDType::F16)?
+            .contiguous()
     }
 
-    /// Predicts every tile of [`tiles`](Self::tiles) and restores BF16
-    /// `[1, T, 4096]` on `stream`: rows times both scales in FP32.
-    pub fn predict(&self, stream: &Stream, tiles: &[u8], tokens: usize) -> Result<Array> {
+    /// The host bytes of [`packed`](Self::pack), row-contiguous as
+    /// `to_bytes_ready` requires. Waits only for this array; work queued after
+    /// the pack (for example the GPU MLP share) keeps running.
+    pub fn host(packed: &Array) -> Result<Vec<u8>> {
+        packed.to_bytes_ready()
+    }
+
+    /// Waits only for [`packed`](Self::pack) — work queued after it (the GPU
+    /// share) keeps running — and returns its bytes.
+    fn wait_tiles(packed: &Array) -> Result<Vec<u8>> {
+        packed.to_bytes_ready()
+    }
+
+    /// Predicts every tile of [`packed`](Self::pack)'s bytes and restores BF16
+    /// `[1, T, 4096]` on `stream`: rows times both scales in FP32. The host
+    /// read of `packed` happens here, under the same timer as the ANE
+    /// predictions, so the trace's `wait_ms` covers the GPU/ANE overlap
+    /// window rather than a separate, untimed wait in the caller.
+    ///
+    /// With `APXINF_CLEF_ANE_TRACE=1` this prints one stderr line per call:
+    /// `APXINF_CLEF_ANE layer=<L> tiles=<n> gap_ms=<ms since the previous
+    /// predict's return, any program of the service> wait_ms=<ms to read the
+    /// packed tiles from the GPU (the GPU/ANE overlap window)>
+    /// predict_ms=<sum of the host-blocking Core ML predicts>`.
+    /// `index` is the program's layer.
+    pub fn predict(
+        &self,
+        stream: &Stream,
+        packed: &Array,
+        tokens: usize,
+        index: usize,
+    ) -> Result<Array> {
+        let trace = trace_enabled();
+        let chrome = super::trace_json::enabled();
+        let started = std::time::Instant::now();
+        // The gap is the ANE service's idle interval before this call, from
+        // the previous predict's return on any program of the service (not
+        // this layer's); first call reports 0.
+        let since_last = if trace { trace_gap(started) } else { None };
+        let chrome_wait = if chrome {
+            super::trace_json::to_us(started)
+        } else {
+            None
+        };
+        let tiles = Self::wait_tiles(packed)?;
+        let wait_ms = started.elapsed().as_secs_f64() * 1000.0;
         // SAFETY: every bit pattern is a valid f16; `align_to` returns only the aligned middle.
         let (head, aligned, tail) = unsafe { tiles.align_to::<f16>() };
         let copied: Vec<f16>;
@@ -681,8 +885,15 @@ impl AneMlp {
             ));
         }
         let mut parts = Vec::with_capacity(values.len() / (HIDDEN * TILE));
+        let mut predict_ms = 0.0;
+        let chrome_predict_ts = if chrome {
+            super::trace_json::to_us(std::time::Instant::now())
+        } else {
+            None
+        };
         for (i, tile) in values.chunks_exact(HIDDEN * TILE).enumerate() {
             let rows = TILE.min(tokens - i * TILE);
+            let predict_started = std::time::Instant::now();
             let out = self.model.predict(
                 &[("x", tile, &[1, HIDDEN, 1, TILE])],
                 &[
@@ -691,6 +902,7 @@ impl AneMlp {
                     ("up_scale", &[1, 1, 1, TILE]),
                 ],
             )?;
+            predict_ms += predict_started.elapsed().as_secs_f64() * 1000.0;
             let scale = |v: &[f16]| -> Result<Array> {
                 Array::from_bytes(stream, &[TILE, 1], MlxDType::F16, f16_bytes(v))?
                     .slice_axis(0, 0, rows)?
@@ -707,13 +919,159 @@ impl AneMlp {
                     .cast(MlxDType::BF16)?,
             );
         }
-        Array::concat(&parts.iter().collect::<Vec<_>>(), 1)
+        let result = Array::concat(&parts.iter().collect::<Vec<_>>(), 1)?;
+        if let (Some(ts0), Some(ts_p)) = (chrome_wait, chrome_predict_ts) {
+            // `wait0`-style pack-read overlap window (the GPU/ANE overlap).
+            super::trace_json::record(
+                "ane_wait_pack",
+                "ane",
+                &format!("L{index}"),
+                ts0,
+                wait_ms * 1000.0,
+                serde_json::json!({"layer": index, "wait_ms": wait_ms}),
+            );
+            super::trace_json::record(
+                "ane_predict",
+                "ane",
+                &format!("L{index}"),
+                ts_p,
+                predict_ms * 1000.0,
+                // Metadata only — `tiles` is the raw packed weight buffer
+                // (~8.8MB); serializing it into args produced ~13MB events
+                // (1GB / 7.78GB traces, D31). The tile count and byte length
+                // carry the same geometry for the timeline.
+                serde_json::json!({
+                    "layer": index,
+                    "tiles": values.len() / (HIDDEN * TILE),
+                    "tile_bytes": tiles.len(),
+                    "predict_ms": predict_ms,
+                }),
+            );
+            if let Some(gap) = since_last {
+                super::trace_json::instant(
+                    "ane_gap",
+                    "ane",
+                    "service",
+                    ts0,
+                    serde_json::json!({"layer": index, "gap_ms": gap}),
+                );
+            }
+        }
+        if trace {
+            // The gap is measured from the previous predict's return on the
+            // service clock; stamp only now, after this call has finished.
+            trace_stamp();
+            eprintln!(
+                "APXINF_CLEF_ANE layer={index} tiles={} gap_ms={:.3} wait_ms={wait_ms:.3} predict_ms={predict_ms:.3}",
+                values.len() / (HIDDEN * TILE),
+                since_last.unwrap_or(0.0),
+            );
+        }
+        Ok(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ane_split_geometry_matches_the_campaign_depths() -> Result<()> {
+        assert_eq!(ane_split_geometry(6656)?, (5632, 2, 2816));
+        assert_eq!(ane_split_geometry(5632)?, (6656, 2, 3328));
+        assert_eq!(ane_split_geometry(4608)?, (7680, 2, 3840));
+        // Non-64-multiple columns would leave a packed down column partial.
+        assert!(ane_split_geometry(6657).is_err());
+        // GPU takes nothing: the Neural Engine runs all 12288 columns (three parts).
+        assert_eq!(ane_split_geometry(0)?, (12288, 3, 4096));
+        // The Neural Engine must keep at least one column.
+        assert!(ane_split_geometry(INTERMEDIATE).is_err());
+        assert!(ane_split_geometry(INTERMEDIATE + 64).is_err());
+        Ok(())
+    }
+
+    /// Serializes the two `gpu_columns` probes: `APXINF_CLEF_ANE_COLUMNS` is
+    /// process-global, and cargo runs tests in parallel within one binary.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn gpu_columns_defaults_to_6656_and_reads_the_campaign_depths() -> Result<()> {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var_os("APXINF_CLEF_ANE_COLUMNS");
+        std::env::remove_var("APXINF_CLEF_ANE_COLUMNS");
+        assert_eq!(gpu_columns()?, GPU_COLUMNS, "unset must default to 6656");
+        for (value, expected) in [("6656", 6656), ("5632", 5632), ("4608", 4608)] {
+            std::env::set_var("APXINF_CLEF_ANE_COLUMNS", value);
+            assert_eq!(gpu_columns()?, expected, "value {value}");
+        }
+        match prior {
+            Some(value) => std::env::set_var("APXINF_CLEF_ANE_COLUMNS", value),
+            None => std::env::remove_var("APXINF_CLEF_ANE_COLUMNS"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_columns_rejects_unqualified_values() -> Result<()> {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var_os("APXINF_CLEF_ANE_COLUMNS");
+        for value in ["0", "1", "64", "6657", "12288", "12352", "-1", "abc", "6656.0"] {
+            std::env::set_var("APXINF_CLEF_ANE_COLUMNS", value);
+            assert!(gpu_columns().is_err(), "accepted unqualified columns {value}");
+        }
+        match prior {
+            Some(value) => std::env::set_var("APXINF_CLEF_ANE_COLUMNS", value),
+            None => std::env::remove_var("APXINF_CLEF_ANE_COLUMNS"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn placement_retries_only_the_transient_inspect_races() {
+        for message in [
+            "invalid operator or storage input: Clef runtime placement is unknown",
+            "Core ML plan wait timed out; framework work is not cancelled",
+            "cannot inspect the Core ML compute plan: internal failure",
+        ] {
+            assert!(
+                is_transient_placement_error(&Error::Other(message.into())),
+                "expected transient: {message}",
+            );
+        }
+        for message in [
+            "Core ML path contains a NUL byte",
+            "invalid operator or storage input: runtime operation is not ANE-preferred and supported",
+            "duplicate compiled input port",
+        ] {
+            assert!(
+                !is_transient_placement_error(&Error::Other(message.into())),
+                "expected permanent: {message}",
+            );
+        }
+    }
+
+    #[test]
+    fn placement_retry_attempts_default_to_three_and_clamp_invalid_env() -> Result<()> {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var_os("APXINF_CLEF_PLACEMENT_RETRIES");
+        std::env::remove_var("APXINF_CLEF_PLACEMENT_RETRIES");
+        assert_eq!(placement_attempts(), PLACEMENT_RETRIES);
+        std::env::set_var("APXINF_CLEF_PLACEMENT_RETRIES", "");
+        assert_eq!(placement_attempts(), PLACEMENT_RETRIES);
+        std::env::set_var("APXINF_CLEF_PLACEMENT_RETRIES", "1");
+        assert_eq!(placement_attempts(), 1);
+        std::env::set_var("APXINF_CLEF_PLACEMENT_RETRIES", "abc");
+        assert_eq!(placement_attempts(), PLACEMENT_RETRIES);
+        std::env::set_var("APXINF_CLEF_PLACEMENT_RETRIES", "99");
+        assert_eq!(placement_attempts(), 6);
+        std::env::set_var("APXINF_CLEF_PLACEMENT_RETRIES", "0");
+        assert_eq!(placement_attempts(), 1);
+        match prior {
+            Some(value) => std::env::set_var("APXINF_CLEF_PLACEMENT_RETRIES", value),
+            None => std::env::remove_var("APXINF_CLEF_PLACEMENT_RETRIES"),
+        }
+        Ok(())
+    }
 
     #[test]
     fn non_clef_package_is_rejected_before_compilation() -> Result<()> {
@@ -837,5 +1195,46 @@ mod tests {
         let w: Vec<f16> = (0..12).map(|v| f16::from_f32(v as f32)).collect();
         let c: Vec<f32> = columns(&w, 4, 1, 2).iter().map(|v| v.to_f32()).collect();
         assert_eq!(c, [1., 2., 5., 6., 9., 10.]);
+    }
+
+    /// `pack`'s lazy graph: whole and partial tiles have the exact tile bytes
+    /// `host` yields, in row-contiguous FP16 channel-first order.
+    #[test]
+    fn pack_tiles_are_whole_contiguous_and_w1_bit_equal() -> Result<()> {
+        let stream = Stream::cpu()?;
+        let cases = [
+            (1, 4_194_304usize),
+            (127, 4_194_304),
+            (128, 4_194_304),
+            (129, 4_194_304),
+            (512, 4_194_304),
+            (513, 8_388_608),
+        ];
+        for (tokens, bytes) in cases {
+            let h = Array::from_f32(
+                &stream,
+                &[1, tokens, HIDDEN],
+                &(0..tokens * HIDDEN)
+                    .map(|index| index as f32)
+                    .collect::<Vec<_>>(),
+            )?
+            .cast(MlxDType::BF16)?;
+            let packed = AneMlp::pack(&h)?;
+            // `cast` is elementwise: on a CPU stream the result keeps
+            // `[1, tokens, 4096]` with the transpose realized only by the
+            // following `contiguous`. Materializing bytes realizes it either
+            // way; the byte layout and length are the contract.
+            assert_eq!(packed.dtype(), MlxDType::F16);
+            assert_eq!(packed.numel(), tokens.div_ceil(TILE) * HIDDEN * TILE);
+            let eager = AneMlp::pack(&h)?.to_bytes()?;
+            assert_eq!(AneMlp::host(&packed)?, eager, "tokens={tokens}");
+            assert_eq!(AneMlp::host(&packed)?.len(), bytes, "tokens={tokens}");
+            // W1 schedules `async_eval(pack); async_eval(gpu); host(pack)`:
+            // the ready wait must not wait for a separately queued array.
+            let other = AneMlp::pack(&h)?.mul(&AneMlp::pack(&h)?)?;
+            stream.async_eval(std::slice::from_ref(&other))?;
+            assert_eq!(AneMlp::host(&packed)?, eager, "after async, tokens={tokens}");
+        }
+        Ok(())
     }
 }
