@@ -66,6 +66,22 @@ boundary records cleanly. See [TIMELINE-OPERATOR.md](TIMELINE-OPERATOR.md)
 (host os_signpost operator labels aligned to the Metal command-buffer lane;
 Core AI remains forbidden and the ANE hardware axis is still unmeasured).
 
+### Autonomous round 2026-11-05 (three more closed directions)
+
+Full records: [ANE-COLUMN-BALANCE.md](ANE-COLUMN-BALANCE.md) (shallower GPU/ANE
+column split, 6656→7680: NOT-WORTH — auto tier Swapouts-contaminated so latency
+not measurable, parity 0.0483 > 0.035, smoke +8 %), [PREP-IMAGE-CACHE.md](PREP-IMAGE-CACHE.md)
+(repeat-image prepared cache: NOT-WORTH by hard bound, 12.7 ms preprocess ÷
+1140 ms hit window ≈ 1.1 % < 2 %; bit-identical when it hits), and
+[EAGER-EVAL.md](EAGER-EVAL.md) (per-layer `async_eval` of the lazy backbone:
+NOT-WORTH — A/A bit-identical and parity unchanged at 0.0328, but median
++0.115 %, CI95 [−0.038 %, +0.264 %]; chrome shows each layer span absorbed
+the GPU execution instead of overlapping the host build). After these, no
+remaining timeline-backed candidate clears the <2 % / parity-risk /
+KEEP-measurability filters — the candidate pool is dry on this host and
+protocol; see EAGER-EVAL.md §3.3 for the screening table and the three
+follow-ups worth doing instead.
+
 ## Measurement discipline
 
 - Shared Metal locks: take `~/.cache/enginetailor/metal-measure.lock` first, then

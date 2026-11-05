@@ -34,6 +34,17 @@ elementwise fusion 不同（合并的是 matmul 本身），此前未评估过�
 - **测量方案**：reference（GPU-only）tier 先行：3 轮反序配对、双锁单窗、
   Swapouts 门；42 案 parity（决策 + max|Δp|）；KEEP 后再测 auto tier。
 
+### 状态（A，补记）
+- A 已在 docs-only PR #9 记录为 **NOT-WORTH**：reference tier latency
+  median **+0.109 %**（CI95 [−0.100 %, +0.303 %] 含 0），且 parity 门
+  失败（vs 冻结 MLX max|Δp| **0.049 > 0.035**）；实现按"不留死代码"
+  未保留，gate 默认关闭。完整证据见
+  [FUSION-MATMUL.md](FUSION-MATMUL.md)。
+- 两处技术前提经实测不成立：本节"`a`/`b` 各 1 列"实为 **32 行**；
+  "合并改变 scale 分组"不成立——Q4 scales 为**每输出行**
+  （`[out, in/64]`）。另：A1 也**非 bit 一致**（GEMM shape 改变
+  tiling），故两步都走了 parity 门。
+
 ## 候选 B：多图逐图 image-row 前缀链（Tier-2 扩展）
 
 当前 Tier-2 的前缀 = system + header + **全部**图像的 rows（`media_end`），

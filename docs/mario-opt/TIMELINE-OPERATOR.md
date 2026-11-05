@@ -83,6 +83,16 @@ Data 卷回到 ~37 GiB 可用）。处理：用 APFS clone（`cp -c`，同卷、
 录制随即成功。原 `~/Documents` 路径在录制中不可用，这是**本机录制的硬约束**，
 不是 ApxInf 代码问题。
 
+**多案 job 同样必须走暂存**：后续 before/after 录制一开始用
+`run_fusion_campaign.write_job` 生成两案 job（snapshot 与图片都指向
+`~/Documents`），两次都表现为 xctrace 收尾超时——实际是 worker 在
+`metal_clef::load` 的 `open()` 挂死、xctrace 空等，且超时杀进程组时
+worker 因自成 session 逃逸成孤儿。改走
+`make_1case_job.build_from_suite(suite, ids, STAGED_CHECKPOINT)`
+（统一改写 snapshot + 每个 case 的图片路径）后正常。**规则：任何
+`--launch` 录制的 job，其 `snapshot` 与 `record.images` 都必须在 TCC
+边界外。**
+
 ### 2.3 录制次序（take 记录）
 
 | take | 结果 | 处置 |
