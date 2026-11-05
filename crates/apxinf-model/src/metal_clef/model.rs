@@ -50,6 +50,26 @@ fn fusion_flag(value: Option<String>) -> bool {
     value.as_deref() == Some("1")
 }
 
+/// A1's env gate (`APXINF_CLEF_FUSE_KV=1`): concatenate each attention
+/// layer's k and v into one projection. Read once per process at load.
+fn fuse_kv_flag(value: Option<String>) -> bool {
+    value.as_deref() == Some("1")
+}
+
+fn fuse_kv_enabled() -> bool {
+    fuse_kv_flag(std::env::var("APXINF_CLEF_FUSE_KV").ok())
+}
+
+/// A2's env gate (`APXINF_CLEF_FUSE_GDN=1`): merge each gated-delta layer's
+/// z, b and a projections into one GEMM. Read once per process at load.
+fn fuse_gdn_flag(value: Option<String>) -> bool {
+    value.as_deref() == Some("1")
+}
+
+fn fuse_gdn_enabled() -> bool {
+    fuse_gdn_flag(std::env::var("APXINF_CLEF_FUSE_GDN").ok())
+}
+
 /// The Tier-1 prefix-cache env gate (`APXINF_CLEF_PREFIX_CACHE`), default ON
 /// (D20): unset fills and reuses the Tier-1 cache; only the explicit spelling
 /// `0` disables it. The shared pure form keeps the unit test free of
@@ -296,17 +316,10 @@ impl NeuronMlp {
 /// the checkpoint's full Q4 weights are released.
 #[cfg(feature = "coreml")]
 fn moved_mlp(stream: &Stream) -> Result<Mlp> {
-    let empty = || -> Result<Q4> {
-        Ok(Q4 {
-            weight: Array::zeros(stream, &[0, 0], MlxDType::U32)?,
-            scales: Array::zeros(stream, &[0, 0], MlxDType::BF16)?,
-            biases: Array::zeros(stream, &[0, 0], MlxDType::BF16)?,
-        })
-    };
     Ok(Mlp {
-        gate: empty()?,
-        up: empty()?,
-        down: empty()?,
+        gate: empty_q4(stream)?,
+        up: empty_q4(stream)?,
+        down: empty_q4(stream)?,
     })
 }
 
@@ -347,6 +360,14 @@ pub struct Network {
     head: Head,
     kernels: Kernels,
     gpu: Option<GpuKernels>,
+    /// A1 (`APXINF_CLEF_FUSE_KV`): attention layers hold a concatenated k+v
+    /// projection in `k` and an empty `v` slot; `attention()` issues it once.
+    fuse_kv: bool,
+    /// A2 (`APXINF_CLEF_FUSE_GDN`): gated-delta layers hold a concatenated
+    /// z+b+a projection in `z` and empty `b`/`a` slots; `gated_delta()` issues
+    /// it once. On GPU compositions the concatenated width is padded to a
+    /// multiple of 128 for the split GEMM; the padded columns are discarded.
+    fuse_gdn: bool,
     /// The column split's per-layer Neural Engine programs, in layer order.
     #[cfg(feature = "coreml")]
     ane: Vec<super::ane::AneMlp>,
@@ -480,6 +501,70 @@ fn qmm(x: &Array, q: &Q4) -> Result<Array> {
     x.quantized_matmul(&q.weight, &q.scales, &q.biases, true, 64, 4)
 }
 
+/// An affine-Q4 slot whose weights moved into a fused projection: empty
+/// arrays, so the checkpoint's originals are released (the same idiom as
+/// [`moved_mlp`]). The fused slot keeps its own reference.
+fn empty_q4(stream: &Stream) -> Result<Q4> {
+    Ok(Q4 {
+        weight: Array::zeros(stream, &[0, 0], MlxDType::U32)?,
+        scales: Array::zeros(stream, &[0, 0], MlxDType::BF16)?,
+        biases: Array::zeros(stream, &[0, 0], MlxDType::BF16)?,
+    })
+}
+
+/// Concatenate affine-Q4 weights along the **output** axis and materialise
+/// them once at load. Scales and biases are per output row (`[N, K/64]`), so
+/// no 64-column scale grouping is shared between rows and none changes here.
+/// `pad_rows` appends all-zero rows (zero weight, scale and bias dequantise
+/// to 0) for kernels whose output width must be a fixed multiple — the GPU
+/// composition's split GEMM needs `N % 128 == 0`.
+fn concat_q4(stream: &Stream, parts: &[&Q4], pad_rows: usize) -> Result<Q4> {
+    let first = parts
+        .first()
+        .ok_or(Error::Contract("concat_q4 needs at least one weight"))?;
+    let [_, words] = *first.weight.shape() else {
+        return Err(Error::Contract("concat_q4 weight must be rank 2"));
+    };
+    let k = words
+        .checked_mul(8)
+        .ok_or(Error::Contract("concat_q4 width overflows usize"))?;
+    for q in parts {
+        if q.weight.shape()[1] != words
+            || q.weight.dtype() != MlxDType::U32
+            || q.scales.shape() != [q.weight.shape()[0], k / 64]
+            || q.biases.shape() != [q.weight.shape()[0], k / 64]
+            || q.scales.dtype() != MlxDType::BF16
+            || q.biases.dtype() != MlxDType::BF16
+        {
+            return Err(Error::Contract(
+                "concat_q4 parts must share one affine-Q4 K and layout",
+            ));
+        }
+    }
+    let weights: Vec<&Array> = parts.iter().map(|q| &q.weight).collect();
+    let scales: Vec<&Array> = parts.iter().map(|q| &q.scales).collect();
+    let biases: Vec<&Array> = parts.iter().map(|q| &q.biases).collect();
+    let mut weight = Array::concat(&weights, 0)?;
+    let mut scales = Array::concat(&scales, 0)?;
+    let mut biases = Array::concat(&biases, 0)?;
+    if pad_rows > 0 {
+        let zw = Array::zeros(stream, &[pad_rows, words], MlxDType::U32)?;
+        let zs = Array::zeros(stream, &[pad_rows, k / 64], MlxDType::BF16)?;
+        let zb = Array::zeros(stream, &[pad_rows, k / 64], MlxDType::BF16)?;
+        weight = Array::concat(&[&weight, &zw], 0)?;
+        scales = Array::concat(&[&scales, &zs], 0)?;
+        biases = Array::concat(&[&biases, &zb], 0)?;
+    }
+    // Evaluate once: without this the concat would be re-enqueued on every
+    // request, adding three kernels and erasing the fusion's purpose.
+    stream.eval(&[weight.clone(), scales.clone(), biases.clone()])?;
+    Ok(Q4 {
+        weight,
+        scales,
+        biases,
+    })
+}
+
 /// `nn.Linear` without bias: `x @ W.T`.
 fn project(x: &Array, weight: &Array) -> Result<Array> {
     x.matmul(&weight.transpose(&[1, 0])?)
@@ -562,6 +647,43 @@ impl Network {
             Composition::Reference => None,
             _ => Some(GpuKernels::new(&stream)?),
         };
+        // Matmul-level fusion (candidate A), built once at load. A1
+        // concatenates each attention layer's k and v into one projection; A2
+        // concatenates each gated-delta layer's z, b and a. The originals are
+        // released into empty slots, so the fused path adds no device memory
+        // beyond A2's padding on GPU compositions. The gate is read once: the
+        // baseline and fused arms of a campaign run in separate processes.
+        let fuse_kv = fuse_kv_enabled();
+        let fuse_gdn = fuse_gdn_enabled();
+        if fuse_kv || fuse_gdn {
+            let heads = config.text.linear_num_value_heads;
+            let z_dim = heads * config.text.linear_value_head_dim;
+            let ab_dim = 2 * heads;
+            // The GPU composition's split GEMM needs an output width that is
+            // a multiple of 128 (two 64-multiple halves); the reference
+            // composition's qmm has no such constraint.
+            let pad = if fuse_gdn && gpu.is_some() {
+                (128 - (z_dim + ab_dim) % 128) % 128
+            } else {
+                0
+            };
+            for layer in &mut backbone.layers {
+                match &mut layer.mixer {
+                    Mixer::Attention(a) if fuse_kv => {
+                        let kv = concat_q4(&stream, &[&a.k, &a.v], 0)?;
+                        a.k = kv;
+                        a.v = empty_q4(&stream)?;
+                    }
+                    Mixer::GatedDelta(g) if fuse_gdn => {
+                        let zba = concat_q4(&stream, &[&g.z, &g.b, &g.a], pad)?;
+                        g.z = zba;
+                        g.b = empty_q4(&stream)?;
+                        g.a = empty_q4(&stream)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
         // Column split: build each layer's program from the full MLP, then
         // keep only the GPU share's weights. The Neural Engine depth comes
         // from APXINF_CLEF_ANE_COLUMNS (unset: the qualified 6656).
@@ -636,6 +758,8 @@ impl Network {
             head,
             kernels,
             gpu,
+            fuse_kv,
+            fuse_gdn,
             #[cfg(feature = "coreml")]
             ane,
             #[cfg(feature = "coreml")]
@@ -1228,10 +1352,53 @@ impl Network {
         let (key_dim, value_dim) = (hk * dk, hv * dv);
         let conv_dim = 2 * key_dim + value_dim;
         let mixed = self.split_projection(x, &g.qkv)?;
-        let z = self
-            .split_projection(x, &g.z)?
-            .reshape(&[1, tokens, hv, dv])?;
-        let (b, a) = (qmm(x, &g.b)?, qmm(x, &g.a)?);
+        // A2: with the gate on, `g.z` holds the concatenated z+b+a projection
+        // (`g.b` and `g.a` are empty slots). The reference composition ran all
+        // three through `qmm`, so one `qmm` covers them; GPU compositions ran
+        // z through the wn2 split GEMM, so the concat (padded to a 128-multiple
+        // width at load) is decoded in two halves and issued as one split GEMM
+        // — the padded columns are computed and discarded.
+        let z_dim = value_dim;
+        let (z, b, a) = if self.fuse_gdn {
+            let out = if let Some(c) = &self.gpu {
+                let total = g.z.weight.shape()[0];
+                if total == 0 || total % 128 != 0 {
+                    return Err(Error::Contract(
+                        "fused gated-delta projection must have a 128-multiple width",
+                    ));
+                }
+                let nw = total / 2;
+                let h = c.pad.call(x)?;
+                // Decode and queue the low half before decoding the high
+                // half, the dispatch order `split_linear` pins for MLX.
+                let low_w = c
+                    .project_decode
+                    .call(&g.z.weight, &g.z.scales, &g.z.biases, 0, nw)?;
+                let low = c.split.low(&h, tokens, &low_w)?;
+                let high_w =
+                    c.project_decode
+                        .call(&g.z.weight, &g.z.scales, &g.z.biases, nw, nw)?;
+                c.split.high(&high_w, &low, &h, tokens)?
+            } else {
+                qmm(x, &g.z)?
+            };
+            (
+                out.slice_axis(2, 0, z_dim)?.reshape(&[1, tokens, hv, dv])?,
+                // b/a are tiny: make the sliced views row-contiguous before
+                // the compiled `_compute_g_beta`, whose traced graph assumes
+                // packed input rows.
+                out.slice_axis(2, z_dim, z_dim + hv)?.contiguous()?,
+                out.slice_axis(2, z_dim + hv, z_dim + 2 * hv)?
+                    .contiguous()?,
+            )
+        } else {
+            (
+                self.split_projection(x, &g.z)?
+                    .reshape(&[1, tokens, hv, dv])?,
+                qmm(x, &g.b)?,
+                qmm(x, &g.a)?,
+            )
+        };
         if save {
             let keep = t.linear_conv_kernel_dim - 1;
             publish(&mixed.slice_axis(1, tokens - keep, tokens)?)?;
@@ -1325,10 +1492,24 @@ impl Network {
         let projected = self
             .split_projection(x, &a.q)?
             .reshape(&[1, tokens, heads, 2 * d])?;
-        let (keys, values) = (
-            self.single_projection(x, &a.k)?,
-            self.single_projection(x, &a.v)?,
-        );
+        // A1: with the gate on, `a.k` holds the concatenated k+v projection
+        // (`a.v` is an empty slot), so one projection issues and the halves
+        // are sliced off. The slices are strided views (row stride
+        // 2 * kv_dim); `reshape` keeps them views and the first consumers —
+        // row reductions and the strides-aware Metal kernels — accept that.
+        let kv_dim = kv * d;
+        let (keys, values) = if self.fuse_kv {
+            let kv_out = self.single_projection(x, &a.k)?;
+            (
+                kv_out.slice_axis(2, 0, kv_dim)?,
+                kv_out.slice_axis(2, kv_dim, 2 * kv_dim)?,
+            )
+        } else {
+            (
+                self.single_projection(x, &a.k)?,
+                self.single_projection(x, &a.v)?,
+            )
+        };
         let queries = projected.slice_axis(3, 0, d)?;
         let gate = projected
             .slice_axis(3, d, 2 * d)?
@@ -1578,6 +1759,251 @@ impl Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A synthetic affine-Q4 weight with deterministic in-range nibbles and
+    /// per-row group-64 scales/biases, so the fusion tests do not need the
+    /// checkpoint.
+    fn synthetic_q4(stream: &Stream, out: usize, input: usize, seed: u32) -> Result<Q4> {
+        let words: Vec<u32> = (0..out * (input / 8))
+            .map(|word| {
+                let mut packed = 0u32;
+                for nibble in 0..8 {
+                    let value = ((word * 8 + nibble) as u32).wrapping_mul(17 + seed) % 15;
+                    packed |= value << (nibble * 4);
+                }
+                packed
+            })
+            .collect();
+        let weight_bytes: Vec<u8> = words.iter().flat_map(|word| word.to_ne_bytes()).collect();
+        let weight = Array::from_bytes(stream, &[out, input / 8], MlxDType::U32, &weight_bytes)?;
+        let scales: Vec<f32> = (0..out * (input / 64))
+            .map(|index| 0.01 + ((index as u32 + seed) % 7) as f32 * 0.005)
+            .collect();
+        let biases: Vec<f32> = (0..out * (input / 64))
+            .map(|index| -0.02 + ((index as u32 + seed * 3) % 5) as f32 * 0.01)
+            .collect();
+        let scales = Array::from_f32(stream, &[out, input / 64], &scales)?.cast(MlxDType::BF16)?;
+        let biases = Array::from_f32(stream, &[out, input / 64], &biases)?.cast(MlxDType::BF16)?;
+        Ok(Q4 {
+            weight,
+            scales,
+            biases,
+        })
+    }
+
+    #[test]
+    fn matmul_fusion_gates_need_the_explicit_spelling() {
+        for value in [
+            None,
+            Some(String::new()),
+            Some("0".into()),
+            Some("true".into()),
+        ] {
+            assert!(!fuse_kv_flag(value.clone()), "{value:?}");
+            assert!(!fuse_gdn_flag(value.clone()), "{value:?}");
+        }
+        assert!(fuse_kv_flag(Some("1".into())));
+        assert!(fuse_gdn_flag(Some("1".into())));
+    }
+
+    #[test]
+    fn concat_q4_concatenates_rows_and_zero_pads() -> Result<()> {
+        let stream = Stream::cpu()?;
+        let k = synthetic_q4(&stream, 8, 64, 1)?;
+        let v = synthetic_q4(&stream, 8, 64, 5)?;
+        let fused = concat_q4(&stream, &[&k, &v], 16)?;
+        assert_eq!(fused.weight.shape(), [32, 8]);
+        assert_eq!(fused.scales.shape(), [32, 1]);
+        assert_eq!(fused.biases.shape(), [32, 1]);
+        // The 16 padding rows are all zero: a dequantise of them is 0.
+        let bytes = fused.weight.to_bytes()?;
+        assert!(bytes[16 * 8 * 4..].iter().all(|&byte| byte == 0));
+        assert!(fused.scales.to_f32_vec()?[16..].iter().all(|&x| x == 0.0));
+        assert!(fused.biases.to_f32_vec()?[16..].iter().all(|&x| x == 0.0));
+        // The originals are unchanged, so the concat is purely additive.
+        assert_eq!(k.weight.to_bytes()?[..8 * 8 * 4], bytes[..8 * 8 * 4]);
+        Ok(())
+    }
+
+    /// Differences between two same-length BF16 buffers: count of differing
+    /// elements, largest absolute difference and largest relative difference
+    /// (BF16 bit patterns widened to F32). Used instead of printing megabytes
+    /// of bytes when a fused projection is compared to the separate one.
+    fn bf16_diffs(a: &[u8], b: &[u8]) -> (usize, f32, f32) {
+        assert_eq!(a.len(), b.len(), "compared BF16 buffers must match in size");
+        let mut count = 0usize;
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (x, y) in a.chunks_exact(2).zip(b.chunks_exact(2)) {
+            if x == y {
+                continue;
+            }
+            count += 1;
+            let xf = f32::from_bits((u16::from_le_bytes([x[0], x[1]]) as u32) << 16);
+            let yf = f32::from_bits((u16::from_le_bytes([y[0], y[1]]) as u32) << 16);
+            let delta = (xf - yf).abs();
+            max_abs = max_abs.max(delta);
+            max_rel = max_rel.max(delta / xf.abs().max(yf.abs()).max(1e-6));
+        }
+        (count, max_abs, max_rel)
+    }
+
+    /// Gather `width` consecutive BF16 columns of every row from a row-major
+    /// `[rows, total]` byte buffer, so a column slice of a fused `[1, T, N]`
+    /// output can be compared with a standalone `[1, T, width]` projection.
+    fn gather_columns(
+        bytes: &[u8],
+        rows: usize,
+        total: usize,
+        start: usize,
+        width: usize,
+    ) -> Vec<u8> {
+        assert!(start + width <= total, "column range exceeds the row");
+        let mut out = Vec::with_capacity(rows * width * 2);
+        let row_bytes = total * 2;
+        for row in 0..rows {
+            out.extend_from_slice(
+                &bytes[row * row_bytes + start * 2..row * row_bytes + (start + width) * 2],
+            );
+        }
+        out
+    }
+
+    /// Largest absolute BF16 value in a byte buffer, used to scale an ulp
+    /// bound when comparing projections whose accumulation order differs.
+    fn bf16_scale(bytes: &[u8]) -> f32 {
+        bytes
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// A1 and A2 at the `qmm` level on the real device. `quantized_matmul` is
+    /// deterministic for identical inputs (the Tier-2 A/A established this
+    /// across processes for the reference composition), but its **shape**
+    /// changes the GEMM tiling and with it the FP32 accumulation order — the
+    /// fused `[.., 2048]` projection is therefore *not* bit-identical to two
+    /// separate `[.., 1024]` projections, it differs in the last BF16 bit
+    /// (measured: ~68 % of elements flip, max absolute gap within one BF16
+    /// ulp of the buffer scale; relative error is only meaningful away from
+    /// zero). This contradicts the "A1 expected bit-identical" hypothesis, so
+    /// the campaign must run A1 through the same 42-case parity gate as A2.
+    /// This test pins the measured relationship: hard determinism, and an
+    /// absolute ulp bound on the fused-vs-separate gap.
+    #[test]
+    fn fused_projection_slices_track_the_separate_path() -> Result<()> {
+        let stream = Stream::metal(0)?;
+        let tokens = 17usize;
+        let input = 4096usize;
+        let hidden: Vec<f32> = (0..tokens * input)
+            .map(|index| ((index * 7) % 251) as f32 / 251.0 - 0.5)
+            .collect();
+        let x = Array::from_f32(&stream, &[1, tokens, input], &hidden)?.cast(MlxDType::BF16)?;
+
+        // A1: attention k and v, 1024 rows each (the Clef geometry).
+        let k = synthetic_q4(&stream, 1024, input, 3)?;
+        let v = synthetic_q4(&stream, 1024, input, 9)?;
+        let k_bytes = qmm(&x, &k)?.to_bytes()?;
+        // Determinism: two identical projections must be byte-equal (this is
+        // what makes the campaign's cross-process A/A meaningful).
+        let (det, _, _) = bf16_diffs(&k_bytes, &qmm(&x, &k)?.to_bytes()?);
+        assert_eq!(det, 0, "quantized_matmul must be deterministic");
+
+        let kv = concat_q4(&stream, &[&k, &v], 0)?;
+        let out = qmm(&x, &kv)?;
+        let fused = out.to_bytes()?;
+        assert_eq!(fused.len(), 2 * k_bytes.len());
+        let v_bytes = qmm(&x, &v)?.to_bytes()?;
+        // The fused output is row-major `[1, T, 2048]`; take each row's
+        // first/second 1024 columns (a flat prefix would cut rows in half).
+        let fused_k = gather_columns(&fused, tokens, 2048, 0, 1024);
+        let fused_v = gather_columns(&fused, tokens, 2048, 1024, 1024);
+        let (dk, abs_k, rel_k) = bf16_diffs(&fused_k, &k_bytes);
+        let (dv, abs_v, rel_v) = bf16_diffs(&fused_v, &v_bytes);
+        println!(
+            "A1 fused-vs-separate: k {dk}/{} elems differ max|d|={abs_k:.3e} (scale {:.3e}) rel={rel_k:.3e}; \
+             v {dv}/{} elems differ max|d|={abs_v:.3e} (scale {:.3e}) rel={rel_v:.3e}",
+            k_bytes.len() / 2,
+            bf16_scale(&k_bytes),
+            v_bytes.len() / 2,
+            bf16_scale(&v_bytes),
+        );
+        // The fused projection stays within a couple of BF16 spacings of the
+        // separate one (~68 % of elements flip in the last bits); relative
+        // error near zero is meaningless, so the bound is absolute and scaled
+        // by the buffer magnitude. A wiring/scale bug would be far larger.
+        let ulp_k = bf16_scale(&k_bytes) * 2f32.powi(-5);
+        let ulp_v = bf16_scale(&v_bytes) * 2f32.powi(-5);
+        assert!(
+            abs_k <= ulp_k && abs_v <= ulp_v,
+            "fused k/v must stay within ~4 BF16 spacings: {abs_k:.3e} vs {ulp_k:.3e}, {abs_v:.3e} vs {ulp_v:.3e}"
+        );
+
+        // The k half also has to survive the layout chain the attention path
+        // uses: strided slice -> reshape -> row reduction.
+        let norm: Vec<f32> = (0..256)
+            .map(|index| 0.5 + (index % 17) as f32 / 34.0)
+            .collect();
+        let norm = Array::from_f32(&stream, &[256], &norm)?.cast(MlxDType::BF16)?;
+        let fused_norm = out
+            .slice_axis(2, 0, 1024)?
+            .reshape(&[1, tokens, 4, 256])?
+            .fast_rms_norm(&norm, EPS)?
+            .to_bytes()?;
+        let separate_norm = qmm(&x, &k)?
+            .reshape(&[1, tokens, 4, 256])?
+            .fast_rms_norm(&norm, EPS)?
+            .to_bytes()?;
+        let (dn, abs_n, rel_n) = bf16_diffs(&fused_norm, &separate_norm);
+        println!(
+            "A1 rms_norm through the strided slice: {dn}/{} elems differ max|d|={abs_n:.3e} (scale {:.3e}) rel={rel_n:.3e}",
+            separate_norm.len() / 2,
+            bf16_scale(&separate_norm),
+        );
+        assert!(
+            abs_n <= bf16_scale(&separate_norm) * 2f32.powi(-5),
+            "rms_norm over the fused slice must stay within ~4 BF16 spacings"
+        );
+
+        // A2: gated-delta z (4096 rows) + b and a (32 rows each). The concat
+        // is padded by 64 rows so a GPU-composition split GEMM (width % 128)
+        // could consume it; the slices ignore the padding.
+        let z = synthetic_q4(&stream, 4096, input, 1)?;
+        let b = synthetic_q4(&stream, 32, input, 4)?;
+        let a = synthetic_q4(&stream, 32, input, 8)?;
+        let zba = concat_q4(&stream, &[&z, &b, &a], 64)?;
+        assert_eq!(zba.weight.shape()[0], 4224);
+        let out = qmm(&x, &zba)?.to_bytes()?;
+        let z_bytes = qmm(&x, &z)?.to_bytes()?;
+        let b_bytes = qmm(&x, &b)?.to_bytes()?;
+        let a_bytes = qmm(&x, &a)?.to_bytes()?;
+        let fused_z = gather_columns(&out, tokens, 4224, 0, 4096);
+        let fused_b = gather_columns(&out, tokens, 4224, 4096, 32);
+        let fused_a = gather_columns(&out, tokens, 4224, 4128, 32);
+        let (dz, abs_z, rel_z) = bf16_diffs(&fused_z, &z_bytes);
+        let (db, abs_b, rel_b) = bf16_diffs(&fused_b, &b_bytes);
+        let (da, abs_a, rel_a) = bf16_diffs(&fused_a, &a_bytes);
+        println!(
+            "A2 fused-vs-separate: z {dz}/{} max|d|={abs_z:.3e} (scale {:.3e}) rel={rel_z:.3e}; \
+             b {db}/{} max|d|={abs_b:.3e} (scale {:.3e}) rel={rel_b:.3e}; \
+             a {da}/{} max|d|={abs_a:.3e} (scale {:.3e}) rel={rel_a:.3e}",
+            z_bytes.len() / 2,
+            bf16_scale(&z_bytes),
+            b_bytes.len() / 2,
+            bf16_scale(&b_bytes),
+            a_bytes.len() / 2,
+            bf16_scale(&a_bytes),
+        );
+        let ulp_z = bf16_scale(&z_bytes) * 2f32.powi(-5);
+        let ulp_b = bf16_scale(&b_bytes) * 2f32.powi(-5);
+        let ulp_a = bf16_scale(&a_bytes) * 2f32.powi(-5);
+        assert!(
+            abs_z <= ulp_z && abs_b <= ulp_b && abs_a <= ulp_a,
+            "fused z/b/a must stay within ~4 BF16 spacings: {abs_z:.3e}/{ulp_z:.3e}, \
+             {abs_b:.3e}/{ulp_b:.3e}, {abs_a:.3e}/{ulp_a:.3e}"
+        );
+        Ok(())
+    }
 
     fn g_beta_inputs(stream: &Stream, tokens: usize, variant: usize) -> Result<Vec<Array>> {
         let value_heads = 32;
