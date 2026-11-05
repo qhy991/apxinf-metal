@@ -16,6 +16,13 @@ use crate::registry;
 pub fn register_builtin_models() {
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     registry::register("metal_clef", crate::metal_clef::load);
+    // Checkpoint detection returns `d3` for `d3-code-readout-v1`, which
+    // `metal_registry_name` maps to `metal_d3`; the explicit
+    // `--model-name metal_d3_lite` spelling is the second alias.
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+    registry::register("metal_d3", crate::metal_d3_lite::load);
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+    registry::register("metal_d3_lite", crate::metal_d3_lite::load);
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     registry::register("metal_minicpm5", crate::metal_minicpm5::load);
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]

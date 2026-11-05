@@ -422,7 +422,11 @@ impl AutoModel {
             return Err(Error::Other("PI0.5 requires CUDA or HIP support".into()));
         }
 
-        if matches!(model_name, "d3" | "d3-cuda") {
+        // The CUDA d3 loader is the only d3 implementation on CUDA/CPU. On
+        // Metal, fall through so the registered `metal_d3` factory (the
+        // d3-lite Metal port) can admit the request; `metal_registry_name`
+        // maps the detected `d3` name to that factory.
+        if matches!(model_name, "d3" | "d3-cuda") && !matches!(device, Device::Metal(_)) {
             #[cfg(feature = "cuda")]
             return crate::d3::load::load_with_cuda_new(path, device, options);
 
