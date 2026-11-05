@@ -37,6 +37,29 @@ chunk shapes, and rejects a full prompt-sized `forward`. Every admitted
 `forward` still returns all of its input rows. Ordinary generation uses
 ApxInf's shared sampler/EOS loop.
 
+The experimental `bf16-compiled` eager path uses MLX's built-in causal mask for
+more than one query row. It slices K/V to exactly `position + rows` entries.
+MLX 0.32.3 documents lower-right causal alignment, so query row `i` admits keys
+through `position + i`. Other eager paths retain the explicit mask.
+
+Compiled decode retains its explicit mask because its K/V arrays include unused
+capacity. This experiment changes neither the 512-token chunk nor the head.
+The experiment has no latency measurement or checkpoint parity result yet.
+
+The ignored `builtin_causal_matches_exact_prefix_mask` test compares both masks
+with identical, deterministic BF16 inputs. Q has shape `[1,16,4,128]`.
+K/V have shape `[1,2,position+4,128]`, with positions 0 and 7.
+The tolerance is `0.015625 + 0.0078125 * abs(reference)` per output value.
+The offset case also checks that an upper-left mask produces different outputs.
+This small operator test does not establish checkpoint generation parity.
+
+Run the test under the shared Metal lock:
+
+```sh
+cargo test -p apxinf-model --features mlx --release \
+  builtin_causal_matches_exact_prefix_mask -- --ignored --test-threads=1
+```
+
 Ordinary BF16 generation supports one sequence with at most 65792 total tokens,
 including prompt and reserved output, within the checkpoint's 131072 positions.
 This admits a 65536-token prompt with up to 256 reserved output tokens.

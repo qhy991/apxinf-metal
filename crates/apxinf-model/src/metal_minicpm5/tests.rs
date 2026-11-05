@@ -1,11 +1,78 @@
-//! Real-checkpoint lifecycle checks, separate from numerical qualification.
+//! Attention boundary and real-checkpoint lifecycle checks.
 use super::{config::Config, weights::Weights, MiniCpm5, Variant};
 use crate::{LlmInput, LlmTrait, TextPreparationState};
 use apxinf_core::{Error, Result, Tensor};
-use apxinf_mlx::{clear_cache, memory_stats, MlxBackend};
+use apxinf_mlx::{clear_cache, memory_stats, Array, MlxBackend, MlxDType};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{env, path::PathBuf};
+
+#[test]
+#[ignore = "requires exclusive shared Metal locks"]
+fn builtin_causal_matches_exact_prefix_mask() -> Result<()> {
+    let backend = MlxBackend::new(0)?;
+    let stream = backend.stream();
+    let fixture = |heads: usize, length: usize, salt: usize| -> Result<Array> {
+        let data = (0..heads * length * 128)
+            .map(|index| {
+                let head = index / (length * 128);
+                let row = index / 128 % length;
+                let channel = index % 128;
+                ((head * 17 + row * 13 + channel * 7 + salt) % 61) as f32 / 32. - 30. / 32.
+                    + row as f32 / 8.
+            })
+            .collect::<Vec<_>>();
+        Array::from_f32(stream, &[1, heads, length, 128], &data)?.cast(MlxDType::BF16)
+    };
+    for (position, rows) in [(0, 4), (7, 4)] {
+        let end = position + rows;
+        let q = fixture(16, rows, 3)?;
+        let k = fixture(2, end, 11)?;
+        let v = fixture(2, end, 23)?;
+        let k_positions =
+            Array::arange(stream, 0., end as f32, 1., MlxDType::I32)?.reshape(&[1, end])?;
+        let q_positions = Array::arange(stream, position as f32, end as f32, 1., MlxDType::I32)?
+            .reshape(&[rows, 1])?;
+        let mask = k_positions
+            .less_equal(&q_positions)?
+            .reshape(&[1, 1, rows, end])?;
+        let expected = q.sdpa(&k, &v, 128f32.powf(-0.5), false, Some(&mask))?;
+        let actual = q.sdpa(&k, &v, 128f32.powf(-0.5), true, None)?;
+        assert_eq!(actual.shape(), &[1, 16, rows, 128]);
+        assert_eq!(actual.dtype(), MlxDType::BF16);
+        let expected = expected.to_f32_vec()?;
+        let actual = actual.to_f32_vec()?;
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            let tolerance = 0.015625 + 0.0078125 * expected.abs();
+            assert!(
+                actual.is_finite()
+                    && expected.is_finite()
+                    && (actual - expected).abs() <= tolerance,
+                "position={position}, rows={rows}, element={index}, actual={actual}, expected={expected}, tolerance={tolerance}"
+            );
+        }
+        if position > 0 {
+            let upper_left_rows =
+                Array::arange(stream, 0., rows as f32, 1., MlxDType::I32)?.reshape(&[rows, 1])?;
+            let upper_left_mask = k_positions
+                .less_equal(&upper_left_rows)?
+                .reshape(&[1, 1, rows, end])?;
+            let upper_left = q
+                .sdpa(&k, &v, 128f32.powf(-0.5), false, Some(&upper_left_mask))?
+                .to_f32_vec()?;
+            let max_difference = expected
+                .iter()
+                .zip(upper_left)
+                .map(|(expected, upper_left)| (expected - upper_left).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max_difference > 0.0625,
+                "fixture must distinguish lower-right and upper-left causal alignment"
+            );
+        }
+    }
+    Ok(())
+}
 
 #[derive(Deserialize)]
 struct ReplayInputs {
