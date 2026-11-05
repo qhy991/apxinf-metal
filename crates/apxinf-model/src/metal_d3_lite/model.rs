@@ -481,15 +481,11 @@ mod tests {
     fn decay_beta_follows_compute_g_and_sigmoid() {
         let stream = stream();
         let a_log = Array::from_f32(&stream, &[2], &[0.0, 1.0]).unwrap();
-        let a = Array::from_f32(&stream, &[1, 3, 2], &[0.0, 0.5, -0.5, 1.0, -1.0, 2.0])
-            .unwrap()
-            .cast(MlxDType::BF16)
-            .unwrap();
+        // Equal inputs across the two heads make `A_log` the only variable:
+        // softplus(0) = ln 2, so decay is 0.5 vs exp(-e * ln 2) ≈ 0.152.
+        let a = Array::zeros(&stream, &[1, 3, 2], MlxDType::BF16).unwrap();
+        let dt_bias = Array::zeros(&stream, &[2], MlxDType::BF16).unwrap();
         let b = Array::from_f32(&stream, &[1, 3, 2], &[-2.0, -1.0, 0.0, 1.0, 2.0, 3.0])
-            .unwrap()
-            .cast(MlxDType::BF16)
-            .unwrap();
-        let dt_bias = Array::from_f32(&stream, &[2], &[0.1, -0.1])
             .unwrap()
             .cast(MlxDType::BF16)
             .unwrap();
@@ -501,11 +497,21 @@ mod tests {
         let decay = decay.to_f32_vec().unwrap();
         let beta = beta.cast(MlxDType::F32).unwrap().to_f32_vec().unwrap();
         // `exp(-exp(A_log) * softplus(a + dt_bias))` in (0, 1].
-        assert!(decay.iter().all(|value| value.is_finite() && *value > 0.0 && *value <= 1.0));
-        assert!(decay.iter().zip([0.0f32, 1.0]).all(|(value, log)| value <= (-exp_f32(log)).exp() + 1e-6));
+        assert!(decay
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0 && *value <= 1.0));
+        let ln_two = 2f32.ln();
+        let expected = [
+            (-ln_two).exp(),
+            (-(std::f32::consts::E * ln_two)).exp(),
+        ];
+        assert!((decay[0] - expected[0]).abs() < 2e-3, "{} vs {}", decay[0], expected[0]);
+        assert!((decay[1] - expected[1]).abs() < 2e-3, "{} vs {}", decay[1], expected[1]);
+        assert!(decay[0] > decay[1], "larger A_log must decay faster");
         assert!(beta.iter().all(|value| (0.0..1.0).contains(value)));
         // b = -2 → sigmoid ≈ 0.119; b = 3 → ≈ 0.953.
         assert!((beta[0] - (-2.0f32).exp() / (1.0 + (-2.0f32).exp())).abs() < 3e-3);
+        assert!((beta[5] - 3.0f32.exp() / (1.0 + 3.0f32.exp())).abs() < 3e-3);
     }
 
     #[test]
@@ -519,11 +525,65 @@ mod tests {
         assert_eq!(output.shape(), &[1, 2, 2]);
         assert_eq!(
             output.to_f32_vec().unwrap(),
-            [-2.0, -2.0, 8.0, 8.5],
+            [-2.0, -2.0, 3.0, 9.0],
         );
     }
 
-    fn exp_f32(value: f32) -> f32 {
-        value.exp()
+    /// End-to-end device acceptance for the prepared whole-request callable:
+    /// compiled output matches the eager body, replay traces nothing new,
+    /// changed inputs reach the output, and a new length traces exactly once.
+    #[test]
+    #[ignore = "requires APXINF_D3_CHECKPOINT and an Apple Metal GPU"]
+    fn compiled_forward_matches_eager_replays_and_binds_changed_inputs() -> Result<()> {
+        let directory = std::env::var_os("APXINF_D3_CHECKPOINT")
+            .map(std::path::PathBuf::from)
+            .expect("set APXINF_D3_CHECKPOINT to the d3-lite package directory");
+        let config = Config::from_dir(&directory)?;
+        let stream = Stream::metal(0)?;
+        let weights = Weights::load(config.geometry, &stream, &directory)?;
+        let model = Model::new(&config, stream.clone(), weights)?;
+        let count = config.codes.len();
+        let tokens = 37usize;
+        let first = vec![1u32; tokens];
+        let eager = model.eager_probabilities(&first, count)?;
+        let compiled = model.probabilities(&first, count)?;
+        let max = eager
+            .iter()
+            .zip(&compiled)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max < 1e-4, "compiled vs eager max|Δp| = {max}");
+
+        // Replay: the trace callback must not run again for a known profile.
+        let before = stream.counters();
+        let replay = model.probabilities(&first, count)?;
+        let after = stream.counters();
+        assert_eq!(before.trace_callbacks, after.trace_callbacks);
+        assert!(
+            replay
+                .iter()
+                .zip(&compiled)
+                .all(|(left, right)| left.to_bits() == right.to_bits()),
+            "prepared replay changed values"
+        );
+
+        // Changed token IDs must reach the published probabilities.
+        let changed = model.probabilities(&vec![2u32; tokens], count)?;
+        let changed_delta = compiled
+            .iter()
+            .zip(&changed)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(changed_delta > 0.0, "changed token IDs did not change probabilities");
+
+        // A second length traces once; repeating it traces nothing.
+        let longer = vec![1u32; 64];
+        model.probabilities(&longer, count)?;
+        let before = stream.counters();
+        model.probabilities(&longer, count)?;
+        let after = stream.counters();
+        assert_eq!(before.trace_callbacks, after.trace_callbacks);
+        assert_eq!(model.prepared_profiles(), vec![(tokens, count), (64, count)]);
+        Ok(())
     }
 }

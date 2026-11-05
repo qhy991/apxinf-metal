@@ -3,7 +3,7 @@
 //!
 //! This is the Metal port of the d3 family (registry name `metal_d3`, explicit
 //! `--model-name metal_d3_lite` also accepted). It is deliberately independent
-//! of the CUDA-only [`crate::d3`] directory: ports are self-contained and copy
+//! of the CUDA-only `d3` directory at `src/d3/`: ports are self-contained and copy
 //! the checkpoint contract they need (see `doc/model-layer-architecture.md`,
 //! "Where backend-native model code lives").
 //!
