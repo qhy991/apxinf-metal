@@ -19,6 +19,10 @@ Context for a follow-up agent working on the Clef Flash 9B × Mario decision dem
 - `metal_clef/vision.rs`, `vision_ane.rs`, `preprocess.rs` — vision tower path + host preprocessing.
 - `metal_clef/ane.rs` — GPU/ANE column split with `ane_wait_pack` / `ane_predict` instrumentation
   and placement retry (`APXINF_CLEF_PLACEMENT_RETRIES`).
+- `metal_clef/model.rs` — matmul-level projection fusion (`APXINF_CLEF_FUSE_KV` /
+  `APXINF_CLEF_FUSE_GDN`, default OFF): attention k/v and gated-delta z/b/a are
+  concatenated at load and issued as one projection. Measured NOT-WORTH; see
+  [FUSION-MATMUL.md](FUSION-MATMUL.md).
 - `crates/apxinf-mlx/src/fusions.rs` + `native/{rms_norm_scale,gdn_conv_split,mrope_half_split}.metal`,
   `src/mrope_rope.rs`, `src/causal_conv.rs` — fusion candidates (mostly measured NO-GAIN, flags default off).
 - `src/bin/apxinf-decide-server.rs` — long-running decision server used by the Mario demo.
@@ -56,7 +60,9 @@ Context for a follow-up agent working on the Clef Flash 9B × Mario decision dem
 fusion combos (−0.372 %, CI<0), deeper ANE column split (−2.48 %, parity gate fail),
 wavefront K=2 (ANE gap median 1.3 ms — overlap already achieved), full-GPU megakernel (<2 % bound),
 `mx.compile` vision (0.7 ms host build), vis014 row split (single image below the 1024-row floor),
-vision Metal batch (<2 %). Hardware `xctrace` timeline is **reopened and delivered**:
+vision Metal batch (<2 %), matmul-level projection fusion (reference tier +0.109 %, CI95
+[−0.100 %, +0.303 %], parity gate failed 0.049 > 0.035 — see
+[FUSION-MATMUL.md](FUSION-MATMUL.md)). Hardware `xctrace` timeline is **reopened and delivered**:
 the earlier "injected-dyld hang" is a TCC-boundary `open()` hang when the traced
 process reads `~/Documents`; staging the checkpoint and case image outside that
 boundary records cleanly. See [TIMELINE-OPERATOR.md](TIMELINE-OPERATOR.md)

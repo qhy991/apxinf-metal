@@ -1,6 +1,7 @@
-# 新优化方向候选（待批准，未实施）
+# 新优化方向候选（A 已批准并实施，结果见 FUSION-MATMUL.md；B 未批准）
 
-任务 2 的交付物：候选清单。**在批准之前不写任何实现。** 测量纪律沿用
+任务 2 的交付物：候选清单。**批准前不写实现**——已履行：A 的实现与
+campaign 都在收到批准（PR #5 评论 `08b361d…`）之后才开始。测量纪律沿用
 [HANDOVER.md](HANDOVER.md)：3 轮反序、双锁单窗口、Swapouts ≠ 0 不进 KEEP。
 
 已关闭方向不重做：fusion 组合、deeper-ANE、wavefront K=2、megakernel、
@@ -34,6 +35,19 @@ elementwise fusion 不同（合并的是 matmul 本身），此前未评估过�
 - **测量方案**：reference（GPU-only）tier 先行：3 轮反序配对、双锁单窗、
   Swapouts 门；42 案 parity（决策 + max|Δp|）；KEEP 后再测 auto tier。
 
+### 状态（A）
+- **已批准**（2026-11-05 PR #5 评论 `08b361d…`）后才开始实施。
+- **两处技术更正**（实测，见 [FUSION-MATMUL.md](FUSION-MATMUL.md) §2）：
+  本节“`a`/`b` 各 1 列”不成立——实为 32 行（`linear_num_value_heads`）；
+  “合并改变 scale 分组”不成立——Q4 scales 为**每输出行**
+  （`[out, in/64]`），沿输出轴拼接不共享、不改变任何分组。
+  另有未预料的发现：**A1 也不是 bit 一致**（GEMM shape 变化改变 tiling
+  与 FP32 累加顺序），所以 A1 与 A2 都走了完整 parity 门。
+- **结果**：**NOT-WORTH**——reference tier median **+0.109 %**
+  （CI95 [−0.100 %, +0.303 %] 含 0），且 parity 门失败
+  （vs 冻结 MLX max|Δp| **0.04896 > 0.035**，42/42 决策相同）。
+  gate 保持默认关闭，证据见 [FUSION-MATMUL.md](FUSION-MATMUL.md) §3.2。
+
 ## 候选 B：多图逐图 image-row 前缀链（Tier-2 扩展）
 
 当前 Tier-2 的前缀 = system + header + **全部**图像的 rows（`media_end`），
@@ -59,6 +73,10 @@ backbone 前缀被重算。
 - **测量方案**：(0) **traffic preflight**：只读计数图像子集复用率，
   一次运行、不改模型；(1) preflight 通过才构造“多图共享子集”套件；
   (2) 3 轮反序配对 + 42 案 parity + no-hit control（照 Tier-2 的双重门）。
+
+### 状态（B）
+- **未批准**（“先不做，等以后有明确子集复用流量再说”）→ 未实施，
+  preflight 也未做。本方向保留在这里，等出现明确子集复用流量时再申请。
 
 ## 建议
 
