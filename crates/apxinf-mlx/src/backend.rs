@@ -466,25 +466,31 @@ impl Backend for MlxBackend {
         self
     }
 }
-impl SamplingBackend for MlxBackend {
-    fn create_token_sampler(&self, spec: TokenSamplingSpec) -> Result<Box<dyn TokenSampler>> {
+impl MlxBackend {
+    pub fn create_greedy_sampler(&self, spec: TokenSamplingSpec) -> Result<MlxGreedySampler> {
         spec.validate()?;
-        Ok(Box::new(Greedy {
+        Ok(MlxGreedySampler {
             backend: self.clone(),
             spec,
             remaining: None,
-        }))
+        })
+    }
+}
+impl SamplingBackend for MlxBackend {
+    fn create_token_sampler(&self, spec: TokenSamplingSpec) -> Result<Box<dyn TokenSampler>> {
+        Ok(Box::new(self.create_greedy_sampler(spec)?))
     }
     fn create_normal_generator(&self, _output: Tensor) -> Result<Box<dyn NormalGenerator>> {
         Err(Error::UnsupportedOp("MLX normal generator"))
     }
 }
-struct Greedy {
+/// Greedy selection with exclusive ownership of the request capacity.
+pub struct MlxGreedySampler {
     backend: MlxBackend,
     spec: TokenSamplingSpec,
     remaining: Option<usize>,
 }
-impl TokenSampler for Greedy {
+impl TokenSampler for MlxGreedySampler {
     fn spec(&self) -> TokenSamplingSpec {
         self.spec
     }
@@ -513,6 +519,13 @@ impl TokenSampler for Greedy {
         Ok(())
     }
     fn sample(&mut self, logits: NextTokenLogits<'_>) -> Result<TokenSample> {
+        let token = self.token_array(logits)?.to_u32_scalar()?;
+        self.accept_token(token)
+    }
+}
+
+impl MlxGreedySampler {
+    fn token_array(&self, logits: NextTokenLogits<'_>) -> Result<Array> {
         let remaining = self
             .remaining
             .ok_or_else(|| err("sampler requires begin"))?;
@@ -531,55 +544,317 @@ impl TokenSampler for Greedy {
             ])?
             .slice_axis(0, logits.row_index(), logits.row_index() + 1)?
             .cast(MlxDType::F32)?;
-        // Match core NaN/+inf/-inf normalization; argmax resolves ties to first.
-        let token = greedy_token(&a)?;
-        self.remaining = Some(remaining - 1);
+        greedy_token_array(&a)
+    }
+
+    fn accept_token(&mut self, token: u32) -> Result<TokenSample> {
+        if token == u32::MAX {
+            return Err(err("all token logits are invalid"));
+        }
+        self.remaining = Some(self.remaining.expect("sample requires begin") - 1);
         Ok(TokenSample {
             token_id: token,
             logprob: None,
         })
     }
+
+    /// Build selection without evaluating logits or consuming request capacity.
+    pub fn plan(&mut self, logits: NextTokenLogits<'_>) -> Result<PlannedGreedy<'_>> {
+        let token = self.token_array(logits)?.contiguous()?;
+        Ok(PlannedGreedy {
+            sampler: self,
+            token,
+        })
+    }
 }
-fn greedy_token(a: &Array) -> Result<u32> {
+
+/// A selection graph that exclusively borrows its sampler until completion.
+pub struct PlannedGreedy<'a> {
+    sampler: &'a mut MlxGreedySampler,
+    token: Array,
+}
+
+/// A completed graph whose scalar result has not yet consumed sampler capacity.
+pub struct EvaluatedGreedy<'a> {
+    sampler: &'a mut MlxGreedySampler,
+    token: Array,
+}
+
+impl<'a> PlannedGreedy<'a> {
+    /// Evaluate selection and every required array in one synchronized call.
+    pub fn evaluate(self, required: &[Array]) -> Result<EvaluatedGreedy<'a>> {
+        let mut roots = Vec::with_capacity(required.len() + 1);
+        roots.extend_from_slice(required);
+        roots.push(self.token.clone());
+        self.sampler.backend.stream.eval(&roots)?;
+        Ok(EvaluatedGreedy {
+            sampler: self.sampler,
+            token: self.token,
+        })
+    }
+}
+
+impl EvaluatedGreedy<'_> {
+    /// Read the completed scalar and consume capacity only for a valid token.
+    pub fn finish(self) -> Result<TokenSample> {
+        let bytes = self.token.to_bytes_ready()?;
+        let token = u32::from_ne_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| err("invalid greedy scalar size"))?,
+        );
+        self.sampler.accept_token(token)
+    }
+}
+
+fn greedy_token_array(a: &Array) -> Result<Array> {
+    // Match core NaN/+inf/-inf normalization; argmax resolves ties to first.
     let adjusted = a.nan_to_num(f32::NEG_INFINITY, f32::MAX, f32::NEG_INFINITY)?;
     let valid = adjusted.max(-1)?.isfinite()?.reshape(&[1])?;
     let invalid = Array::from_i32(a.stream(), &[1], &[-1])?.cast(MlxDType::U32)?;
-    let token = valid
-        .where_select(&adjusted.argmax(-1)?.reshape(&[1])?, &invalid)?
-        .to_u32_scalar()?;
-    if token == u32::MAX {
-        return Err(err("all token logits are invalid"));
-    }
-    Ok(token)
+    valid.where_select(&adjusted.argmax(-1)?.reshape(&[1])?, &invalid)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apxinf_core::{RngKey, TokenSamplingParams};
+
+    fn cpu_sampler() -> Result<MlxGreedySampler> {
+        MlxBackend {
+            stream: Stream::cpu()?,
+            index: 0,
+        }
+        .create_greedy_sampler(TokenSamplingSpec {
+            vocab_size: 4,
+            max_sequence_len: 3,
+        })
+    }
+
+    fn begin(sampler: &mut MlxGreedySampler) -> Result<()> {
+        sampler.begin(TokenSamplingInit {
+            prompt_token_ids: &[0],
+            params: &TokenSamplingParams::greedy(),
+            rng: RngKey::default(),
+        })
+    }
+
+    fn cpu_selection(
+        sampler: &mut MlxGreedySampler,
+        values: &[f32],
+        joint: bool,
+    ) -> Result<TokenSample> {
+        let array = Array::from_f32(sampler.backend.stream(), &[1, 4], values)?;
+        let token = greedy_token_array(&array)?;
+        if joint {
+            let required = array.add(&Array::scalar(array.stream(), 2., MlxDType::F32)?)?;
+            let stream = array.stream().clone();
+            let planned = PlannedGreedy {
+                token: token.contiguous()?,
+                sampler,
+            };
+            let before = stream.counters().eval_calls;
+            let evaluated = planned.evaluate(&[array, required.clone()])?;
+            assert_eq!(stream.counters().eval_calls, before + 1);
+            let sample = evaluated.finish();
+            assert_eq!(stream.counters().eval_calls, before + 2);
+            let bytes = required.to_bytes_ready()?;
+            assert_eq!(bytes.len(), 16);
+            for (bytes, input) in bytes.chunks_exact(4).zip(values) {
+                let actual = f32::from_ne_bytes(bytes.try_into().unwrap());
+                let expected = input + 2.;
+                assert!(actual == expected || (actual.is_nan() && expected.is_nan()));
+            }
+            sample
+        } else {
+            sampler.accept_token(token.to_u32_scalar()?)
+        }
+    }
+
     #[test]
-    fn greedy_matches_core_invalid_and_tie_rules() -> Result<()> {
-        let s = Stream::cpu()?;
-        assert_eq!(
-            greedy_token(&Array::from_f32(
-                &s,
-                &[1, 4],
-                &[f32::NAN, 4., 4., f32::NEG_INFINITY]
-            )?)?,
-            1
-        );
-        assert_eq!(
-            greedy_token(&Array::from_f32(&s, &[1, 3], &[1., f32::INFINITY, 2.])?)?,
-            1
-        );
-        assert!(greedy_token(&Array::from_f32(
-            &s,
-            &[1, 2],
-            &[f32::NAN, f32::NEG_INFINITY]
-        )?)
+    fn greedy_joint_and_direct_share_nonfinite_tie_and_invalid_rules() -> Result<()> {
+        for (values, expected) in [
+            ([1., 4., 4., -2.], Some(1)),
+            ([f32::NAN, 4., 4., f32::NEG_INFINITY], Some(1)),
+            ([1., f32::INFINITY, f32::INFINITY, 2.], Some(1)),
+            ([f32::NEG_INFINITY, -4., -4., f32::NAN], Some(1)),
+            (
+                [f32::NAN, f32::NEG_INFINITY, f32::NAN, f32::NEG_INFINITY],
+                None,
+            ),
+        ] {
+            for joint in [false, true] {
+                let mut sampler = cpu_sampler()?;
+                begin(&mut sampler)?;
+                let sample = cpu_selection(&mut sampler, &values, joint);
+                match expected {
+                    Some(token) => {
+                        assert_eq!(sample?.token_id, token);
+                        assert_eq!(sampler.remaining, Some(1));
+                    }
+                    None => {
+                        assert!(sample
+                            .unwrap_err()
+                            .to_string()
+                            .contains("all token logits are invalid"));
+                        assert_eq!(sampler.remaining, Some(2));
+                        assert_eq!(
+                            cpu_selection(&mut sampler, &[3., 1., 0., 0.], joint)?.token_id,
+                            0
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn greedy_begin_capacity_and_reinitialization_are_shared() -> Result<()> {
+        let mut sampler = cpu_sampler()?;
+        let tensor = Tensor::from_f32(vec![1, 4], &[0.; 4])?;
+        assert!(sampler.plan(NextTokenLogits::last(&tensor, 4)?).is_err());
+        begin(&mut sampler)?;
+        cpu_selection(&mut sampler, &[0., 1., 0., 0.], true)?;
+        cpu_selection(&mut sampler, &[0., 0., 1., 0.], false)?;
+        assert_eq!(sampler.remaining, Some(0));
+        assert!(sampler
+            .plan(NextTokenLogits::last(&tensor, 4)?)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("capacity exhausted"));
+        assert!(sampler
+            .sample(NextTokenLogits::last(&tensor, 4)?)
+            .unwrap_err()
+            .to_string()
+            .contains("capacity exhausted"));
+        for params in [
+            TokenSamplingParams {
+                return_logprob: true,
+                ..TokenSamplingParams::greedy()
+            },
+            TokenSamplingParams {
+                penalties: TokenPenalties {
+                    repetition: 1.1,
+                    ..TokenPenalties::default()
+                },
+                ..TokenSamplingParams::greedy()
+            },
+            TokenSamplingParams {
+                selection: TokenSelection::Random {
+                    temperature: 1.,
+                    top_k: None,
+                    top_p: 1.,
+                },
+                ..TokenSamplingParams::greedy()
+            },
+        ] {
+            assert!(sampler
+                .begin(TokenSamplingInit {
+                    prompt_token_ids: &[0],
+                    params: &params,
+                    rng: RngKey::default()
+                })
+                .is_err());
+            assert_eq!(sampler.remaining, None);
+            begin(&mut sampler)?;
+            assert_eq!(sampler.remaining, Some(2));
+        }
+        for prompt in [&[4][..], &[0, 0, 0, 0][..]] {
+            assert!(sampler
+                .begin(TokenSamplingInit {
+                    prompt_token_ids: prompt,
+                    params: &TokenSamplingParams::greedy(),
+                    rng: RngKey::default()
+                })
+                .is_err());
+            assert_eq!(sampler.remaining, None);
+        }
+        begin(&mut sampler)?;
+        let smaller = Tensor::from_f32(vec![1, 3], &[0.; 3])?;
+        assert!(sampler
+            .plan(NextTokenLogits::last(&smaller, 3)?)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("vocabulary mismatch"));
+        assert_eq!(sampler.remaining, Some(2));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires exclusive Apple Silicon Metal test slot and pinned MLX SDK"]
+    fn greedy_public_sampler_and_joint_plan_match_on_metal() -> Result<()> {
+        let backend = MlxBackend::new(0)?;
+        for values in [
+            [1., 4., 4., -2.],
+            [f32::NAN, 4., 4., f32::NEG_INFINITY],
+            [1., f32::INFINITY, f32::INFINITY, 2.],
+            [f32::NAN, f32::NEG_INFINITY, f32::NAN, f32::NEG_INFINITY],
+        ] {
+            let spec = TokenSamplingSpec {
+                vocab_size: 4,
+                max_sequence_len: 3,
+            };
+            let mut direct = backend.create_token_sampler(spec)?;
+            let mut joint = backend.create_greedy_sampler(spec)?;
+            let params = TokenSamplingParams::greedy();
+            let init = TokenSamplingInit {
+                prompt_token_ids: &[0],
+                params: &params,
+                rng: RngKey::default(),
+            };
+            direct.begin(init)?;
+            joint.begin(init)?;
+            let array = Array::from_f32(backend.stream(), &[1, 4], &values)?;
+            let logits = backend.from_array(array.clone())?;
+            let expected = direct
+                .sample(NextTokenLogits::last(&logits, 4)?)
+                .map(|x| x.token_id)
+                .map_err(|e| e.to_string());
+            let actual = joint
+                .plan(NextTokenLogits::last(&logits, 4)?)?
+                .evaluate(&[array])?
+                .finish()
+                .map(|x| x.token_id)
+                .map_err(|e| e.to_string());
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn greedy_abandoned_or_failed_evaluation_does_not_consume_capacity() -> Result<()> {
+        let mut sampler = cpu_sampler()?;
+        begin(&mut sampler)?;
+        let token = Array::from_i32(sampler.backend.stream(), &[1], &[1])?.cast(MlxDType::U32)?;
+        drop(PlannedGreedy {
+            token: token.clone(),
+            sampler: &mut sampler,
+        });
+        assert_eq!(sampler.remaining, Some(2));
+        let other = Stream::cpu()?;
+        let foreign = Array::zeros(&other, &[1], MlxDType::F32)?;
+        assert!(PlannedGreedy {
+            token: token.clone(),
+            sampler: &mut sampler
+        }
+        .evaluate(&[foreign])
         .is_err());
+        assert_eq!(sampler.remaining, Some(2));
+        drop(
+            PlannedGreedy {
+                token,
+                sampler: &mut sampler,
+            }
+            .evaluate(&[])?,
+        );
+        assert_eq!(sampler.remaining, Some(2));
         Ok(())
     }
 }
+
 type Pair = (Array, Array);
 struct MlxKvCache {
     backend: MlxBackend,

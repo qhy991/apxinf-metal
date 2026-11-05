@@ -9,12 +9,16 @@ use super::{
     weights::{LayerWeights, Weights},
 };
 use crate::llm_trait::{
+    drive_with_steps, GeneratedToken, GenerationOutput, GenerationRequest, GenerationStep,
     LlmInput, LlmTrait, TextCompilationScope, TextPreparationState, TextPreparationStatus,
 };
-use apxinf_core::{Backend, Device, Error, Result, Tensor};
+use crate::{GenerationOptions, GenerationProfile};
+use apxinf_core::{
+    Backend, Device, Error, NextTokenLogits, Result, Tensor, TokenSample, TokenSampler,
+};
 use apxinf_loader::ModelConfig;
 use apxinf_mlx::fusions::QkNormRope;
-use apxinf_mlx::{Array, Compiled, MlxBackend, MlxDType, Stream};
+use apxinf_mlx::{Array, Compiled, MlxBackend, MlxDType, MlxGreedySampler, Stream};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -59,6 +63,59 @@ fn decode_mask(positions: &Array, index: &Array) -> Result<Array> {
 struct KvState {
     keys: Array,
     values: Array,
+}
+
+struct PendingQwenStep {
+    logits: Option<Tensor>,
+    kv: Vec<KvState>,
+    end: usize,
+}
+
+struct CommittedSample(Result<TokenSample>);
+
+impl PendingQwenStep {
+    fn roots(&self, backend: &MlxBackend) -> Result<Vec<Array>> {
+        let mut roots = Vec::with_capacity(self.kv.len() * 2 + 1);
+        if let Some(logits) = &self.logits {
+            roots.push(backend.array(logits)?);
+        }
+        roots.extend(
+            self.kv
+                .iter()
+                .flat_map(|kv| [kv.keys.clone(), kv.values.clone()]),
+        );
+        Ok(roots)
+    }
+}
+
+struct QwenJointSteps {
+    sampler: MlxGreedySampler,
+}
+
+impl GenerationStep<Qwen3Model> for QwenJointSteps {
+    fn prefill(&mut self, model: &mut Qwen3Model, input: LlmInput<'_>) -> Result<TokenSample> {
+        let last = model.consume_prefill_prefix(input)?;
+        model.execute_sampled(last, model.position, &mut self.sampler)
+    }
+
+    fn decode(
+        &mut self,
+        model: &mut Qwen3Model,
+        token_id: u32,
+        position: u32,
+    ) -> Result<TokenSample> {
+        model.execute_sampled(&[token_id], position as usize, &mut self.sampler)
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JointFault {
+    Build,
+    ModelEval,
+    JointEval,
+    Readback,
+    InvalidLogits,
 }
 
 struct Seams {
@@ -162,6 +219,10 @@ pub struct Qwen3Model {
     prepared_lengths: HashSet<usize>,
     decode_positions: HashMap<usize, Array>,
     invalid: Option<String>,
+    #[cfg(test)]
+    joint_fault: Option<JointFault>,
+    #[cfg(test)]
+    joint_steps: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
 impl Qwen3Model {
@@ -230,6 +291,10 @@ impl Qwen3Model {
             prepared_lengths: HashSet::new(),
             decode_positions: HashMap::new(),
             invalid: None,
+            #[cfg(test)]
+            joint_fault: None,
+            #[cfg(test)]
+            joint_steps: Default::default(),
         };
         model.prepare(1, 0)?;
         Ok(model)
@@ -499,12 +564,12 @@ impl Qwen3Model {
         Ok((out, KvState { keys, values }))
     }
 
-    fn run(
+    fn build_step(
         &mut self,
         tokens: &[u32],
         end: usize,
         emit_logits: bool,
-    ) -> Result<(Option<Tensor>, Vec<KvState>)> {
+    ) -> Result<PendingQwenStep> {
         let s = self.backend.stream();
         let len = tokens.len();
         let ids = Array::from_i32(
@@ -573,18 +638,17 @@ impl Qwen3Model {
         } else {
             None
         };
-        let mut required = Vec::with_capacity(pending.len() * 2 + 1);
-        if let Some(output) = &output {
-            required.push(self.backend.array(output)?);
-        }
-        required.extend(
-            pending
-                .iter()
-                .flat_map(|kv| [kv.keys.clone(), kv.values.clone()]),
-        );
-        s.eval(&required)?;
-        // Stream::eval includes stream synchronization and exception checking.
-        Ok((output, pending))
+        Ok(PendingQwenStep {
+            logits: output,
+            kv: pending,
+            end,
+        })
+    }
+
+    fn publish_step(&mut self, pending: PendingQwenStep) -> Option<Tensor> {
+        self.kv = pending.kv;
+        self.position = pending.end;
+        pending.logits
     }
 
     fn validate_input(&self, token_ids: &[u32], start_pos: usize) -> Result<usize> {
@@ -619,21 +683,181 @@ impl Qwen3Model {
         if !self.prepared_lengths.contains(&token_ids.len()) {
             return Err(err("Qwen3 input length was not prepared; call prepare or prewarm_decode before inference"));
         }
-        match self.run(token_ids, end, emit_logits) {
-            Ok((output, pending)) => {
-                self.kv = pending;
-                self.position = end;
-                Ok(output)
-            }
+        let result: Result<PendingQwenStep> = (|| {
+            let pending = self.build_step(token_ids, end, emit_logits)?;
+            self.backend.stream().eval(&pending.roots(&self.backend)?)?;
+            Ok(pending)
+        })();
+        match result {
+            Ok(pending) => Ok(self.publish_step(pending)),
             Err(error) => {
                 self.invalid = Some(error.to_string());
                 Err(error)
             }
         }
     }
+
+    fn consume_prefill_prefix<'a>(&mut self, input: LlmInput<'a>) -> Result<&'a [u32]> {
+        if input.image.is_some() {
+            return Err(err("Qwen3 does not support images"));
+        }
+        self.validate_input(input.token_ids, 0)?;
+        let prefix = input.token_ids.len() - 1;
+        // Check the entire schedule before consuming any part of the prompt.
+        if !self.prepared_lengths.contains(&1)
+            || (prefix >= 512 && !self.prepared_lengths.contains(&512))
+            || (prefix % 512 != 0 && !self.prepared_lengths.contains(&(prefix % 512)))
+        {
+            return Err(err("Qwen3 prefill schedule was not prepared"));
+        }
+        for chunk in input.token_ids[..prefix].chunks(512) {
+            self.execute(chunk, self.position, false)?;
+        }
+        Ok(&input.token_ids[prefix..])
+    }
+
+    fn execute_sampled(
+        &mut self,
+        token_ids: &[u32],
+        start_pos: usize,
+        sampler: &mut MlxGreedySampler,
+    ) -> Result<TokenSample> {
+        let end = self.validate_input(token_ids, start_pos)?;
+        if !self.prepared_lengths.contains(&token_ids.len()) {
+            return Err(err("Qwen3 input length was not prepared; call prepare or prewarm_decode before inference"));
+        }
+        #[cfg(test)]
+        {
+            self.joint_steps.set(self.joint_steps.get() + 1);
+        }
+        let result: Result<CommittedSample> = (|| {
+            #[cfg(test)]
+            if self.joint_fault == Some(JointFault::Build) {
+                return Err(err("injected model build failure"));
+            }
+            let pending = self.build_step(token_ids, end, true)?;
+            #[cfg(test)]
+            let pending = if self.joint_fault == Some(JointFault::InvalidLogits) {
+                let logits = Array::from_f32(
+                    self.backend.stream(),
+                    &[1, self.config.vocab_size],
+                    &vec![f32::NAN; self.config.vocab_size],
+                )?;
+                PendingQwenStep {
+                    logits: Some(self.backend.from_array(logits)?),
+                    ..pending
+                }
+            } else {
+                pending
+            };
+            let roots = pending.roots(&self.backend)?;
+            let plan =
+                NextTokenLogits::last(pending.logits.as_ref().unwrap(), self.config.vocab_size)
+                    .and_then(|logits| sampler.plan(logits));
+            let plan = match plan {
+                Ok(plan) => plan,
+                Err(error) => {
+                    #[cfg(test)]
+                    if self.joint_fault == Some(JointFault::ModelEval) {
+                        return Err(err("injected model eval failure"));
+                    }
+                    self.backend.stream().eval(&roots)?;
+                    self.publish_step(pending);
+                    return Ok(CommittedSample(Err(error)));
+                }
+            };
+            #[cfg(test)]
+            if self.joint_fault == Some(JointFault::JointEval) {
+                return Err(err("injected joint eval failure"));
+            }
+            let evaluated = plan.evaluate(&roots)?;
+            self.publish_step(pending);
+            #[cfg(test)]
+            if self.joint_fault == Some(JointFault::Readback) {
+                return Ok(CommittedSample(Err(err("injected readback failure"))));
+            }
+            Ok(CommittedSample(evaluated.finish()))
+        })();
+        match result {
+            Ok(CommittedSample(sample)) => sample,
+            Err(error) => {
+                self.invalid = Some(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    fn generate_request(
+        &mut self,
+        request: GenerationRequest<'_>,
+        on_token: impl FnMut(GeneratedToken),
+    ) -> Result<GenerationOutput> {
+        if self.variant != Variant::Bf16Compiled {
+            return crate::llm_trait::generate_streaming_with_options(self, request, on_token);
+        }
+        drive_with_steps(self, request, on_token, |model, spec, init| {
+            let mut sampler = model.backend.create_greedy_sampler(spec)?;
+            sampler.begin(init)?;
+            Ok(QwenJointSteps { sampler })
+        })
+    }
+
+    fn generate_greedy(
+        &mut self,
+        input: LlmInput<'_>,
+        max_new_tokens: usize,
+        mut on_token: impl FnMut(u32),
+        eos_token_id: Option<u32>,
+    ) -> Result<(Vec<u32>, GenerationProfile)> {
+        let options = GenerationOptions::greedy(max_new_tokens, eos_token_id);
+        let output = self.generate_request(
+            GenerationRequest {
+                input,
+                options: &options,
+            },
+            |token| on_token(token.token_id),
+        )?;
+        Ok((output.token_ids(), output.profile))
+    }
 }
 
 impl LlmTrait for Qwen3Model {
+    fn generate_streaming_with_options(
+        &mut self,
+        request: GenerationRequest<'_>,
+        on_token: impl FnMut(GeneratedToken),
+    ) -> Result<GenerationOutput> {
+        self.generate_request(request, on_token)
+    }
+
+    fn generate_streaming_with_options_dyn(
+        &mut self,
+        request: GenerationRequest<'_>,
+        on_token: &mut dyn FnMut(GeneratedToken),
+    ) -> Result<GenerationOutput> {
+        self.generate_request(request, on_token)
+    }
+
+    fn generate_streaming(
+        &mut self,
+        input: LlmInput<'_>,
+        max_new_tokens: usize,
+        on_token: impl FnMut(u32),
+        eos_token_id: Option<u32>,
+    ) -> Result<(Vec<u32>, GenerationProfile)> {
+        self.generate_greedy(input, max_new_tokens, on_token, eos_token_id)
+    }
+
+    fn generate_streaming_dyn(
+        &mut self,
+        input: LlmInput<'_>,
+        max_new_tokens: usize,
+        on_token: &mut dyn FnMut(u32),
+        eos_token_id: Option<u32>,
+    ) -> Result<(Vec<u32>, GenerationProfile)> {
+        self.generate_greedy(input, max_new_tokens, on_token, eos_token_id)
+    }
+
     fn preparation_status(&self) -> TextPreparationStatus {
         let implementation_ready = match self.variant {
             Variant::Bf16Public => true,
@@ -700,22 +924,8 @@ impl LlmTrait for Qwen3Model {
     }
 
     fn prefill(&mut self, input: LlmInput<'_>) -> Result<Tensor> {
-        if input.image.is_some() {
-            return Err(err("Qwen3 does not support images"));
-        }
-        self.validate_input(input.token_ids, 0)?;
-        let prefix = input.token_ids.len() - 1;
-        // Check the entire schedule before consuming any part of the prompt.
-        if !self.prepared_lengths.contains(&1)
-            || (prefix >= 512 && !self.prepared_lengths.contains(&512))
-            || (prefix % 512 != 0 && !self.prepared_lengths.contains(&(prefix % 512)))
-        {
-            return Err(err("Qwen3 prefill schedule was not prepared"));
-        }
-        for chunk in input.token_ids[..prefix].chunks(512) {
-            self.execute(chunk, self.position, false)?;
-        }
-        self.execute(&input.token_ids[prefix..], self.position, true)?
+        let last = self.consume_prefill_prefix(input)?;
+        self.execute(last, self.position, true)?
             .ok_or_else(|| err("missing Qwen3 prefill logits"))
     }
 
@@ -969,5 +1179,261 @@ mod tests {
                 assert!(x.is_finite() && y.is_finite() && (x - y).abs() <= 0.05 + 0.03 * x.abs());
             }
         }
+    }
+    fn sampler(model: &Qwen3Model, prompt: &[u32], count: usize) -> MlxGreedySampler {
+        let mut sampler = model
+            .backend
+            .create_greedy_sampler(apxinf_core::TokenSamplingSpec {
+                vocab_size: model.config.vocab_size,
+                max_sequence_len: prompt.len() + count,
+            })
+            .unwrap();
+        sampler
+            .begin(apxinf_core::TokenSamplingInit {
+                prompt_token_ids: prompt,
+                params: &apxinf_core::TokenSamplingParams::greedy(),
+                rng: apxinf_core::RngKey::default(),
+            })
+            .unwrap();
+        sampler
+    }
+
+    #[test]
+    #[ignore = "requires exclusive Apple Silicon Metal test slot and pinned MLX SDK"]
+    fn joint_greedy_matches_sync_prefix_decode_and_retained_outputs() {
+        let mut model = tiny(Variant::Bf16Compiled);
+        for length in [1, 512, 513, 1024] {
+            let prompt: Vec<_> = (0..length).map(|i| (i % 16) as u32).collect();
+            model.reset();
+            model.prepare(length, 4).unwrap();
+            let mut direct = sampler(&model, &prompt, 4);
+            let retained = model.prefill(LlmInput::text(&prompt)).unwrap();
+            let retained_values = values(&model, &retained);
+            let mut expected = vec![
+                direct
+                    .sample(NextTokenLogits::last(&retained, 16).unwrap())
+                    .unwrap()
+                    .token_id,
+            ];
+            for index in 0..3 {
+                let logits = model
+                    .forward(&[expected[index]], (length + index) as u32)
+                    .unwrap();
+                expected.push(
+                    direct
+                        .sample(NextTokenLogits::last(&logits, 16).unwrap())
+                        .unwrap()
+                        .token_id,
+                );
+            }
+            model.reset();
+            let mut joint = QwenJointSteps {
+                sampler: sampler(&model, &prompt, 4),
+            };
+            let first = joint
+                .prefill(&mut model, LlmInput::text(&prompt))
+                .unwrap()
+                .token_id;
+            assert_eq!(model.position(), length);
+            let mut actual = vec![first];
+            for index in 0..3 {
+                actual.push(
+                    joint
+                        .decode(&mut model, actual[index], (length + index) as u32)
+                        .unwrap()
+                        .token_id,
+                );
+                assert_eq!(model.position(), length + index + 1);
+            }
+            assert_eq!(actual, expected);
+            model.reset();
+            assert_eq!(values(&model, &retained), retained_values);
+            let mut replay = sampler(&model, &prompt, 1);
+            let last = model
+                .consume_prefill_prefix(LlmInput::text(&prompt))
+                .unwrap();
+            let position = model.position();
+            assert_eq!(
+                model
+                    .execute_sampled(last, position, &mut replay)
+                    .unwrap()
+                    .token_id,
+                expected[0]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires exclusive Apple Silicon Metal test slot and pinned MLX SDK"]
+    fn joint_greedy_static_dyn_legacy_and_worker_routes() {
+        let mut model = tiny(Variant::Bf16Compiled);
+        let prompt = [1, 7, 3];
+        let options = GenerationOptions::greedy(3, None);
+        let request = GenerationRequest {
+            input: LlmInput::text(&prompt),
+            options: &options,
+        };
+        let calls = model.joint_steps.clone();
+        let mut callbacks = Vec::new();
+        let expected = model
+            .generate_streaming_with_options(request, |token| callbacks.push(token))
+            .unwrap();
+        assert_eq!(expected.tokens, callbacks);
+        assert_eq!(calls.get(), 3);
+        let dynamic: &mut dyn LlmTrait = &mut model;
+        assert_eq!(
+            dynamic
+                .generate_streaming_with_options_dyn(request, &mut |_| {})
+                .unwrap()
+                .tokens,
+            expected.tokens
+        );
+        assert_eq!(calls.get(), 6);
+        assert_eq!(
+            dynamic
+                .generate_streaming_dyn(request.input, 3, &mut |_| {}, None)
+                .unwrap()
+                .0,
+            expected.token_ids()
+        );
+        assert_eq!(calls.get(), 9);
+        assert_eq!(
+            model
+                .generate_streaming(request.input, 3, |_| {}, None)
+                .unwrap()
+                .0,
+            expected.token_ids()
+        );
+        assert_eq!(calls.get(), 12);
+        let position = model.position();
+        let zero = GenerationOptions::greedy(0, None);
+        assert!(model
+            .generate_streaming_with_options(
+                GenerationRequest {
+                    input: request.input,
+                    options: &zero
+                },
+                |_| panic!("zero callback")
+            )
+            .unwrap()
+            .tokens
+            .is_empty());
+        assert_eq!(model.position(), position);
+        assert_eq!(calls.get(), 12);
+        let mut eos_callbacks = Vec::new();
+        let eos = model
+            .generate_streaming(
+                request.input,
+                4,
+                |token| eos_callbacks.push(token),
+                Some(expected.tokens[0].token_id),
+            )
+            .unwrap()
+            .0;
+        assert_eq!(eos, vec![expected.tokens[0].token_id]);
+        assert_eq!(eos_callbacks, eos);
+        assert_eq!(calls.get(), 13);
+        assert_eq!(model.position(), prompt.len());
+        let mut loaded = crate::LoadedModel::text(Box::new(model));
+        assert_eq!(
+            loaded
+                .generate_streaming_with_options(request.input, &options, |_| {})
+                .unwrap()
+                .tokens,
+            expected.tokens
+        );
+        assert_eq!(calls.get(), 16);
+        assert_eq!(
+            loaded
+                .generate_streaming(request.input, 3, |_| {}, None)
+                .unwrap()
+                .0,
+            expected.token_ids()
+        );
+        assert_eq!(calls.get(), 19);
+        let mut public = tiny(Variant::Bf16Public);
+        public
+            .generate_streaming(request.input, 2, |_| {}, None)
+            .unwrap();
+        assert_eq!(public.joint_steps.get(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires exclusive Apple Silicon Metal test slot and pinned MLX SDK"]
+    fn joint_greedy_failures_preserve_the_commit_boundary() {
+        let mut model = tiny(Variant::Bf16Compiled);
+        model.prepare(1, 4).unwrap();
+        for fault in [
+            JointFault::Build,
+            JointFault::JointEval,
+            JointFault::Readback,
+            JointFault::InvalidLogits,
+        ] {
+            model.reset();
+            model.joint_fault = Some(fault);
+            let mut sample = sampler(&model, &[1], 1);
+            assert!(model.execute_sampled(&[1], 0, &mut sample).is_err());
+            let committed = matches!(fault, JointFault::Readback | JointFault::InvalidLogits);
+            assert_eq!(model.position(), usize::from(committed));
+            assert_eq!(model.invalid.is_none(), committed);
+            model.joint_fault = None;
+            if committed {
+                assert!(model.execute_sampled(&[2], 1, &mut sample).is_ok());
+                assert!(model
+                    .execute_sampled(&[3], 2, &mut sample)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("capacity exhausted"));
+                assert_eq!(model.position(), 3);
+                assert!(model.invalid.is_none());
+            } else {
+                assert!(model.forward(&[1], 0).is_err());
+            }
+            model.reset();
+            assert_eq!(
+                model.preparation_status().state,
+                TextPreparationState::Ready
+            );
+            assert!(model.forward(&[1], 0).is_ok());
+        }
+        for fail_eval in [false, true] {
+            model.reset();
+            model.joint_fault = fail_eval.then_some(JointFault::ModelEval);
+            let mut unbegun = model
+                .backend
+                .create_greedy_sampler(apxinf_core::TokenSamplingSpec {
+                    vocab_size: 16,
+                    max_sequence_len: 5,
+                })
+                .unwrap();
+            let error = model
+                .execute_sampled(&[1], 0, &mut unbegun)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(model.position(), usize::from(!fail_eval));
+            assert_eq!(model.invalid.is_some(), fail_eval);
+            assert!(error.contains(if fail_eval {
+                "injected model eval"
+            } else {
+                "requires begin"
+            }));
+        }
+        model.joint_fault = None;
+        model.reset();
+        model.prepare(513, 1).unwrap();
+        model.prepared_lengths.remove(&512);
+        let prompt = vec![1; 513];
+        let mut joint = QwenJointSteps {
+            sampler: sampler(&model, &prompt, 1),
+        };
+        assert!(joint.prefill(&mut model, LlmInput::text(&prompt)).is_err());
+        assert_eq!(model.position(), 0);
+        assert!(model.invalid.is_none());
+        assert!(model.execute_sampled(&[1], 1, &mut joint.sampler).is_err());
+        assert!(model.execute_sampled(&[16], 0, &mut joint.sampler).is_err());
+        model.prepared_lengths.remove(&1);
+        assert!(model.execute_sampled(&[1], 0, &mut joint.sampler).is_err());
+        assert_eq!(model.position(), 0);
+        assert!(model.invalid.is_none());
     }
 }

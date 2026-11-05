@@ -63,6 +63,37 @@ token and return `[1,vocab_size]`. The chunk head is never evaluated. The shared
 generation driver uses this hook, while `forward` continues
 to return every row. All prompt chunk shapes are warmed by `prepare`.
 
+The `bf16-compiled` generation experiment evaluates the final prompt row,
+all pending KV arrays, and the greedy selection together.
+One shared driver retains EOS handling, callbacks, timing, and output limits.
+Static, dynamic, and `LoadedModel` entry points select this path.
+
+Public free generation functions retain the ordinary sampler path.
+The `bf16-public` and `mixed-w8` variants retain that path too.
+Public `forward` and `prefill` still return evaluated logits.
+The prefix schedule and BF16 operations do not change.
+
+A pending step owns logits, KV arrays, and its unpublished end position.
+Successful joint evaluation publishes the model state before scalar readback.
+All-invalid logits or readback failure leave that state committed.
+These failures do not consume sampler capacity.
+A sampler planning failure evaluates and publishes model state before returning
+the sampler error, unless model evaluation also fails.
+
+A joint evaluation failure invalidates the model and leaves the step position
+unpublished.
+Reset the model before reuse.
+The joint call cannot distinguish model failures from sampler execution failures.
+This conservative behavior differs from the former sampler-only execution failure
+case, which followed model publication.
+The experiment does not claim identical state for that failure case.
+
+The ordinary sampler retains its direct scalar read.
+Both paths share option validation, the greedy graph, and token acceptance.
+The joint path reads a contiguous U32 scalar after evaluation.
+This read can wait for the array and still increments the evaluation counter.
+The counter does not measure stream synchronizations.
+
 Long generation prepares the 512-token chunks and final row. It does not prepare
 a full prompt-sized `forward` above 2048 rows; that call fails explicitly.
 This avoids allocating a large `[prompt,vocabulary]` result during generation.

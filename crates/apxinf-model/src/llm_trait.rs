@@ -3,12 +3,13 @@
 use std::collections::HashMap;
 
 use apxinf_core::{
-    Backend, Device, Error, NextTokenLogits, Result, Tensor, TokenSamplingInit, TokenSamplingSpec,
+    Backend, Device, Error, NextTokenLogits, Result, Tensor, TokenSample, TokenSampler,
+    TokenSamplingInit, TokenSamplingSpec,
 };
 use apxinf_loader::ModelConfig;
 use serde::Serialize;
 
-use crate::generation_config::{GenerationOptions, ResolvedGenerationOptions};
+use crate::generation_config::GenerationOptions;
 use crate::profiling::GenerationProfile;
 
 /// Processor output for one or more images in a generation prompt.
@@ -278,20 +279,53 @@ where
     M: LlmTrait + ?Sized,
     F: FnMut(GeneratedToken),
 {
-    let options = request.options.resolve()?;
-    generate_streaming_with_resolved_options(model, request.input, &options, on_token)
+    drive_with_steps(model, request, on_token, |model, spec, init| {
+        let mut sampler = model.backend().create_token_sampler(spec)?;
+        sampler.begin(init)?;
+        Ok(StandardSteps {
+            sampler,
+            vocab_size: spec.vocab_size,
+        })
+    })
 }
 
-fn generate_streaming_with_resolved_options<M, F>(
+pub(crate) trait GenerationStep<M: LlmTrait + ?Sized> {
+    fn prefill(&mut self, model: &mut M, input: LlmInput<'_>) -> Result<TokenSample>;
+    fn decode(&mut self, model: &mut M, token_id: u32, position: u32) -> Result<TokenSample>;
+}
+
+struct StandardSteps {
+    sampler: Box<dyn TokenSampler>,
+    vocab_size: usize,
+}
+
+impl<M: LlmTrait + ?Sized> GenerationStep<M> for StandardSteps {
+    fn prefill(&mut self, model: &mut M, input: LlmInput<'_>) -> Result<TokenSample> {
+        let logits = model.prefill(input)?;
+        self.sampler
+            .sample(NextTokenLogits::last(&logits, self.vocab_size)?)
+    }
+
+    fn decode(&mut self, model: &mut M, token_id: u32, position: u32) -> Result<TokenSample> {
+        let logits = model.forward(&[token_id], position)?;
+        self.sampler
+            .sample(NextTokenLogits::last(&logits, self.vocab_size)?)
+    }
+}
+
+pub(crate) fn drive_with_steps<M, S, F>(
     model: &mut M,
-    input: LlmInput<'_>,
-    options: &ResolvedGenerationOptions,
+    request: GenerationRequest<'_>,
     mut on_token: F,
+    begin: impl FnOnce(&M, TokenSamplingSpec, TokenSamplingInit<'_>) -> Result<S>,
 ) -> Result<GenerationOutput>
 where
     M: LlmTrait + ?Sized,
+    S: GenerationStep<M>,
     F: FnMut(GeneratedToken),
 {
+    let options = request.options.resolve()?;
+    let input = request.input;
     let prompt_tokens = input.token_ids;
     if prompt_tokens.is_empty() {
         return Err(Error::Other("generate_streaming: empty prompt".into()));
@@ -318,19 +352,21 @@ where
         vocab_size: model.vocab_size(),
         max_sequence_len: capacity,
     };
-    let mut sampler = model.backend().create_token_sampler(spec)?;
-    sampler.begin(TokenSamplingInit {
-        prompt_token_ids: prompt_tokens,
-        params: &options.sampling,
-        rng: options.rng,
-    })?;
+    let mut steps = begin(
+        model,
+        spec,
+        TokenSamplingInit {
+            prompt_token_ids: prompt_tokens,
+            params: &options.sampling,
+            rng: options.rng,
+        },
+    )?;
 
     model.reset();
     model.prewarm_decode(prompt_tokens.len(), options.max_new_tokens);
 
     let mut generated = Vec::with_capacity(options.max_new_tokens);
-    let logits = model.prefill(input)?;
-    let first = sampler.sample(NextTokenLogits::last(&logits, spec.vocab_size)?)?;
+    let first = steps.prefill(model, input)?;
     profile.record_first_token();
     let mut current = GeneratedToken {
         token_id: first.token_id,
@@ -348,8 +384,7 @@ where
             .checked_add(index - 1)
             .and_then(|position| u32::try_from(position).ok())
             .ok_or_else(|| Error::Other("generation position exceeds u32".into()))?;
-        let logits = model.forward(&[current.token_id], position)?;
-        let sample = sampler.sample(NextTokenLogits::last(&logits, spec.vocab_size)?)?;
+        let sample = steps.decode(model, current.token_id, position)?;
         current = GeneratedToken {
             token_id: sample.token_id,
             logprob: sample.logprob,
@@ -390,4 +425,128 @@ where
         |token| on_token(token.token_id),
     )?;
     Ok((output.token_ids(), output.profile))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct StepModel {
+        events: RefCell<Vec<String>>,
+    }
+
+    impl LlmTrait for StepModel {
+        fn load(_: ModelConfig, _: HashMap<String, Tensor>, _: Device) -> Result<Self> {
+            unreachable!()
+        }
+        fn backend(&self) -> &dyn Backend {
+            panic!("injected steps must own sampling")
+        }
+        fn forward(&mut self, _: &[u32], _: u32) -> Result<Tensor> {
+            panic!("injected steps must own execution")
+        }
+        fn reset(&mut self) {
+            self.events.borrow_mut().push("reset".into());
+        }
+        fn prewarm_decode(&mut self, _: usize, _: usize) {
+            self.events.borrow_mut().push("prepare".into());
+        }
+        fn vocab_size(&self) -> usize {
+            16
+        }
+    }
+
+    struct Steps;
+    impl GenerationStep<StepModel> for Steps {
+        fn prefill(&mut self, model: &mut StepModel, _: LlmInput<'_>) -> Result<TokenSample> {
+            model.events.borrow_mut().push("prefill".into());
+            Ok(TokenSample {
+                token_id: 7,
+                logprob: None,
+            })
+        }
+        fn decode(
+            &mut self,
+            model: &mut StepModel,
+            token_id: u32,
+            position: u32,
+        ) -> Result<TokenSample> {
+            model
+                .events
+                .borrow_mut()
+                .push(format!("decode {token_id} {position}"));
+            Ok(TokenSample {
+                token_id: 9,
+                logprob: None,
+            })
+        }
+    }
+
+    #[test]
+    fn injected_steps_keep_zero_eos_callback_and_initialization_order() {
+        for (limit, eos, expected) in [
+            (0, None, vec![]),
+            (1, None, vec![7]),
+            (4, Some(7), vec![7]),
+            (4, Some(9), vec![7, 9]),
+            (3, None, vec![7, 9, 9]),
+        ] {
+            let mut model = StepModel::default();
+            let options = GenerationOptions::greedy(limit, eos);
+            let mut streamed = Vec::new();
+            let output = drive_with_steps(
+                &mut model,
+                GenerationRequest {
+                    input: LlmInput::text(&[1, 2]),
+                    options: &options,
+                },
+                |token| streamed.push(token.token_id),
+                |model, spec, init| {
+                    assert_eq!(spec.max_sequence_len, 2 + limit);
+                    assert_eq!(init.prompt_token_ids, &[1, 2]);
+                    model.events.borrow_mut().push("begin".into());
+                    Ok(Steps)
+                },
+            )
+            .unwrap();
+            assert_eq!(output.token_ids(), expected);
+            assert_eq!(streamed, expected);
+            let mut events: Vec<String> = if limit == 0 {
+                vec![]
+            } else {
+                vec![
+                    "begin".into(),
+                    "reset".into(),
+                    "prepare".into(),
+                    "prefill".into(),
+                ]
+            };
+            if expected.len() >= 2 {
+                events.push("decode 7 2".into());
+            }
+            if expected.len() >= 3 {
+                events.push("decode 9 3".into());
+            }
+            assert_eq!(*model.events.borrow(), events);
+        }
+    }
+
+    #[test]
+    fn injected_begin_error_precedes_reset_and_prepare() {
+        let mut model = StepModel::default();
+        let options = GenerationOptions::greedy(1, None);
+        let result = drive_with_steps(
+            &mut model,
+            GenerationRequest {
+                input: LlmInput::text(&[1]),
+                options: &options,
+            },
+            |_| panic!("callback after failed begin"),
+            |_, _, _| -> Result<Steps> { Err(Error::Other("begin failed".into())) },
+        );
+        assert!(result.err().unwrap().to_string().contains("begin failed"));
+        assert!(model.events.borrow().is_empty());
+    }
 }
