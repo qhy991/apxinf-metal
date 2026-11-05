@@ -182,7 +182,11 @@ impl ClefRunner {
         // the caller's timer covers this cost on both sides.
         let chrome = trace_json::enabled();
         let request_start = std::time::Instant::now();
-        let ts_request = if chrome { trace_json::to_us(request_start) } else { None };
+        let ts_request = if chrome {
+            trace_json::to_us(request_start)
+        } else {
+            None
+        };
         let prepared = if images.is_empty() {
             None
         } else {
@@ -228,8 +232,10 @@ impl ClefRunner {
                     &[prepared.rows(), preprocess::PATCH_WIDTH],
                     &prepared.pixels,
                 )?;
-                self.network
-                    .logits_with_vision(&encoded, Some((&pixels, &prepared.grids)))?
+                self.network.logits_with_vision(
+                    &encoded,
+                    Some((&pixels, &prepared.grids, &prepared.image_key)),
+                )?
             }
         };
         self.last_input_ids.clone_from(&encoded.input_ids);

@@ -6,8 +6,9 @@
 //! compiled functions. The gated-delta recurrence is a Metal kernel with the
 //! MLX-VLM kernel's arithmetic. The GPU composition replaces the MLP, the
 //! gated-delta projections, convolution and recurrence, and the attention
-//! projections with its own kernels. One request is one lazy
-//! graph evaluated once; no state survives between requests.
+//! projections with its own kernels. One request is one lazy graph evaluated
+//! once; the optional Tier-1/Tier-2 prefix cache is the only state that can
+//! survive between requests.
 use super::config::{Config, MAX_INPUT_TOKENS};
 use super::encode::{Encoded, EncodedQuestion};
 use super::vision::{mrope_position_ids, Vision};
@@ -25,11 +26,15 @@ use apxinf_mlx::fusions::{
 use apxinf_mlx::fusions::{AneTileHandoff, AneTileMerge, MppF16Gemm, SplitMppF16Gemm};
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
 const EPS: f32 = 1e-6;
 const HEAD_EPS: f32 = 1e-5;
 const G_BETA_WARM_LENGTHS: [usize; 3] = [1, 2, MAX_INPUT_TOKENS];
+/// How many recently seen prepared-image identities Tier-2 may recognize. The
+/// bound keeps a long-lived resident demo process from growing without limit.
+const RECENT_IMAGE_KEYS: usize = 16;
 
 /// `APXINF_CLEF_FUSION=1` enables the gated-delta q/k RMSNorm+scale fusion.
 /// Default (unset) keeps the unfused `fast_rms_norm_unweighted` + `mul` path.
@@ -55,6 +60,28 @@ fn prefix_cache_flag(value: Option<String>) -> bool {
 
 fn prefix_cache_enabled() -> bool {
     prefix_cache_flag(std::env::var("APXINF_CLEF_PREFIX_CACHE").ok())
+}
+
+/// Tier-2's default after the reference-tier KEEP gate passed: ON. The
+/// measurement runner still sets the gate explicitly on both arms; with this
+/// const true the unset spelling means ON and only explicit `0` disables it,
+/// mirroring Tier-1.
+const TIER2_DEFAULT_ON: bool = true;
+
+/// `APXINF_CLEF_PREFIX_CACHE_TIER2` gate. After KEEP the default is ON: unset
+/// and lookalikes enable Tier-2 and only explicit `0` disables it, mirroring
+/// [`prefix_cache_flag`]. Set [`TIER2_DEFAULT_ON`] to false to revert to the
+/// qualification spelling (exact `1` only).
+fn tier2_prefix_cache_flag(value: Option<String>) -> bool {
+    if TIER2_DEFAULT_ON {
+        value.as_deref() != Some("0")
+    } else {
+        value.as_deref() == Some("1")
+    }
+}
+
+fn tier2_prefix_cache_enabled() -> bool {
+    tier2_prefix_cache_flag(std::env::var("APXINF_CLEF_PREFIX_CACHE_TIER2").ok())
 }
 
 struct Kernels {
@@ -340,6 +367,14 @@ pub struct Network {
     /// fill. Single-threaded callers only (the worker and decide-server are
     /// serial), so no synchronization is needed.
     prefix_cache: RefCell<Option<PrefixCache>>,
+    /// Tier-2 image-row prefix cache. It is filled only after the same
+    /// prepared image has been seen at least once in this resident process;
+    /// the first occurrence stays on the exact Tier-1 path so unique-image
+    /// requests keep the established MLX parity and pay no fill penalty.
+    tier2_cache: RefCell<Option<PrefixCache>>,
+    /// Recently seen prepared-image identities, in request order. Bounded to
+    /// [`RECENT_IMAGE_KEYS`]; membership decides whether Tier-2 may be used.
+    recent_image_keys: RefCell<VecDeque<[u8; 32]>>,
     /// Prompt token IDs for the current request, kept so `backbone_cached`
     /// can hash and slice the prefix without re-reading device memory.
     last_prefix_ids: RefCell<Option<Vec<u32>>>,
@@ -365,7 +400,10 @@ struct CachedLayer {
 struct PrefixCache {
     prefix_tokens: usize,
     /// Bit-mix of the prefix token IDs; checked before reuse.
-    hash: u64,
+    prompt_hash: u64,
+    /// Identity of the prepared vision input. Tier-2 compares this so two
+    /// images with identical placeholder token ids never share a prefix.
+    image_key: [u8; 32],
     /// The chunk-0 backbone output `[P, width]`, kept so a cache-hit request
     /// can still run `head_forward` over the full sequence: question/option
     /// spans, `memory`, `global` and the lexical rows are all indexed into the
@@ -374,9 +412,8 @@ struct PrefixCache {
     layers: Vec<CachedLayer>,
 }
 
-/// Stable-order bit-mix of the prefix token IDs. The prefix is a code
-/// constant (`SYSTEM_PROMPT`, one image start marker), so this is enough to
-/// decide a Tier-1 hit: a change to the prompt changes the hash.
+/// Stable-order bit-mix of the prefix token IDs. A change to the system/chat
+/// text, media markers, or placeholder count changes the hash.
 fn prefix_hash(ids: &[u32]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     ids.len().hash(&mut hasher);
@@ -384,6 +421,43 @@ fn prefix_hash(ids: &[u32]) -> u64 {
         id.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// Whether a cached prefix may be reused for `prefix_end` prompt ids.
+/// `image_key = None` skips the image comparison (Tier-1); `Some` requires the
+/// prepared-image identity to match (Tier-2).
+fn prefix_cache_matches(
+    cache: &PrefixCache,
+    prefix_end: usize,
+    prompt_ids: &[u32],
+    image_key: Option<&[u8; 32]>,
+) -> bool {
+    if cache.prefix_tokens != prefix_end {
+        return false;
+    }
+    let end = prefix_end.min(prompt_ids.len());
+    if cache.prompt_hash != prefix_hash(&prompt_ids[..end]) {
+        return false;
+    }
+    if let Some(key) = image_key {
+        if cache.image_key != *key {
+            return false;
+        }
+    }
+    true
+}
+
+/// Return the resident cache in `slot` when [`prefix_cache_matches`] accepts
+/// it. `image_key = None` means "do not check the image", which is how Tier-1
+/// stays independent of image content.
+fn cached_prefix(
+    slot: &RefCell<Option<PrefixCache>>,
+    prefix_end: usize,
+    prompt_ids: &[u32],
+    image_key: Option<&[u8; 32]>,
+) -> Option<PrefixCache> {
+    let cache = slot.borrow().clone()?;
+    prefix_cache_matches(&cache, prefix_end, prompt_ids, image_key).then_some(cache)
 }
 
 /// Python scalars combine with arrays in the array's dtype.
@@ -475,8 +549,12 @@ impl Network {
             recurrence: GatedDeltaRecurrence::new(&stream)?,
             rope: MropeHalfSplitRope::new(&stream, config.rotary_dim())?,
             g_beta: prepared_g_beta(&stream, config.text.linear_num_value_heads)?,
-            rms_norm_scale: fusion_enabled().then(|| RmsNormScale::new(&stream, EPS)).transpose()?,
-            gdn_conv_split: fusion_enabled().then(|| GdnConvSplit::new(&stream)).transpose()?,
+            rms_norm_scale: fusion_enabled()
+                .then(|| RmsNormScale::new(&stream, EPS))
+                .transpose()?,
+            gdn_conv_split: fusion_enabled()
+                .then(|| GdnConvSplit::new(&stream))
+                .transpose()?,
         };
         #[cfg_attr(not(feature = "coreml"), allow(unused_mut))]
         let mut gpu = match composition {
@@ -567,6 +645,8 @@ impl Network {
             rope_selector,
             vision,
             prefix_cache: RefCell::new(None),
+            tier2_cache: RefCell::new(None),
+            recent_image_keys: RefCell::new(VecDeque::with_capacity(RECENT_IMAGE_KEYS)),
             last_prefix_ids: RefCell::new(None),
         })
     }
@@ -587,10 +667,16 @@ impl Network {
     /// placeholder rows in order, and every attention layer uses the prompt's
     /// three-axis mRoPE positions. A request without images takes the same path
     /// with equal axes, so the text result is unchanged.
+    ///
+    /// Tier-2 is deliberately delayed until a prepared image has been seen at
+    /// least once in this resident process. The first occurrence runs the
+    /// exact Tier-1 path (same numerics, no image-prefix fill cost); a repeat
+    /// may then fill or hit the Tier-2 cache. This keeps unique-image workloads
+    /// — including the 42-case demo suite — on the established parity path.
     pub fn logits_with_vision(
         &self,
         encoded: &Encoded,
-        vision: Option<(&Array, &[[u32; 3]])>,
+        vision: Option<(&Array, &[[u32; 3]], &[u8; 32])>,
     ) -> Result<Vec<Array>> {
         let tokens = encoded.input_ids.len();
         let width = self.config.text.hidden_size;
@@ -606,20 +692,15 @@ impl Network {
             64,
             4,
         )?;
+
+        // Positions are prompt/grid derived, so they can be computed before
+        // the vision tower. Chunked RoPE must slice this full array; it is not
+        // a serial arange after an image run.
         let positions = match vision {
             None => Self::text_positions(&self.stream, tokens)?,
-            Some((pixels, grids)) => {
-                // `grids` are `image_grid_thw` in patch units
-                // (`[1, height / 16, width / 16]`), the unit `preprocess` and
-                // the processor use; `Vision::forward` asserts that the grids
-                // cover exactly `pixels.shape()[0]` patch rows.
-                let features = self.vision.forward(pixels, grids)?;
-                hidden = self.splice_vision(&encoded.input_ids, &hidden, &features)?;
-                let positions = mrope_position_ids(
-                    &encoded.input_ids,
-                    grids,
-                    self.config.image_token_id,
-                )?;
+            Some((_, grids, _)) => {
+                let positions =
+                    mrope_position_ids(&encoded.input_ids, grids, self.config.image_token_id)?;
                 let mut flat = Vec::with_capacity(tokens * 3);
                 for axis in 0..3 {
                     flat.extend(positions.iter().map(|position| position[axis]));
@@ -627,7 +708,51 @@ impl Network {
                 Array::from_i32(&self.stream, &[3, 1, tokens], &flat)?
             }
         };
-        let hidden = if prefix_cache_enabled() && vision.is_some() {
+
+        let image_key = vision.map(|(_, _, key)| *key);
+        let repeat_image = image_key
+            .map(|key| self.recent_image_keys.borrow().contains(&key))
+            .unwrap_or(false);
+        let tier2_prefix_end = (prefix_cache_enabled()
+            && tier2_prefix_cache_enabled()
+            && vision.is_some()
+            && repeat_image)
+            .then_some(encoded.media_end)
+            .flatten()
+            .filter(|&end| end < tokens);
+
+        let tier2_hit_cache = tier2_prefix_end.and_then(|end| {
+            vision.and_then(|(_, _, image_key)| {
+                cached_prefix(&self.tier2_cache, end, &encoded.input_ids, Some(image_key))
+            })
+        });
+        let tier2_hit = tier2_hit_cache.is_some();
+
+        // A Tier-2 hit already contains the image-row prefix state, so the
+        // vision tower and splice are skipped. On a Tier-2 fill (the repeat's
+        // first request) or any Tier-1 request the normal vision path runs.
+        if let Some((pixels, grids, _)) = vision {
+            if !(tier2_prefix_end.is_some() && tier2_hit) {
+                let features = self.vision.forward(pixels, grids)?;
+                hidden = self.splice_vision(&encoded.input_ids, &hidden, &features)?;
+            }
+        }
+
+        let hidden = if let Some(prefix_end) = tier2_prefix_end {
+            self.backbone_cached(
+                &self.tier2_cache,
+                &hidden.reshape(&[1, tokens, width])?,
+                &positions,
+                tokens,
+                prefix_end,
+                vision.map(|(_, _, key)| key),
+                tier2_hit_cache,
+                true,
+            )?
+        } else if prefix_cache_enabled() && vision.is_some() {
+            // Tier-1: the prefix ends at the first image placeholder, so the
+            // image content is never part of the reused state. This is also
+            // the path for a unique image's first occurrence.
             let prefix_end = encoded
                 .input_ids
                 .iter()
@@ -635,62 +760,93 @@ impl Network {
                 .unwrap_or(tokens);
             if prefix_end < tokens {
                 self.backbone_cached(
+                    &self.prefix_cache,
                     &hidden.reshape(&[1, tokens, width])?,
                     &positions,
                     tokens,
                     prefix_end,
+                    vision.map(|(_, _, key)| key),
+                    None,
+                    false,
                 )?
             } else {
-                self.backbone_forward(&hidden.reshape(&[1, tokens, width])?, &positions, tokens, None)?
+                self.backbone_forward(
+                    &hidden.reshape(&[1, tokens, width])?,
+                    &positions,
+                    tokens,
+                    None,
+                )?
             }
         } else {
-            self.backbone_forward(&hidden.reshape(&[1, tokens, width])?, &positions, tokens, None)?
+            self.backbone_forward(
+                &hidden.reshape(&[1, tokens, width])?,
+                &positions,
+                tokens,
+                None,
+            )?
         };
-        self.head_forward(
-            &hidden.reshape(&[tokens, width])?,
-            &ids,
-            &encoded.questions,
-        )
+
+        // Remember the prepared image identity for the next request. The
+        // deque is bounded, so a long-lived resident process cannot grow
+        // without limit; repeated keys move to the back.
+        if let Some(key) = image_key {
+            let mut keys = self.recent_image_keys.borrow_mut();
+            if let Some(position) = keys.iter().position(|seen| *seen == key) {
+                keys.remove(position);
+            }
+            keys.push_back(key);
+            while keys.len() > RECENT_IMAGE_KEYS {
+                keys.pop_front();
+            }
+        }
+
+        self.head_forward(&hidden.reshape(&[tokens, width])?, &ids, &encoded.questions)
     }
 
-    /// Chunked backbone with a Tier-1 prefix cache: on a miss the constant
-    /// system/chat prefix (everything up to the first image placeholder) is
-    /// run once, its per-layer gated-delta/attention/conv state is retained,
-    /// and the remaining tokens continue from that state; on a hit the prefix
+    /// Chunked backbone with a prefix cache. Tier-1 (`tier2 = false`) ends at
+    /// the first image placeholder and ignores image identity on a hit; Tier-2
+    /// (`tier2 = true`) ends after the media block and requires the prepared
+    /// image key. On a miss the prefix is filled and its per-layer gated-delta
+    /// state, conv history and attention KV are retained; on a hit the prefix
     /// chunk is skipped entirely. The two chunk outputs are concatenated so
-    /// `head_forward` still sees one `[tokens, width]` hidden with the
-    /// original absolute indexing.
+    /// `head_forward` still sees one `[tokens, width]` hidden with the original
+    /// absolute indexing.
     fn backbone_cached(
         &self,
+        cache_slot: &RefCell<Option<PrefixCache>>,
         embeds: &Array,
         positions: &Array,
         tokens: usize,
         prefix_end: usize,
+        image_key: Option<&[u8; 32]>,
+        hit_cache: Option<PrefixCache>,
+        tier2: bool,
     ) -> Result<Array> {
         let width = embeds.shape()[2];
-        // Keep both chunks rank 3: the mixers shape their intermediates from
-        // `[1, tokens, ...]`, and `prefix_hidden` is the same rank so the two
-        // chunk outputs concat on the token axis before `head_forward` flattens.
-        let prefix = embeds.slice_axis(1, 0, prefix_end)?;
-        let cached = self.prefix_cache.borrow().clone();
-        let hit = matches!(
-            &cached,
-            Some(cache)
-                if cache.prefix_tokens == prefix_end
-                    && cache.hash == prefix_hash(&self.prefix_ids(prefix_end))
-        );
-        // `chunk0` = the constant system/chat prefix: on a hit it is skipped
-        // entirely (zero duration, the Q23 saving), on a miss it is the 32-layer
-        // fill. `chunk1` = the dynamic rest, which always runs.
+        let hit_image_key = tier2.then_some(image_key).flatten();
+        let cached = hit_cache.or_else(|| {
+            cached_prefix(
+                cache_slot,
+                prefix_end,
+                &self.prefix_ids(prefix_end),
+                hit_image_key,
+            )
+        });
+        let hit = cached.is_some();
+        // `chunk0` = the cached prefix: on a hit it is skipped entirely (the
+        // Tier-1/Tier-2 saving), on a miss it is the 32-layer fill. `chunk1`
+        // = the dynamic rest, which always runs.
         let chunk0_start = std::time::Instant::now();
         let cache = match cached {
-            Some(cache)
-                if cache.prefix_tokens == prefix_end
-                    && cache.hash == prefix_hash(&self.prefix_ids(prefix_end)) =>
-            {
-                cache
+            Some(cache) => cache,
+            None => {
+                // Keep both chunks rank 3: the mixers shape their
+                // intermediates from `[1, tokens, ...]`, and `prefix_hidden`
+                // is the same rank so the two chunk outputs concat on the
+                // token axis before `head_forward` flattens.
+                let prefix = embeds.slice_axis(1, 0, prefix_end)?;
+                self.fill_prefix_cache(cache_slot, &prefix, positions, prefix_end, image_key)?
             }
-            _ => self.fill_prefix_cache(&prefix, positions, prefix_end)?,
         };
         if let Some(ts0) = super::trace_json::to_us(chunk0_start) {
             super::trace_json::record(
@@ -699,7 +855,12 @@ impl Network {
                 "prefix",
                 ts0,
                 chunk0_start.elapsed().as_secs_f64() * 1_000_000.0,
-                serde_json::json!({"cache_hit": hit, "prefix_tokens": prefix_end}),
+                serde_json::json!({
+                    "cache_hit": hit,
+                    "prefix_tokens": prefix_end,
+                    "tier2": tier2,
+                    "vision_skipped": tier2 && hit,
+                }),
             );
         }
         let rest = embeds.slice_axis(1, prefix_end, tokens)?;
@@ -718,6 +879,8 @@ impl Network {
                     "cache_hit": hit,
                     "prefix_tokens": prefix_end,
                     "rest_tokens": tokens - prefix_end,
+                    "tier2": tier2,
+                    "vision_skipped": tier2 && hit,
                 }),
             );
         }
@@ -734,14 +897,17 @@ impl Network {
             .unwrap_or_default()
     }
 
-    /// Run the constant prefix through the backbone once, capturing every
+    /// Run the cached prefix through the backbone once, capturing every
     /// layer's recurrence state, conv history and attention KV, plus the
-    /// prefix's final hidden for `head_forward` on later hits.
+    /// prefix's final hidden for `head_forward` on later hits. `image_key` is
+    /// stored even for Tier-1 fills; Tier-1 simply does not compare it.
     fn fill_prefix_cache(
         &self,
+        cache_slot: &RefCell<Option<PrefixCache>>,
         prefix: &Array,
         positions: &Array,
         prefix_end: usize,
+        image_key: Option<&[u8; 32]>,
     ) -> Result<PrefixCache> {
         let prefix_positions = positions.slice_axis(2, 0, prefix_end)?;
         let mut layers = Vec::with_capacity(self.backbone.layers.len());
@@ -780,22 +946,15 @@ impl Network {
                 Mixer::Attention(a) => {
                     let mut keys = None;
                     let mut values = None;
-                    let r = self.attention(
-                        &x,
-                        a,
-                        &prefix_positions,
-                        prefix_end,
-                        None,
-                        true,
-                        |a| {
+                    let r =
+                        self.attention(&x, a, &prefix_positions, prefix_end, None, true, |a| {
                             if keys.is_none() {
                                 keys = Some(a.clone());
                             } else {
                                 values = Some(a.clone());
                             }
                             Ok(())
-                        },
-                    )?;
+                        })?;
                     // Attention layers never read `state`/`conv`; these valid
                     // placeholders only satisfy the `CachedLayer` shape.
                     (
@@ -810,7 +969,12 @@ impl Network {
             let h1 = h.add(&r)?;
             let m = self.mlp(&h1.fast_rms_norm(&layer.post_norm, EPS)?, &layer.mlp, index)?;
             h = h1.add(&m)?;
-            layers.push(CachedLayer { state, conv, keys, values });
+            layers.push(CachedLayer {
+                state,
+                conv,
+                keys,
+                values,
+            });
             if let Some(ts0) = super::trace_json::to_us(layer_start) {
                 super::trace_json::record(
                     "layer",
@@ -832,11 +996,12 @@ impl Network {
         let prefix_ids = self.last_prefix_ids.borrow().clone().unwrap_or_default();
         let cache = PrefixCache {
             prefix_tokens: prefix_end,
-            hash: prefix_hash(&prefix_ids[..prefix_end.min(prefix_ids.len())]),
+            prompt_hash: prefix_hash(&prefix_ids[..prefix_end.min(prefix_ids.len())]),
+            image_key: image_key.copied().unwrap_or([0; 32]),
             prefix_hidden,
             layers,
         };
-        *self.prefix_cache.borrow_mut() = Some(cache.clone());
+        *cache_slot.borrow_mut() = Some(cache.clone());
         Ok(cache)
     }
 
@@ -848,12 +1013,7 @@ impl Network {
     }
 
     /// Replace image placeholder rows with vision features, in prompt order.
-    fn splice_vision(
-        &self,
-        input_ids: &[u32],
-        hidden: &Array,
-        features: &Array,
-    ) -> Result<Array> {
+    fn splice_vision(&self, input_ids: &[u32], hidden: &Array, features: &Array) -> Result<Array> {
         let tokens = hidden.shape()[0];
         let width = hidden.shape()[1];
         let rows = features.shape()[0];
@@ -880,7 +1040,10 @@ impl Network {
             )));
         }
         let combined = Array::concat(
-            &[&hidden.reshape(&[1, tokens, width])?, &features.reshape(&[1, rows, width])?],
+            &[
+                &hidden.reshape(&[1, tokens, width])?,
+                &features.reshape(&[1, rows, width])?,
+            ],
             1,
         )?;
         let index = Array::from_i32(&self.stream, &[tokens], &index)?;
@@ -1055,7 +1218,11 @@ impl Network {
             publish(&mixed.slice_axis(1, tokens - keep, tokens)?)?;
         }
         let conv = match &self.gpu {
-            Some(c) => silu(&c.conv.call_with_history(&mixed, &g.conv, cached.map(|c| &c.conv))?)?,
+            Some(c) => silu(&c.conv.call_with_history(
+                &mixed,
+                &g.conv,
+                cached.map(|c| &c.conv),
+            )?)?,
             None => {
                 let state = match cached {
                     Some(c) => c.conv.clone(),
@@ -1533,7 +1700,11 @@ mod tests {
             assert_eq!(new, old, "tokens={tokens}");
             // The outstanding GPU share must still be evaluable afterwards;
             // BF16 (`h.mul` preserves the dtype) is 2 bytes per element.
-            assert_eq!(gpu.to_bytes()?.len(), tokens * hidden * 2, "tokens={tokens}");
+            assert_eq!(
+                gpu.to_bytes()?.len(),
+                tokens * hidden * 2,
+                "tokens={tokens}"
+            );
         }
         Ok(())
     }
@@ -1569,6 +1740,81 @@ mod tests {
         }
     }
 
+    /// Tier-2 follows `TIER2_DEFAULT_ON`. After KEEP that const is true, so the
+    /// gate mirrors Tier-1 (unset/lookalikes on, explicit `0` off). The same
+    /// test also covers the OFF spelling if the const is reverted.
+    #[test]
+    fn tier2_prefix_cache_env_gate_follows_the_configured_default() {
+        assert_eq!(
+            tier2_prefix_cache_flag(None),
+            TIER2_DEFAULT_ON,
+            "unset must follow the current default"
+        );
+        if TIER2_DEFAULT_ON {
+            assert!(!tier2_prefix_cache_flag(Some("0".to_owned())));
+            for on in ["", "1", "true", "yes", "2", "1 ", "01", "fill"] {
+                assert!(tier2_prefix_cache_flag(Some(on.to_owned())), "{on:?}");
+            }
+        } else {
+            assert!(tier2_prefix_cache_flag(Some("1".to_owned())));
+            for off in ["", "0", "true", "yes", "2", "1 ", "01", "fill"] {
+                assert!(!tier2_prefix_cache_flag(Some(off.to_owned())), "{off:?}");
+            }
+        }
+    }
+
+    /// The cache match is the correctness boundary for both tiers: Tier-1
+    /// ignores image identity, Tier-2 requires it, and both require the exact
+    /// prefix length and prompt hash.
+    #[test]
+    fn prefix_cache_match_requires_boundary_hash_and_optional_image_key() -> Result<()> {
+        let stream = Stream::cpu()?;
+        let ids = [1u32, 2, 3, 4, 5];
+        let image_key = [7u8; 32];
+        let cache = PrefixCache {
+            prefix_tokens: ids.len(),
+            prompt_hash: prefix_hash(&ids),
+            image_key,
+            prefix_hidden: Array::zeros(&stream, &[1, ids.len(), 4], MlxDType::BF16)?,
+            layers: Vec::new(),
+        };
+        // Tier-2: image identity participates.
+        assert!(prefix_cache_matches(
+            &cache,
+            ids.len(),
+            &ids,
+            Some(&image_key)
+        ));
+        // Tier-1: image identity is deliberately not checked.
+        assert!(prefix_cache_matches(&cache, ids.len(), &ids, None));
+        assert!(!prefix_cache_matches(
+            &cache,
+            ids.len() - 1,
+            &ids,
+            Some(&image_key)
+        ));
+        assert!(!prefix_cache_matches(
+            &cache,
+            ids.len(),
+            &[1, 2, 3, 4, 6],
+            Some(&image_key)
+        ));
+        let other_key = [8u8; 32];
+        assert!(!prefix_cache_matches(
+            &cache,
+            ids.len(),
+            &ids,
+            Some(&other_key)
+        ));
+        assert!(!prefix_cache_matches(
+            &cache,
+            ids.len(),
+            &ids[..3],
+            Some(&image_key)
+        ));
+        Ok(())
+    }
+
     /// The full MLP call (column-split branch) is bit-identical before and
     /// after W1: the new issue order against a replay of the previous
     /// (`tiles` read before the GPU share is queued) order, same `Network`,
@@ -1581,9 +1827,7 @@ mod tests {
     fn w1_column_split_mlp_is_bit_equal() -> Result<()> {
         use super::super::ane::AneMlp;
         let var = |name: &str| {
-            std::path::PathBuf::from(
-                std::env::var(name).unwrap_or_else(|_| panic!("set {name}")),
-            )
+            std::path::PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("set {name}")))
         };
         let checkpoint = var("APXINF_CLEF_CHECKPOINT");
         let read = |name: &str| {
@@ -1608,8 +1852,7 @@ mod tests {
         let values = (0..tokens * hidden)
             .map(|index| (index % 251) as f32 / 16.0)
             .collect::<Vec<_>>();
-        let h = Array::from_f32(&stream, &[1, tokens, hidden], &values)?
-            .cast(MlxDType::BF16)?;
+        let h = Array::from_f32(&stream, &[1, tokens, hidden], &values)?.cast(MlxDType::BF16)?;
         let m = &net.backbone.layers[0].mlp;
         // W1 order, as `mlp` now runs it.
         let new = net.mlp(&h, m, 0)?.to_bytes()?;

@@ -34,6 +34,10 @@ pub struct EncodedQuestion {
 pub struct Encoded {
     pub input_ids: Vec<u32>,
     pub questions: Vec<EncodedQuestion>,
+    /// Token index just after the media block (`image end marker` + trailing
+    /// newline) for an image request; `None` for a text-only request. Tier-2
+    /// uses this boundary to cache the image-row prefix.
+    pub media_end: Option<usize>,
 }
 
 fn invalid(message: String) -> Error {
@@ -267,6 +271,8 @@ pub fn encode(tokenizer: &Tokenizer, schema: &DecisionSchema) -> Result<Encoded>
 /// `<|vision_start|>` + `<|image_pad|>` per merged row + `<|vision_end|>`, the
 /// block is appended after `STATE:\n` and followed by one newline, before the
 /// state text. `image_token_id` (0 for text-only requests) validates the count.
+/// The returned [`Encoded::media_end`] is the token index just after that
+/// media block, or `None` when no images were supplied.
 pub fn encode_with_images(
     tokenizer: &Tokenizer,
     schema: &DecisionSchema,
@@ -323,6 +329,11 @@ pub fn encode_with_images(
         "<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\nSTATE:\n"
     ))?;
     prefix.extend(media_ids(tokenizer, grids, image_token_id)?);
+    // The media block is contiguous at the end of `prefix`: one image start
+    // marker, `rows` image placeholders, one image end marker per image, and
+    // one trailing newline. Recording the boundary here keeps Tier-2 from
+    // re-scanning device-visible ids later.
+    let media_end = (!grids.is_empty()).then_some(prefix.len());
     let suffix = tokens(
         "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:",
     )?;
@@ -347,6 +358,7 @@ pub fn encode_with_images(
     Ok(Encoded {
         input_ids,
         questions,
+        media_end,
     })
 }
 
