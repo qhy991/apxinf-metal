@@ -3,9 +3,13 @@ name = "apxinf-tokenizer"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["training-tools"]
+training-tools = ["tokenizers/progressbar", "tokenizers/esaxx_fast"]
+
 [dependencies]
 apxinf-core = { path = "../apxinf-core" }
-tokenizers = "0.20"
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 minijinja = "2"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 serde = { version = "1", features = ["derive"] }

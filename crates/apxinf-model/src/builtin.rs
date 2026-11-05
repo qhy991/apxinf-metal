@@ -1,30 +1,63 @@
 //! Built-in model registrations used by [`crate::AutoModel`].
 
+#[cfg(feature = "model-llama")]
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+#[cfg(any(
+    feature = "model-llama",
+    feature = "model-qwen35",
+    feature = "model-qwen3vl"
+))]
+use std::{path::Path, sync::Arc};
 
-use apxinf_core::{Backend, DType, Device, Error, Result, Tensor};
+#[cfg(any(
+    feature = "model-llama",
+    feature = "model-qwen35",
+    feature = "model-qwen3vl"
+))]
+use apxinf_core::{Backend, Device, Error, Result};
+#[cfg(feature = "model-llama")]
+use apxinf_core::{DType, Tensor};
 
+#[cfg(any(
+    feature = "model-llama",
+    feature = "model-qwen35",
+    feature = "model-qwen3vl"
+))]
 use crate::auto::{LoadOptions, LoadedModel};
+#[cfg(feature = "model-llama")]
 use crate::llama::{GeneralLlama, LlamaWeights};
+#[cfg(feature = "model-qwen35")]
 use crate::qwen35::{GeneralQwen35, Qwen35Config};
+#[cfg(feature = "model-qwen3vl")]
 use crate::qwen3vl::{GeneralQwen3VL, Qwen3VLConfig};
+#[cfg(any(
+    feature = "model-llama",
+    feature = "model-qwen35",
+    feature = "model-qwen3vl"
+))]
 use crate::registry;
 
 /// Register every implementation shipped in this crate. Re-registering is
 /// harmless and keeps `AutoModel::load_model` self-contained for users.
 pub fn register_builtin_models() {
+    #[cfg(feature = "model-llama")]
     registry::register("llama", load_llama);
-    registry::register("qwen3_vl", load_qwen3vl);
-    registry::register("qwen3vl", load_qwen3vl);
-    registry::register("qwen3_5", load_qwen35);
-    registry::register("qwen35", load_qwen35);
+    #[cfg(feature = "model-qwen3vl")]
+    {
+        registry::register("qwen3_vl", load_qwen3vl);
+        registry::register("qwen3vl", load_qwen3vl);
+    }
+    #[cfg(feature = "model-qwen35")]
+    {
+        registry::register("qwen3_5", load_qwen35);
+        registry::register("qwen35", load_qwen35);
+    }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "model-pi05", feature = "cuda"))]
     crate::pi05::register_builtin();
 }
 
+#[cfg(feature = "model-qwen35")]
 fn load_qwen35(
     path: &Path,
     device: Device,
@@ -59,6 +92,7 @@ fn load_qwen35(
     Ok(LoadedModel::Text(Box::new(model)))
 }
 
+#[cfg(feature = "model-llama")]
 fn load_llama(
     path: &Path,
     device: Device,
@@ -85,6 +119,7 @@ fn load_llama(
     )?)))
 }
 
+#[cfg(feature = "model-qwen3vl")]
 fn load_qwen3vl(
     path: &Path,
     _device: Device,
@@ -104,6 +139,7 @@ fn load_qwen3vl(
     Ok(LoadedModel::Text(Box::new(model)))
 }
 
+#[cfg(any(feature = "model-llama", feature = "model-qwen3vl"))]
 fn reject_qwen35_metal_options(options: &LoadOptions, model_family: &str) -> Result<()> {
     if options.metal_w8_lm_head || options.metal_w8_mlp_block {
         return Err(Error::Other(format!(
@@ -113,6 +149,7 @@ fn reject_qwen35_metal_options(options: &LoadOptions, model_family: &str) -> Res
     Ok(())
 }
 
+#[cfg(feature = "model-llama")]
 fn upcast_bf16_weights(tensors: &mut HashMap<String, Tensor>) -> Result<()> {
     for tensor in tensors.values_mut() {
         if tensor.dtype() != DType::BF16 {

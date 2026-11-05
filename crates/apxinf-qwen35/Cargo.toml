@@ -1,0 +1,29 @@
+[package]
+name = "apxinf-qwen35"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "apxinf-qwen35-08b"
+path = "src/main.rs"
+
+[features]
+default = []
+# Retain the general build scope for a comparison through the same entry point.
+general-reference = [
+    "apxinf-model/model-registry",
+    "apxinf-model/model-llama",
+    "apxinf-model/model-qwen3vl",
+    "apxinf-model/model-pi05",
+    "apxinf-model/metal-w8",
+    "apxinf-loader/gguf",
+    "apxinf-tokenizer/training-tools",
+]
+
+[dependencies]
+apxinf-core = { path = "../apxinf-core", features = ["accelerate"] }
+apxinf-loader = { path = "../apxinf-loader", default-features = false, features = ["safetensors"] }
+apxinf-model = { path = "../apxinf-model", default-features = false, features = ["model-qwen35", "accelerate", "metal-w8-head-mlp"] }
+apxinf-tokenizer = { path = "../apxinf-tokenizer", default-features = false }
+serde_json = "1"
+sha2 = "=0.10.9"

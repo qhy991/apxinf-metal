@@ -33,6 +33,7 @@ struct ApxinfMetalW8Handle {
     KernelParams params;
 };
 
+#ifdef APXINF_METAL_EXPERIMENTS
 struct ApxinfMetalW8MatVecHandle {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
@@ -43,9 +44,12 @@ struct ApxinfMetalW8MatVecHandle {
     id<MTLBuffer> output;
     KernelParams params;
 };
+#endif
 
 #include "metal_w8_source.inc"
+#ifdef APXINF_METAL_EXPERIMENTS
 #include "metal_w8_matvec_source.inc"
+#endif
 
 void write_error(char *output, size_t capacity, const char *message) {
     if (output == nullptr || capacity == 0) {
@@ -213,6 +217,7 @@ extern "C" void apxinf_metal_w8_destroy(void *opaque_handle) {
     delete handle;
 }
 
+#ifdef APXINF_METAL_EXPERIMENTS
 extern "C" int apxinf_metal_w8_matvec_create(
     const int8_t *weights, const float *scales, uint32_t rows, uint32_t columns,
     uint32_t group_size, void **output, char *error_output, size_t error_capacity) {
@@ -328,3 +333,4 @@ extern "C" void apxinf_metal_w8_matvec_destroy(void *opaque_handle) {
     auto handle = static_cast<ApxinfMetalW8MatVecHandle *>(opaque_handle);
     delete handle;
 }
+#endif

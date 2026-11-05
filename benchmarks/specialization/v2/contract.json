@@ -1,0 +1,46 @@
+{
+  "schema": "apxinf-specialization-stage2-v1",
+  "target": "Qwen/Qwen3.5-0.8B",
+  "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "profile": "qwen35-0.8b-f32-metal-w8-head-mlp-v1",
+  "asset_reference": ".apxinf/experiments/model-specialization-20261010/inputs.json",
+  "hardware": "Apple M4, 10 GPU cores, 16 GiB unified memory",
+  "precision": "Existing CPU/Accelerate F32 body and Metal W8 head plus all 24 MLP blocks",
+  "generation": "Existing greedy generation and chat tokenizer EOS 248046, matching the general CLI. Fresh state for each request.",
+  "max_context": 2048,
+  "batch": 1,
+  "concurrency": 1,
+  "build_order": ["full", "reference", "minimal", "minimal", "reference", "full"],
+  "runtime_order": ["reference", "minimal", "minimal", "reference"],
+  "variants": {
+    "full": "Existing general ApxInf CLI with all model families and legacy metal-w8",
+    "reference": "Dedicated entry with general-reference feature restoring the general compilation scope",
+    "minimal": "Identical dedicated entry with only its required model, Metal, loader and tokenizer features"
+  },
+  "build": {
+    "profile": "Cargo release defaults with identical compiler environment",
+    "jobs": 4,
+    "cache": "New target directory for each clean build, existing dependency download cache, uncontrolled filesystem cache",
+    "rebuild": "No-change rebuild, then comment-only edit to each variant's entry source and rebuild",
+    "network": "Offline, locked after registering the new first-party package"
+  },
+  "runtime": {
+    "warmup_rounds": 2,
+    "measured_rounds": 3,
+    "case_order": "Repeat the ordered corpus each round to exercise request-state reset",
+    "cold_cli": "Run the actual general CLI once per case to establish output parity",
+    "startup": "Each resident process verifies assets, loads tokenizer and constructs model before its ready record",
+    "request_ms": "Reset through generation return, excluding prompt preparation, text decoding and serialization",
+    "ttft_ms": "Request start through first token callback, not first visible text",
+    "decode_ms": "First token callback through generation return",
+    "complete_process": "Parent launch through process exit, including all requests and input/output handling",
+    "output": "JSON and JSONL only for timing; plain streaming gets a separate correctness check"
+  },
+  "acceptance": {
+    "correctness": "Exact prompt and output token equality between dedicated build selections. General CLI comparison checks prompt token counts and exact output tokens. Require every case, the complete sample grid and the declared execution path.",
+    "source_pruning": "Model dependency files, tokenizer features, native objects and symbols must establish the minimal compilation scope",
+    "performance": "Diagnostic observations only. No formal campaign qualification or stable-speedup claim.",
+    "memory": "Record swap and thermal state around each process. Active swap makes latency attribution inconclusive.",
+    "limits": "Two processes per resident variant. No universal minimum-size or maximum-speed claim. Upstream tokenizer Rust code without feature controls remains."
+  }
+}

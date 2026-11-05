@@ -1,215 +1,106 @@
-fn main() {
-    println!("cargo:rerun-if-changed=src/metal_w8_bridge.mm");
-    println!("cargo:rerun-if-changed=src/metal_w8_mlp_bridge.mm");
-    println!("cargo:rerun-if-changed=src/metal_w8_gdn_bridge.mm");
-    println!("cargo:rerun-if-changed=src/metal_w8_linear_layer_bridge.mm");
-    println!("cargo:rerun-if-changed=src/metal_w8_linear_layer_stack3_bridge.mm");
-    println!("cargo:rerun-if-changed=src/metal_w8_mlp_stack3_boundary_v1_bridge.mm");
-    println!("cargo:rerun-if-changed=src/metal_w8_tail_mlp_head_v1_bridge.mm");
-    println!("cargo:rerun-if-changed=src/metal_gdn_recurrent_count18_profile_v1_bridge.mm");
-    println!("cargo:rerun-if-changed=src/metal_gdn_core_fused_count18_profile_v1_bridge.mm");
-    println!("cargo:rerun-if-changed=src/metal_full_attention_decode_v1_bridge.mm");
-    println!("cargo:rerun-if-changed=src/metal_w8.metal");
-    println!("cargo:rerun-if-changed=src/metal_w8_matvec.metal");
-    println!("cargo:rerun-if-changed=src/metal_w8_mlp.metal");
-    println!("cargo:rerun-if-changed=src/metal_w8_gdn.metal");
-    println!("cargo:rerun-if-changed=src/metal_w8_gdn_out_g32.metal");
-    println!("cargo:rerun-if-changed=src/metal_w8_linear_layer.metal");
-    println!("cargo:rerun-if-changed=src/metal_full_attention_decode_v1.metal");
+use std::path::Path;
 
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+fn read_shader(name: &str) -> String {
+    let path = format!("src/{name}.metal");
+    println!("cargo:rerun-if-changed={path}");
+    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"))
+}
+
+fn embed_shader(output_dir: &Path, name: &str, symbol: &str, source: &str) {
+    const DELIMITER: &str = "APX_METAL";
+    assert!(
+        !source.contains(&format!("){DELIMITER}\"")),
+        "Metal shader contains the C++ raw-string delimiter"
+    );
+    std::fs::write(
+        output_dir.join(format!("{name}_source.inc")),
+        format!("constexpr const char *{symbol} = R\"{DELIMITER}({source}){DELIMITER}\";\n"),
+    )
+    .expect("write the embedded Metal shader include");
+}
+
+fn compile_bridge(output_dir: &Path, name: &str, experiments: bool) {
+    let path = format!("src/{name}_bridge.mm");
+    println!("cargo:rerun-if-changed={path}");
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .file(path)
+        .include(output_dir)
+        .flag("-std=c++17")
+        .flag("-fobjc-arc")
+        .flag("-fblocks");
+    if experiments {
+        build.define("APXINF_METAL_EXPERIMENTS", None);
+    }
+    build.compile(&format!("apxinf_{name}_bridge"));
+}
+
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
+        || std::env::var_os("CARGO_FEATURE_W8_HEAD_MLP").is_none()
+    {
         return;
     }
 
-    let shader =
-        std::fs::read_to_string("src/metal_w8.metal").expect("read the Metal W8 shader source");
-    const DELIMITER: &str = "APX_METAL";
-    assert!(
-        !shader.contains(&format!("){}\"", DELIMITER)),
-        "Metal shader contains the generated C++ raw-string delimiter"
-    );
     let output_dir =
         std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"));
-    std::fs::write(
-        output_dir.join("metal_w8_source.inc"),
-        format!("constexpr const char *kMetalSource = R\"{DELIMITER}({shader}){DELIMITER}\";\n"),
-    )
-    .expect("write the generated Metal shader include");
+    let experiments = std::env::var_os("CARGO_FEATURE_EXPERIMENTS").is_some();
+    let head = read_shader("metal_w8");
+    let mlp = read_shader("metal_w8_mlp");
+    embed_shader(&output_dir, "metal_w8", "kMetalSource", &head);
+    embed_shader(&output_dir, "metal_w8_mlp", "kMetalMlpSource", &mlp);
 
-    let matvec_shader = std::fs::read_to_string("src/metal_w8_matvec.metal")
-        .expect("read the Metal W8 matvec shader source");
-    assert!(
-        !matvec_shader.contains(&format!("){}\"", DELIMITER)),
-        "Metal matvec shader contains the generated C++ raw-string delimiter"
-    );
-    std::fs::write(
-        output_dir.join("metal_w8_matvec_source.inc"),
-        format!(
-            "constexpr const char *kMetalMatVecSource = R\"{DELIMITER}({matvec_shader}){DELIMITER}\";\n"
-        ),
-    )
-    .expect("write the generated Metal matvec shader include");
+    if experiments {
+        let matvec = read_shader("metal_w8_matvec");
+        let gdn = read_shader("metal_w8_gdn");
+        let linear = read_shader("metal_w8_linear_layer");
+        let gdn_out_g32 = read_shader("metal_w8_gdn_out_g32");
+        let full_attention = read_shader("metal_full_attention_decode_v1");
+        embed_shader(
+            &output_dir,
+            "metal_w8_matvec",
+            "kMetalMatVecSource",
+            &matvec,
+        );
+        embed_shader(&output_dir, "metal_w8_gdn", "kMetalGdnSource", &gdn);
+        embed_shader(
+            &output_dir,
+            "metal_w8_linear_layer",
+            "kMetalLinearLayerSource",
+            &format!("{gdn}\n{mlp}\n{linear}\n{gdn_out_g32}"),
+        );
+        embed_shader(
+            &output_dir,
+            "metal_w8_tail_mlp_head_v1",
+            "kMetalTailMlpHeadSourceV1",
+            &format!("{mlp}\n{linear}\n{head}"),
+        );
+        embed_shader(
+            &output_dir,
+            "metal_full_attention_decode_v1",
+            "kMetalFullAttentionDecodeSourceV1",
+            &full_attention,
+        );
+    }
 
-    let mlp_shader = std::fs::read_to_string("src/metal_w8_mlp.metal")
-        .expect("read the Metal W8 MLP shader source");
-    assert!(
-        !mlp_shader.contains(&format!("){}\"", DELIMITER)),
-        "Metal MLP shader contains the generated C++ raw-string delimiter"
-    );
-    std::fs::write(
-        output_dir.join("metal_w8_mlp_source.inc"),
-        format!(
-            "constexpr const char *kMetalMlpSource = R\"{DELIMITER}({mlp_shader}){DELIMITER}\";\n"
-        ),
-    )
-    .expect("write the generated Metal MLP shader include");
-
-    let gdn_shader = std::fs::read_to_string("src/metal_w8_gdn.metal")
-        .expect("read the Metal W8 GDN shader source");
-    assert!(
-        !gdn_shader.contains(&format!("){}\"", DELIMITER)),
-        "Metal GDN shader contains the generated C++ raw-string delimiter"
-    );
-    std::fs::write(
-        output_dir.join("metal_w8_gdn_source.inc"),
-        format!(
-            "constexpr const char *kMetalGdnSource = R\"{DELIMITER}({gdn_shader}){DELIMITER}\";\n"
-        ),
-    )
-    .expect("write the generated Metal GDN shader include");
-
-    let linear_layer_shader = std::fs::read_to_string("src/metal_w8_linear_layer.metal")
-        .expect("read the Metal W8 linear-layer shader source");
-    let gdn_out_g32_shader = std::fs::read_to_string("src/metal_w8_gdn_out_g32.metal")
-        .expect("read the Metal W8 GDN-output-G32 shader source");
-    assert!(
-        !linear_layer_shader.contains(&format!("){}\"", DELIMITER)),
-        "Metal linear-layer shader contains the generated C++ raw-string delimiter"
-    );
-    let combined_linear_layer_shader =
-        format!("{gdn_shader}\n{mlp_shader}\n{linear_layer_shader}\n{gdn_out_g32_shader}");
-    std::fs::write(
-        output_dir.join("metal_w8_linear_layer_source.inc"),
-        format!(
-            "constexpr const char *kMetalLinearLayerSource = R\"{DELIMITER}({combined_linear_layer_shader}){DELIMITER}\";\n"
-        ),
-    )
-    .expect("write the generated Metal linear-layer shader include");
-
-    // Tail v1 composes the existing RMS/residual, MLP, and top-4 kernels in
-    // one library. The kernel files above remain the only shader source.
-    let combined_tail_mlp_head_shader = format!("{mlp_shader}\n{linear_layer_shader}\n{shader}");
-    std::fs::write(
-        output_dir.join("metal_w8_tail_mlp_head_v1_source.inc"),
-        format!(
-            "constexpr const char *kMetalTailMlpHeadSourceV1 = R\"{DELIMITER}({combined_tail_mlp_head_shader}){DELIMITER}\";\n"
-        ),
-    )
-    .expect("write the generated Metal tail MLP+head v1 shader include");
-
-    let full_attention_shader = std::fs::read_to_string("src/metal_full_attention_decode_v1.metal")
-        .expect("read the Metal full-attention decode v1 shader source");
-    assert!(
-        !full_attention_shader.contains(&format!("){}\"", DELIMITER)),
-        "Metal full-attention decode v1 shader contains the generated C++ raw-string delimiter"
-    );
-    std::fs::write(
-        output_dir.join("metal_full_attention_decode_v1_source.inc"),
-        format!(
-            "constexpr const char *kMetalFullAttentionDecodeSourceV1 = R\"{DELIMITER}({full_attention_shader}){DELIMITER}\";\n"
-        ),
-    )
-    .expect("write the generated Metal full-attention decode v1 shader include");
-
-    cc::Build::new()
-        .cpp(true)
-        .file("src/metal_w8_bridge.mm")
-        .include(&output_dir)
-        .flag("-std=c++17")
-        .flag("-fobjc-arc")
-        .flag("-fblocks")
-        .compile("apxinf_metal_w8_bridge");
-
-    cc::Build::new()
-        .cpp(true)
-        .file("src/metal_w8_mlp_bridge.mm")
-        .include(&output_dir)
-        .flag("-std=c++17")
-        .flag("-fobjc-arc")
-        .flag("-fblocks")
-        .compile("apxinf_metal_w8_mlp_bridge");
-
-    cc::Build::new()
-        .cpp(true)
-        .file("src/metal_w8_gdn_bridge.mm")
-        .include(&output_dir)
-        .flag("-std=c++17")
-        .flag("-fobjc-arc")
-        .flag("-fblocks")
-        .compile("apxinf_metal_w8_gdn_bridge");
-
-    cc::Build::new()
-        .cpp(true)
-        .file("src/metal_w8_linear_layer_bridge.mm")
-        .include(&output_dir)
-        .flag("-std=c++17")
-        .flag("-fobjc-arc")
-        .flag("-fblocks")
-        .compile("apxinf_metal_w8_linear_layer_bridge");
-
-    cc::Build::new()
-        .cpp(true)
-        .file("src/metal_w8_linear_layer_stack3_bridge.mm")
-        .include(&output_dir)
-        .flag("-std=c++17")
-        .flag("-fobjc-arc")
-        .flag("-fblocks")
-        .compile("apxinf_metal_w8_linear_layer_stack3_bridge");
-
-    cc::Build::new()
-        .cpp(true)
-        .file("src/metal_w8_mlp_stack3_boundary_v1_bridge.mm")
-        .include(&output_dir)
-        .flag("-std=c++17")
-        .flag("-fobjc-arc")
-        .flag("-fblocks")
-        .compile("apxinf_metal_w8_mlp_stack3_boundary_v1_bridge");
-
-    cc::Build::new()
-        .cpp(true)
-        .file("src/metal_w8_tail_mlp_head_v1_bridge.mm")
-        .include(&output_dir)
-        .flag("-std=c++17")
-        .flag("-fobjc-arc")
-        .flag("-fblocks")
-        .compile("apxinf_metal_w8_tail_mlp_head_v1_bridge");
-
-    cc::Build::new()
-        .cpp(true)
-        .file("src/metal_gdn_recurrent_count18_profile_v1_bridge.mm")
-        .include(&output_dir)
-        .flag("-std=c++17")
-        .flag("-fobjc-arc")
-        .flag("-fblocks")
-        .compile("apxinf_metal_gdn_recurrent_count18_profile_v1_bridge");
-
-    cc::Build::new()
-        .cpp(true)
-        .file("src/metal_gdn_core_fused_count18_profile_v1_bridge.mm")
-        .include(&output_dir)
-        .flag("-std=c++17")
-        .flag("-fobjc-arc")
-        .flag("-fblocks")
-        .compile("apxinf_metal_gdn_core_fused_count18_profile_v1_bridge");
-
-    cc::Build::new()
-        .cpp(true)
-        .file("src/metal_full_attention_decode_v1_bridge.mm")
-        .include(&output_dir)
-        .flag("-std=c++17")
-        .flag("-fobjc-arc")
-        .flag("-fblocks")
-        .compile("apxinf_metal_full_attention_decode_v1_bridge");
+    compile_bridge(&output_dir, "metal_w8", experiments);
+    compile_bridge(&output_dir, "metal_w8_mlp", experiments);
+    if experiments {
+        for bridge in [
+            "metal_w8_gdn",
+            "metal_w8_linear_layer",
+            "metal_w8_linear_layer_stack3",
+            "metal_w8_mlp_stack3_boundary_v1",
+            "metal_w8_tail_mlp_head_v1",
+            "metal_gdn_recurrent_count18_profile_v1",
+            "metal_gdn_core_fused_count18_profile_v1",
+            "metal_full_attention_decode_v1",
+        ] {
+            compile_bridge(&output_dir, bridge, experiments);
+        }
+    }
 
     println!("cargo:rustc-link-lib=framework=Foundation");
     println!("cargo:rustc-link-lib=framework=Metal");

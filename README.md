@@ -81,6 +81,21 @@ tiers with body-level numerical drift, not parity claims.
 The exact model revision, oracle, measurements, and limitations are documented
 in [the Qwen3.5 macOS bring-up](doc/20260823-qwen35-macos-bringup/README.md).
 
+## Local HTTP serving on macOS
+
+The separate `apxinf-serve` binary exposes local text generation through
+Anthropic Messages and OpenAI Chat Completions.
+It supports SSE output, client tools, cancellation, a bounded queue, and metrics.
+One MLX worker executes one request at a time.
+
+Read the [startup guide](doc/serving/local-service-v0.1.md) for the pinned
+environment, deployment limits, and supported API fields.
+Read the [validation report](doc/serving/serving-validation-20261009.md) for
+Qwen3.5-2B measurements and actual Claude Code tasks.
+The [system design](doc/serving-system-design-20261009.md) defines the broader
+framework and staged extensions.
+This HTTP profile does not expose images, sessions, prefix reuse, or continuous batching.
+
 ## 1. NVIDIA build environment
 
 Use a Linux host with an NVIDIA driver and a complete CUDA toolkit. The build

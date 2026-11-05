@@ -27,43 +27,43 @@ pub struct GeneralQwen35 {
     weights: RuntimeWeights,
     backend: Arc<dyn Backend>,
     state: Qwen35HybridState,
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     metal_w8_lm_head: Option<apxinf_metal::MetalW8LmHead>,
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     metal_w8_lm_head_stats: Option<Qwen35MetalW8LmHeadStats>,
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     metal_w8_body: Option<Qwen35MetalW8Body>,
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     metal_w8_mlp_blocks: Option<Qwen35MetalW8MlpBlocks>,
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     metal_w8_gdn: Option<Qwen35MetalW8GdnLayer>,
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     metal_w8_linear_layer: Option<Qwen35MetalW8LinearLayer>,
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     metal_w8_all_linear_layers_precision_v2: Option<Qwen35MetalW8AllLinearLayersPrecisionV2>,
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     metal_w8_linear_layer_stacks_v1: Option<Qwen35MetalW8LinearLayerStacksV1>,
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     metal_w8_mlp_stack3_boundary_body_v1: Option<Qwen35MetalW8MlpStack3BoundaryBodyV1>,
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     metal_w8_mlp_stack3_boundary_tail_head_v1: Option<Qwen35MetalW8MlpStack3BoundaryTailHeadV1>,
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     metal_w8_stack3_lm_head_v2_terminal_error: Option<bool>,
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     packed_w8_linear_layer_reference: Option<Qwen35PackedW8LinearLayerReference>,
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fail_after_layer_once_for_test: Option<usize>,
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fail_stack3_lm_head_v2_before_submit_once_for_test: bool,
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fail_mlp_stack3_boundary_final_mlp_after_submit_once_for_test: bool,
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     boundary_tail_head_fault_once_for_test: Option<Qwen35BoundaryTailHeadFaultV1ForTest>,
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fail_boundary_tail_head_rerank_once_for_test: bool,
 }
 
-#[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+#[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
 #[derive(Clone, Copy)]
 enum Qwen35BoundaryTailHeadFaultV1ForTest {
     TailPostExecution,
@@ -74,7 +74,7 @@ enum Qwen35BoundaryTailHeadFaultV1ForTest {
 
 /// Observable receipt for one explicitly selected, decode-only Metal W8 GDN
 /// attention block. One successful decode is one command buffer and one wait.
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8GdnStats {
     pub layer_index: usize,
@@ -87,7 +87,7 @@ pub struct Qwen35MetalW8GdnStats {
     pub block_elapsed_ns: u128,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 struct Qwen35MetalW8GdnLayer {
     layer_index: usize,
     dimensions: apxinf_metal::GdnDimensions,
@@ -100,7 +100,7 @@ struct Qwen35MetalW8GdnLayer {
 
 /// Observable receipt for one explicitly selected complete decode-only Metal
 /// W8 linear-attention layer.
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8LinearLayerStats {
     pub layer_index: usize,
@@ -121,13 +121,13 @@ pub struct Qwen35MetalW8LinearLayerStats {
 
 /// Fixed precision profile supported by the versioned complete-layer Metal
 /// diagnostic. No default or registry path constructs this profile.
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Qwen35MetalW8LinearLayerPrecisionProfile {
     GdnOutG32V2,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8LinearLayerPrecisionProfile {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -142,7 +142,7 @@ impl Qwen35MetalW8LinearLayerPrecisionProfile {
 
 /// Extended receipt exposed only for the versioned precision-v2 lane. The
 /// legacy receipt remains byte-for-byte shape-compatible with its old API.
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8LinearLayerPrecisionV2Stats {
     pub profile: Qwen35MetalW8LinearLayerPrecisionProfile,
@@ -154,7 +154,7 @@ pub struct Qwen35MetalW8LinearLayerPrecisionV2Stats {
 /// Aggregate receipt for the explicit all-linear-layers precision-v2 lane.
 /// Linear-attention layers own their complete GDN+MLP block; only the MLPs of
 /// full-attention layers use the existing standalone Metal W8 MLP block.
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8AllLinearLayersPrecisionV2Stats {
     pub profile: Qwen35MetalW8LinearLayerPrecisionProfile,
@@ -165,21 +165,21 @@ pub struct Qwen35MetalW8AllLinearLayersPrecisionV2Stats {
     pub terminal_error: bool,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8LinearLayerBufferLedger {
     pub layer_index: usize,
     pub ledger: apxinf_metal::LinearLayerBufferLedger,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8MlpBlockBufferLedger {
     pub layer_index: usize,
     pub ledger: apxinf_metal::MlpBlockBufferLedger,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8AllLinearLayersPrecisionV2AggregateLedger {
     pub scope: &'static str,
@@ -200,7 +200,7 @@ pub struct Qwen35MetalW8AllLinearLayersPrecisionV2AggregateLedger {
     pub waits_per_decode: usize,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 struct Qwen35MetalW8LinearLayer {
     layer_index: usize,
     dimensions: apxinf_metal::GdnDimensions,
@@ -215,7 +215,7 @@ struct Qwen35MetalW8LinearLayer {
     fail_next_decode_after_scratch: bool,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 struct Qwen35MetalW8AllLinearLayersPrecisionV2 {
     profile: Qwen35MetalW8LinearLayerPrecisionProfile,
     layers: Vec<Option<Qwen35MetalW8LinearLayer>>,
@@ -225,7 +225,7 @@ struct Qwen35MetalW8AllLinearLayersPrecisionV2 {
 /// Observable receipt for one fixed-depth, three-layer Metal transaction.
 /// The v1 mechanism deliberately performs no host finite check between the
 /// three layers; only its final output is checked before atomic state commit.
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8LinearLayerStack3V1Stats {
     pub layer_indices: [usize; 3],
@@ -244,7 +244,7 @@ pub struct Qwen35MetalW8LinearLayerStack3V1Stats {
     pub block_elapsed_ns: u128,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8LinearLayerStacksV1Stats {
     pub mechanism: &'static str,
@@ -254,14 +254,14 @@ pub struct Qwen35MetalW8LinearLayerStacksV1Stats {
     pub terminal_error: bool,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8LinearLayerStack3BufferLedger {
     pub layer_indices: [usize; 3],
     pub ledger: apxinf_metal::LinearLayerStack3BufferLedger,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8LinearLayerStacksV1AggregateLedger {
     pub scope: &'static str,
@@ -286,7 +286,7 @@ pub struct Qwen35MetalW8LinearLayerStacksV1AggregateLedger {
 
 /// Versioned diagnostic ledger for six Stack3 body transactions, six
 /// full-attention Metal MLP blocks, and the existing tied top-4 head.
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8Stack3LmHeadV2AggregateLedger {
     pub scope: &'static str,
@@ -309,7 +309,7 @@ pub struct Qwen35MetalW8Stack3LmHeadV2AggregateLedger {
     pub final_output_finite_checks_per_call: usize,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 struct Qwen35MetalW8LinearLayerStack3V1 {
     layer_indices: [usize; 3],
     gdn_core_profile: apxinf_metal::GdnCoreProfileV1,
@@ -325,7 +325,7 @@ struct Qwen35MetalW8LinearLayerStack3V1 {
     fail_next_decode_after_scratch: bool,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 struct Qwen35MetalW8LinearLayerStacksV1 {
     stacks: Vec<Qwen35MetalW8LinearLayerStack3V1>,
     layer_to_stack: Vec<Option<(usize, usize)>>,
@@ -333,10 +333,10 @@ struct Qwen35MetalW8LinearLayerStacksV1 {
     owns_full_attention_mlp_blocks: bool,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 const QWEN35_MLP_STACK3_BOUNDARY_INITIAL_STACK_V1: [usize; 3] = [0, 1, 2];
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 const QWEN35_MLP_STACK3_BOUNDARY_REGIONS_V1: [(usize, [usize; 3]); 5] = [
     (3, [4, 5, 6]),
     (7, [8, 9, 10]),
@@ -345,10 +345,10 @@ const QWEN35_MLP_STACK3_BOUNDARY_REGIONS_V1: [(usize, [usize; 3]); 5] = [
     (19, [20, 21, 22]),
 ];
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 const QWEN35_MLP_STACK3_BOUNDARY_FINAL_MLP_V1: usize = 23;
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 const fn qwen35_gdn_core_profile_v1_label(profile: apxinf_metal::GdnCoreProfileV1) -> &'static str {
     match profile {
         apxinf_metal::GdnCoreProfileV1::LegacyFourDispatch => "legacy-four-dispatch",
@@ -357,7 +357,7 @@ const fn qwen35_gdn_core_profile_v1_label(profile: apxinf_metal::GdnCoreProfileV
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 fn qwen35_gdn_core_production_receipt_v1_json(
     receipt: Option<apxinf_metal::GdnCoreProductionReceiptV1>,
 ) -> serde_json::Value {
@@ -384,7 +384,7 @@ fn qwen35_gdn_core_production_receipt_v1_json(
     })
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 const fn qwen35_stack3_mechanism_for_gdn_core_profile_v1(
     profile: apxinf_metal::GdnCoreProfileV1,
 ) -> &'static str {
@@ -399,7 +399,7 @@ const fn qwen35_stack3_mechanism_for_gdn_core_profile_v1(
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 const fn qwen35_boundary_mechanism_for_gdn_core_profile_v1(
     profile: apxinf_metal::GdnCoreProfileV1,
 ) -> &'static str {
@@ -414,7 +414,7 @@ const fn qwen35_boundary_mechanism_for_gdn_core_profile_v1(
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 const fn qwen35_boundary_tail_head_mechanism_for_gdn_core_profile_v1(
     profile: apxinf_metal::GdnCoreProfileV1,
 ) -> &'static str {
@@ -431,7 +431,7 @@ const fn qwen35_boundary_tail_head_mechanism_for_gdn_core_profile_v1(
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 fn validate_qwen35_production_gdn_core_profile_v1(
     profile: apxinf_metal::GdnCoreProfileV1,
 ) -> Result<()> {
@@ -445,7 +445,7 @@ fn validate_qwen35_production_gdn_core_profile_v1(
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 fn qwen35_matches_gdn_core_fused_v1_shape(config: &Qwen35TextConfig) -> bool {
     (
         config.hidden_size,
@@ -458,7 +458,7 @@ fn qwen35_matches_gdn_core_fused_v1_shape(config: &Qwen35TextConfig) -> bool {
     ) == (1_024, 16, 16, 128, 128, 4, 1.0e-6_f32.to_bits())
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 fn validate_qwen35_gdn_core_fused_v1_shape(config: &Qwen35TextConfig) -> Result<()> {
     if !qwen35_matches_gdn_core_fused_v1_shape(config) {
         return Err(Error::Other(format!(
@@ -475,7 +475,7 @@ fn validate_qwen35_gdn_core_fused_v1_shape(config: &Qwen35TextConfig) -> Result<
     Ok(())
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8MlpStack3BoundaryRegionV1Stats {
     pub boundary_mlp_layer_index: usize,
@@ -493,7 +493,7 @@ pub struct Qwen35MetalW8MlpStack3BoundaryRegionV1Stats {
     pub block_elapsed_ns: u128,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8MlpStack3BoundaryBodyV1Stats {
     pub mechanism: &'static str,
@@ -503,7 +503,7 @@ pub struct Qwen35MetalW8MlpStack3BoundaryBodyV1Stats {
     pub terminal_error: bool,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8MlpStack3BoundaryRegionBufferLedgerV1 {
     pub boundary_mlp_layer_index: usize,
@@ -511,7 +511,7 @@ pub struct Qwen35MetalW8MlpStack3BoundaryRegionBufferLedgerV1 {
     pub ledger: apxinf_metal::MlpStack3BoundaryBufferLedgerV1,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8MlpStack3BoundaryBodyV1AggregateLedger {
     pub scope: &'static str,
@@ -536,7 +536,7 @@ pub struct Qwen35MetalW8MlpStack3BoundaryBodyV1AggregateLedger {
     pub final_output_finite_checks_per_decode: usize,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8MlpStack3BoundaryTailHeadV1AggregateLedger {
     pub scope: &'static str,
@@ -563,7 +563,7 @@ pub struct Qwen35MetalW8MlpStack3BoundaryTailHeadV1AggregateLedger {
     pub waits_per_decode: usize,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 struct Qwen35MetalW8MlpStack3BoundaryRegionV1 {
     boundary_mlp_layer_index: usize,
     stack_layer_indices: [usize; 3],
@@ -580,7 +580,7 @@ struct Qwen35MetalW8MlpStack3BoundaryRegionV1 {
     fail_next_decode_after_scratch: bool,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 struct Qwen35MetalW8MlpStack3BoundaryBodyV1 {
     initial_stack: Qwen35MetalW8LinearLayerStack3V1,
     boundaries: Vec<Qwen35MetalW8MlpStack3BoundaryRegionV1>,
@@ -590,7 +590,7 @@ struct Qwen35MetalW8MlpStack3BoundaryBodyV1 {
 
 /// Independent receipt for the diagnostic lane that replaces the standalone
 /// layer-23 MLP and the ordinary output projection with one tail transaction.
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8MlpStack3BoundaryTailHeadV1Stats {
     pub mechanism: &'static str,
@@ -608,7 +608,7 @@ pub struct Qwen35MetalW8MlpStack3BoundaryTailHeadV1Stats {
     pub terminal_error: bool,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 struct Qwen35MetalW8MlpStack3BoundaryTailHeadV1 {
     gdn_core_profile: apxinf_metal::GdnCoreProfileV1,
     initial_stack: Qwen35MetalW8LinearLayerStack3V1,
@@ -626,7 +626,7 @@ struct Qwen35MetalW8MlpStack3BoundaryTailHeadV1 {
 /// Receipt for the CPU implementation of the exact packed W8 complete-layer
 /// oracle. This exists only to distinguish quantization error from Metal
 /// arithmetic in an explicit quality gate.
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Qwen35PackedW8LinearLayerReferenceProfile {
     G64,
@@ -635,7 +635,7 @@ pub enum Qwen35PackedW8LinearLayerReferenceProfile {
     GdnOutAndMlpDownG32,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35PackedW8LinearLayerReferenceProfile {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -661,7 +661,7 @@ impl Qwen35PackedW8LinearLayerReferenceProfile {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen35PackedW8LinearLayerReferenceStats {
     pub layer_index: usize,
@@ -676,7 +676,7 @@ pub struct Qwen35PackedW8LinearLayerReferenceStats {
     pub block_elapsed_ns: u128,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 struct Qwen35PackedW8LinearLayerReference {
     layer_index: usize,
     profile: Qwen35PackedW8LinearLayerReferenceProfile,
@@ -695,14 +695,14 @@ struct Qwen35PackedW8LinearLayerReference {
     fail_next_decode_after_reference: bool,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 struct Qwen35PackedW8LinearLayerWeights {
     dimensions: apxinf_metal::GdnDimensions,
     packed: apxinf_metal::PackedW8LinearLayerBlock,
 }
 
 /// Observable receipt for the explicitly selected decode-only body lane.
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8BodyStats {
     pub layer_index: usize,
@@ -711,12 +711,12 @@ pub struct Qwen35MetalW8BodyStats {
     pub projection_elapsed_ns: u128,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 struct Qwen35MetalW8Body {
     layers: Vec<Option<Qwen35MetalW8BodyLayer>>,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 struct Qwen35MetalW8BodyLayer {
     layer_index: usize,
     mlp_gate_up: apxinf_metal::MetalW8MatVec,
@@ -725,7 +725,7 @@ struct Qwen35MetalW8BodyLayer {
 }
 
 /// Observable receipt for the complete decode-only Metal W8 MLP block lane.
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-w8-head-mlp")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen35MetalW8MlpBlockStats {
     pub layer_index: usize,
@@ -737,7 +737,7 @@ pub struct Qwen35MetalW8MlpBlockStats {
 /// Observable receipt for the explicitly enabled Metal W8 top-4 head. Calls
 /// are separated by phase so a combined tracer can prove that CPU body prefill
 /// did not accidentally exercise any decode-only MLP block.
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-w8-head-mlp")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Qwen35MetalW8LmHeadStats {
     pub prefill_calls: usize,
@@ -747,14 +747,14 @@ pub struct Qwen35MetalW8LmHeadStats {
     pub rerank_elapsed_ns: u128,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-w8-head-mlp")]
 #[derive(Clone, Copy)]
 enum Qwen35MetalW8LmHeadPhase {
     Prefill,
     Decode,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-w8-head-mlp")]
 impl Qwen35MetalW8LmHeadPhase {
     fn label(self) -> &'static str {
         match self {
@@ -764,12 +764,12 @@ impl Qwen35MetalW8LmHeadPhase {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-w8-head-mlp")]
 struct Qwen35MetalW8MlpBlocks {
     layers: Vec<Option<Qwen35MetalW8MlpBlockLayer>>,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-w8-head-mlp")]
 struct Qwen35MetalW8MlpBlockLayer {
     layer_index: usize,
     mlp: apxinf_metal::MetalW8MlpBlock,
@@ -783,7 +783,7 @@ struct Qwen35MetalW8MlpBlockLayer {
 /// standalone Metal head it is only the top-4 submission/wait, while the
 /// boundary + tail-head v1 lane measures its whole fused layer-23 MLP + final
 /// RMS + top-4 transaction.
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 pub struct Qwen35MetalTeacherStep {
     pub cpu_token: u32,
     pub w8_candidates: [u32; apxinf_metal::W8_TOP_K],
@@ -794,7 +794,7 @@ pub struct Qwen35MetalTeacherStep {
     pub rerank_elapsed_ns: u128,
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalTeacherStep {
     /// Elapsed time for the accelerator transaction that publishes the four
     /// candidates. This is top-4-only for the standalone head, but includes
@@ -804,7 +804,7 @@ impl Qwen35MetalTeacherStep {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 struct Qwen35BoundaryTailHeadOutputV1 {
     normalized_hidden: Tensor,
     candidates: [u32; apxinf_metal::W8_TOP_K],
@@ -825,7 +825,7 @@ impl GeneralQwen35 {
 
     /// Explicit constructor for the decode-only Metal W8 tied lm_head.
     /// Unsupported platforms, shapes, or untied checkpoints return an error.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     pub fn from_weights_with_metal_w8(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -839,7 +839,7 @@ impl GeneralQwen35 {
     /// Diagnostic opt-in for exactly one state-resident decode-only Metal W8
     /// GDN attention block. CPU prefill remains authoritative and seeds the
     /// selected layer; ordinary constructors never create this lane.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn from_weights_with_metal_w8_gdn_layer(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -859,7 +859,7 @@ impl GeneralQwen35 {
     /// Diagnostic opt-in for exactly one complete state-resident decode-only
     /// Metal W8 linear-attention layer. CPU prefill remains authoritative and
     /// seeds the selected GDN state; ordinary constructors never create it.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn from_weights_with_metal_w8_linear_layer(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -880,7 +880,7 @@ impl GeneralQwen35 {
     /// Diagnostic-only precision-v2 complete linear-attention layer. The
     /// selected layer keeps G64 everywhere except its GDN output projection,
     /// which uses the dedicated G32 Metal ABI and kernel.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn from_weights_with_metal_w8_linear_layer_precision_v2(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -907,7 +907,7 @@ impl GeneralQwen35 {
     /// Each selected linear layer owns its complete GDN+MLP decode block. The
     /// full-attention layers keep CPU attention and use standalone Metal W8
     /// MLP blocks, so no layer executes its MLP twice.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn from_weights_with_metal_w8_all_linear_layers_precision_v2(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -946,7 +946,7 @@ impl GeneralQwen35 {
     /// Diagnostic-only stack3-v1 route for one explicit run of three
     /// consecutive linear-attention layers. CPU prefill remains authoritative;
     /// ordinary constructors and registry/default paths never create it.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn from_weights_with_metal_w8_linear_layer_stack3_v1(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -971,7 +971,7 @@ impl GeneralQwen35 {
     /// Diagnostic-only stack3-v1 route for every maximal three-layer linear-
     /// attention run. Full-attention layers retain CPU attention/KV and use
     /// one standalone Metal W8 MLP, so no MLP is executed twice.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn from_weights_with_metal_w8_all_linear_layer_stacks_v1(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -1032,7 +1032,7 @@ impl GeneralQwen35 {
     /// boundaries each own the following Stack3 transaction, and layer 23
     /// retains one standalone Metal MLP. Ordinary constructors never create
     /// this lane.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn from_weights_with_metal_w8_mlp_stack3_boundary_body_v1(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -1053,7 +1053,7 @@ impl GeneralQwen35 {
     /// full-attention MLP→Stack3 boundaries, and one fused layer-23 MLP +
     /// final RMS + tied top-4 transaction. CPU/F32 remains authoritative for
     /// prefill and for the exact four-candidate rerank.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn from_weights_with_metal_w8_mlp_stack3_boundary_tail_head_v1(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -1075,7 +1075,7 @@ impl GeneralQwen35 {
     /// attention, MLPs, tail/head, state publication, and submission topology
     /// remain unchanged. No default, AutoModel, registry, or CLI path calls
     /// this constructor.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn from_weights_with_metal_w8_mlp_stack3_boundary_tail_head_gdn_core_fused_v1(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -1091,7 +1091,7 @@ impl GeneralQwen35 {
         )
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     fn from_weights_with_metal_w8_mlp_stack3_boundary_tail_head_gdn_core_profile_v1(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -1126,7 +1126,7 @@ impl GeneralQwen35 {
     /// one Stack3 transaction, each full-attention layer owns one standalone
     /// Metal MLP block, and the tied output uses the existing top-4 Metal head
     /// plus exact F32 rerank. No registry or default constructor calls this.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn from_weights_with_metal_w8_all_linear_layer_stacks_and_lm_head_v2(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -1186,7 +1186,7 @@ impl GeneralQwen35 {
     /// Diagnostic control for exactly one complete decode-only packed W8
     /// linear-attention layer executed by the canonical CPU reference. This
     /// is gate-only and ordinary constructors never create it.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn from_weights_with_packed_w8_linear_layer_reference(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -1207,7 +1207,7 @@ impl GeneralQwen35 {
     /// CPU-only precision-screen portfolio for the explicit packed complete-
     /// layer custody lane. Ordinary constructors and Metal lanes never call
     /// this profile-aware constructor.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn from_weights_with_packed_w8_linear_layer_reference_profile(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -1228,7 +1228,7 @@ impl GeneralQwen35 {
 
     /// Diagnostic opt-in for one decode-only MLP gate+up W8 projection lane.
     /// The ordinary constructors remain the kill switch and never create it.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn from_weights_with_metal_w8_body_layer(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -1247,7 +1247,7 @@ impl GeneralQwen35 {
 
     /// Diagnostic opt-in for a selected set of decode-only MLP gate+up lanes.
     /// Empty, duplicate, and out-of-range sets fail closed.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn from_weights_with_metal_w8_body_layers(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -1270,7 +1270,7 @@ impl GeneralQwen35 {
 
     /// Diagnostic opt-in for one complete decode-only Metal W8 MLP block.
     /// The ordinary and gate+up constructors remain independent kill switches.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     pub fn from_weights_with_metal_w8_mlp_block_layer(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -1289,7 +1289,7 @@ impl GeneralQwen35 {
 
     /// Diagnostic opt-in for selected complete decode-only Metal W8 MLP blocks.
     /// Empty, duplicate, and out-of-range sets fail closed.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     pub fn from_weights_with_metal_w8_mlp_block_layers(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -1313,7 +1313,7 @@ impl GeneralQwen35 {
     /// Diagnostic opt-in combining complete decode-only Metal W8 MLP blocks
     /// for every layer with the existing tied top-4 + F32-rerank head. The
     /// ordinary and single-lane constructors remain independent kill switches.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     pub fn from_weights_with_metal_w8_mlp_blocks_and_lm_head(
         config: Qwen35Config,
         tensors: HashMap<String, Tensor>,
@@ -1444,30 +1444,30 @@ impl GeneralQwen35 {
         // CPU weights stay where they are. In particular, do not call
         // CpuBackend::to_device, which would deep-clone every tensor and double
         // peak memory on a 16-GB Mac.
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         let metal_w8_body = metal_w8_body_layers
             .map(|layer_indices| Qwen35MetalW8Body::pack(&weights, &config.text, &layer_indices))
             .transpose()?;
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-w8-head-mlp")]
         let metal_w8_mlp_blocks = metal_w8_mlp_block_layers
             .map(|layer_indices| {
                 Qwen35MetalW8MlpBlocks::pack(&weights, &config.text, &layer_indices)
             })
             .transpose()?;
-        #[cfg(not(feature = "metal-w8"))]
+        #[cfg(not(feature = "metal-experiments"))]
         if metal_w8_body_layers.is_some() {
             return Err(Error::Other(
                 "qwen3.5 Metal W8 body requires the `metal-w8` build feature".into(),
             ));
         }
-        #[cfg(not(feature = "metal-w8"))]
+        #[cfg(not(feature = "metal-w8-head-mlp"))]
         if metal_w8_mlp_block_layers.is_some() {
             return Err(Error::Other(
                 "qwen3.5 Metal W8 MLP block requires the `metal-w8` build feature".into(),
             ));
         }
         let weights = RuntimeWeights::pack(weights, &config.text)?;
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-w8-head-mlp")]
         let metal_w8_lm_head = if metal_w8_lm_head {
             if !config.text.tie_word_embeddings || weights.lm_head.is_some() {
                 return Err(Error::Other(
@@ -1487,11 +1487,11 @@ impl GeneralQwen35 {
         } else {
             None
         };
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-w8-head-mlp")]
         let metal_w8_lm_head_stats = metal_w8_lm_head
             .as_ref()
             .map(|_| Qwen35MetalW8LmHeadStats::default());
-        #[cfg(not(feature = "metal-w8"))]
+        #[cfg(not(feature = "metal-w8-head-mlp"))]
         if metal_w8_lm_head {
             return Err(Error::Other(
                 "qwen3.5 Metal W8 lm_head requires the `metal-w8` build feature".into(),
@@ -1503,39 +1503,39 @@ impl GeneralQwen35 {
             weights,
             backend,
             state,
-            #[cfg(feature = "metal-w8")]
+            #[cfg(feature = "metal-w8-head-mlp")]
             metal_w8_lm_head,
-            #[cfg(feature = "metal-w8")]
+            #[cfg(feature = "metal-w8-head-mlp")]
             metal_w8_lm_head_stats,
-            #[cfg(feature = "metal-w8")]
+            #[cfg(feature = "metal-experiments")]
             metal_w8_body,
-            #[cfg(feature = "metal-w8")]
+            #[cfg(feature = "metal-w8-head-mlp")]
             metal_w8_mlp_blocks,
-            #[cfg(feature = "metal-w8")]
+            #[cfg(feature = "metal-experiments")]
             metal_w8_gdn: None,
-            #[cfg(feature = "metal-w8")]
+            #[cfg(feature = "metal-experiments")]
             metal_w8_linear_layer: None,
-            #[cfg(feature = "metal-w8")]
+            #[cfg(feature = "metal-experiments")]
             metal_w8_all_linear_layers_precision_v2: None,
-            #[cfg(feature = "metal-w8")]
+            #[cfg(feature = "metal-experiments")]
             metal_w8_linear_layer_stacks_v1: None,
-            #[cfg(feature = "metal-w8")]
+            #[cfg(feature = "metal-experiments")]
             metal_w8_mlp_stack3_boundary_body_v1: None,
-            #[cfg(feature = "metal-w8")]
+            #[cfg(feature = "metal-experiments")]
             metal_w8_mlp_stack3_boundary_tail_head_v1: None,
-            #[cfg(feature = "metal-w8")]
+            #[cfg(feature = "metal-experiments")]
             metal_w8_stack3_lm_head_v2_terminal_error: None,
-            #[cfg(feature = "metal-w8")]
+            #[cfg(feature = "metal-experiments")]
             packed_w8_linear_layer_reference: None,
-            #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+            #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
             fail_after_layer_once_for_test: None,
-            #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+            #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
             fail_stack3_lm_head_v2_before_submit_once_for_test: false,
-            #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+            #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
             fail_mlp_stack3_boundary_final_mlp_after_submit_once_for_test: false,
-            #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+            #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
             boundary_tail_head_fault_once_for_test: None,
-            #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+            #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
             fail_boundary_tail_head_rerank_once_for_test: false,
         })
     }
@@ -1552,14 +1552,14 @@ impl GeneralQwen35 {
         &*self.backend
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_body_stats(&self) -> Option<Qwen35MetalW8BodyStats> {
         let mut stats = self.metal_w8_body_layer_stats().into_iter();
         let only = stats.next()?;
         stats.next().is_none().then_some(only)
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_body_layer_stats(&self) -> Vec<Qwen35MetalW8BodyStats> {
         self.metal_w8_body
             .as_ref()
@@ -1567,14 +1567,14 @@ impl GeneralQwen35 {
             .unwrap_or_default()
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     pub fn metal_w8_mlp_block_stats(&self) -> Option<Qwen35MetalW8MlpBlockStats> {
         let mut stats = self.metal_w8_mlp_block_layer_stats().into_iter();
         let only = stats.next()?;
         stats.next().is_none().then_some(only)
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     pub fn metal_w8_mlp_block_layer_stats(&self) -> Vec<Qwen35MetalW8MlpBlockStats> {
         self.metal_w8_mlp_blocks
             .as_ref()
@@ -1582,19 +1582,19 @@ impl GeneralQwen35 {
             .unwrap_or_default()
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_gdn_stats(&self) -> Option<Qwen35MetalW8GdnStats> {
         self.metal_w8_gdn.as_ref().map(Qwen35MetalW8GdnLayer::stats)
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_linear_layer_stats(&self) -> Option<Qwen35MetalW8LinearLayerStats> {
         self.metal_w8_linear_layer
             .as_ref()
             .map(Qwen35MetalW8LinearLayer::stats)
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_linear_layer_precision_v2_stats(
         &self,
     ) -> Option<Qwen35MetalW8LinearLayerPrecisionV2Stats> {
@@ -1603,7 +1603,7 @@ impl GeneralQwen35 {
             .and_then(Qwen35MetalW8LinearLayer::precision_v2_stats)
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_linear_layer_buffer_ledger(
         &self,
     ) -> Option<apxinf_metal::LinearLayerBufferLedger> {
@@ -1612,7 +1612,7 @@ impl GeneralQwen35 {
             .map(|layer| layer.block.buffer_ledger())
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_all_linear_layers_precision_v2_stats(
         &self,
     ) -> Option<Qwen35MetalW8AllLinearLayersPrecisionV2Stats> {
@@ -1621,7 +1621,7 @@ impl GeneralQwen35 {
             .map(|lane| lane.stats(self.metal_w8_mlp_block_layer_stats()))
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_linear_layer_stacks_v1_stats(
         &self,
     ) -> Option<Qwen35MetalW8LinearLayerStacksV1Stats> {
@@ -1630,7 +1630,7 @@ impl GeneralQwen35 {
             .map(|lane| lane.stats(self.metal_w8_mlp_block_layer_stats()))
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_mlp_stack3_boundary_body_v1_stats(
         &self,
     ) -> Option<Qwen35MetalW8MlpStack3BoundaryBodyV1Stats> {
@@ -1639,7 +1639,7 @@ impl GeneralQwen35 {
             .map(Qwen35MetalW8MlpStack3BoundaryBodyV1::stats)
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_mlp_stack3_boundary_tail_head_v1_stats(
         &self,
     ) -> Option<Qwen35MetalW8MlpStack3BoundaryTailHeadV1Stats> {
@@ -1648,7 +1648,7 @@ impl GeneralQwen35 {
             .map(Qwen35MetalW8MlpStack3BoundaryTailHeadV1::stats)
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_mlp_stack3_boundary_tail_head_v1_aggregate_ledger(
         &self,
     ) -> Option<Qwen35MetalW8MlpStack3BoundaryTailHeadV1AggregateLedger> {
@@ -1657,7 +1657,7 @@ impl GeneralQwen35 {
             .and_then(|lane| lane.aggregate_ledger().ok())
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_mlp_stack3_boundary_body_v1_aggregate_ledger(
         &self,
     ) -> Option<Qwen35MetalW8MlpStack3BoundaryBodyV1AggregateLedger> {
@@ -1666,7 +1666,7 @@ impl GeneralQwen35 {
             .and_then(|body| body.aggregate_ledger().ok())
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_linear_layer_stack3_v1_buffer_ledgers(
         &self,
     ) -> Option<Vec<Qwen35MetalW8LinearLayerStack3BufferLedger>> {
@@ -1675,7 +1675,7 @@ impl GeneralQwen35 {
             .map(Qwen35MetalW8LinearLayerStacksV1::buffer_ledgers)
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_linear_layer_stacks_v1_aggregate_ledger(
         &self,
     ) -> Option<Qwen35MetalW8LinearLayerStacksV1AggregateLedger> {
@@ -1694,7 +1694,7 @@ impl GeneralQwen35 {
         ))
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_stack3_lm_head_v2_aggregate_ledger(
         &self,
     ) -> Option<Qwen35MetalW8Stack3LmHeadV2AggregateLedger> {
@@ -1703,7 +1703,7 @@ impl GeneralQwen35 {
         Qwen35MetalW8Stack3LmHeadV2AggregateLedger::new(body, lm_head).ok()
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_all_linear_layers_precision_v2_buffer_ledgers(
         &self,
     ) -> Option<Vec<Qwen35MetalW8LinearLayerBufferLedger>> {
@@ -1712,7 +1712,7 @@ impl GeneralQwen35 {
             .map(Qwen35MetalW8AllLinearLayersPrecisionV2::buffer_ledgers)
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn metal_w8_all_linear_layers_precision_v2_aggregate_ledger(
         &self,
     ) -> Option<Qwen35MetalW8AllLinearLayersPrecisionV2AggregateLedger> {
@@ -1731,7 +1731,7 @@ impl GeneralQwen35 {
         ))
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn packed_w8_linear_layer_reference_stats(
         &self,
     ) -> Option<Qwen35PackedW8LinearLayerReferenceStats> {
@@ -1740,7 +1740,7 @@ impl GeneralQwen35 {
             .map(Qwen35PackedW8LinearLayerReference::stats)
     }
 
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fn inject_metal_w8_gdn_failure_once_for_test(&mut self) {
         self.metal_w8_gdn
             .as_mut()
@@ -1748,7 +1748,7 @@ impl GeneralQwen35 {
             .fail_next_decode_after_scratch = true;
     }
 
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fn inject_metal_w8_linear_layer_failure_once_for_test(&mut self) {
         self.metal_w8_linear_layer
             .as_mut()
@@ -1756,7 +1756,7 @@ impl GeneralQwen35 {
             .fail_next_decode_after_scratch = true;
     }
 
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fn inject_metal_w8_stack3_failure_once_for_test(&mut self, stack_index: usize) {
         self.metal_w8_linear_layer_stacks_v1
             .as_mut()
@@ -1767,7 +1767,7 @@ impl GeneralQwen35 {
             .fail_next_decode_after_scratch = true;
     }
 
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fn inject_metal_w8_mlp_stack3_boundary_failure_once_for_test(&mut self, boundary_index: usize) {
         self.metal_w8_mlp_stack3_boundary_body_v1
             .as_mut()
@@ -1778,7 +1778,7 @@ impl GeneralQwen35 {
             .fail_next_decode_after_scratch = true;
     }
 
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fn inject_metal_w8_mlp_stack3_boundary_initial_failure_once_for_test(&mut self) {
         self.metal_w8_mlp_stack3_boundary_body_v1
             .as_mut()
@@ -1787,7 +1787,7 @@ impl GeneralQwen35 {
             .fail_next_decode_after_scratch = true;
     }
 
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fn inject_metal_w8_boundary_tail_head_initial_failure_once_for_test(&mut self) {
         self.metal_w8_mlp_stack3_boundary_tail_head_v1
             .as_mut()
@@ -1796,7 +1796,7 @@ impl GeneralQwen35 {
             .fail_next_decode_after_scratch = true;
     }
 
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fn inject_metal_w8_boundary_tail_head_tail_post_execution_failure_once_for_test(&mut self) {
         assert!(
             self.metal_w8_mlp_stack3_boundary_tail_head_v1.is_some(),
@@ -1806,7 +1806,7 @@ impl GeneralQwen35 {
             Some(Qwen35BoundaryTailHeadFaultV1ForTest::TailPostExecution);
     }
 
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fn inject_metal_w8_boundary_tail_head_malformed_once_for_test(
         &mut self,
         fault: Qwen35BoundaryTailHeadFaultV1ForTest,
@@ -1827,7 +1827,7 @@ impl GeneralQwen35 {
         self.boundary_tail_head_fault_once_for_test = Some(fault);
     }
 
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fn inject_metal_w8_boundary_tail_head_rerank_failure_once_for_test(&mut self) {
         assert!(
             self.metal_w8_mlp_stack3_boundary_tail_head_v1.is_some(),
@@ -1836,7 +1836,7 @@ impl GeneralQwen35 {
         self.fail_boundary_tail_head_rerank_once_for_test = true;
     }
 
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fn inject_metal_w8_mlp_stack3_boundary_final_mlp_failure_once_for_test(&mut self) {
         assert!(
             self.metal_w8_mlp_stack3_boundary_body_v1.is_some(),
@@ -1845,7 +1845,7 @@ impl GeneralQwen35 {
         self.fail_mlp_stack3_boundary_final_mlp_after_submit_once_for_test = true;
     }
 
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fn inject_metal_w8_stack3_lm_head_failure_once_for_test(&mut self) {
         assert!(
             self.metal_w8_stack3_lm_head_v2_terminal_error.is_some(),
@@ -1854,7 +1854,7 @@ impl GeneralQwen35 {
         self.fail_stack3_lm_head_v2_before_submit_once_for_test = true;
     }
 
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fn inject_packed_w8_linear_layer_reference_failure_once_for_test(&mut self) {
         self.packed_w8_linear_layer_reference
             .as_mut()
@@ -1862,7 +1862,7 @@ impl GeneralQwen35 {
             .fail_next_decode_after_reference = true;
     }
 
-    #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+    #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
     fn inject_failure_after_layer_once_for_test(&mut self, layer_index: usize) {
         assert!(
             layer_index < self.config.text.n_layers,
@@ -1871,7 +1871,7 @@ impl GeneralQwen35 {
         self.fail_after_layer_once_for_test = Some(layer_index);
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     fn ensure_complete_linear_layer_lane_is_not_terminal(&self) -> Result<()> {
         if self.metal_w8_stack3_lm_head_v2_terminal_error == Some(true) {
             return Err(Error::Other(
@@ -1942,7 +1942,7 @@ impl GeneralQwen35 {
         Ok(())
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     fn complete_linear_layer_lane_versions(&self) -> (Option<u64>, Option<u64>) {
         (
             self.metal_w8_linear_layer
@@ -1954,7 +1954,7 @@ impl GeneralQwen35 {
         )
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     fn latch_complete_linear_layer_lanes_after_partial_commit(
         &mut self,
         versions_before: (Option<u64>, Option<u64>),
@@ -2027,7 +2027,7 @@ impl GeneralQwen35 {
             || boundary_tail_head_requires_reset
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     fn finish_stack3_lm_head_v2_post_body<T>(
         &mut self,
         result: Result<T>,
@@ -2048,7 +2048,7 @@ impl GeneralQwen35 {
         }
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     fn maybe_fail_stack3_lm_head_v2_before_submit_for_test(&mut self) -> Result<()> {
         #[cfg(all(test, debug_assertions))]
         if self.fail_stack3_lm_head_v2_before_submit_once_for_test {
@@ -2061,7 +2061,7 @@ impl GeneralQwen35 {
         Ok(())
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     fn finish_boundary_tail_head_v1_post_body<T>(
         &mut self,
         result: Result<T>,
@@ -2081,7 +2081,7 @@ impl GeneralQwen35 {
         }
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     fn run_boundary_tail_head_v1(
         &mut self,
         full_attention_residual: &Tensor,
@@ -2152,7 +2152,7 @@ impl GeneralQwen35 {
         })
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     fn rerank_boundary_tail_head_v1(
         &mut self,
         normalized_hidden: &Tensor,
@@ -2181,7 +2181,7 @@ impl GeneralQwen35 {
         Ok((token, elapsed))
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     pub fn metal_w8_lm_head_stats(&self) -> Option<Qwen35MetalW8LmHeadStats> {
         self.metal_w8_lm_head_stats
     }
@@ -2190,7 +2190,7 @@ impl GeneralQwen35 {
         let text = &self.config.text;
         let backend = &*self.backend;
         let layer = &self.weights.layers[layer_index];
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         if self
             .packed_w8_linear_layer_reference
             .as_ref()
@@ -2216,7 +2216,7 @@ impl GeneralQwen35 {
                 )));
             }
         }
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         if self
             .metal_w8_linear_layer
             .as_ref()
@@ -2242,7 +2242,7 @@ impl GeneralQwen35 {
                 )));
             }
         }
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         if self
             .metal_w8_all_linear_layers_precision_v2
             .as_ref()
@@ -2276,7 +2276,7 @@ impl GeneralQwen35 {
 
         let attention = match (&layer.attention, text.layer_types[layer_index]) {
             (RuntimeAttentionWeights::Linear(weights), Qwen35LayerType::LinearAttention) => {
-                #[cfg(feature = "metal-w8")]
+                #[cfg(feature = "metal-experiments")]
                 {
                     let selected = self
                         .metal_w8_gdn
@@ -2398,7 +2398,7 @@ impl GeneralQwen35 {
                         attention
                     }
                 }
-                #[cfg(not(feature = "metal-w8"))]
+                #[cfg(not(feature = "metal-experiments"))]
                 {
                     let state = self.state.linear_state_mut(layer_index)?;
                     run_linear_attention(backend, text, &normed, weights, state)?
@@ -2431,7 +2431,7 @@ impl GeneralQwen35 {
             text.rms_norm_eps,
             1.0,
         )?;
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-w8-head-mlp")]
         let mlp = if start_pos > 0 && normed.shape().dims()[0] == 1 {
             if let Some(block) = self
                 .metal_w8_mlp_blocks
@@ -2439,24 +2439,31 @@ impl GeneralQwen35 {
                 .and_then(|blocks| blocks.layer_mut(layer_index))
             {
                 run_mlp_with_metal_w8_block(&normed, block)?
-            } else if let Some(body) = self
-                .metal_w8_body
-                .as_mut()
-                .and_then(|body| body.layer_mut(layer_index))
-            {
-                run_mlp_with_metal_w8(backend, &normed, &layer.mlp, body)?
             } else {
+                #[cfg(feature = "metal-experiments")]
+                {
+                    if let Some(body) = self
+                        .metal_w8_body
+                        .as_mut()
+                        .and_then(|body| body.layer_mut(layer_index))
+                    {
+                        run_mlp_with_metal_w8(backend, &normed, &layer.mlp, body)?
+                    } else {
+                        run_mlp(backend, &normed, &layer.mlp)?
+                    }
+                }
+                #[cfg(not(feature = "metal-experiments"))]
                 run_mlp(backend, &normed, &layer.mlp)?
             }
         } else {
             run_mlp(backend, &normed, &layer.mlp)?
         };
-        #[cfg(not(feature = "metal-w8"))]
+        #[cfg(not(feature = "metal-w8-head-mlp"))]
         let mlp = run_mlp(backend, &normed, &layer.mlp)?;
         backend.add(&residual, &mlp)
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     fn forward_full_attention_residual_for_mlp_stack3_boundary_body_v1(
         &mut self,
         x: &Tensor,
@@ -2497,7 +2504,7 @@ impl GeneralQwen35 {
         self.backend.add(x, &attention)
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     fn forward_final_full_attention_mlp_for_mlp_stack3_boundary_body_v1(
         &mut self,
         x: &Tensor,
@@ -2550,9 +2557,9 @@ impl GeneralQwen35 {
                 self.config.text.vocab_size
             )));
         }
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         self.ensure_complete_linear_layer_lane_is_not_terminal()?;
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         if (self.metal_w8_linear_layer_stacks_v1.is_some()
             || self.metal_w8_mlp_stack3_boundary_body_v1.is_some()
             || self.metal_w8_mlp_stack3_boundary_tail_head_v1.is_some())
@@ -2566,7 +2573,7 @@ impl GeneralQwen35 {
         }
         self.state.validate_forward(start_pos, sequence_length)?;
 
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         let lane_versions_before = self.complete_linear_layer_lane_versions();
 
         let body_result = (|| {
@@ -2575,7 +2582,7 @@ impl GeneralQwen35 {
                 .embedding(&self.weights.token_embedding, token_ids)?;
             let mut layer_index = 0;
             while layer_index < self.config.text.n_layers {
-                #[cfg(feature = "metal-w8")]
+                #[cfg(feature = "metal-experiments")]
                 if start_pos > 0 && hidden.shape().dims() == [1, self.config.text.hidden_size] {
                     if self.metal_w8_mlp_stack3_boundary_tail_head_v1.is_some() {
                         if layer_index == QWEN35_MLP_STACK3_BOUNDARY_INITIAL_STACK_V1[0] {
@@ -2724,7 +2731,7 @@ impl GeneralQwen35 {
                     }
                 }
                 hidden = self.forward_layer(&hidden, layer_index, start_pos)?;
-                #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+                #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
                 if self.fail_after_layer_once_for_test == Some(layer_index) {
                     self.fail_after_layer_once_for_test = None;
                     return Err(Error::Other(format!(
@@ -2734,7 +2741,7 @@ impl GeneralQwen35 {
                 layer_index += 1;
             }
             self.state.advance(sequence_length);
-            #[cfg(feature = "metal-w8")]
+            #[cfg(feature = "metal-experiments")]
             if start_pos == 0 {
                 if let Some(lane) = self.metal_w8_mlp_stack3_boundary_tail_head_v1.as_mut() {
                     lane.prefill_body_calls = lane.prefill_body_calls.saturating_add(1);
@@ -2746,7 +2753,7 @@ impl GeneralQwen35 {
         match body_result {
             Ok(hidden) => Ok(hidden),
             Err(error) => {
-                #[cfg(feature = "metal-w8")]
+                #[cfg(feature = "metal-experiments")]
                 if self.latch_complete_linear_layer_lanes_after_partial_commit(lane_versions_before)
                 {
                     if self.metal_w8_mlp_stack3_boundary_body_v1.is_some() {
@@ -2826,7 +2833,7 @@ impl GeneralQwen35 {
         Ok(last_hidden)
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     fn metal_w8_reranked_token(
         &mut self,
         hidden: &Tensor,
@@ -2839,6 +2846,7 @@ impl GeneralQwen35 {
                 got: normalized.shape().to_string(),
             });
         }
+        #[cfg(feature = "metal-experiments")]
         self.maybe_fail_stack3_lm_head_v2_before_submit_for_test()?;
         let topk_started = std::time::Instant::now();
         let candidates = self
@@ -2884,7 +2892,7 @@ impl GeneralQwen35 {
     /// Compare CPU/F32, raw Metal/W8 top-4, and the F32-reranked Metal result
     /// on the same forced decode hidden state. This is a correctness gate, not
     /// the production fast path: it intentionally computes full CPU logits.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn teacher_forced_decode_candidates(
         &mut self,
         token: u32,
@@ -2964,14 +2972,17 @@ impl GeneralQwen35 {
 
     /// Backward-compatible teacher-gate surface. The Metal result includes the
     /// exact-F32 candidate rerank, rather than returning raw W8 top-1.
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     pub fn teacher_forced_decode_argmaxes(&mut self, token: u32, pos: u32) -> Result<(u32, u32)> {
         let comparison = self.teacher_forced_decode_candidates(token, pos)?;
         Ok((comparison.cpu_token, comparison.reranked_token))
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(any(
+    feature = "metal-experiments",
+    all(test, feature = "metal-w8-head-mlp")
+))]
 fn argmax_f32_row(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     if logits.shape().dims() != [1, vocab_size] {
         return Err(Error::ShapeMismatch {
@@ -2993,7 +3004,7 @@ fn argmax_f32_row(logits: &Tensor, vocab_size: usize) -> Result<u32> {
 /// Recompute only four candidate logits from the original tied F32 embedding.
 /// Candidate order does not affect the result; exact-score ties select the
 /// lowest token ID just like the native full-head argmax.
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-w8-head-mlp")]
 fn rerank_tied_f32_candidates(
     embedding: &[f32],
     hidden: &[f32],
@@ -3066,10 +3077,10 @@ impl LlmTrait for GeneralQwen35 {
 
     fn forward(&mut self, token_ids: &[u32], start_pos: u32) -> Result<Tensor> {
         let hidden = self.forward_hidden(token_ids, start_pos)?;
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         let boundary_tail_decode =
             start_pos > 0 && self.metal_w8_mlp_stack3_boundary_tail_head_v1.is_some();
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         let result = if boundary_tail_decode {
             (|| {
                 let output = self.run_boundary_tail_head_v1(&hidden)?;
@@ -3078,14 +3089,14 @@ impl LlmTrait for GeneralQwen35 {
         } else {
             self.project_logits(&hidden)
         };
-        #[cfg(not(feature = "metal-w8"))]
+        #[cfg(not(feature = "metal-experiments"))]
         let result = self.project_logits(&hidden);
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         {
             let result = self.finish_stack3_lm_head_v2_post_body(result, "CPU/F32 projection");
             return self.finish_boundary_tail_head_v1_post_body(result, "CPU/F32 projection");
         }
-        #[cfg(not(feature = "metal-w8"))]
+        #[cfg(not(feature = "metal-experiments"))]
         result
     }
 
@@ -3097,7 +3108,7 @@ impl LlmTrait for GeneralQwen35 {
         }
         let hidden = self.forward_hidden(input.token_ids, 0)?;
         let result = self.project_last_logits(&hidden);
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         {
             if result.is_ok() {
                 if let Some(lane) = self.metal_w8_mlp_stack3_boundary_tail_head_v1.as_mut() {
@@ -3109,12 +3120,12 @@ impl LlmTrait for GeneralQwen35 {
             return self
                 .finish_boundary_tail_head_v1_post_body(result, "CPU/F32 prefill projection");
         }
-        #[cfg(not(feature = "metal-w8"))]
+        #[cfg(not(feature = "metal-experiments"))]
         result
     }
 
     fn prefill_token_for_generation(&mut self, input: LlmInput<'_>) -> Option<Result<u32>> {
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-w8-head-mlp")]
         {
             self.metal_w8_lm_head.as_ref()?;
             if input.image.is_some() {
@@ -3130,9 +3141,11 @@ impl LlmTrait for GeneralQwen35 {
                 let last_hidden = self.last_hidden_row(&hidden)?;
                 self.metal_w8_reranked_token(&last_hidden, Qwen35MetalW8LmHeadPhase::Prefill)
             })();
-            return Some(self.finish_stack3_lm_head_v2_post_body(result, "prefill head"));
+            #[cfg(feature = "metal-experiments")]
+            let result = self.finish_stack3_lm_head_v2_post_body(result, "prefill head");
+            return Some(result);
         }
-        #[cfg(not(feature = "metal-w8"))]
+        #[cfg(not(feature = "metal-w8-head-mlp"))]
         {
             let _ = input;
             None
@@ -3154,55 +3167,55 @@ impl LlmTrait for GeneralQwen35 {
 
     fn reset(&mut self) {
         let _ = self.state.reset();
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         let reset_all_linear_precision_v2 = self.metal_w8_all_linear_layers_precision_v2.is_some();
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         let reset_stack3_full_mlp = self
             .metal_w8_linear_layer_stacks_v1
             .as_ref()
             .is_some_and(|lane| lane.owns_full_attention_mlp_blocks);
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         if let Some(gdn) = self.metal_w8_gdn.as_mut() {
             let _ = gdn.reset();
         }
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         if let Some(linear_layer) = self.metal_w8_linear_layer.as_mut() {
             let _ = linear_layer.reset();
         }
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         if let Some(all_linear_layers) = self.metal_w8_all_linear_layers_precision_v2.as_mut() {
             let _ = all_linear_layers.reset();
         }
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         if let Some(stack3) = self.metal_w8_linear_layer_stacks_v1.as_mut() {
             let _ = stack3.reset();
         }
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         if let Some(boundary_body) = self.metal_w8_mlp_stack3_boundary_body_v1.as_mut() {
             let _ = boundary_body.reset();
         }
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         if let Some(lane) = self.metal_w8_mlp_stack3_boundary_tail_head_v1.as_mut() {
             let _ = lane.reset();
         }
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         if reset_all_linear_precision_v2 || reset_stack3_full_mlp {
             if let Some(mlp_blocks) = self.metal_w8_mlp_blocks.as_mut() {
                 mlp_blocks.reset_stats();
             }
         }
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         if self.metal_w8_stack3_lm_head_v2_terminal_error.is_some() {
             self.metal_w8_stack3_lm_head_v2_terminal_error = Some(false);
             if let Some(stats) = self.metal_w8_lm_head_stats.as_mut() {
                 *stats = Qwen35MetalW8LmHeadStats::default();
             }
         }
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         if let Some(reference) = self.packed_w8_linear_layer_reference.as_mut() {
             reference.reset();
         }
-        #[cfg(all(test, debug_assertions, feature = "metal-w8"))]
+        #[cfg(all(test, debug_assertions, feature = "metal-experiments"))]
         {
             self.fail_after_layer_once_for_test = None;
             self.fail_stack3_lm_head_v2_before_submit_once_for_test = false;
@@ -3213,8 +3226,9 @@ impl LlmTrait for GeneralQwen35 {
     }
 
     fn decode_token(&mut self, token: u32, pos: u32) -> Option<Result<u32>> {
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-w8-head-mlp")]
         {
+            #[cfg(feature = "metal-experiments")]
             if self.metal_w8_mlp_stack3_boundary_tail_head_v1.is_some() {
                 let residual = match self.forward_hidden(&[token], pos) {
                     Ok(hidden) => hidden,
@@ -3246,9 +3260,11 @@ impl LlmTrait for GeneralQwen35 {
                 Err(error) => return Some(Err(error)),
             };
             let result = self.metal_w8_reranked_token(&hidden, Qwen35MetalW8LmHeadPhase::Decode);
-            return Some(self.finish_stack3_lm_head_v2_post_body(result, "decode head"));
+            #[cfg(feature = "metal-experiments")]
+            let result = self.finish_stack3_lm_head_v2_post_body(result, "decode head");
+            return Some(result);
         }
-        #[cfg(not(feature = "metal-w8"))]
+        #[cfg(not(feature = "metal-w8-head-mlp"))]
         {
             let _ = (token, pos);
             None
@@ -3256,7 +3272,7 @@ impl LlmTrait for GeneralQwen35 {
     }
 
     fn generation_path_receipt(&self) -> Option<serde_json::Value> {
-        #[cfg(feature = "metal-w8")]
+        #[cfg(feature = "metal-experiments")]
         {
             if let Some(lane) = self.metal_w8_mlp_stack3_boundary_tail_head_v1_stats() {
                 let aggregate =
@@ -3653,6 +3669,9 @@ impl LlmTrait for GeneralQwen35 {
                     "terminal_error": all_linear.terminal_error,
                 }));
             }
+        }
+        #[cfg(feature = "metal-w8-head-mlp")]
+        {
             let mlp_layers = self
                 .metal_w8_mlp_block_layer_stats()
                 .into_iter()
@@ -3681,7 +3700,7 @@ impl LlmTrait for GeneralQwen35 {
                 "lm_head": head,
             }));
         }
-        #[cfg(not(feature = "metal-w8"))]
+        #[cfg(not(feature = "metal-w8-head-mlp"))]
         {
             Some(serde_json::json!({
                 "format": "apxinf-qwen35-generation-path-v1",
@@ -3880,7 +3899,7 @@ fn run_full_attention(
     backend.matmul(&attention, &weights.output_projection)
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8GdnLayer {
     fn pack(
         weights: &Qwen35TextWeights,
@@ -4061,7 +4080,7 @@ impl Qwen35MetalW8GdnLayer {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 fn pack_qwen35_w8_linear_layer(
     weights: &Qwen35TextWeights,
     config: &Qwen35TextConfig,
@@ -4272,7 +4291,7 @@ fn pack_qwen35_w8_linear_layer(
     Ok(Qwen35PackedW8LinearLayerWeights { dimensions, packed })
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8LinearLayer {
     fn pack(
         weights: &Qwen35TextWeights,
@@ -4410,7 +4429,7 @@ impl Qwen35MetalW8LinearLayer {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8AllLinearLayersPrecisionV2AggregateLedger {
     fn new(
         linear_layers: Vec<Qwen35MetalW8LinearLayerBufferLedger>,
@@ -4450,7 +4469,7 @@ impl Qwen35MetalW8AllLinearLayersPrecisionV2AggregateLedger {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8AllLinearLayersPrecisionV2 {
     fn pack(
         weights: &Qwen35TextWeights,
@@ -4555,7 +4574,7 @@ impl Qwen35MetalW8AllLinearLayersPrecisionV2 {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8LinearLayerStack3V1 {
     fn pack(
         weights: &Qwen35TextWeights,
@@ -4734,7 +4753,7 @@ impl Qwen35MetalW8LinearLayerStack3V1 {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8LinearLayerStacksV1AggregateLedger {
     fn new(
         stacks: Vec<Qwen35MetalW8LinearLayerStack3BufferLedger>,
@@ -4782,7 +4801,7 @@ impl Qwen35MetalW8LinearLayerStacksV1AggregateLedger {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8Stack3LmHeadV2AggregateLedger {
     fn new(
         body: Qwen35MetalW8LinearLayerStacksV1AggregateLedger,
@@ -4861,7 +4880,7 @@ impl Qwen35MetalW8Stack3LmHeadV2AggregateLedger {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8LinearLayerStacksV1 {
     fn pack(
         weights: &Qwen35TextWeights,
@@ -4985,7 +5004,7 @@ impl Qwen35MetalW8LinearLayerStacksV1 {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8MlpStack3BoundaryRegionV1 {
     fn pack(
         weights: &Qwen35TextWeights,
@@ -5226,7 +5245,7 @@ impl Qwen35MetalW8MlpStack3BoundaryRegionV1 {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8MlpStack3BoundaryBodyV1 {
     fn pack(weights: &Qwen35TextWeights, config: &Qwen35TextConfig) -> Result<Self> {
         Self::validate_config_schedule(config)?;
@@ -5491,7 +5510,7 @@ impl Qwen35MetalW8MlpStack3BoundaryBodyV1 {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8MlpStack3BoundaryTailHeadV1 {
     fn pack_with_gdn_core_profile_v1(
         weights: &Qwen35TextWeights,
@@ -5752,7 +5771,7 @@ impl Qwen35MetalW8MlpStack3BoundaryTailHeadV1 {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8MlpStack3BoundaryTailHeadV1AggregateLedger {
     fn new(
         initial_stack: Qwen35MetalW8LinearLayerStack3BufferLedger,
@@ -5869,7 +5888,7 @@ impl Qwen35MetalW8MlpStack3BoundaryTailHeadV1AggregateLedger {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8MlpStack3BoundaryBodyV1AggregateLedger {
     fn new(
         initial_stack: Qwen35MetalW8LinearLayerStack3BufferLedger,
@@ -5944,7 +5963,7 @@ impl Qwen35MetalW8MlpStack3BoundaryBodyV1AggregateLedger {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35PackedW8LinearLayerReference {
     fn pack(
         weights: &Qwen35TextWeights,
@@ -6019,7 +6038,7 @@ impl Qwen35PackedW8LinearLayerReference {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 fn gdn_decode_state_from_cpu(
     config: &Qwen35TextConfig,
     state: &Qwen35LinearState,
@@ -6052,7 +6071,7 @@ fn gdn_decode_state_from_cpu(
     .map_err(|error| Error::Other(format!("qwen3.5 Metal W8 GDN state seed: {error}")))
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 fn run_linear_attention_with_metal_w8_gdn(
     hidden: &Tensor,
     gdn: &mut Qwen35MetalW8GdnLayer,
@@ -6098,7 +6117,7 @@ fn run_linear_attention_with_metal_w8_gdn(
     Ok(tensor)
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 fn run_linear_layer_with_metal_w8(
     hidden: &Tensor,
     linear_layer: &mut Qwen35MetalW8LinearLayer,
@@ -6174,7 +6193,7 @@ fn run_linear_layer_with_metal_w8(
     Ok(tensor)
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 fn run_linear_layer_stack3_with_metal_w8(
     hidden: &Tensor,
     stack: &mut Qwen35MetalW8LinearLayerStack3V1,
@@ -6250,7 +6269,7 @@ fn run_linear_layer_stack3_with_metal_w8(
     Ok(tensor)
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 fn run_mlp_stack3_boundary_with_metal_w8(
     hidden: &Tensor,
     region: &mut Qwen35MetalW8MlpStack3BoundaryRegionV1,
@@ -6326,7 +6345,7 @@ fn run_mlp_stack3_boundary_with_metal_w8(
     Ok(tensor)
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 fn run_linear_layer_with_packed_w8_reference(
     hidden: &Tensor,
     reference: &mut Qwen35PackedW8LinearLayerReference,
@@ -6405,7 +6424,7 @@ fn run_linear_layer_with_packed_w8_reference(
     Ok(tensor)
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8Body {
     fn pack(
         weights: &Qwen35TextWeights,
@@ -6459,7 +6478,7 @@ impl Qwen35MetalW8Body {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 impl Qwen35MetalW8BodyLayer {
     fn pack(
         weights: &Qwen35TextWeights,
@@ -6510,7 +6529,7 @@ impl Qwen35MetalW8BodyLayer {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-w8-head-mlp")]
 impl Qwen35MetalW8MlpBlocks {
     fn pack(
         weights: &Qwen35TextWeights,
@@ -6566,6 +6585,7 @@ impl Qwen35MetalW8MlpBlocks {
             .collect()
     }
 
+    #[cfg(feature = "metal-experiments")]
     fn buffer_ledgers(&self) -> Vec<Qwen35MetalW8MlpBlockBufferLedger> {
         self.layers
             .iter()
@@ -6577,6 +6597,7 @@ impl Qwen35MetalW8MlpBlocks {
             .collect()
     }
 
+    #[cfg(feature = "metal-experiments")]
     fn reset_stats(&mut self) {
         for layer in self.layers.iter_mut().flatten() {
             layer.decode_calls = 0;
@@ -6585,7 +6606,7 @@ impl Qwen35MetalW8MlpBlocks {
     }
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-w8-head-mlp")]
 fn pack_qwen35_w8_mlp_block(
     weights: &Qwen35TextWeights,
     config: &Qwen35TextConfig,
@@ -6628,7 +6649,7 @@ fn pack_qwen35_w8_mlp_block(
     })
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-w8-head-mlp")]
 impl Qwen35MetalW8MlpBlockLayer {
     fn pack(
         weights: &Qwen35TextWeights,
@@ -6657,7 +6678,7 @@ fn run_mlp(backend: &dyn Backend, hidden: &Tensor, weights: &RuntimeMlpWeights) 
     backend.matmul(&activated, &weights.down_projection)
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-experiments")]
 fn run_mlp_with_metal_w8(
     backend: &dyn Backend,
     hidden: &Tensor,
@@ -6699,7 +6720,7 @@ fn run_mlp_with_metal_w8(
     backend.matmul(&activated, &weights.down_projection)
 }
 
-#[cfg(feature = "metal-w8")]
+#[cfg(feature = "metal-w8-head-mlp")]
 fn run_mlp_with_metal_w8_block(
     hidden: &Tensor,
     block: &mut Qwen35MetalW8MlpBlockLayer,
@@ -7194,7 +7215,7 @@ mod tests {
         (config, tensors)
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     fn metal_width_fixture() -> (Qwen35Config, HashMap<String, Tensor>) {
         let raw = MINI_CONFIG
             .replacen("\"hidden_size\": 8", "\"hidden_size\": 64", 1)
@@ -7216,7 +7237,7 @@ mod tests {
         (config, tensors)
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-w8-head-mlp", target_os = "macos"))]
     fn metal_mlp_block_fixture() -> (Qwen35Config, HashMap<String, Tensor>) {
         let raw = MINI_CONFIG
             .replacen("\"hidden_size\": 8", "\"hidden_size\": 64", 1)
@@ -7239,7 +7260,7 @@ mod tests {
         (config, tensors)
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     fn metal_gdn_fixture() -> (Qwen35Config, HashMap<String, Tensor>) {
         let raw = MINI_CONFIG
             .replacen("\"hidden_size\": 8", "\"hidden_size\": 64", 1)
@@ -7271,7 +7292,7 @@ mod tests {
         (config, tensors)
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     fn metal_linear_layer_fixture() -> (Qwen35Config, HashMap<String, Tensor>) {
         let raw = MINI_CONFIG
             .replacen("\"hidden_size\": 8", "\"hidden_size\": 64", 1)
@@ -7304,7 +7325,7 @@ mod tests {
         (config, tensors)
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     fn metal_all_linear_layers_fixture() -> (Qwen35Config, HashMap<String, Tensor>) {
         let layer_types = (0..24)
             .map(|layer_index| {
@@ -7362,7 +7383,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     fn assert_gdn_seed_matches_cpu(model: &GeneralQwen35, layer_index: usize) {
         let cpu = model.state.linear_state(layer_index).unwrap();
         let metal = model
@@ -7382,7 +7403,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_w8_gdn_is_explicit_seeds_exactly_and_tracks_two_decode_steps() {
         let (config, tensors) = metal_gdn_fixture();
@@ -7423,7 +7444,7 @@ mod tests {
         assert!(stats.block_elapsed_ns > 0);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_w8_gdn_reset_clears_state_and_requires_a_new_prefill_seed() {
         let (config, tensors) = metal_gdn_fixture();
@@ -7469,7 +7490,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_w8_gdn_error_is_terminal_and_does_not_commit_or_advance() {
         let (config, tensors) = metal_gdn_fixture();
@@ -7518,7 +7539,7 @@ mod tests {
         assert_eq!(diagnostic.metal_w8_gdn_stats().unwrap().decode_calls, 1);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_w8_gdn_constructor_rejects_full_attention_selection() {
         let (config, tensors) = metal_gdn_fixture();
@@ -7534,7 +7555,7 @@ mod tests {
         assert!(error.to_string().contains("not linear attention"));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_w8_linear_layer_is_explicit_seeds_prefill_and_owns_two_decode_steps() {
         let (config, tensors) = metal_linear_layer_fixture();
@@ -7606,7 +7627,7 @@ mod tests {
         assert!(stats.block_elapsed_ns > 0);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_precision_v2_gdn_out_g32_is_explicit_and_reports_its_exact_mechanism() {
         let (config, tensors) = metal_linear_layer_fixture();
@@ -7665,7 +7686,7 @@ mod tests {
         assert!(!decoded.execution.terminal_error);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_precision_v2_all_linear_layers_hit_18_without_duplicate_mlp_selection() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -7846,7 +7867,7 @@ mod tests {
         assert!(!decoded.terminal_error);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_stack3_v1_explicit_slice_runs_layers_zero_one_two_as_one_transaction() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -7903,7 +7924,7 @@ mod tests {
         assert!(!decoded.terminal_error);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_mlp_stack3_boundary_body_v1_is_explicit_and_owns_the_exact_schedule() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -7960,7 +7981,7 @@ mod tests {
         assert!(diagnostic.metal_w8_lm_head_stats().is_none());
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_boundary_tail_head_v1_is_explicit_tied_only_and_owns_layer_23_exclusively() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8031,7 +8052,7 @@ mod tests {
         assert!(error.to_string().contains("tied word embeddings"));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_boundary_tail_head_v1_uses_cpu_prefill_then_two_exact_reranked_decode_steps() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8096,7 +8117,7 @@ mod tests {
         assert!(!decoded.terminal_error);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_boundary_tail_head_v1_generation_uses_cpu_prefill_and_exactly_two_tail_decodes() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8147,7 +8168,7 @@ mod tests {
             .all(|region| region["last_state_commit_mask"] == 0b111));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_boundary_tail_head_v1_reports_an_independent_exact_ledger_and_receipt() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8215,7 +8236,7 @@ mod tests {
         assert_eq!(receipt["terminal_error"], false);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_boundary_tail_head_v1_body_fault_submits_zero_tail_work_and_reset_recovers() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8287,7 +8308,7 @@ mod tests {
         assert!(!recovered.terminal_error);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_boundary_tail_head_v1_tail_post_execution_fault_is_terminal_and_retry_is_zero_work() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8349,7 +8370,7 @@ mod tests {
         assert!(!recovered.terminal_error);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_boundary_tail_head_v1_malformed_tail_outputs_are_terminal_retry_zero_and_resettable() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8402,7 +8423,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_boundary_tail_head_v1_rerank_fault_latches_after_tail_and_reset_recovers() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8451,7 +8472,7 @@ mod tests {
         assert!(!recovered.terminal_error);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_boundary_tail_head_v1_partial_prefill_is_terminal_retry_zero_and_resettable() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8496,7 +8517,7 @@ mod tests {
         assert_eq!(recovered.prefill_body_calls, 1);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_boundary_tail_head_v1_keeps_legacy_lanes_and_receipt_formats_isolated() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8533,7 +8554,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_mlp_stack3_boundary_body_v1_prefills_once_and_runs_two_exact_decode_schedules() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8661,7 +8682,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_mlp_stack3_boundary_body_v1_reports_one_exact_aggregate_and_receipt() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8720,7 +8741,7 @@ mod tests {
         assert_eq!(receipt["terminal_error"], false);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_mlp_stack3_boundary_body_v1_latches_the_whole_lane_after_a_later_fault() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8790,7 +8811,7 @@ mod tests {
         assert_eq!(recovered.final_mlp.decode_calls, 1);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_mlp_stack3_boundary_body_v1_every_region_fault_is_terminal_and_retry_is_zero_work() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8853,7 +8874,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_mlp_stack3_boundary_body_v1_initial_stack_fault_latches_retry_and_resets() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8911,7 +8932,7 @@ mod tests {
         assert_eq!(recovered.final_mlp.decode_calls, 1);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_mlp_stack3_boundary_body_v1_final_mlp_fault_latches_retry_and_resets() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -8964,7 +8985,7 @@ mod tests {
         assert_eq!(recovered.final_mlp.decode_calls, 1);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_mlp_stack3_boundary_body_v1_partial_prefill_is_terminal_until_reset() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -9016,7 +9037,7 @@ mod tests {
             .all(|region| region.prefill_seed_calls == [1, 1, 1]));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_mlp_stack3_boundary_body_v1_rejects_a_changed_full_attention_index() {
         let (mut config, tensors) = metal_all_linear_layers_fixture();
@@ -9037,7 +9058,7 @@ mod tests {
             .contains("requires full-attention layer at index 3"));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_stack3_v1_all_six_runs_have_the_exact_body_ledger_and_no_duplicate_mlp() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -9154,7 +9175,7 @@ mod tests {
         assert!(!decoded.terminal_error);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_stack3_head_v2_constructor_is_an_explicit_composite_kill_switch() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -9182,7 +9203,7 @@ mod tests {
         assert!(diagnostic.metal_w8_lm_head_stats().is_some());
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_stack3_head_v2_model_exposes_body_plus_head_ledger_components() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -9217,7 +9238,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_stack3_head_v2_uses_a_new_generation_receipt_with_head_stats() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -9255,7 +9276,7 @@ mod tests {
         assert_eq!(receipt["terminal_error"], false);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_stack3_head_v2_head_failure_latches_retry_and_reset_clears_every_lane() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -9347,7 +9368,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_stack3_head_v2_body_failure_never_reaches_the_head() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -9381,7 +9402,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_stack3_head_v2_teacher_step_binds_candidate_f32_top4_and_rerank() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -9416,7 +9437,7 @@ mod tests {
             .all(|layer| layer.decode_calls == 1));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_stack3_head_v2_free_run_uses_the_shared_head_fast_path() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -9456,7 +9477,7 @@ mod tests {
             .all(|layer| layer.decode_calls == 2));
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     #[test]
     fn metal_stack3_v1_qwen35_08b_static_ledger_closes_to_the_frozen_target() {
         let stack_ledger = apxinf_metal::LinearLayerStack3BufferLedger {
@@ -9549,7 +9570,7 @@ mod tests {
         assert_eq!(aggregate.final_output_finite_checks_per_decode, 6);
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     #[test]
     fn metal_mlp_stack3_boundary_body_v1_qwen35_08b_static_ledger_is_exact() {
         let initial_stack = Qwen35MetalW8LinearLayerStack3BufferLedger {
@@ -9682,7 +9703,7 @@ mod tests {
         assert_eq!(aggregate.final_output_finite_checks_per_decode, 6);
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     #[test]
     fn metal_boundary_tail_head_gdn_core_fused_v1_is_explicit_fixed_shape_and_qk_closed() {
         let (config, tensors) = fixture();
@@ -9753,7 +9774,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     #[test]
     fn metal_boundary_tail_head_v1_qwen35_08b_profile_ledgers_are_exact() {
         for (
@@ -9932,7 +9953,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     #[test]
     fn metal_stack3_head_v2_static_ledger_adds_the_existing_tied_head_once() {
         let body = Qwen35MetalW8LinearLayerStacksV1AggregateLedger {
@@ -9980,7 +10001,7 @@ mod tests {
         assert!(aggregate.exclusions.contains("F32 rerank"));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_stack3_v1_fault_keeps_all_three_states_atomic_and_latches_the_body_lane() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -10043,7 +10064,7 @@ mod tests {
             .all(|stack| stack.execution.committed_stack_version == 1));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_stack3_v1_latches_the_whole_lane_when_full_layer_three_fails_after_stack_zero_commits()
     {
@@ -10119,7 +10140,7 @@ mod tests {
             .all(|stats| stats.decode_calls == 1));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_stack3_v1_partial_prefill_is_terminal_until_reset() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -10161,7 +10182,7 @@ mod tests {
             .all(|stack| stack.prefill_seed_calls == [1, 1, 1]));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_precision_v2_all_linear_layers_latch_the_whole_lane_after_partial_commit() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -10236,7 +10257,7 @@ mod tests {
         }));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_precision_v2_all_linear_layers_fail_closed_after_partial_prefill() {
         let (config, tensors) = metal_all_linear_layers_fixture();
@@ -10292,7 +10313,7 @@ mod tests {
             .all(|stats| stats.execution.prefill_seed_calls == 1));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_precision_v2_fault_is_terminal_transactional_and_resettable() {
         let (config, tensors) = metal_linear_layer_fixture();
@@ -10362,7 +10383,7 @@ mod tests {
         assert_eq!(diagnostic.state.position(), 3);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_w8_linear_layer_fault_is_terminal_and_commits_no_state_or_position() {
         let (config, tensors) = metal_linear_layer_fixture();
@@ -10433,7 +10454,7 @@ mod tests {
         assert_eq!(diagnostic.metal_w8_linear_layer_stats().unwrap(), failed);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos", debug_assertions))]
     #[test]
     fn metal_w8_linear_layer_latches_terminal_when_a_later_layer_fails() {
         let (config, tensors) = metal_linear_layer_fixture();
@@ -10484,7 +10505,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_w8_linear_layer_reset_clears_ownership_receipts_and_fault_latch() {
         let (config, tensors) = metal_linear_layer_fixture();
@@ -10547,7 +10568,7 @@ mod tests {
         assert!(!fresh.terminal_error);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_w8_linear_layer_constructor_rejects_full_attention_selection() {
         let (config, tensors) = metal_linear_layer_fixture();
@@ -10563,7 +10584,7 @@ mod tests {
         assert!(error.to_string().contains("not linear attention"));
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     #[test]
     fn packed_w8_linear_layer_reference_is_explicit_seeds_and_owns_decode() {
         let (config, tensors) = metal_linear_layer_fixture();
@@ -10627,7 +10648,7 @@ mod tests {
         assert!(stats.block_elapsed_ns > 0);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn packed_reference_precision_profiles_only_change_the_selected_projection_groups() {
         let (config, tensors) = metal_linear_layer_fixture();
@@ -10719,7 +10740,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "metal-w8", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", debug_assertions))]
     #[test]
     fn packed_w8_linear_layer_reference_fault_is_terminal_and_transactional() {
         let (config, tensors) = metal_linear_layer_fixture();
@@ -10785,7 +10806,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "metal-w8", debug_assertions))]
+    #[cfg(all(feature = "metal-experiments", debug_assertions))]
     #[test]
     fn packed_w8_linear_layer_reference_latches_terminal_when_a_later_layer_fails() {
         let (config, tensors) = metal_linear_layer_fixture();
@@ -10836,7 +10857,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     #[test]
     fn packed_w8_linear_layer_reference_reset_clears_state_and_receipts() {
         let (config, tensors) = metal_linear_layer_fixture();
@@ -10877,7 +10898,7 @@ mod tests {
         assert_eq!(fresh.committed_state_version, 1);
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-experiments")]
     #[test]
     fn packed_w8_linear_layer_reference_rejects_full_attention_selection() {
         let (config, tensors) = metal_linear_layer_fixture();
@@ -10914,7 +10935,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_w8_body_is_explicit_and_only_runs_for_selected_decode_layer() {
         let (config, tensors) = metal_width_fixture();
@@ -10943,7 +10964,7 @@ mod tests {
         assert!(stats.projection_elapsed_ns > 0);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-w8-head-mlp", target_os = "macos"))]
     #[test]
     fn metal_w8_mlp_block_is_explicit_and_only_runs_for_selected_decode_layer() {
         let (config, tensors) = metal_mlp_block_fixture();
@@ -10973,7 +10994,7 @@ mod tests {
         assert!(stats.block_elapsed_ns > 0);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-w8-head-mlp", target_os = "macos"))]
     #[test]
     fn metal_w8_mlp_block_layer_set_hits_every_selected_layer_once_per_decode() {
         let (config, tensors) = metal_mlp_block_fixture();
@@ -11004,7 +11025,7 @@ mod tests {
         assert!(stats.iter().all(|stats| stats.block_elapsed_ns > 0));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-w8-head-mlp", target_os = "macos"))]
     #[test]
     fn metal_w8_combined_prefill_and_decode_hit_each_lane_exactly() {
         let (config, tensors) = metal_mlp_block_fixture();
@@ -11063,7 +11084,7 @@ mod tests {
         assert_eq!(receipt["lm_head"]["decode_calls"], 1);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-w8-head-mlp", target_os = "macos"))]
     #[test]
     fn registry_metal_options_select_mlp_only_or_combined_without_double_build() {
         let (config, tensors) = metal_mlp_block_fixture();
@@ -11104,7 +11125,7 @@ mod tests {
         assert!(combined_receipt["lm_head"].is_object());
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-w8-head-mlp", target_os = "macos"))]
     #[test]
     fn metal_w8_mlp_block_layer_set_rejects_invalid_selections() {
         let (config, tensors) = metal_mlp_block_fixture();
@@ -11143,7 +11164,7 @@ mod tests {
         assert!(outside.to_string().contains("outside 0..4"));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_w8_body_rejects_an_out_of_range_layer_without_fallback() {
         let (config, tensors) = metal_width_fixture();
@@ -11160,7 +11181,7 @@ mod tests {
         assert!(error.to_string().contains("outside 0..4"));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_w8_body_does_not_treat_a_one_token_prefill_as_decode() {
         let (config, tensors) = metal_width_fixture();
@@ -11176,7 +11197,7 @@ mod tests {
         assert_eq!(model.metal_w8_body_stats().unwrap().decode_calls, 0);
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_w8_body_layer_set_hits_every_selected_layer_once_per_decode() {
         let (config, tensors) = metal_width_fixture();
@@ -11217,7 +11238,7 @@ mod tests {
         assert!(stats.iter().all(|stats| stats.projection_elapsed_ns > 0));
     }
 
-    #[cfg(all(feature = "metal-w8", target_os = "macos"))]
+    #[cfg(all(feature = "metal-experiments", target_os = "macos"))]
     #[test]
     fn metal_w8_body_layer_set_rejects_empty_and_duplicate_selections() {
         let (config, tensors) = metal_width_fixture();
@@ -11244,7 +11265,7 @@ mod tests {
         assert!(duplicate.to_string().contains("selected more than once"));
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     #[test]
     fn f32_candidate_rerank_is_order_independent_and_uses_lowest_tie() {
         let hidden = [1.0f32, 2.0];
@@ -11257,6 +11278,26 @@ mod tests {
         assert_eq!(
             rerank_tied_f32_candidates(&embedding, &hidden, 4, 2, [3, 2, 0, 1]).unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn cpu_generation_receipt_keeps_the_plain_path_when_optional_routes_are_compiled() {
+        let (config, tensors) = fixture();
+        let mut model = GeneralQwen35::from_weights(config, tensors, Device::Cpu, 16).unwrap();
+        let (tokens, _) = model
+            .generate_streaming(LlmInput::text(&[1, 2]), 2, |_| {}, None)
+            .unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(
+            model.generation_path_receipt().unwrap(),
+            serde_json::json!({
+                "format": "apxinf-qwen35-generation-path-v1",
+                "metal_w8_mlp_block": false,
+                "metal_w8_lm_head": false,
+                "mlp_block_layers": [],
+                "lm_head": null,
+            })
         );
     }
 

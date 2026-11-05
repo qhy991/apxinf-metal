@@ -7,6 +7,8 @@ members = [
     "crates/apxinf-model",
     "crates/apxinf-tokenizer",
     "crates/apxinf-py",
+    "crates/apxinf-serving",
+    "crates/apxinf-qwen35",
 ]
 
 [package]
@@ -15,7 +17,12 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
+default = ["model-llama", "model-qwen35", "model-qwen3vl", "model-pi05"]
+# Select model architectures before compilation. Defaults retain all families.
+model-llama = ["apxinf-model/model-llama"]
+model-qwen35 = ["apxinf-model/model-qwen35"]
+model-qwen3vl = ["apxinf-model/model-qwen3vl"]
+model-pi05 = ["apxinf-model/model-pi05"]
 # CUDA GPU inference. NVTX profiling markers auto-detect the lib name at
 # build time: desktop CUDA 12.x uses libnvtx3interop; Drive OS / embedded
 # CUDA uses libnvToolsExt. Both are handled transparently — see
@@ -39,7 +46,7 @@ metal-w8 = ["apxinf-model/metal-w8"]
 apxinf-core = { path = "crates/apxinf-core" }
 apxinf-cuda = { path = "crates/apxinf-cuda", optional = true, default-features = false }
 apxinf-loader = { path = "crates/apxinf-loader" }
-apxinf-model = { path = "crates/apxinf-model" }
+apxinf-model = { path = "crates/apxinf-model", default-features = false, features = ["model-registry"] }
 apxinf-tokenizer = { path = "crates/apxinf-tokenizer" }
 clap = { version = "=4.5.23", features = ["derive"] }
 serde_json = "1"

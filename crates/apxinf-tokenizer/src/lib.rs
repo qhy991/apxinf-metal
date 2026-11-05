@@ -72,6 +72,57 @@ pub struct Tokenizer {
     chat_template: Option<String>,
 }
 
+type HfDecodeStream<'a> = tokenizers::DecodeStream<
+    'a,
+    tokenizers::models::ModelWrapper,
+    tokenizers::normalizers::NormalizerWrapper,
+    tokenizers::pre_tokenizers::PreTokenizerWrapper,
+    tokenizers::processors::PostProcessorWrapper,
+    tokenizers::decoders::DecoderWrapper,
+>;
+
+/// Incremental text decoding through the tokenizer's existing decoder.
+///
+/// Special tokens are skipped, as in [`Tokenizer::decode`].
+/// Call [`Self::finish`] with the complete output sequence to check and complete the text.
+pub struct TextDecodeStream<'a> {
+    tokenizer: &'a Tokenizer,
+    inner: HfDecodeStream<'a>,
+    emitted: String,
+}
+
+impl TextDecodeStream<'_> {
+    /// Decode one token and return only newly available text.
+    ///
+    /// `None` means that the decoder has no complete text to emit yet.
+    /// Discard the stream after an error.
+    pub fn step(&mut self, token: u32) -> Result<Option<String>> {
+        let chunk = self
+            .inner
+            .step(token)
+            .map_err(|error| Error::Other(format!("tokenizer stream decode: {error}")))?;
+        if let Some(text) = chunk.as_ref() {
+            self.emitted.push_str(text);
+        }
+        Ok(chunk)
+    }
+
+    /// Check the emitted prefix and return the remaining text.
+    ///
+    /// Pass the complete output sequence supplied to [`Self::step`].
+    /// The upstream stream has no flush operation. Full decoding preserves its final UTF-8 handling.
+    /// A changed prefix returns an error because previously emitted text cannot be withdrawn.
+    pub fn finish(self, tokens: &[u32]) -> Result<String> {
+        let complete = self.tokenizer.decode(tokens)?;
+        complete
+            .strip_prefix(&self.emitted)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                Error::Other("tokenizer stream output differs from complete decode".to_owned())
+            })
+    }
+}
+
 impl Tokenizer {
     /// Load tokenizer from tokenizer.json, optionally loading tokenizer_config.json
     /// and the standard standalone chat_template.jinja from the same directory.
@@ -156,6 +207,15 @@ impl Tokenizer {
         self.inner
             .decode(tokens, true)
             .map_err(|e| Error::Other(format!("tokenizer decode: {e}")))
+    }
+
+    /// Start an incremental decoder that skips special tokens.
+    pub fn decode_stream(&self) -> TextDecodeStream<'_> {
+        TextDecodeStream {
+            tokenizer: self,
+            inner: self.inner.decode_stream(true),
+            emitted: String::new(),
+        }
     }
 
     /// Get the vocabulary size.
@@ -367,6 +427,120 @@ mod tests {
             config: TokenizerConfig::default(),
             chat_template: Some(template.to_owned()),
         }
+    }
+
+    fn tokenizer_with_byte_tokens() -> Tokenizer {
+        let vocabulary = [
+            ("<unk>", 0),
+            ("<0x41>", 1),
+            ("<0x42>", 2),
+            ("<0x20>", 3),
+            ("<0xE4>", 4),
+            ("<0xBD>", 5),
+            ("<0xA0>", 6),
+            ("<0xE5>", 7),
+            ("<0xA5>", 8),
+            ("<eos>", 9),
+            ("A", 10),
+        ]
+        .into_iter()
+        .map(|(token, id)| (token.to_owned(), id))
+        .collect();
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocabulary)
+            .unk_token("<unk>".to_owned())
+            .build()
+            .unwrap();
+        let mut inner = HfTokenizer::new(model);
+        inner.with_decoder(Some(
+            tokenizers::decoders::byte_fallback::ByteFallback::new(),
+        ));
+        inner.add_special_tokens(&[tokenizers::AddedToken::from("<eos>", true)]);
+        Tokenizer {
+            inner,
+            config: TokenizerConfig::default(),
+            chat_template: None,
+        }
+    }
+
+    #[test]
+    fn streamed_ascii_matches_complete_decode_without_repeated_prefixes() {
+        let tokenizer = tokenizer_with_byte_tokens();
+        let tokens = [1, 3, 2];
+        let mut stream = tokenizer.decode_stream();
+        let mut text = String::new();
+        for (token, expected) in tokens.into_iter().zip(["A", " ", "B"]) {
+            let chunk = stream.step(token).unwrap().unwrap();
+            assert_eq!(chunk, expected);
+            text.push_str(&chunk);
+        }
+        let tail = stream.finish(&tokens).unwrap();
+        assert!(tail.is_empty());
+        text.push_str(&tail);
+        assert_eq!(text, "A B");
+        assert_eq!(text, tokenizer.decode(&tokens).unwrap());
+    }
+
+    #[test]
+    fn streamed_chinese_waits_for_complete_utf8_and_skips_special_tokens() {
+        let tokenizer = tokenizer_with_byte_tokens();
+        let tokens = [4, 5, 6, 7, 8, 5, 9];
+        let mut stream = tokenizer.decode_stream();
+        let mut text = String::new();
+        for (token, expected) in
+            tokens
+                .into_iter()
+                .zip([None, None, Some("你"), None, None, Some("好"), None])
+        {
+            let chunk = stream.step(token).unwrap();
+            assert_eq!(chunk.as_deref(), expected);
+            if let Some(chunk) = chunk {
+                text.push_str(&chunk);
+            }
+        }
+        text.push_str(&stream.finish(&tokens).unwrap());
+        assert_eq!(text, "你好");
+        assert_eq!(text, tokenizer.decode(&tokens).unwrap());
+    }
+
+    #[test]
+    fn stream_finish_preserves_incomplete_byte_suffix_like_complete_decode() {
+        let tokenizer = tokenizer_with_byte_tokens();
+        let tokens = [10, 4];
+        let mut stream = tokenizer.decode_stream();
+        let first = stream.step(tokens[0]).unwrap().unwrap();
+        assert!(stream.step(tokens[1]).unwrap().is_none());
+        let tail = stream.finish(&tokens).unwrap();
+        assert!(!tail.is_empty());
+        assert_eq!(first + &tail, tokenizer.decode(&tokens).unwrap());
+    }
+
+    #[test]
+    fn stream_finish_rejects_a_different_complete_prefix() {
+        let tokenizer = tokenizer_with_byte_tokens();
+        let mut stream = tokenizer.decode_stream();
+        assert_eq!(stream.step(1).unwrap().as_deref(), Some("A"));
+        assert!(stream.finish(&[2]).is_err());
+    }
+
+    #[test]
+    fn stream_finish_rejects_decoder_changes_to_emitted_text() {
+        let tokenizer = tokenizer_with_byte_tokens();
+        let tokens = [1, 4];
+        let mut stream = tokenizer.decode_stream();
+        assert_eq!(stream.step(tokens[0]).unwrap().as_deref(), Some("A"));
+        assert!(stream.step(tokens[1]).unwrap().is_none());
+        assert!(!tokenizer.decode(&tokens).unwrap().starts_with('A'));
+        assert!(stream.finish(&tokens).is_err());
+    }
+
+    #[test]
+    fn empty_stream_and_special_only_stream_finish_without_text() {
+        let tokenizer = tokenizer_with_byte_tokens();
+        assert_eq!(tokenizer.decode_stream().finish(&[]).unwrap(), "");
+        let mut stream = tokenizer.decode_stream();
+        assert!(stream.step(9).unwrap().is_none());
+        assert_eq!(stream.finish(&[9]).unwrap(), "");
     }
 
     #[test]

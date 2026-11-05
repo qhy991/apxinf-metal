@@ -6,10 +6,10 @@ edition = "2021"
 [dependencies]
 apxinf-core = { path = "../apxinf-core" }
 apxinf-cuda = { path = "../apxinf-cuda", optional = true }
-apxinf-loader = { path = "../apxinf-loader" }
-apxinf-metal = { path = "../apxinf-metal", optional = true }
+apxinf-loader = { path = "../apxinf-loader", default-features = false, features = ["safetensors"] }
+apxinf-metal = { path = "../apxinf-metal", optional = true, default-features = false }
 thiserror = "1"
-once_cell = "1"
+once_cell = { version = "1", optional = true }
 half = "2"
 serde_json = "1"
 
@@ -18,87 +18,110 @@ apxinf-tokenizer = { path = "../apxinf-tokenizer" }
 sha2 = "=0.10.9"
 
 [features]
-default = []
+default = ["model-registry", "model-llama", "model-qwen35", "model-qwen3vl", "model-pi05"]
+model-registry = ["dep:once_cell"]
+model-llama = ["model-registry"]
+model-qwen35 = []
+model-qwen3vl = ["model-registry"]
+model-pi05 = ["model-registry"]
 cuda = ["dep:apxinf-cuda"]
 accelerate = ["apxinf-core/accelerate"]
-metal-w8 = ["dep:apxinf-metal"]
+metal-w8 = ["metal-experiments"]
+metal-w8-head-mlp = ["dep:apxinf-metal", "apxinf-metal/w8-head-mlp"]
+metal-experiments = ["metal-w8-head-mlp", "apxinf-metal/experiments"]
+
+[[test]]
+name = "unified_llm_input"
+required-features = ["model-registry"]
 
 [[example]]
 name = "pi05_bf16_tune"
-required-features = ["cuda"]
+required-features = ["model-pi05", "cuda"]
 
 [[example]]
 name = "pi05_cutlass_tune"
-required-features = ["cuda"]
+required-features = ["model-pi05", "cuda"]
 
 [[example]]
 name = "pi05_bench"
-required-features = ["cuda"]
+required-features = ["model-pi05", "cuda"]
 
 [[example]]
 name = "pi05_auto_smoke"
-required-features = ["cuda"]
+required-features = ["model-pi05", "cuda"]
 
 [[example]]
 name = "pi05_integrity_probe"
-required-features = ["cuda"]
+required-features = ["model-pi05", "cuda"]
 
 [[example]]
 name = "multimodal_check"
-required-features = ["cuda"]
+required-features = ["model-qwen3vl", "cuda"]
 
 [[example]]
 name = "vision_check"
-required-features = ["cuda"]
+required-features = ["model-qwen3vl", "cuda"]
 
 [[example]]
 name = "qwen35_metal_w8_gate"
-required-features = ["metal-w8"]
+required-features = ["model-qwen35", "metal-w8"]
 
 [[example]]
 name = "qwen35_metal_w8_body_screen"
-required-features = ["accelerate", "metal-w8"]
+required-features = ["model-qwen35", "accelerate", "metal-w8"]
 
 [[example]]
 name = "qwen35_metal_w8_body_gate"
-required-features = ["accelerate", "metal-w8"]
+required-features = ["model-qwen35", "accelerate", "metal-w8"]
 
 [[example]]
 name = "qwen35_metal_w8_body_free_run"
-required-features = ["accelerate", "metal-w8"]
+required-features = ["model-qwen35", "accelerate", "metal-w8"]
 
 [[example]]
 name = "qwen35_metal_w8_mlp_block_gate"
-required-features = ["accelerate", "metal-w8"]
+required-features = ["model-qwen35", "accelerate", "metal-w8"]
 
 [[example]]
 name = "qwen35_metal_w8_mlp_block_free_run"
-required-features = ["accelerate", "metal-w8"]
+required-features = ["model-qwen35", "accelerate", "metal-w8"]
 
 [[example]]
 name = "qwen35_metal_w8_combined_gate"
-required-features = ["accelerate", "metal-w8"]
+required-features = ["model-qwen35", "accelerate", "metal-w8"]
 
 [[example]]
 name = "qwen35_metal_w8_combined_free_run"
-required-features = ["accelerate", "metal-w8"]
+required-features = ["model-qwen35", "accelerate", "metal-w8"]
 
 [[example]]
 name = "qwen35_metal_w8_gdn_gate"
-required-features = ["accelerate", "metal-w8"]
+required-features = ["model-qwen35", "accelerate", "metal-w8"]
 
 [[example]]
 name = "qwen35_metal_w8_linear_layer_gate"
-required-features = ["accelerate", "metal-w8"]
+required-features = ["model-qwen35", "accelerate", "metal-w8"]
 
 [[example]]
 name = "qwen35_packed_w8_linear_layer_reference_gate"
-required-features = ["accelerate", "metal-w8"]
+required-features = ["model-qwen35", "accelerate", "metal-w8"]
 
 [[example]]
 name = "qwen35_metal_w8_stack3_head_v2_gate"
-required-features = ["accelerate", "metal-w8"]
+required-features = ["model-qwen35", "accelerate", "metal-w8"]
 
 [[example]]
 name = "qwen35_metal_w8_boundary_tail_head_v1_gate"
-required-features = ["accelerate", "metal-w8"]
+required-features = ["model-qwen35", "accelerate", "metal-w8"]
+
+[[example]]
+name = "qwen35_oracle"
+required-features = ["model-qwen35"]
+
+[[example]]
+name = "qwen35_full_attention_decode_count6_ab_v1"
+required-features = ["model-qwen35", "accelerate", "metal-w8"]
+
+[[example]]
+name = "specialization_bench"
+required-features = ["model-registry", "model-qwen35", "accelerate", "metal-w8-head-mlp"]

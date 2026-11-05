@@ -7,6 +7,7 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 use crate::accelerator::create_backend;
 use crate::builtin::register_builtin_models;
 use crate::llm_trait::{LlmCapabilities, LlmInput, LlmTrait};
+#[cfg(feature = "model-pi05")]
 use crate::pi05::Pi05Config;
 use crate::profiling::GenerationProfile;
 use crate::registry;
@@ -47,6 +48,7 @@ pub struct LoadOptions {
     pub calibration_path: Option<PathBuf>,
     pub tuning_path: Option<PathBuf>,
     /// Explicit architecture config, overriding any on-disk `config.json`.
+    #[cfg(feature = "model-pi05")]
     pub config: Option<Pi05Config>,
     /// When set, load deterministic random weights instead of a checkpoint.
     pub synthetic: Option<SyntheticWeights>,
@@ -195,7 +197,7 @@ impl AutoModel {
                 (false, true) => "Metal W8 lm_head",
                 (false, false) => unreachable!(),
             };
-            if !cfg!(feature = "metal-w8") {
+            if !cfg!(feature = "metal-w8-head-mlp") {
                 return Err(Error::Other(format!(
                     "{requested_path} was requested, but this binary was not built with the `metal-w8` feature"
                 )));
@@ -249,7 +251,7 @@ impl AutoModel {
 mod tests {
     use super::*;
 
-    #[cfg(not(feature = "metal-w8"))]
+    #[cfg(not(feature = "metal-w8-head-mlp"))]
     #[test]
     fn explicit_metal_request_fails_when_feature_is_absent() {
         let options = LoadOptions {
@@ -265,7 +267,7 @@ mod tests {
             .contains("not built with the `metal-w8` feature"));
     }
 
-    #[cfg(not(feature = "metal-w8"))]
+    #[cfg(not(feature = "metal-w8-head-mlp"))]
     #[test]
     fn explicit_metal_mlp_request_fails_when_feature_is_absent() {
         let options = LoadOptions {
@@ -282,7 +284,7 @@ mod tests {
             .contains("not built with the `metal-w8` feature"));
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     #[test]
     fn explicit_metal_request_rejects_another_model_family() {
         let options = LoadOptions {
@@ -296,7 +298,7 @@ mod tests {
         assert!(error.to_string().contains("supports Qwen3.5 only"));
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     #[test]
     fn explicit_metal_mlp_request_rejects_another_model_family() {
         let options = LoadOptions {
@@ -311,7 +313,7 @@ mod tests {
         assert!(error.to_string().contains("supports Qwen3.5 only"));
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     #[test]
     fn explicit_metal_mlp_request_rejects_cuda_before_loading() {
         let options = LoadOptions {
@@ -326,7 +328,7 @@ mod tests {
         assert!(error.to_string().contains("--device cpu"));
     }
 
-    #[cfg(feature = "metal-w8")]
+    #[cfg(feature = "metal-w8-head-mlp")]
     #[test]
     fn explicit_metal_mlp_request_rejects_bf16_before_loading() {
         let options = LoadOptions {

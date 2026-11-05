@@ -1,0 +1,5 @@
+[
+  {"id": "france-zh", "prompt": "法国的首都是哪里？请只用一句话回答。"},
+  {"id": "multiply-en", "prompt": "What is 7 times 8? Give only the answer."},
+  {"id": "ice-en", "prompt": "Explain in one sentence why ice floats on water."}
+]

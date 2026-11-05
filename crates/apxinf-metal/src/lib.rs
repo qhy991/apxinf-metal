@@ -5,22 +5,34 @@
 //! endian F32 scale per row/group. Values use `round()` followed by clamping
 //! to `[-127, 127]`; an all-zero group records scale `1.0`.
 
+#![cfg(feature = "w8-head-mlp")]
+
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+#[cfg(feature = "experiments")]
 mod full_attention_decode_v1;
+#[cfg(feature = "experiments")]
 mod gdn;
+#[cfg(feature = "experiments")]
 mod gdn_core_fused_profile_v1;
+#[cfg(feature = "experiments")]
 mod gdn_recurrent_profile_v1;
+#[cfg(feature = "experiments")]
 mod linear_layer;
+#[cfg(feature = "experiments")]
 mod tail_mlp_head_v1;
 
+#[cfg(feature = "experiments")]
 pub use full_attention_decode_v1::*;
+#[cfg(feature = "experiments")]
 pub use gdn::{
     GdnDecodeResult, GdnDecodeState, GdnDimensions, GdnF32Weights, GdnMetalStats, MetalW8GdnBlock,
     PackedW8GdnBlock,
 };
+#[cfg(feature = "experiments")]
 pub use gdn_core_fused_profile_v1::*;
+#[cfg(feature = "experiments")]
 pub use gdn_recurrent_profile_v1::{
     GdnRecurrentCount18RuntimeReceiptV1, GdnRecurrentCount18SnapshotV1, GdnRecurrentProfileV1,
     MetalGdnRecurrentCount18PrimitiveV1, QWEN35_GDN_CORE_ELEMENTS_PER_SEAM_V1,
@@ -28,6 +40,7 @@ pub use gdn_recurrent_profile_v1::{
     QWEN35_GDN_PROJECTED_ELEMENTS_PER_SEAM_V1, QWEN35_GDN_RECURRENT_ELEMENTS_PER_SEAM_V1,
     QWEN35_GDN_RECURRENT_SEAMS_PER_DECODE_V1, QWEN35_GDN_VALUE_DIM_V1, QWEN35_GDN_VALUE_HEADS_V1,
 };
+#[cfg(feature = "experiments")]
 pub use linear_layer::{
     LinearLayerBufferLedger, LinearLayerDecodeResult, LinearLayerMetalStats,
     LinearLayerQuantizationLedger, LinearLayerStack3BufferLedger, LinearLayerStack3MetalStats,
@@ -35,6 +48,7 @@ pub use linear_layer::{
     MlpStack3BoundaryBufferLedgerV1, MlpStack3BoundaryDecodeResultV1,
     MlpStack3BoundaryMetalStatsV1, PackedW8LinearLayerBlock, PackedW8MlpStack3BoundaryV1,
 };
+#[cfg(feature = "experiments")]
 pub use tail_mlp_head_v1::{
     MetalW8TailMlpHeadV1, PackedW8TailMlpHeadV1, TailMlpHeadBufferLedgerV1,
     TailMlpHeadDecodeResultV1, TailMlpHeadDecodeViewV1, TailMlpHeadMetalStatsV1,
@@ -657,12 +671,14 @@ impl MetalW8LmHead {
 /// The canonical packed weights are `[rows, columns]`. Each call transfers one
 /// F32 input row and returns one F32 output row; weights and scales are uploaded
 /// only when the handle is constructed.
+#[cfg(feature = "experiments")]
 pub struct MetalW8MatVec {
     inner: platform::MatVecHandle,
     rows: usize,
     columns: usize,
 }
 
+#[cfg(feature = "experiments")]
 impl MetalW8MatVec {
     pub fn from_packed(weights: &PackedW8Rows) -> Result<Self, MetalW8Error> {
         weights.require_metal_g64("matvec")?;
@@ -826,6 +842,7 @@ mod platform {
             error_capacity: usize,
         ) -> c_int;
         fn apxinf_metal_w8_destroy(handle: *mut c_void);
+        #[cfg(feature = "experiments")]
         fn apxinf_metal_w8_matvec_create(
             weights: *const i8,
             scales: *const f32,
@@ -836,6 +853,7 @@ mod platform {
             error: *mut c_char,
             error_capacity: usize,
         ) -> c_int;
+        #[cfg(feature = "experiments")]
         fn apxinf_metal_w8_matvec_multiply(
             handle: *mut c_void,
             input: *const f32,
@@ -845,6 +863,7 @@ mod platform {
             error: *mut c_char,
             error_capacity: usize,
         ) -> c_int;
+        #[cfg(feature = "experiments")]
         fn apxinf_metal_w8_matvec_destroy(handle: *mut c_void);
         fn apxinf_metal_w8_mlp_block_create(
             gate_up_weights: *const i8,
@@ -872,6 +891,7 @@ mod platform {
 
     pub(super) struct Handle(NonNull<c_void>);
 
+    #[cfg(feature = "experiments")]
     pub(super) struct MatVecHandle(NonNull<c_void>);
 
     pub(super) struct MlpBlockHandle(NonNull<c_void>);
@@ -926,6 +946,7 @@ mod platform {
         }
     }
 
+    #[cfg(feature = "experiments")]
     impl MatVecHandle {
         pub(super) fn new(weights: &PackedW8Rows) -> Result<Self, MetalW8Error> {
             let mut output = std::ptr::null_mut();
@@ -975,6 +996,7 @@ mod platform {
         }
     }
 
+    #[cfg(feature = "experiments")]
     impl Drop for MatVecHandle {
         fn drop(&mut self) {
             unsafe { apxinf_metal_w8_matvec_destroy(self.0.as_ptr()) };
@@ -1054,6 +1076,7 @@ mod platform {
     use super::{MetalW8Error, PackedW8MlpBlock, PackedW8Rows, W8_TOP_K};
 
     pub(super) struct Handle;
+    #[cfg(feature = "experiments")]
     pub(super) struct MatVecHandle;
 
     pub(super) struct MlpBlockHandle;
@@ -1072,6 +1095,7 @@ mod platform {
         }
     }
 
+    #[cfg(feature = "experiments")]
     impl MatVecHandle {
         pub(super) fn new(_weights: &PackedW8Rows) -> Result<Self, MetalW8Error> {
             Err(MetalW8Error::new("Metal W8 matvec requires macOS"))
@@ -1183,6 +1207,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(g32.scores(&hidden).unwrap(), expected);
         for error in [
+            #[cfg(feature = "experiments")]
             MetalW8MatVec::from_packed(&g32)
                 .err()
                 .expect("legacy Metal matvec must reject g32"),
@@ -1380,11 +1405,16 @@ mod tests {
     #[test]
     fn metal_shader_is_a_single_discoverable_source() {
         let shader = include_str!("metal_w8.metal");
-        let matvec_shader = include_str!("metal_w8_matvec.metal");
         let bridge = include_str!("metal_w8_bridge.mm");
         let mlp_shader = include_str!("metal_w8_mlp.metal");
         let mlp_bridge = include_str!("metal_w8_mlp_bridge.mm");
-        assert!(matvec_shader.contains("kernel void w8_rows_matvec("));
+        #[cfg(feature = "experiments")]
+        {
+            let matvec_shader = include_str!("metal_w8_matvec.metal");
+            assert!(matvec_shader.contains("kernel void w8_rows_matvec("));
+            assert!(!matvec_shader.contains("kernel void w8_mlp_"));
+            assert!(bridge.contains("#include \"metal_w8_matvec_source.inc\""));
+        }
         assert!(!shader.contains("kernel void w8_rows_matvec("));
         assert!(shader.contains("kernel void w8_rows_topk4("));
         assert!(shader.contains("kernel void w8_final_topk4("));
@@ -1392,9 +1422,7 @@ mod tests {
         assert!(mlp_shader.contains("kernel void w8_mlp_silu_mul("));
         assert!(mlp_shader.contains("kernel void w8_mlp_down("));
         assert!(!shader.contains("kernel void w8_mlp_"));
-        assert!(!matvec_shader.contains("kernel void w8_mlp_"));
         assert!(bridge.contains("#include \"metal_w8_source.inc\""));
-        assert!(bridge.contains("#include \"metal_w8_matvec_source.inc\""));
         assert!(mlp_bridge.contains("#include \"metal_w8_mlp_source.inc\""));
         assert!(!bridge.contains("kernel void w8_rows_matvec("));
         assert!(!bridge.contains("kernel void w8_rows_topk4("));
@@ -1402,7 +1430,7 @@ mod tests {
         assert!(!mlp_bridge.contains("kernel void w8_mlp_"));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "experiments"))]
     #[test]
     fn metal_matvec_matches_every_quantized_cpu_score() {
         let rows = 257;

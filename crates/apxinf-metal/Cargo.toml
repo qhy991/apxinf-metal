@@ -4,9 +4,50 @@ version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
+[features]
+default = ["w8-head-mlp", "experiments"]
+w8-head-mlp = []
+experiments = ["w8-head-mlp"]
+
 [build-dependencies]
 cc = "1"
 
 [dev-dependencies]
 serde_json = "1"
 sha2 = "=0.10.9"
+
+[[test]]
+name = "full_attention_decode_v1"
+required-features = ["experiments"]
+
+[[test]]
+name = "gdn_block"
+required-features = ["experiments"]
+
+[[test]]
+name = "linear_layer_block"
+required-features = ["experiments"]
+
+[[test]]
+name = "linear_layer_stack3"
+required-features = ["experiments"]
+
+[[test]]
+name = "mlp_stack3_boundary_v1"
+required-features = ["experiments"]
+
+[[test]]
+name = "tail_mlp_head_v1"
+required-features = ["experiments"]
+
+[[example]]
+name = "qwen35_next_hotspot_screen"
+required-features = ["experiments"]
+
+[[example]]
+name = "qwen35_gdn_core_fused_abc_v1"
+required-features = ["experiments"]
+
+[[example]]
+name = "qwen35_gdn_recurrent_local_reuse_abc_v1"
+required-features = ["experiments"]

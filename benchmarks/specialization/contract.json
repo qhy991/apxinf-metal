@@ -1,0 +1,53 @@
+{
+  "schema": "apxinf-specialization-experiment-v1",
+  "purpose": "Compare model source pruning while preserving the existing native execution path.",
+  "model": "Qwen/Qwen3.5-0.8B",
+  "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "revision_evidence": "doc/20260823-qwen35-macos-bringup/gdn-contiguous-benchmark-20260824.json",
+  "revision_evidence_limit": "Existing local provenance record. No new remote revision verification.",
+  "expected_config_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+  "hardware": "Apple M4, 10 GPU cores, 16 GiB unified memory",
+  "workload": {
+    "batch": 1,
+    "concurrency": 1,
+    "max_context": 2048,
+    "max_new_tokens": 64,
+    "stop_on_eos": true,
+    "prompt_template": "Existing ApxInf Tokenizer::apply_chat_template",
+    "cases": "benchmarks/specialization/cases.json",
+    "generation": "Existing native greedy generation",
+    "precision": "Existing CPU/Accelerate F32 body and Metal W8 head/MLP path"
+  },
+  "control": {
+    "source": "The same final working-tree snapshot for both builds.",
+    "baseline": "All existing model features plus accelerate and metal-w8.",
+    "candidate": "Qwen3.5 model feature only plus accelerate and metal-w8.",
+    "profile": "Cargo release defaults, without variant-specific LTO or stripping.",
+    "network": "Offline Cargo builds with the same existing lockfile.",
+    "source_pruning_proof": "Inspect Rust dependency files and native build outputs. Do not infer pruning from executable size."
+  },
+  "build_measurement": {
+    "order": ["baseline", "candidate", "candidate", "baseline"],
+    "clean": "Each build uses a new Cargo target directory. The dependency download cache remains warm.",
+    "filesystem_cache": "Uncontrolled. No privileged cache purge.",
+    "noop": "Repeat the identical build command without changing inputs.",
+    "incremental": "Rebuild after a comment-only edit to the snapshot CLI source.",
+    "jobs": 4
+  },
+  "generation_measurement": {
+    "order": ["baseline", "candidate", "candidate", "baseline"],
+    "warmups_per_case_per_process": 2,
+    "repeats_per_case_per_process": 3,
+    "request_boundary": "Reset through generation completion and returned token IDs.",
+    "load_boundary": "Model construction includes weight preparation and Metal initialization.",
+    "startup_probe": "CLI --help process latency, separate from model loading.",
+    "quality_check": "Require identical token IDs across both build selections for every measured case.",
+    "quality_limit": "This small suite checks pruning regressions. It does not certify general model quality."
+  },
+  "claims": {
+    "build": "Report observed times and sample counts. A small sample does not prove a universal speedup.",
+    "runtime": "Report same-path inference separately from build cost and executable size.",
+    "scope": "This first experiment prunes model families. It does not prove removal of every unused operator.",
+    "aot": "Existing runtime Metal source compilation remains in scope and must be disclosed."
+  }
+}

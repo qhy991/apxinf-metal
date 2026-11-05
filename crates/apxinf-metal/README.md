@@ -1,5 +1,32 @@
 # ApxInf Metal W8 lm_head
 
+## Compilation features
+
+The default features retain the existing APIs, tests, and examples.
+Consumers that select a smaller scope must disable this crate's default features.
+
+| Features | Compiled scope on macOS |
+|---|---|
+| None | Empty crate, without native bridges or Metal linkage |
+| `w8-head-mlp` | W8 head, complete MLP, their CPU packing helpers, two bridges, and two shaders |
+| `experiments` | The head and MLP scope, plus generic matvec, experimental modules, and eight additional bridges |
+
+`experiments` depends on `w8-head-mlp`. Experimental integration tests and
+examples require `experiments`. The minimal build excludes their test targets.
+It does not read or embed the matvec, GDN, linear-layer, or full-attention shaders.
+The head bridge excludes its matvec implementation through a matching compile definition.
+
+```sh
+cargo check -p apxinf-metal --no-default-features --features w8-head-mlp --all-targets
+cargo check -p apxinf-metal --all-targets
+```
+
+These commands check compilation only. They do not establish GPU correctness or inference performance.
+The existing build script embeds selected shader text for runtime Metal compilation.
+This feature selection does not provide Metal AOT compilation.
+
+## Runtime scope
+
 `apxinf-metal` is an explicitly enabled generation output-head accelerator for
 the native Qwen3.5 runtime on Apple Silicon. The transformer body and prompt
 body stay on the existing CPU/Accelerate path. For both the first generated
