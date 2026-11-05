@@ -8,6 +8,7 @@
 //! as `0.5 v (1 + tanh(v / 2))`, gate and up normalized by their row maxima
 //! before the product, down as K-split INT8 convolutions, 512-token tiles.
 //! Weights are quantized on the host from the Q4 checkpoint.
+use super::signpost;
 use super::weights::{Mlp, Q4};
 use apxinf_core::{Error, Result};
 use apxinf_coreml::{ComputeUnits, Model, Operand, Package, ProgramBuilder, ProgramCache, Var};
@@ -753,14 +754,24 @@ impl AneMlp {
     /// tiles `[tiles, 4096, NEURON_TILE]` (evaluated here). Returns the
     /// program's `y` as `[tiles, 4096, NEURON_TILE]` and both scales as
     /// `[tiles * NEURON_TILE]`, FP16 on `stream`, tile after tile.
-    pub fn predict_tiles(&self, stream: &Stream, packed: &Array) -> Result<[Array; 3]> {
+    pub fn predict_tiles(
+        &self,
+        stream: &Stream,
+        packed: &Array,
+        index: usize,
+        tokens: usize,
+    ) -> Result<[Array; 3]> {
         let [tiles, HIDDEN, NEURON_TILE] = *packed.shape() else {
             return Err(Error::Contract(
                 "Clef GPU+ANE tiles must be [tiles, 4096, 128]",
             ));
         };
         // Wait for the tiles only: the GPU share queued after them keeps running.
-        let bytes = packed.to_bytes_ready()?;
+        // Host signpost scoped to the wait itself (the GPU/ANE overlap window).
+        let bytes = {
+            let _wait_sp = signpost_interval!(signpost::ANE_WAIT, index, tokens);
+            packed.to_bytes_ready()?
+        };
         // SAFETY: every bit pattern is a valid f16; `align_to` returns only the aligned middle.
         let (head, aligned, tail) = unsafe { bytes.align_to::<f16>() };
         let copied: Vec<f16>;
@@ -777,15 +788,19 @@ impl AneMlp {
             .chunks_exact(HIDDEN * NEURON_TILE)
             .map(|tile| vec![tile])
             .collect();
-        let results = self.model.predict_batch(
-            &[("x", &[1, HIDDEN, 1, NEURON_TILE])],
-            &batch,
-            &[
-                ("y", &[1, HIDDEN, 1, NEURON_TILE]),
-                ("gate_scale", &[1, 1, 1, NEURON_TILE]),
-                ("up_scale", &[1, 1, 1, NEURON_TILE]),
-            ],
-        )?;
+        let results = {
+            // Host signpost for the Neural Engine batch predict.
+            let _pred_sp = signpost_interval!(signpost::ANE_PREDICT, index, tiles, tokens);
+            self.model.predict_batch(
+                &[("x", &[1, HIDDEN, 1, NEURON_TILE])],
+                &batch,
+                &[
+                    ("y", &[1, HIDDEN, 1, NEURON_TILE]),
+                    ("gate_scale", &[1, 1, 1, NEURON_TILE]),
+                    ("up_scale", &[1, 1, 1, NEURON_TILE]),
+                ],
+            )?
+        };
         let stacked = |k: usize, shape: &[usize]| -> Result<Array> {
             let mut bytes = Vec::with_capacity(shape.iter().product::<usize>() * 2);
             for r in &results {
@@ -865,7 +880,13 @@ impl AneMlp {
         } else {
             None
         };
-        let tiles = Self::wait_tiles(packed)?;
+        // Host signpost for the GPU→ANE hand-off wait. Scoped to the block so
+        // it closes exactly when `to_bytes_ready` returns: this window is the
+        // GPU/ANE overlap (the GPU share queued after the pack keeps running).
+        let tiles = {
+            let _wait_sp = signpost_interval!(signpost::ANE_WAIT, index, tokens);
+            Self::wait_tiles(packed)?
+        };
         let wait_ms = started.elapsed().as_secs_f64() * 1000.0;
         // SAFETY: every bit pattern is a valid f16; `align_to` returns only the aligned middle.
         let (head, aligned, tail) = unsafe { tiles.align_to::<f16>() };
@@ -884,42 +905,49 @@ impl AneMlp {
                 "Clef GPU+ANE tiles must be whole [4096, 512] tiles",
             ));
         }
-        let mut parts = Vec::with_capacity(values.len() / (HIDDEN * TILE));
+        let tile_count = values.len() / (HIDDEN * TILE);
         let mut predict_ms = 0.0;
         let chrome_predict_ts = if chrome {
             super::trace_json::to_us(std::time::Instant::now())
         } else {
             None
         };
-        for (i, tile) in values.chunks_exact(HIDDEN * TILE).enumerate() {
-            let rows = TILE.min(tokens - i * TILE);
-            let predict_started = std::time::Instant::now();
-            let out = self.model.predict(
-                &[("x", tile, &[1, HIDDEN, 1, TILE])],
-                &[
-                    ("y", &[1, HIDDEN, 1, TILE]),
-                    ("gate_scale", &[1, 1, 1, TILE]),
-                    ("up_scale", &[1, 1, 1, TILE]),
-                ],
-            )?;
-            predict_ms += predict_started.elapsed().as_secs_f64() * 1000.0;
-            let scale = |v: &[f16]| -> Result<Array> {
-                Array::from_bytes(stream, &[TILE, 1], MlxDType::F16, f16_bytes(v))?
-                    .slice_axis(0, 0, rows)?
-                    .cast(MlxDType::F32)
-            };
-            let y = Array::from_bytes(stream, &[HIDDEN, TILE], MlxDType::F16, f16_bytes(&out[0]))?
-                .transpose(&[1, 0])?
-                .slice_axis(0, 0, rows)?
-                .cast(MlxDType::F32)?;
-            parts.push(
-                y.mul(&scale(&out[1])?)?
-                    .mul(&scale(&out[2])?)?
-                    .reshape(&[1, rows, HIDDEN])?
-                    .cast(MlxDType::BF16)?,
-            );
-        }
-        let result = Array::concat(&parts.iter().collect::<Vec<_>>(), 1)?;
+        // Host signpost for the Neural Engine phase: layer, tile count and
+        // token count. Scoped to the Core ML calls + result materialisation.
+        let result = {
+            let _pred_sp = signpost_interval!(signpost::ANE_PREDICT, index, tile_count, tokens);
+            let mut parts = Vec::with_capacity(tile_count);
+            for (i, tile) in values.chunks_exact(HIDDEN * TILE).enumerate() {
+                let rows = TILE.min(tokens - i * TILE);
+                let predict_started = std::time::Instant::now();
+                let out = self.model.predict(
+                    &[("x", tile, &[1, HIDDEN, 1, TILE])],
+                    &[
+                        ("y", &[1, HIDDEN, 1, TILE]),
+                        ("gate_scale", &[1, 1, 1, TILE]),
+                        ("up_scale", &[1, 1, 1, TILE]),
+                    ],
+                )?;
+                predict_ms += predict_started.elapsed().as_secs_f64() * 1000.0;
+                let scale = |v: &[f16]| -> Result<Array> {
+                    Array::from_bytes(stream, &[TILE, 1], MlxDType::F16, f16_bytes(v))?
+                        .slice_axis(0, 0, rows)?
+                        .cast(MlxDType::F32)
+                };
+                let y =
+                    Array::from_bytes(stream, &[HIDDEN, TILE], MlxDType::F16, f16_bytes(&out[0]))?
+                        .transpose(&[1, 0])?
+                        .slice_axis(0, 0, rows)?
+                        .cast(MlxDType::F32)?;
+                parts.push(
+                    y.mul(&scale(&out[1])?)?
+                        .mul(&scale(&out[2])?)?
+                        .reshape(&[1, rows, HIDDEN])?
+                        .cast(MlxDType::BF16)?,
+                );
+            }
+            Array::concat(&parts.iter().collect::<Vec<_>>(), 1)?
+        };
         if let (Some(ts0), Some(ts_p)) = (chrome_wait, chrome_predict_ts) {
             // `wait0`-style pack-read overlap window (the GPU/ANE overlap).
             super::trace_json::record(

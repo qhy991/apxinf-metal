@@ -9,6 +9,7 @@
 //! the ANE column split only replaces text MLP columns.
 use super::config::Config;
 use super::preprocess::{PATCH_WIDTH, SPATIAL_MERGE_SIZE};
+use super::signpost;
 use super::weights::Take;
 use apxinf_core::{Error, Result};
 use apxinf_mlx::fusions::MropeHalfSplitRope;
@@ -276,6 +277,10 @@ impl Vision {
             )));
         }
         let started = std::time::Instant::now();
+        // Host signpost for the whole tower + merger: patch-row count. When
+        // Chrome Tracing or vision timing is also on, the optional stream
+        // eval below stays inside this interval.
+        let _sp = signpost_interval!(signpost::VISION, rows);
         let patches = pixels.cast(MlxDType::BF16)?;
         let mut hidden = linear(&patches, &self.patch_weight, &self.patch_bias)?;
         dump_stage("patch_embed", &hidden)?;

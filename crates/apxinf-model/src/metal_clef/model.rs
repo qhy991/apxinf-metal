@@ -11,6 +11,7 @@
 //! survive between requests.
 use super::config::{Config, MAX_INPUT_TOKENS};
 use super::encode::{Encoded, EncodedQuestion};
+use super::signpost;
 use super::vision::{mrope_position_ids, Vision};
 use super::weights::{
     Attention, Backbone, DecoderLayer, EvidenceLayer, GatedDelta, Head, Linear, Mha, Mixer, Mlp,
@@ -916,10 +917,15 @@ impl Network {
             // Same env-gated layer spans as `backbone_forward`, tagged
             // `chunk0` so the prefix-fill pass shows up on the layer lanes.
             let layer_start = std::time::Instant::now();
-            let mixer = match &layer.mixer {
-                Mixer::GatedDelta(_) => "gated_delta",
-                Mixer::Attention(_) => "attention",
+            let (mixer, mixer_c) = match &layer.mixer {
+                Mixer::GatedDelta(_) => ("gated_delta", c"gated_delta"),
+                Mixer::Attention(_) => ("attention", c"attention"),
             };
+            // Host signpost for the chunk-0 prefix fill: index + mixer type.
+            // `cached=0` — this pass seeds the cache rather than reading it.
+            // The guard closes at the end of this iteration.
+            let _sp =
+                signpost_interval!(signpost::LAYER, index, mixer_c.as_ptr(), prefix_end, 0i32,);
             let x = h.fast_rms_norm(&layer.input_norm, EPS)?;
             let (r, state, conv, keys, values) = match &layer.mixer {
                 Mixer::GatedDelta(g) => {
@@ -1071,12 +1077,22 @@ impl Network {
         };
         for (index, layer) in self.backbone.layers.iter().enumerate() {
             let layer_start = std::time::Instant::now();
-            let x = h.fast_rms_norm(&layer.input_norm, EPS)?;
             let cached = cache.and_then(|c| c.layers.get(index));
-            let mixer = match &layer.mixer {
-                Mixer::GatedDelta(_) => "gated_delta",
-                Mixer::Attention(_) => "attention",
+            let (mixer, mixer_c) = match &layer.mixer {
+                Mixer::GatedDelta(_) => ("gated_delta", c"gated_delta"),
+                Mixer::Attention(_) => ("attention", c"attention"),
             };
+            // Host signpost for the layer: index + mixer type, plus whether
+            // this pass read a cached prefix state. It closes at the end of
+            // this iteration and brackets the lazy-graph build.
+            let _sp = signpost_interval!(
+                signpost::LAYER,
+                index,
+                mixer_c.as_ptr(),
+                tokens,
+                cached.is_some() as i32,
+            );
+            let x = h.fast_rms_norm(&layer.input_norm, EPS)?;
             let r = match &layer.mixer {
                 Mixer::GatedDelta(g) => {
                     self.gated_delta(&x, g, tokens, cached, false, |_| Ok(()))?
@@ -1148,7 +1164,10 @@ impl Network {
                 .slice_axis(1, 0, tokens)?;
             self.stream.async_eval(std::slice::from_ref(&packed))?;
             self.stream.async_eval(std::slice::from_ref(&gpu))?;
-            let [y, gate_scale, up_scale] = layer_mlp.ane.predict_tiles(&self.stream, &packed)?;
+            let [y, gate_scale, up_scale] =
+                layer_mlp
+                    .ane
+                    .predict_tiles(&self.stream, &packed, index, tokens)?;
             return merge.call(&gpu, &y, &gate_scale, &up_scale);
         }
         #[cfg(feature = "coreml")]
@@ -1421,6 +1440,8 @@ impl Network {
         // Production head span (previously only test instrumentation). Host
         // wall time of the lazy head build; the GPU drain is in `logits_sync`.
         let head_start = std::time::Instant::now();
+        // Host signpost for the joint schema head: token and question count.
+        let _sp = signpost_interval!(signpost::HEAD, hidden.shape()[0], questions.len(),);
         let hd = &self.head;
         let lm = &self.backbone.lm_head;
         let lexical = |span: (usize, usize)| -> Result<Array> {

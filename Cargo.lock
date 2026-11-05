@@ -171,6 +171,7 @@ dependencies = [
  "apxinf-loader",
  "apxinf-mlx",
  "apxinf-tokenizer",
+ "cc",
  "half",
  "once_cell",
  "prost",
