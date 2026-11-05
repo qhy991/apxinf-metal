@@ -28,8 +28,9 @@ fn stamp(stage: &str, started: Instant) {
 /// (`mod.rs:179-192`) with the same functions and arguments:
 /// `preprocess::prepare` on `DecisionImage::Path`, then
 /// `encode::encode_with_images` with `config.json:image_token_id`. Returns
-/// the prompt's token count so a caller can cross-check the 299 / 303 / 323
-/// token classes of the 42-case reference.
+/// the prompt's token count and the Tier-2 media-block boundary so a caller can
+/// cross-check the 299 / 303 / 323 token classes and the image-row prefix
+/// boundary of the 42-case reference.
 ///
 /// No checkpoint weights, no `Stream`, no Metal and no locks are touched.
 pub fn preprocess_and_encode(
@@ -37,7 +38,7 @@ pub fn preprocess_and_encode(
     image: &Path,
     tokenizer_path: &Path,
     image_token_id: u32,
-) -> Result<usize> {
+) -> Result<(usize, Option<usize>)> {
     let started = Instant::now();
     let tokenizer = Tokenizer::from_file(tokenizer_path)?;
     stamp("tokenizer_load", started);
@@ -63,14 +64,9 @@ pub fn preprocess_and_encode(
     let _ = resized;
 
     let started = Instant::now();
-    let encoded = encode::encode_with_images(
-        &tokenizer,
-        schema,
-        &prepared.grids,
-        image_token_id,
-    )?;
+    let encoded = encode::encode_with_images(&tokenizer, schema, &prepared.grids, image_token_id)?;
     stamp("encode", started);
-    Ok(encoded.input_ids.len())
+    Ok((encoded.input_ids.len(), encoded.media_end))
 }
 
 #[cfg(test)]
@@ -79,7 +75,8 @@ mod tests {
     use serde_json::Value;
 
     const SUITE: &str = "/Users/haiyan/Documents/Infinity/Agent4Kernel/mario-showcase-20261103/suite/separate/separate-proto14.json";
-    const CHECKPOINT: &str = "/Users/haiyan/Documents/Infinity/Agent4Kernel/models/clef-flash-4bit-b5adbe2";
+    const CHECKPOINT: &str =
+        "/Users/haiyan/Documents/Infinity/Agent4Kernel/models/clef-flash-4bit-b5adbe2";
 
     fn schema_from(record: &Value) -> Result<DecisionSchema> {
         let body = serde_json::json!({
@@ -91,20 +88,19 @@ mod tests {
 
     #[test]
     fn all_42_single_image_fronts_encode_without_a_device() -> Result<()> {
-        let suite: Value =
-            serde_json::from_str(&std::fs::read_to_string(SUITE).map_err(|e| {
-                apxinf_core::Error::Other(format!("read suite: {e}"))
-            })?)
-            .map_err(|e| apxinf_core::Error::Other(format!("parse suite: {e}")))?;
+        let suite: Value = serde_json::from_str(
+            &std::fs::read_to_string(SUITE)
+                .map_err(|e| apxinf_core::Error::Other(format!("read suite: {e}")))?,
+        )
+        .map_err(|e| apxinf_core::Error::Other(format!("parse suite: {e}")))?;
         let cases = suite
             .get("cases")
             .and_then(Value::as_array)
             .ok_or_else(|| apxinf_core::Error::Other("suite has no cases".into()))?;
         assert_eq!(cases.len(), 42, "the parity suite is 42 single-image cases");
         let config: Value = serde_json::from_str(
-            &std::fs::read_to_string(format!("{CHECKPOINT}/config.json")).map_err(|e| {
-                apxinf_core::Error::Other(format!("read config: {e}"))
-            })?,
+            &std::fs::read_to_string(format!("{CHECKPOINT}/config.json"))
+                .map_err(|e| apxinf_core::Error::Other(format!("read config: {e}")))?,
         )
         .map_err(|e| apxinf_core::Error::Other(format!("parse config: {e}")))?;
         let image_token_id = config["image_token_id"]
@@ -113,6 +109,7 @@ mod tests {
             as u32;
         let tokenizer_path = Path::new(CHECKPOINT).join("tokenizer.json");
         let mut counts = Vec::with_capacity(cases.len());
+        let mut media_ends = Vec::with_capacity(cases.len());
         for case in cases {
             let record = case
                 .get("record")
@@ -123,18 +120,25 @@ mod tests {
                 .and_then(|images| images.first())
                 .and_then(Value::as_str)
                 .ok_or_else(|| apxinf_core::Error::Other("case has no image path".into()))?;
-            let count = preprocess_and_encode(
-                &schema,
-                Path::new(image),
-                &tokenizer_path,
-                image_token_id,
-            )?;
+            let (count, media_end) =
+                preprocess_and_encode(&schema, Path::new(image), &tokenizer_path, image_token_id)?;
+            // Every image request must publish a Tier-2 boundary strictly
+            // inside its own prompt: after the media block, before
+            // state/schema/suffix.
+            let end = media_end.expect("image request must publish media_end");
+            assert!(
+                end > 0 && end < count,
+                "media_end {end} outside prompt of {count}"
+            );
             counts.push(count);
+            media_ends.push(media_end);
         }
-        counts.sort_unstable();
+        let min_count = counts.iter().copied().min().unwrap();
+        let max_count = counts.iter().copied().max().unwrap();
         // The 42-case reference is 299 / 303 / 323 tokens (PARITY-EVIDENCE §2).
-        assert_eq!(counts[0], 299, "smallest prompt must match the reference");
-        assert_eq!(*counts.last().unwrap(), 323, "largest prompt must match the reference");
+        assert_eq!(min_count, 299, "smallest prompt must match the reference");
+        assert_eq!(max_count, 323, "largest prompt must match the reference");
+        assert!(media_ends.iter().all(Option::is_some));
         Ok(())
     }
 }

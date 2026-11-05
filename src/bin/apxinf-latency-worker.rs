@@ -429,6 +429,22 @@ fn dtype_name(descr: &str) -> &'static str {
     }
 }
 
+/// `(peak_bytes, active_bytes, cache_bytes)` of the resident MLX allocator.
+/// `apxinf_mlx::memory_stats` only exists on the native Apple target, which is
+/// the only place these numbers are meaningful; the Linux feature-isolation
+/// check compiles this binary without the MLX native exports, so it gets zeros
+/// instead of a link-time failure.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn resident_memory() -> Fallible<(usize, usize, usize)> {
+    let memory = apxinf_mlx::memory_stats().map_err(|e| e.to_string())?;
+    Ok((memory.peak_bytes, memory.active_bytes, memory.cache_bytes))
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn resident_memory() -> Fallible<(usize, usize, usize)> {
+    Ok((0, 0, 0))
+}
+
 fn main_inner(job_path: &Path) -> Fallible<()> {
     let job: Value = serde_json::from_str(
         &std::fs::read_to_string(job_path).map_err(|e| format!("read job: {e}"))?,
@@ -537,10 +553,10 @@ fn main_inner(job_path: &Path) -> Fallible<()> {
         record.insert("latency_ms".into(), json!(latency_ms));
         record.insert("preparation_ms".into(), json!(0.0));
         // Process-cumulative allocator peak, as the MLX workers report it.
-        let memory = apxinf_mlx::memory_stats().map_err(|e| e.to_string())?;
-        record.insert("peak_bytes".into(), json!(memory.peak_bytes));
-        record.insert("active_bytes".into(), json!(memory.active_bytes));
-        record.insert("cache_bytes".into(), json!(memory.cache_bytes));
+        let (peak_bytes, active_bytes, cache_bytes) = resident_memory()?;
+        record.insert("peak_bytes".into(), json!(peak_bytes));
+        record.insert("active_bytes".into(), json!(active_bytes));
+        record.insert("cache_bytes".into(), json!(cache_bytes));
         record.insert("payload".into(), payload);
         record.insert("arrays".into(), arrays.into());
         if let Some(debug) = debug {

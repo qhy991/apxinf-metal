@@ -10,6 +10,12 @@ Context for a follow-up agent working on the Clef Flash 9B × Mario decision dem
 - `metal_clef/model.rs` — prefix KV cache (`APXINF_CLEF_PREFIX_CACHE`, default ON):
   attention layers cache KV, GatedDelta layers cache recurrence state + causal-conv history;
   chunk0 (system+chat prefix + `<|vision_start|>`, ~37–50 tokens) skips all 32 layers.
+- `metal_clef/model.rs` + `encode.rs` + `preprocess.rs` — Tier-2 image-row prefix cache
+  (`APXINF_CLEF_PREFIX_CACHE_TIER2`, default ON after the reference-tier KEEP gate):
+  a same-image hit skips the vision tower, splice, and the image-row backbone prefix; the cache
+  key is the prompt hash plus a SHA-256 of the prepared patch matrix and grids. Tier-2 is only
+  attempted after the same prepared image has been seen at least once in the resident process, so
+  the first occurrence of a unique image stays on the exact Tier-1 path.
 - `metal_clef/vision.rs`, `vision_ane.rs`, `preprocess.rs` — vision tower path + host preprocessing.
 - `metal_clef/ane.rs` — GPU/ANE column split with `ane_wait_pack` / `ane_predict` instrumentation
   and placement retry (`APXINF_CLEF_PLACEMENT_RETRIES`).
@@ -30,6 +36,19 @@ Context for a follow-up agent working on the Clef Flash 9B × Mario decision dem
 - Prefix cache, auto tier: +1.68–2.15 % (CI lower bound > 0 but below the 2 % KEEP gate) → **NOT-WORTH**.
   An earlier +3.273 % KEEP was withdrawn after a runner statistics bug (`pooled.update(per)` overwrote
   per case instead of accumulating; the CI was the last round only).
+- Tier-2 image-row prefix cache, reference tier, same-image multi-question suite (6 images × 4 question
+  variants, 3 paired rounds, n=72 case-aligned gains): Tier-1-only 2174.6–2180.9 ms → Tier-1+2
+  1127.9–1130.9 ms = **+45.327 %**, paired bootstrap **CI95 [42.799 %, 47.640 %]**, 100 % cases faster;
+  parity vs Tier-1-only **48/48 decisions per round**, max|Δp| **0.020407**; A/A **24/24 per arm per
+  round**; all 6 arms **Swapouts +0** → **KEEP**.
+- Tier-2, reference tier, 42-case parity double gate (post-reboot): vs frozen MLX **42/42 decisions**,
+  max|Δp| **0.032783** (worst `f0045-enemy/enemy/true`); vs Tier-1-only no-hit control **42/42**,
+  max|Δp| **0.000671**. Clean-round no-hit latency 2211.96 → 2212.47 ms, paired median **−0.155 %**,
+  CI [−0.567 %, +0.593 %] → no-hit path is neutral.
+- Tier-2, auto tier: **not-measured** — ANE programs were warmed in `/tmp/clef-ane-cache-tier2-postboot`
+  and a single-arm probe was clean (Swapouts +0), but every full paired round had candidate-arm
+  Swapouts > 0 (r0 +31,900; r1 +5,304 / baseline +11,308). Per policy the reference result is not
+  substituted for the demo conclusion.
 - Demo end-to-end: reference 6599 ms/decision; auto 4467.5 ms/decision (0.677), identical confusion matrix.
 
 ## Closed directions (do not redo)
@@ -41,8 +60,9 @@ vision Metal batch (<2 %), hardware `xctrace` timeline (unusable on this host: i
 
 ## Measurement discipline
 
-- Shared Metal locks: `~/.cache/enginetailor/metal-measure.lock` then `/tmp/enginetailor-metal.lock`
-  (outer `/tmp` first when taking both).
+- Shared Metal locks: take `~/.cache/enginetailor/metal-measure.lock` first, then
+  `/tmp/enginetailor-metal.lock` (the existing campaign runner order), and hold both for an entire
+  paired round.
 - Pair arms within one lock window, reverse arm order across rounds, record `vm_stat` swap deltas;
   a sample with non-zero Swapouts is contaminated. 42-case runs are for statistics — never enable
   the Chrome trace for them (trace only 1–2 representative requests; volume ≈ events × requests).

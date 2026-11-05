@@ -7,6 +7,7 @@
 //! CPU inside the timed request: no Python and no pre-decoded tensor at the API.
 use crate::decision::DecisionImage;
 use apxinf_core::{Error, Result};
+use sha2::{Digest, Sha256};
 
 /// Vision patch geometry, from `config.json` `vision_config`.
 pub const PATCH_SIZE: usize = 16;
@@ -29,6 +30,10 @@ pub struct PreparedImages {
     pub pixels: Vec<f32>,
     /// `[temporal, height / patch, width / patch]` per image, in input order.
     pub grids: Vec<[u32; 3]>,
+    /// SHA-256 of the prepared patch matrix and grids. Tier-2 uses this as the
+    /// image identity so two different images with identical placeholder token
+    /// ids can never share a cached prefix.
+    pub image_key: [u8; 32],
 }
 
 impl PreparedImages {
@@ -49,6 +54,30 @@ impl PreparedImages {
             })
             .sum()
     }
+}
+
+/// Stable identity of the exact vision input: the ordered patch matrix and
+/// grids. The digest is computed on host f32 bit patterns, so it changes when
+/// any preprocessed pixel or grid changes, but not when the same visual input
+/// is supplied through a different PNG encoding.
+fn prepared_image_key(pixels: &[f32], grids: &[[u32; 3]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update((pixels.len() as u64).to_le_bytes());
+    hasher.update((grids.len() as u64).to_le_bytes());
+    for grid in grids {
+        for value in grid {
+            hasher.update(value.to_le_bytes());
+        }
+    }
+    // Buffer the pixel bits first. Calling `update` once per f32 (hundreds of
+    // thousands of times for a 480-row image) dominates the request on the
+    // M1 Pro; one bulk update keeps the key's cost in the low single-digit ms.
+    let mut bytes = Vec::with_capacity(pixels.len() * 4);
+    for value in pixels {
+        bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
+    hasher.update(&bytes);
+    hasher.finalize().into()
 }
 
 /// Decode and preprocess every image of one request, in request order.
@@ -74,7 +103,12 @@ pub fn prepare(images: &[DecisionImage<'_>]) -> Result<PreparedImages> {
     if rows == 0 || pixels.len() % PATCH_WIDTH != 0 {
         return Err(Error::Contract("Clef image patches are empty or ragged"));
     }
-    let prepared = PreparedImages { pixels, grids };
+    let image_key = prepared_image_key(&pixels, &grids);
+    let prepared = PreparedImages {
+        pixels,
+        grids,
+        image_key,
+    };
     dump_if_requested(&prepared)?;
     Ok(prepared)
 }
@@ -646,6 +680,30 @@ mod tests {
                 "channel {channel}"
             );
         }
+    }
+
+    #[test]
+    fn image_key_tracks_prepared_pixels_and_grids() {
+        let base = prepared_image_key(&[1.0, 2.0], &[[1, 16, 16]]);
+        assert_eq!(base, prepared_image_key(&[1.0, 2.0], &[[1, 16, 16]]));
+        // Increment the f32 bit pattern so the perturbation cannot round away.
+        let changed = f32::from_bits(2.0f32.to_bits() + 1);
+        assert_ne!(base, prepared_image_key(&[1.0, changed], &[[1, 16, 16]]));
+        assert_ne!(base, prepared_image_key(&[1.0], &[[1, 16, 16]]));
+        assert_ne!(base, prepared_image_key(&[1.0, 2.0], &[[1, 16, 32]]));
+        assert_ne!(
+            base,
+            prepared_image_key(&[1.0, 2.0], &[[1, 16, 16], [1, 16, 16]])
+        );
+    }
+
+    #[test]
+    fn prepare_publishes_the_key_of_its_prepared_input() {
+        let prepared = prepare(&[DecisionImage::Png(RGB_PNG)]).unwrap();
+        assert_eq!(
+            prepared.image_key,
+            prepared_image_key(&prepared.pixels, &prepared.grids)
+        );
     }
 
     /// Pillow 12.3.0 `Image.resize(..., BICUBIC)` reference values for a
