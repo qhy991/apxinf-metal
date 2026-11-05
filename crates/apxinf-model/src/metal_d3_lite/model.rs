@@ -26,7 +26,7 @@ use apxinf_mlx::fusions::{GatedDeltaRecurrence, HalfSplitRope};
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 
 use super::config::{Config, Geometry, MAX_INPUT_TOKENS};
-use super::weights::{Attention, GatedDelta, Mlp, Mixer, Weights};
+use super::weights::{Attention, GatedDelta, Mixer, Mlp, Weights};
 
 const EPS: f32 = 1e-6;
 
@@ -152,7 +152,9 @@ impl Model {
             .iter()
             .map(|&token| {
                 i32::try_from(token).map_err(|_| {
-                    Error::Other(format!("d3-lite token ID {token} exceeds the embedding index range"))
+                    Error::Other(format!(
+                        "d3-lite token ID {token} exceeds the embedding index range"
+                    ))
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -270,14 +272,8 @@ fn forward(parts: &Parts, ids: &Array, candidate_count: &Array) -> Result<Vec<Ar
         return Err(Error::Contract("d3-lite ids must be nonempty"));
     }
     let mut hidden = parts.weights.embed.take(ids, 0)?;
-    let positions = Array::arange(
-        &parts.stream,
-        0.0,
-        length as f32,
-        1.0,
-        MlxDType::I32,
-    )?
-    .reshape(&[1, length])?;
+    let positions = Array::arange(&parts.stream, 0.0, length as f32, 1.0, MlxDType::I32)?
+        .reshape(&[1, length])?;
     for (index, layer) in parts.weights.layers.iter().enumerate() {
         let normalized = hidden.fast_rms_norm(&layer.input_norm, geometry.eps)?;
         let mixed = if geometry.is_attention(index) {
@@ -335,8 +331,12 @@ fn gated_delta_forward(
     let value_dim = geometry.value_dim();
     let conv_dim = geometry.conv_dim();
     let qkv = project(input, &gated_delta.qkv.weight)?;
-    let z = project(input, &gated_delta.z.weight)?
-        .reshape(&[1, length, geometry.v_heads, geometry.v_dim])?;
+    let z = project(input, &gated_delta.z.weight)?.reshape(&[
+        1,
+        length,
+        geometry.v_heads,
+        geometry.v_dim,
+    ])?;
     let b = project(input, &gated_delta.b.weight)?;
     let a = project(input, &gated_delta.a.weight)?;
     // Stock reference: a depthwise causal convolution over `S - 1` zero rows.
@@ -345,18 +345,27 @@ fn gated_delta_forward(
         &[1, geometry.conv_kernel - 1, conv_dim],
         qkv.dtype(),
     )?;
-    let convolved = Array::concat(&[&history, &qkv], 1)?
-        .conv1d(&gated_delta.conv, 1, 0, 1, conv_dim)?;
+    let convolved =
+        Array::concat(&[&history, &qkv], 1)?.conv1d(&gated_delta.conv, 1, 0, 1, conv_dim)?;
     let convolved = silu(&convolved)?;
-    let queries = convolved
-        .slice_axis(2, 0, key_dim)?
-        .reshape(&[1, length, geometry.k_heads, geometry.k_dim])?;
-    let keys = convolved
-        .slice_axis(2, key_dim, 2 * key_dim)?
-        .reshape(&[1, length, geometry.k_heads, geometry.k_dim])?;
-    let values = convolved
-        .slice_axis(2, 2 * key_dim, conv_dim)?
-        .reshape(&[1, length, geometry.v_heads, geometry.v_dim])?;
+    let queries = convolved.slice_axis(2, 0, key_dim)?.reshape(&[
+        1,
+        length,
+        geometry.k_heads,
+        geometry.k_dim,
+    ])?;
+    let keys = convolved.slice_axis(2, key_dim, 2 * key_dim)?.reshape(&[
+        1,
+        length,
+        geometry.k_heads,
+        geometry.k_dim,
+    ])?;
+    let values = convolved.slice_axis(2, 2 * key_dim, conv_dim)?.reshape(&[
+        1,
+        length,
+        geometry.v_heads,
+        geometry.v_dim,
+    ])?;
     // Official GDN q/k l2-norm: `x * rsqrt(sum(x^2) + 1e-6)`, written as an
     // RMSNorm whose epsilon is on the mean (`1e-6 / k_dim`), then scaled by
     // `k_dim^-1` for q and `k_dim^-0.5` for k. The mlx-lm variant uses a mean
@@ -375,10 +384,9 @@ fn gated_delta_forward(
         &[1, geometry.v_heads, geometry.v_dim, geometry.k_dim],
         MlxDType::F32,
     )?;
-    let (recurrent, _next_state) =
-        parts
-            .recurrence
-            .call(&queries, &keys, &values, &decay, &beta, &state)?;
+    let (recurrent, _next_state) = parts
+        .recurrence
+        .call(&queries, &keys, &values, &decay, &beta, &state)?;
     let normalized = recurrent.fast_rms_norm(&gated_delta.norm, geometry.eps)?;
     // Gated norm in FP32, rounded once to BF16 before the output projection.
     let gated = silu(&z.cast(MlxDType::F32)?)?
@@ -401,8 +409,12 @@ fn attention_forward(
         return Err(Error::Contract("d3-lite attention input must be [1, L, H]"));
     };
     // One packed projection yields queries and the output gate: `[B, L, 2*heads*head_dim]`.
-    let projected = project(input, &attention.q.weight)?
-        .reshape(&[1, length, geometry.q_heads, 2 * geometry.head_dim])?;
+    let projected = project(input, &attention.q.weight)?.reshape(&[
+        1,
+        length,
+        geometry.q_heads,
+        2 * geometry.head_dim,
+    ])?;
     let queries = projected.slice_axis(3, 0, geometry.head_dim)?;
     let gate = projected
         .slice_axis(3, geometry.head_dim, 2 * geometry.head_dim)?
@@ -429,9 +441,11 @@ fn attention_forward(
         false,
         None,
     )?;
-    let output = output
-        .transpose(&[0, 2, 1, 3])?
-        .reshape(&[1, length, geometry.q_heads * geometry.head_dim])?;
+    let output = output.transpose(&[0, 2, 1, 3])?.reshape(&[
+        1,
+        length,
+        geometry.q_heads * geometry.head_dim,
+    ])?;
     project(&output.mul(&gate.sigmoid()?)?, &attention.o.weight)
 }
 
@@ -501,12 +515,19 @@ mod tests {
             .iter()
             .all(|value| value.is_finite() && *value > 0.0 && *value <= 1.0));
         let ln_two = 2f32.ln();
-        let expected = [
-            (-ln_two).exp(),
-            (-(std::f32::consts::E * ln_two)).exp(),
-        ];
-        assert!((decay[0] - expected[0]).abs() < 2e-3, "{} vs {}", decay[0], expected[0]);
-        assert!((decay[1] - expected[1]).abs() < 2e-3, "{} vs {}", decay[1], expected[1]);
+        let expected = [(-ln_two).exp(), (-(std::f32::consts::E * ln_two)).exp()];
+        assert!(
+            (decay[0] - expected[0]).abs() < 2e-3,
+            "{} vs {}",
+            decay[0],
+            expected[0]
+        );
+        assert!(
+            (decay[1] - expected[1]).abs() < 2e-3,
+            "{} vs {}",
+            decay[1],
+            expected[1]
+        );
         assert!(decay[0] > decay[1], "larger A_log must decay faster");
         assert!(beta.iter().all(|value| (0.0..1.0).contains(value)));
         // b = -2 → sigmoid ≈ 0.119; b = 3 → ≈ 0.953.
@@ -518,15 +539,12 @@ mod tests {
     fn project_is_linear_without_bias() {
         let stream = stream();
         let weight = Array::from_f32(&stream, &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let input = Array::from_f32(&stream, &[1, 2, 3], &[1.0, 0.0, -1.0, 0.5, 2.0, -0.5])
-            .unwrap();
+        let input =
+            Array::from_f32(&stream, &[1, 2, 3], &[1.0, 0.0, -1.0, 0.5, 2.0, -0.5]).unwrap();
         let output = project(&input, &weight).unwrap();
         stream.eval(&[output.clone()]).unwrap();
         assert_eq!(output.shape(), &[1, 2, 2]);
-        assert_eq!(
-            output.to_f32_vec().unwrap(),
-            [-2.0, -2.0, 3.0, 9.0],
-        );
+        assert_eq!(output.to_f32_vec().unwrap(), [-2.0, -2.0, 3.0, 9.0],);
     }
 
     /// End-to-end device acceptance for the prepared whole-request callable:
@@ -574,7 +592,10 @@ mod tests {
             .zip(&changed)
             .map(|(left, right)| (left - right).abs())
             .fold(0.0f32, f32::max);
-        assert!(changed_delta > 0.0, "changed token IDs did not change probabilities");
+        assert!(
+            changed_delta > 0.0,
+            "changed token IDs did not change probabilities"
+        );
 
         // A second length traces once; repeating it traces nothing.
         let longer = vec![1u32; 64];
@@ -583,7 +604,10 @@ mod tests {
         model.probabilities(&longer, count)?;
         let after = stream.counters();
         assert_eq!(before.trace_callbacks, after.trace_callbacks);
-        assert_eq!(model.prepared_profiles(), vec![(tokens, count), (64, count)]);
+        assert_eq!(
+            model.prepared_profiles(),
+            vec![(tokens, count), (64, count)]
+        );
         Ok(())
     }
 }

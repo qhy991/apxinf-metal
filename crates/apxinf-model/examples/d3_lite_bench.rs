@@ -117,9 +117,21 @@ fn parse_options() -> Result<Options, String> {
             "--set" => set = Some(value()?),
             "--bucket" => bucket = value()?,
             "--reference" => reference = Some(PathBuf::from(value()?)),
-            "--warmup" => warmup = value()?.parse().map_err(|_| "--warmup must be an integer")?,
-            "--repeat" => repeat = value()?.parse().map_err(|_| "--repeat must be an integer")?,
-            "--rounds" => rounds = value()?.parse().map_err(|_| "--rounds must be an integer")?,
+            "--warmup" => {
+                warmup = value()?
+                    .parse()
+                    .map_err(|_| "--warmup must be an integer")?
+            }
+            "--repeat" => {
+                repeat = value()?
+                    .parse()
+                    .map_err(|_| "--repeat must be an integer")?
+            }
+            "--rounds" => {
+                rounds = value()?
+                    .parse()
+                    .map_err(|_| "--rounds must be an integer")?
+            }
             "--records" => records = Some(PathBuf::from(value()?)),
             "--summary" => summary = Some(PathBuf::from(value()?)),
             "--help" | "-h" => return Err(usage().into()),
@@ -148,12 +160,17 @@ fn parse_options() -> Result<Options, String> {
     })
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> Result<T, Box<dyn std::error::Error>> {
+fn read_json<T: for<'de> Deserialize<'de>>(
+    path: &std::path::Path,
+) -> Result<T, Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&raw)?)
 }
 
-fn write_json(path: &std::path::Path, value: &impl Serialize) -> Result<(), Box<dyn std::error::Error>> {
+fn write_json(
+    path: &std::path::Path,
+    value: &impl Serialize,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -263,7 +280,8 @@ fn timing_stats(values: &[f64]) -> serde_json::Value {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let options = parse_options().map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    let options =
+        parse_options().map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
     let workload: Workload = read_json(&options.workload)?;
     let cases = workload
         .cases
@@ -271,9 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Mirrors the reference collector: the gate set is every case; the
         // timing set is the flagged subset (the 8 timing cases).
         .filter(|case| options.set == "gate" || case.timing)
-        .filter(|case| {
-            options.bucket == "all" || case.bucket.to_string() == options.bucket
-        })
+        .filter(|case| options.bucket == "all" || case.bucket.to_string() == options.bucket)
         .collect::<Vec<_>>();
     if cases.is_empty() {
         return Err(format!(

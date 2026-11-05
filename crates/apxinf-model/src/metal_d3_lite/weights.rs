@@ -156,7 +156,10 @@ impl Weights {
         let conv_dim = geometry.conv_dim();
         let q_width = geometry.q_width();
         let kv_width = geometry.kv_width();
-        let embed = take.bf16("language_model.embed_tokens.weight", &[geometry.vocab, hidden])?;
+        let embed = take.bf16(
+            "language_model.embed_tokens.weight",
+            &[geometry.vocab, hidden],
+        )?;
         let mut layers = Vec::with_capacity(geometry.layers);
         for index in 0..geometry.layers {
             let prefix = format!("language_model.layers.{index}");
@@ -166,9 +169,15 @@ impl Weights {
                     q: take.linear(&format!("{attention}.q_proj"), q_width, hidden)?,
                     k: take.linear(&format!("{attention}.k_proj"), kv_width, hidden)?,
                     v: take.linear(&format!("{attention}.v_proj"), kv_width, hidden)?,
-                    o: take.linear(&format!("{attention}.o_proj"), hidden, geometry.q_heads * geometry.head_dim)?,
-                    q_norm: take.shifted(&format!("{attention}.q_norm.weight"), &[geometry.head_dim])?,
-                    k_norm: take.shifted(&format!("{attention}.k_norm.weight"), &[geometry.head_dim])?,
+                    o: take.linear(
+                        &format!("{attention}.o_proj"),
+                        hidden,
+                        geometry.q_heads * geometry.head_dim,
+                    )?,
+                    q_norm: take
+                        .shifted(&format!("{attention}.q_norm.weight"), &[geometry.head_dim])?,
+                    k_norm: take
+                        .shifted(&format!("{attention}.k_norm.weight"), &[geometry.head_dim])?,
                 })
             } else {
                 let linear = format!("{prefix}.linear_attn");

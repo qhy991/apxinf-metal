@@ -116,14 +116,13 @@ impl Config {
                     path.display()
                 ))
             })?;
-        let manifest: Manifest = serde_json::from_str(&read("MODEL_MANIFEST.json")?).map_err(
-            |error| {
+        let manifest: Manifest =
+            serde_json::from_str(&read("MODEL_MANIFEST.json")?).map_err(|error| {
                 Error::Other(format!(
                     "parse {}MODEL_MANIFEST.json: {error}",
                     path.display()
                 ))
-            },
-        )?;
+            })?;
         let config = Self::compose(checkpoint, decision, manifest)?;
         Ok(config)
     }
@@ -614,7 +613,11 @@ mod tests {
     #[test]
     fn rejects_a_non_fp32_readout_and_a_non_unit_temperature() {
         for (field, value, message) in [
-            ("readout_dtype", serde_json::json!("bfloat16"), "decision contract"),
+            (
+                "readout_dtype",
+                serde_json::json!("bfloat16"),
+                "decision contract",
+            ),
             ("temperature", serde_json::json!(0.5), "decision contract"),
             ("pooling", serde_json::json!("mean"), "decision contract"),
         ] {
