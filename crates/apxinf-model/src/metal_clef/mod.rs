@@ -1,6 +1,10 @@
 //! Native Clef Flash on Apple Metal: Qwen3.5 hybrid backbone (affine Q4) in
 //! the stock MLX-VLM composition or the optimized GPU composition, and the
 //! BF16 joint schema head. No Python model execution.
+// The macro must be imported before every module that expands it: `macro_use`
+// scoping is textual, and `ane` is declared first below.
+#[macro_use]
+pub(crate) mod signpost;
 #[cfg(feature = "coreml")]
 mod ane;
 #[cfg(feature = "coreml")]
@@ -182,6 +186,9 @@ impl ClefRunner {
         // the caller's timer covers this cost on both sides.
         let chrome = trace_json::enabled();
         let request_start = std::time::Instant::now();
+        // Host signpost for the whole request; the guard closes it on every
+        // exit path. Args are the request shape known at entry.
+        let _sp = signpost_interval!(signpost::REQUEST, images.len());
         let ts_request = if chrome {
             trace_json::to_us(request_start)
         } else {
@@ -191,6 +198,7 @@ impl ClefRunner {
             None
         } else {
             let t = std::time::Instant::now();
+            let _sp = signpost_interval!(signpost::PREPROCESS, images.len());
             let prepared = Some(preprocess::prepare(images)?);
             if let Some(ts0) = ts_request {
                 trace_json::record(
@@ -205,14 +213,22 @@ impl ClefRunner {
             prepared
         };
         let enc_start = std::time::Instant::now();
-        let encoded = match &prepared {
-            None => encode::encode(&self.tokenizer, schema)?,
-            Some(prepared) => encode::encode_with_images(
-                &self.tokenizer,
-                schema,
-                &prepared.grids,
-                self.image_token_id,
-            )?,
+        // The token count is only known after the prompt is built, so the
+        // encode interval carries the request shape instead. The guard is
+        // scoped to the block: a function-scoped `_sp` would keep the
+        // interval open until `decide_schema` returns (first recording hit
+        // exactly that, spanning the whole request).
+        let encoded = {
+            let _sp = signpost_interval!(signpost::ENCODE, images.len(), schema.questions.len());
+            match &prepared {
+                None => encode::encode(&self.tokenizer, schema)?,
+                Some(prepared) => encode::encode_with_images(
+                    &self.tokenizer,
+                    schema,
+                    &prepared.grids,
+                    self.image_token_id,
+                )?,
+            }
         };
         if let Some(ts0) = trace_json::to_us(enc_start) {
             trace_json::record(
@@ -248,7 +264,13 @@ impl ClefRunner {
             .map(|l| l.cast(MlxDType::F32)?.softmax_with(-1, false))
             .collect::<Result<Vec<_>>>()?;
         let sync_start = std::time::Instant::now();
-        let values = Array::concat(&probabilities.iter().collect::<Vec<_>>(), 0)?.to_f32_vec()?;
+        // The GPU drain: host wall time of the `to_f32_vec` stream sync that
+        // materialises the lazy graph. Signpost args = the queued logits.
+        // Scoped to the drain itself (see the encode guard above).
+        let values = {
+            let _sp = signpost_interval!(signpost::SYNC, logits.len());
+            Array::concat(&probabilities.iter().collect::<Vec<_>>(), 0)?.to_f32_vec()?
+        };
         if let Some(ts0) = trace_json::to_us(sync_start) {
             // This is the `to_f32_vec` -> `to_bytes` stream-sync (mod.rs:209);
             // it sits inside W1's gap0 (head+sync+preprocess ~110ms) and is
