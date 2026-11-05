@@ -88,6 +88,63 @@ fn real_checkpoint_long_chunk_and_bucket_boundary() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "requires official MiniCPM checkpoint and exclusive shared Metal locks"]
+fn real_checkpoint_cache_only_prefill_matches_materialized_chunks() -> Result<()> {
+    let checkpoint = PathBuf::from(
+        env::var_os("APXINF_MINICPM_CHECKPOINT")
+            .ok_or(Error::Contract("set APXINF_MINICPM_CHECKPOINT"))?,
+    );
+    let config = Config::from_json(&std::fs::read_to_string(checkpoint.join("config.json"))?)?;
+    let backend = MlxBackend::new(0)?;
+    let (map, _) =
+        apxinf_loader::safetensors::load_native_path(&checkpoint).map_err(Error::Other)?;
+    let weights = Weights::load(&config, backend.stream(), map)?;
+    let mut model = MiniCpm5::new(config, weights, backend.clone(), Variant::Compiled)?;
+    let prompt = (0..4351).map(|i| 1 + (i % 31) as u32).collect::<Vec<_>>();
+    model.prepare(prompt.len(), 2)?;
+    let mut reference = None;
+    for chunk in prompt.chunks(super::config::PREFILL_CHUNK) {
+        let logits = model.run_tokens(chunk, model.offset, true)?;
+        // Evaluate each head before the next chunk, as the previous path did.
+        backend.stream().eval(std::slice::from_ref(&logits))?;
+        if model.offset == prompt.len() {
+            reference = Some(backend.from_array(logits.reshape(&[1, model.vocab_size()])?)?);
+        }
+    }
+    let reference = reference.unwrap();
+    let expected = digest(&backend, &reference)?;
+    let decode = model.forward(&[2], prompt.len() as u32)?;
+    let expected_decode = digest(&backend, &decode)?;
+    drop(decode);
+    let decode = model.forward(&[3], prompt.len() as u32 + 1)?;
+    let expected_boundary = digest(&backend, &decode)?;
+    drop(decode);
+
+    model.reset();
+    model.prepare(prompt.len(), 2)?;
+    let output = model.prefill(LlmInput::text(&prompt))?;
+    assert_eq!(output.shape().dims(), [1, model.vocab_size()]);
+    assert_eq!(digest(&backend, &output)?, expected);
+    let decode = model.forward(&[2], prompt.len() as u32)?;
+    assert_eq!(digest(&backend, &decode)?, expected_decode);
+    drop(decode);
+    let decode = model.forward(&[3], prompt.len() as u32 + 1)?;
+    assert_eq!(digest(&backend, &decode)?, expected_boundary);
+    drop(decode);
+    assert_eq!(digest(&backend, &reference)?, expected);
+    assert_eq!(digest(&backend, &output)?, expected);
+
+    model.reset();
+    model.prepare(3, 1)?;
+    drop(model.prefill(LlmInput::text(&[1, 7, 3]))?);
+    assert_eq!(digest(&backend, &reference)?, expected);
+    assert_eq!(digest(&backend, &output)?, expected);
+    drop(model);
+    assert_eq!(digest(&backend, &output)?, expected);
+    Ok(())
+}
+
 /// Run only this test in an isolated process under the shared Metal lock:
 /// `minicpm5::tests::real_checkpoint_full_forward_retention_and_release
 /// --exact --ignored --test-threads=1 --nocapture`.

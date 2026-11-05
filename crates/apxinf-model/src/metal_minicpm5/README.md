@@ -24,18 +24,29 @@ the source runtime, including the `bf16-public` selection.
 `model.rs` owns the forward order, per-request position/KV, precomputed position
 tables, and pure compiled decode function. `bf16-public` is the ordered reference
 composition. `bf16-compiled` selects local norm/RoPE compilation and whole-step
-decode with the fixed packed residual/norm kernel. Every new KV array and output
-is evaluated before the request state is published; failed preparation cannot
-be reported ready. Changing prepared capacity requires a reset.
+decode with the fixed packed residual/norm kernel. Execution evaluates every new
+KV array before it publishes request state. Failed preparation cannot report
+readiness. Changing prepared capacity requires a reset.
 
 `LlmTrait::forward` always returns `[input_tokens, vocabulary]` logits.
 Generation `prefill` consumes prompts up to 4096 tokens in the original shape.
 Longer prompts use 512-token chunks, with a causal mask that includes the prior
-cache and the current chunk. Each chunk projects only its final normalized row;
-only the last chunk's logits are returned. Long preparation advertises these
+cache and the current chunk. Each chunk constructs logits for its final row.
+Only the last chunk returns logits. Long preparation advertises these
 chunk shapes, and rejects a full prompt-sized `forward`. Every admitted
 `forward` still returns all of its input rows. Ordinary generation uses
 ApxInf's shared sampler/EOS loop.
+
+The experimental `bf16-compiled` path evaluates only KV outputs for intermediate
+chunks of long prefill. It drops each unused logits graph before the next chunk.
+The final chunk evaluates its logits and KV outputs before it publishes request
+state. Public `forward`, `bf16-public`, DSpark, and compiled decode retain their
+evaluation behavior. This experiment has no measured performance result.
+
+The ignored `real_checkpoint_cache_only_prefill_matches_materialized_chunks`
+test compares final logits and forced decode against chunks that materialize
+every head. It also checks retained outputs after decode, reset, and model drop.
+The test requires `APXINF_MINICPM_CHECKPOINT` and the shared Metal lock.
 
 Ordinary BF16 generation supports one sequence with at most 65792 total tokens,
 including prompt and reserved output, within the checkpoint's 131072 positions.

@@ -470,7 +470,11 @@ impl MiniCpm5 {
                 _ => self.eager(&tokens, position, last_only, &previous)?,
             };
             drop(previous);
-            self.backend.stream().eval(&output)?;
+            let cache_only =
+                self.variant == Variant::Compiled && last_only && position + ids.len() < prompt;
+            self.backend
+                .stream()
+                .eval(if cache_only { &output[1..] } else { &output })?;
             Ok::<_, Error>(output)
         })();
         match result {
@@ -598,7 +602,13 @@ impl LlmTrait for MiniCpm5 {
         };
         let mut logits = None;
         for chunk in input.token_ids.chunks(chunk_size) {
-            logits = Some(self.run_tokens(chunk, self.offset, true)?);
+            let output = self.run_tokens(chunk, self.offset, true)?;
+            if self.offset == input.token_ids.len() {
+                logits = Some(output);
+            } else {
+                // Unevaluated logits retain the old KV graph until dropped.
+                drop(output);
+            }
         }
         let logits = logits.unwrap();
         self.backend
