@@ -1,8 +1,17 @@
 # D3-lite P1 alignment report (native apxinf-metal ↔ references)
 
-Status: **BLOCKED before execution** — the native `d3` module cannot build or run on
-this host, and it cannot load the d3-lite checkpoint. No parity or latency numbers
-are claimed.
+> **Historical record (captured 2026-11-05, before the port).** P1 was
+> subsequently re-scoped by the requester to **P1a** — implement the d3-lite
+> text path as a native MLX/Metal backend — because this report showed the
+> CUDA-only `d3` module could neither link nor load the d3-lite package on the
+> target machine. The current implementation, parity table and baseline live in
+> [d3-lite-metal.md](d3-lite-metal.md). Statements below (including
+> "no `metal_d3` factory") describe `7bab554e` as captured, not the present
+> tree.
+
+Status at capture: **BLOCKED before execution** — the native `d3` module
+cannot build or run on this host, and it cannot load the d3-lite checkpoint. No
+parity or latency numbers are claimed here.
 
 ## 1. Scope and inputs
 
