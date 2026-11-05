@@ -27,6 +27,14 @@ collector, whose receipts are documented as byte-identical to the
 checkpoint-reference receipts. The checkpoint's `modeling_d3.py` semantics are
 what both implement.
 
+Copy-not-share note: the request allowed reusing the CUDA `d3` family's
+config/weights parsing if convenient. The repository's backend-native port rule
+(`model-layer-architecture.md`, "Where backend-native model code lives") and
+`scripts/check_model_family_boundaries.sh` require a port to be self-contained
+and never import another model-family directory, including a port of the same
+family. The checkpoint contract is therefore copied into this port (with the
+d3-lite geometry that the CUDA copy does not accept) rather than imported.
+
 ## 2. Architecture mapping
 
 | Responsibility | Reference (EngineTailor MLX) | This port (`metal_d3_lite`) |
