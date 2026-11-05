@@ -56,7 +56,10 @@ Context for a follow-up agent working on the Clef Flash 9B × Mario decision dem
 fusion combos (−0.372 %, CI<0), deeper ANE column split (−2.48 %, parity gate fail),
 wavefront K=2 (ANE gap median 1.3 ms — overlap already achieved), full-GPU megakernel (<2 % bound),
 `mx.compile` vision (0.7 ms host build), vis014 row split (single image below the 1024-row floor),
-vision Metal batch (<2 %). Hardware `xctrace` timeline is **reopened and delivered**:
+vision Metal batch (<2 %), matmul-level projection fusion (reference tier +0.109 %, CI95
+[−0.100 %, +0.303 %], parity gate failed 0.049 > 0.035 — evidence and methodology in
+[FUSION-MATMUL.md](FUSION-MATMUL.md); the implementation was dropped per "不留死代码").
+Hardware `xctrace` timeline is **reopened and delivered**:
 the earlier "injected-dyld hang" is a TCC-boundary `open()` hang when the traced
 process reads `~/Documents`; staging the checkpoint and case image outside that
 boundary records cleanly. See [TIMELINE-OPERATOR.md](TIMELINE-OPERATOR.md)
