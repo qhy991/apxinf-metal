@@ -136,7 +136,7 @@ take 记录：
 
 | take | 结果 | Swapouts | 用途 |
 | --- | --- | --- | --- |
-| reference #1（`--launch` + `--target-stdin`） | 目标进程卡在 main 之前（176 KB RSS、0 % CPU），ktrace 溢出涨到 1.69 GB；已杀掉并删除 ktrace / trace | — | 不用；改 `--all-processes` |
+| reference #1（`--launch` + `--target-stdin`） | 目标进程卡在 main 之前（176 KB RSS、0 % CPU），ktrace 溢出涨到 1.69 GB；已杀掉并删除 ktrace / trace。暂存目录本身在 `~/Documents` 下，推测与 [TIMELINE-OPERATOR.md](TIMELINE-OPERATOR.md) §2.2 的 TCC 边界 `open()` 挂死同型（未采栈确认） | — | 不用；改 `--all-processes`，server 由录制脚本而非 xctrace 拉起 |
 | **reference #2** | xctrace exit 0，ktrace 1.3 GB 已删 | **+0** | **主结论** |
 | auto #1 | xctrace exit 0，ktrace 1.4 GB 已删 | **+129,644** | **swap 污染**：只用调用数、tile 数、逐调用中位数、joint 窗口 |
 | auto #2（加了 swap 稳定等待） | plain server 在加载期退出（`server closed stdout`），swap 已用 2.63 / 4 GB、磁盘余 15.6 GiB | +0 | 未录；swap 池饱和，按 skill 停止重试 |
