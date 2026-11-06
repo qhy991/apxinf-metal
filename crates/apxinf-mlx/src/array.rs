@@ -8,6 +8,7 @@ use std::{
     path::Path,
     ptr::NonNull,
     rc::Rc,
+    time::{Duration, Instant},
 };
 
 fn error(message: impl Into<String>) -> Error {
@@ -874,13 +875,26 @@ impl Compiled {
     /// or unavailable compiler that returns the original eager body fails here.
     /// This observes Rust trace callbacks, not Metal pipeline/JIT compilation.
     pub fn prepare(&self, inputs: &[Array]) -> Result<Vec<Array>> {
+        self.prepare_timed(inputs).map(|(output, _, _)| output)
+    }
+
+    /// [`prepare`](Self::prepare) plus the host wall-clock of each of its two
+    /// `call_and_eval`s: `t₁` brackets the first call (trace + compile + Metal
+    /// JIT + eval) and `t₂` the replay (pure GPU work), so `t₁ − t₂` is the
+    /// trace/compile cost. Additive; [`prepare`](Self::prepare) is exactly this
+    /// call with the two durations dropped.
+    pub fn prepare_timed(&self, inputs: &[Array]) -> Result<(Vec<Array>, Duration, Duration)> {
+        let first = Instant::now();
         self.call_and_eval(inputs)?;
+        let t1 = first.elapsed();
         let before = self.trace.stream.counters().trace_callbacks;
+        let replay = Instant::now();
         let output = self.call_and_eval(inputs)?;
+        let t2 = replay.elapsed();
         if self.trace.stream.counters().trace_callbacks != before {
             return Err(error("MLX prepared profile retraced on replay; required compiled execution is unavailable"));
         }
-        Ok(output)
+        Ok((output, t1, t2))
     }
 }
 impl Drop for Compiled {

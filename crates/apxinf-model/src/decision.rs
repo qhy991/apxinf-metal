@@ -210,12 +210,26 @@ pub struct SchemaDecisionOutput {
 /// `sync` is the probability readback. On a text request `layout` and `vision`
 /// are zero, and `forward` carries validation, profile preparation and the
 /// compiled call.
+///
+/// **First-request attribution (`t₁`/`t₂`/`t₃`).** On the *first* request for
+/// an image shape the compiled callable must be prepared; the three optional
+/// fields split `forward` for that one call: `t₁_ms` is the wall of the first
+/// `call_and_eval` inside [`apxinf_mlx::Compiled::prepare`] (trace + compile +
+/// Metal JIT + one eval), `t₂_ms` the second `call_and_eval` (replay only, pure
+/// GPU work) and `t₃_ms` the real request's call. Trace/compile cost is
+/// `t₁ − t₂`. All three are `None` whenever no prepare ran during the call —
+/// i.e. every steady-state request and every request on an already-warm
+/// worker — so the fields are purely additive. They are reported only for the
+/// first request of a shape on that worker.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DecisionStageProfile {
     pub layout_ms: f64,
     pub vision_ms: f64,
     pub forward_ms: f64,
     pub sync_ms: f64,
+    pub t1_ms: Option<f64>,
+    pub t2_ms: Option<f64>,
+    pub t3_ms: Option<f64>,
 }
 
 /// Encoded-prompt decisions: the caller tokenizes a complete prompt and the

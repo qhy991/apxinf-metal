@@ -318,6 +318,13 @@ impl Model {
     /// compile; `Compiled::prepare` evaluates the profile twice and fails if
     /// the second invocation traces again.
     pub fn prepare_profile(&self, length: usize, count: usize) -> Result<()> {
+        self.prepare_profile_timed(length, count).map(|_| ())
+    }
+
+    /// [`prepare_profile`](Self::prepare_profile) plus the host wall of the
+    /// two `call_and_eval`s it performs: `(t₁, t₂)` in milliseconds, so
+    /// `t₁ − t₂` is the trace/compile cost of this profile.
+    fn prepare_profile_timed(&self, length: usize, count: usize) -> Result<(f64, f64)> {
         let geometry = self.parts.geometry;
         if length == 0 || length > geometry.max_positions || length > MAX_INPUT_TOKENS {
             return Err(Error::Other(format!(
@@ -334,18 +341,21 @@ impl Model {
         // the traced graph depends on shapes, not values.
         let ids = Array::zeros(self.stream(), &[1, length], MlxDType::I32)?;
         let count_array = Array::from_i32(self.stream(), &[1], &[count as i32])?;
-        self.compiled.prepare(&[ids, count_array])?;
+        let (_, t1, t2) = self.compiled.prepare_timed(&[ids, count_array])?;
         if !self.is_prepared(length, count) {
             self.prepared.borrow_mut().push((length, count));
         }
-        Ok(())
+        Ok((t1.as_secs_f64() * 1e3, t2.as_secs_f64() * 1e3))
     }
 
-    fn prepare_for(&self, token_ids: &[u32], count: usize) -> Result<()> {
+    /// Prepare this profile if it is not ready yet. Returns `Some((t₁, t₂))`
+    /// exactly when a prepare ran during this call — i.e. this is the first
+    /// request for the shape on this worker — and `None` otherwise.
+    fn prepare_for(&self, token_ids: &[u32], count: usize) -> Result<Option<(f64, f64)>> {
         if self.is_prepared(token_ids.len(), count) {
-            return Ok(());
+            return Ok(None);
         }
-        self.prepare_profile(token_ids.len(), count)
+        self.prepare_profile_timed(token_ids.len(), count).map(Some)
     }
 
     /// One request: prepared compiled execution. The returned vector holds the
@@ -365,10 +375,12 @@ impl Model {
     ) -> Result<(Vec<f32>, DecisionStageProfile)> {
         self.validate(token_ids, count)?;
         let request = Instant::now();
-        self.prepare_for(token_ids, count)?;
+        let prepared = self.prepare_for(token_ids, count)?;
         let (ids, candidate_count) = self.inputs(token_ids, count)?;
         let _fwd = signpost_interval!(signpost::FORWARD, token_ids.len(), 0usize);
+        let real = Instant::now();
         let outputs = self.compiled.call_and_eval(&[ids, candidate_count])?;
+        let t3_ms = real.elapsed().as_secs_f64() * 1e3;
         drop(_fwd);
         let forward_ms = request.elapsed().as_secs_f64() * 1e3;
         let sync = Instant::now();
@@ -383,6 +395,9 @@ impl Model {
                 vision_ms: 0.0,
                 forward_ms,
                 sync_ms,
+                t1_ms: prepared.map(|(t1, _)| t1),
+                t2_ms: prepared.map(|(_, t2)| t2),
+                t3_ms: prepared.map(|_| t3_ms),
             },
         ))
     }
@@ -413,13 +428,14 @@ impl Model {
 
     /// Trace and warm one exact image profile. Zero token IDs, positions,
     /// features and run start keep the warm-up input independent of any
-    /// request; the traced graph depends on shapes, not values.
+    /// request; the traced graph depends on shapes, not values. Returns the
+    /// host wall of the two `call_and_eval`s `(t₁, t₂)` in milliseconds.
     fn prepare_image_profile(
         &self,
         length: usize,
         count: usize,
         image_tokens: usize,
-    ) -> Result<()> {
+    ) -> Result<(f64, f64)> {
         let geometry = self.parts.geometry;
         if length == 0 || length > geometry.max_positions || length > MAX_INPUT_TOKENS {
             return Err(Error::Other(format!(
@@ -448,21 +464,36 @@ impl Model {
         // Start 0 writes the feature run over the head of the warm-up row;
         // the values do not affect the traced graph.
         let run_start = Array::zeros(self.stream(), &[1], MlxDType::I32)?;
-        self.image_compiled
-            .prepare(&[ids, positions, count_array, features, run_start])?;
+        let (_, t1, t2) = self.image_compiled.prepare_timed(&[
+            ids,
+            positions,
+            count_array,
+            features,
+            run_start,
+        ])?;
         if !self.is_image_prepared(length, count, image_tokens) {
             self.prepared_images
                 .borrow_mut()
                 .push((length, count, image_tokens));
         }
-        Ok(())
+        Ok((t1.as_secs_f64() * 1e3, t2.as_secs_f64() * 1e3))
     }
 
-    fn prepare_image_for(&self, length: usize, count: usize, image_tokens: usize) -> Result<()> {
+    /// Prepare this image profile if it is not ready yet. Returns
+    /// `Some((t₁, t₂))` exactly when a prepare ran during this call — i.e.
+    /// this is the first request for the shape on this worker — and `None`
+    /// otherwise (steady state, or a shape warmed at load).
+    fn prepare_image_for(
+        &self,
+        length: usize,
+        count: usize,
+        image_tokens: usize,
+    ) -> Result<Option<(f64, f64)>> {
         if self.is_image_prepared(length, count, image_tokens) {
-            return Ok(());
+            return Ok(None);
         }
         self.prepare_image_profile(length, count, image_tokens)
+            .map(Some)
     }
 
     /// One image request: the eager vision tower produces merged image
@@ -541,7 +572,7 @@ impl Model {
         let vision_ms = vision.elapsed().as_secs_f64() * 1e3;
 
         let forward = Instant::now();
-        self.prepare_image_for(length, count, image_tokens)?;
+        let prepared = self.prepare_image_for(length, count, image_tokens)?;
 
         let ids = token_ids
             .iter()
@@ -558,6 +589,7 @@ impl Model {
         let count_array = Array::from_i32(self.stream(), &[1], &[count as i32])?;
         let run_start = Array::from_i32(self.stream(), &[1], &[run_start])?;
         let _fwd = signpost_interval!(signpost::FORWARD, length, image_tokens);
+        let real = Instant::now();
         let outputs = self.image_compiled.call_and_eval(&[
             ids,
             positions,
@@ -565,6 +597,7 @@ impl Model {
             features,
             run_start,
         ])?;
+        let t3_ms = real.elapsed().as_secs_f64() * 1e3;
         drop(_fwd);
         let forward_ms = forward.elapsed().as_secs_f64() * 1e3;
 
@@ -580,6 +613,9 @@ impl Model {
                 vision_ms,
                 forward_ms,
                 sync_ms,
+                t1_ms: prepared.map(|(t1, _)| t1),
+                t2_ms: prepared.map(|(_, t2)| t2),
+                t3_ms: prepared.map(|_| t3_ms),
             },
         ))
     }
