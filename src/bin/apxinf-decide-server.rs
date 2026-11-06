@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! apxinf-decide-server --model <checkpoint> [--model-name NAME] [--device metal:N]
-//!                       [--concurrency N]
+//!                       [--concurrency N] [--warm-shapes <file>]
 //! ```
 //!
 //! One checkpoint, one `{"type":"ready",…}` line on stdout, then one JSONL
@@ -32,9 +32,25 @@
 //! `Server`/`LoadedModel` entirely on that thread — the model is `!Send`
 //! (`Rc` handles, `RefCell` caches, thread-local MLX stream) and is never
 //! shared or locked. The main thread reads stdin and dispatches request
-//! `String`s into a bounded queue of capacity N; one writer thread emits
-//! responses under a single stdout lock, in completion order. Memory cost is
-//! N × model, which is expected. N = 1 stays on the original serial path.
+//! `String`s into **per-question worker queues**: a request naming exactly one
+//! manifest question goes to the worker that owns that question (worker `i`
+//! owns shape index `i` mod N), while an unknown/unmapped question, a joint
+//! body or malformed JSON falls back to the least-loaded worker, which answers
+//! with the existing lazy `prepare`. Backpressure bounds the total queued at
+//! N; one writer thread emits responses under a single stdout lock, in
+//! completion order. Memory cost is N × model, which is expected. N = 1 stays
+//! on the original serial path.
+//!
+//! **Warm start (`--warm-shapes` / `APXINF_DECIDE_WARM_SHAPES`).** The
+//! manifest names the demo's shapes (question id, exact crop size, fixed
+//! prompt) and a shared `state`. Before the single `ready` line, every worker
+//! runs **one full synthetic `decide`** per shape it owns — serial (N = 1)
+//! warms all three, each pooled worker warms exactly its own — discarding the
+//! answer. A full decide is required because the vision tower is eager: a
+//! zero-feature `prepare_image_profile` does not warm its first-use Metal JIT.
+//! `ready.load_ms` then reports the wall of load + warm and the additive
+//! `ready.warm_ms` splits the two off. With no manifest the server behaves
+//! exactly as before (cold start, lazy prepare).
 //!
 //! **Image contract.** d3-lite writes one contiguous image-placeholder run
 //! (P1b), so one request carries at most one image. The demo's separate
@@ -49,12 +65,18 @@
 //! The stage split (`stages`) is the runner's host wall-clock attribution:
 //! `host_prep` (decode + preprocess + prompt encode), then `layout`, `vision`,
 //! `forward` (text layers + FP32 readout) and `sync` from the model profile.
+//! On the **first request of a shape** (a prepare ran during the call) the
+//! additive `t1_ms`/`t2_ms`/`t3_ms` fields split that request further:
+//! `t1` = first `call_and_eval` inside `prepare` (trace + compile + Metal JIT
+//! + eval), `t2` = the replay (GPU only) and `t3` = the real request call, so
+//! `t1 − t2` is the trace/compile cost. They are JSON `null` on every
+//! steady-state or already-warm request.
 
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 mod live {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::io::{BufRead, Write};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError, Sender};
     use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -80,10 +102,14 @@ mod live {
             Ok(options) => options,
             Err(error) => fail_start(&error),
         };
+        let manifest = match load_warm_manifest(&options) {
+            Ok(manifest) => manifest,
+            Err(error) => fail_start(&error),
+        };
         if options.concurrency == 1 {
-            serial(&options);
+            serial(&options, manifest.as_ref());
         } else {
-            parallel(options);
+            parallel(options, manifest);
         }
     }
 
@@ -104,6 +130,50 @@ mod live {
         model_name: Option<String>,
         device: Device,
         concurrency: usize,
+        /// `--warm-shapes <file>` (env `APXINF_DECIDE_WARM_SHAPES`). `None`
+        /// keeps the pre-warm behaviour exactly: no load-time warm, lazy
+        /// prepare on the first request for each shape.
+        warm_shapes: Option<PathBuf>,
+    }
+
+    /// One entry of the warm manifest: the question id, the exact crop
+    /// dimensions the demo sends to the server (post-upscale, so the
+    /// checkpoint's resize/grid and therefore the compiled profile match) and
+    /// the fixed prompt the real request carries.
+    #[derive(Clone, Debug)]
+    struct WarmShape {
+        id: String,
+        width: usize,
+        height: usize,
+        instructions: String,
+    }
+
+    /// The `--warm-shapes` file: a shared `state` plus the shapes to warm.
+    #[derive(Clone, Debug)]
+    struct WarmManifest {
+        state: String,
+        shapes: Vec<WarmShape>,
+    }
+
+    impl WarmManifest {
+        /// The worker that owns `shape_index` under question-affine
+        /// ownership: worker `i` owns every shape whose index is `i` mod
+        /// `workers`. For the campaign's N = 3 that is one shape each
+        /// (enemy→0, obstacle→1, gap→2); serial (N = 1) owns all three; N = 2
+        /// splits 2+1; extra workers (N > 3) own nothing and serve only the
+        /// fallback path.
+        fn owner(&self, shape_index: usize, workers: usize) -> usize {
+            shape_index % workers
+        }
+
+        /// `question id -> owning worker`, the routing table for the pool.
+        fn owners(&self, workers: usize) -> HashMap<String, usize> {
+            self.shapes
+                .iter()
+                .enumerate()
+                .map(|(index, shape)| (shape.id.clone(), self.owner(index, workers)))
+                .collect()
+        }
     }
 
     fn parse_options() -> Fallible<Options> {
@@ -115,6 +185,11 @@ mod live {
             Ok(value) => parse_concurrency("APXINF_DECIDE_CONCURRENCY", &value)?,
             Err(_) => 1,
         };
+        // The manifest is opt-in; the flag wins over the environment, which
+        // is how the attribution runs stay unwarmed.
+        let mut warm_shapes = std::env::var_os("APXINF_DECIDE_WARM_SHAPES")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty());
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -132,10 +207,17 @@ mod live {
                     let value = args.next().ok_or("--concurrency needs a value")?;
                     concurrency = parse_concurrency("--concurrency", &value)?
                 }
+                "--warm-shapes" => {
+                    let value = args.next().ok_or("--warm-shapes needs a file")?;
+                    if value.is_empty() {
+                        return Err("--warm-shapes needs a non-empty file".into());
+                    }
+                    warm_shapes = Some(PathBuf::from(value));
+                }
                 "--help" | "-h" => {
                     return Err("usage: apxinf-decide-server --model <checkpoint> \
                                  [--model-name NAME] [--device metal:N] \
-                                 [--concurrency N]"
+                                 [--concurrency N] [--warm-shapes <file>]"
                         .into())
                 }
                 other if model.is_none() && !other.starts_with('-') => {
@@ -149,7 +231,100 @@ mod live {
             model_name,
             device,
             concurrency,
+            warm_shapes,
         })
+    }
+
+    /// Read and validate `--warm-shapes <file>`. A present-but-broken
+    /// manifest is a start-up error (an explicit warm request that cannot be
+    /// honoured must fail loudly, not silently fall back to cold start).
+    fn load_warm_manifest(options: &Options) -> Fallible<Option<WarmManifest>> {
+        let Some(path) = &options.warm_shapes else {
+            return Ok(None);
+        };
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("warm shapes {path:?}: {error}"))?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|error| format!("warm shapes {path:?}: {error}"))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("warm shapes {path:?}: expected a JSON object"))?;
+        if let Some(schema) = object.get("schema").and_then(Value::as_str) {
+            if schema != "d3-lite-warm-shapes/1" {
+                return Err(format!(
+                    "warm shapes {path:?}: unsupported schema {schema:?}, \
+                     want \"d3-lite-warm-shapes/1\""
+                ));
+            }
+        }
+        let state = object
+            .get("state")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("warm shapes {path:?}: needs a string `state`"))?;
+        if state.is_empty() {
+            return Err(format!("warm shapes {path:?}: `state` must not be empty"));
+        }
+        let raw_shapes = object
+            .get("shapes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("warm shapes {path:?}: needs a `shapes` array"))?;
+        if raw_shapes.is_empty() {
+            return Err(format!("warm shapes {path:?}: `shapes` must not be empty"));
+        }
+        let mut shapes = Vec::with_capacity(raw_shapes.len());
+        let mut seen = std::collections::HashSet::new();
+        for (index, raw) in raw_shapes.iter().enumerate() {
+            let entry = raw
+                .as_object()
+                .ok_or_else(|| format!("warm shapes {path:?}: shape {index} is not an object"))?;
+            let id = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    format!("warm shapes {path:?}: shape {index} needs a non-empty `id`")
+                })?
+                .to_string();
+            if !seen.insert(id.clone()) {
+                return Err(format!("warm shapes {path:?}: duplicate shape id {id:?}"));
+            }
+            let width = manifest_dimension(path, &id, entry, "width")?;
+            let height = manifest_dimension(path, &id, entry, "height")?;
+            let instructions = entry
+                .get("instructions")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| {
+                    format!("warm shapes {path:?}: shape {id:?} needs non-empty `instructions`")
+                })?
+                .to_string();
+            shapes.push(WarmShape {
+                id,
+                width,
+                height,
+                instructions,
+            });
+        }
+        Ok(Some(WarmManifest {
+            state: state.to_string(),
+            shapes,
+        }))
+    }
+
+    fn manifest_dimension(
+        path: &Path,
+        id: &str,
+        entry: &Map<String, Value>,
+        key: &str,
+    ) -> Fallible<usize> {
+        let value = entry
+            .get(key)
+            .and_then(Value::as_u64)
+            .filter(|&value| value > 0 && value <= 16_384)
+            .ok_or_else(|| {
+                format!("warm shapes {path:?}: shape {id:?} needs `{key}` in 1..=16384")
+            })?;
+        Ok(value as usize)
     }
 
     fn parse_concurrency(flag: &str, value: &str) -> Fallible<usize> {
@@ -222,7 +397,10 @@ mod live {
 
     /// The one `ready` line, printed by whichever thread owns the startup
     /// decision — the main thread in both the serial and pooled paths.
-    fn print_ready(model_name: &str, load_ms: f64) -> Fallible<()> {
+    /// `load_ms` is the wall of load **plus** the pre-ready warm (additive
+    /// `warm_ms` separates the two so the demo can see what spawn→ready is
+    /// made of).
+    fn print_ready(model_name: &str, load_ms: f64, warm_ms: f64) -> Fallible<()> {
         writeln!(
             std::io::stdout(),
             "{}",
@@ -231,6 +409,7 @@ mod live {
                 "model": model_name,
                 "variant": VARIANT,
                 "load_ms": load_ms,
+                "warm_ms": warm_ms,
                 "codes_verified": true,
             })
         )
@@ -240,17 +419,83 @@ mod live {
             .map_err(|error| format!("flush ready: {error}"))
     }
 
-    /// N = 1: the original serial path — build on the main thread, print
-    /// `ready`, then read a line, answer it, write the response.
-    fn serial(options: &Options) {
-        let (server, load_ms) = match build(options) {
+    /// N = 1: the original serial path — build on the main thread, warm every
+    /// manifest shape (fairness: serial gets the *same* total warmup the
+    /// pooled arm's three workers get, on the same clock), print `ready`, then
+    /// read a line, answer it, write the response.
+    fn serial(options: &Options, manifest: Option<&WarmManifest>) {
+        let (mut server, load_ms) = match build(options) {
             Ok(loaded) => loaded,
             Err(error) => fail_start(&error),
         };
-        if let Err(error) = print_ready(&server.model_name, load_ms) {
+        let warm_ms = match manifest {
+            Some(manifest) => match warm_owned(&mut server, manifest, 1, 0) {
+                Ok(milliseconds) => milliseconds,
+                Err(error) => fail_start(&error),
+            },
+            None => 0.0,
+        };
+        if let Err(error) = print_ready(&server.model_name, load_ms + warm_ms, warm_ms) {
             fail_start(&error);
         }
         serve(server);
+    }
+
+    /// One full synthetic `decide` for every manifest shape this worker owns,
+    /// output discarded, and the wall of that warm. This is the load-time half
+    /// of the fairness rule: with `workers = 1` (serial) it warms all three
+    /// shapes; with `workers = 3` each pooled worker warms exactly its own.
+    ///
+    /// The request is *full*, not a zero-feature `prepare_image_profile`:
+    /// the vision tower is eager, so only a real forward warms its first-use
+    /// Metal JIT. The exact crop size reproduces the real request's
+    /// resize/grid (hence the same compiled profile) and the fixed prompt
+    /// reproduces its token length.
+    fn warm_owned(
+        server: &mut Server,
+        manifest: &WarmManifest,
+        workers: usize,
+        index: usize,
+    ) -> Fallible<f64> {
+        let started = Instant::now();
+        for (shape_index, shape) in manifest.shapes.iter().enumerate() {
+            if manifest.owner(shape_index, workers) != index {
+                continue;
+            }
+            let request = synthetic_request(shape, &manifest.state)
+                .map_err(|error| format!("warm {}: {error}", shape.id))?;
+            // The answer (and its latency/profile) is deliberately dropped:
+            // the point is the first-use setup, not the value.
+            let _ = answer(&mut server.model, &server.format, &request)
+                .map_err(|error| format!("warm {}: {error}", shape.id))?;
+        }
+        Ok(started.elapsed().as_secs_f64() * 1e3)
+    }
+
+    /// The synthetic warm request: a solid-black PNG of the shape's exact
+    /// crop size plus its fixed prompt, in the real request shape so it runs
+    /// through the same decode → preprocess → encode → `decide` path.
+    fn synthetic_request(shape: &WarmShape, state: &str) -> Fallible<Value> {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            shape.width as u32,
+            shape.height as u32,
+            image::Rgb([0u8, 0u8, 0u8]),
+        ));
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut buffer, image::ImageFormat::Png)
+            .map_err(|error| format!("synthetic PNG: {error}"))?;
+        let mut questions = Map::new();
+        questions.insert(
+            shape.id.clone(),
+            json!({"type": "noul", "instructions": shape.instructions.clone()}),
+        );
+        Ok(json!({
+            "id": 0,
+            "state": state,
+            "questions": Value::Object(questions),
+            "images": [base64::encode(buffer.into_inner())],
+        }))
     }
 
     fn serve(mut server: Server) {
@@ -278,13 +523,18 @@ mod live {
     // Request-level concurrency (N > 1)
     // ------------------------------------------------------------------
 
-    /// Shared pool state: a bounded FIFO of request lines, the in-flight
-    /// counter, and the live-worker counter. A `Mutex<VecDeque>` + condvar
-    /// stands in for a multi-consumer bounded mpsc (std's `Receiver` cannot
-    /// be cloned); the lock is held only for queue bookkeeping, never across
-    /// a model call. `close()` is the shutdown signal.
+    /// Shared pool state: one FIFO **per worker** (a worker's queue is its
+    /// question's queue under question-affine ownership), the total queued
+    /// count that bounds the producer, and the in-flight/live counters. One
+    /// `Mutex` + condvar stands in for the multi-consumer bounded channel
+    /// (std's `Receiver` cannot be cloned); the lock is held only for queue
+    /// bookkeeping, never across a model call. `close()` is the shutdown
+    /// signal. Requests whose question is unknown, unmapped, or whose body
+    /// does not name exactly one question take the fallback path: they are
+    /// pushed to the least-loaded worker, which answers with the existing
+    /// lazy `prepare`.
     struct Pool {
-        queue: Mutex<VecDeque<String>>,
+        state: Mutex<PoolState>,
         closed: AtomicBool,
         changed: Condvar,
         /// Queued + currently processing; reaches 0 when all work is done.
@@ -293,17 +543,31 @@ mod live {
         live: AtomicUsize,
         /// Set by the writer when stdout breaks.
         stdout_broken: AtomicBool,
+        /// Question id → owning worker index; built from the warm manifest.
+        owners: HashMap<String, usize>,
+    }
+
+    /// The lock-guarded half of [`Pool`]. `queued` is the global
+    /// backpressure counter (the shared FIFO's old `len()`), so a producer
+    /// still blocks once `workers` requests are waiting.
+    struct PoolState {
+        queues: Vec<VecDeque<String>>,
+        queued: usize,
     }
 
     impl Pool {
-        fn new(workers: usize) -> Self {
+        fn new(workers: usize, owners: HashMap<String, usize>) -> Self {
             Self {
-                queue: Mutex::new(VecDeque::new()),
+                state: Mutex::new(PoolState {
+                    queues: (0..workers).map(|_| VecDeque::new()).collect(),
+                    queued: 0,
+                }),
                 closed: AtomicBool::new(false),
                 changed: Condvar::new(),
                 outstanding: AtomicUsize::new(0),
                 live: AtomicUsize::new(workers),
                 stdout_broken: AtomicBool::new(false),
+                owners,
             }
         }
 
@@ -312,23 +576,48 @@ mod live {
             self.closed.store(true, Ordering::SeqCst);
             self.changed.notify_all();
         }
+
+        fn shutting_down(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+                || self.stdout_broken.load(Ordering::SeqCst)
+                || self.live.load(Ordering::SeqCst) == 0
+        }
     }
 
-    /// Lock the queue, recovering from a poisoned mutex left by a panicked
-    /// worker: the queue itself is still usable.
-    fn queue_lock(pool: &Pool) -> MutexGuard<'_, VecDeque<String>> {
-        pool.queue
+    /// Lock the queues, recovering from a poisoned mutex left by a panicked
+    /// worker: the queues themselves are still usable.
+    fn state_lock(pool: &Pool) -> MutexGuard<'_, PoolState> {
+        pool.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn queue_wait<'a>(
-        pool: &Pool,
-        guard: MutexGuard<'a, VecDeque<String>>,
-    ) -> MutexGuard<'a, VecDeque<String>> {
+    fn state_wait<'a>(pool: &Pool, guard: MutexGuard<'a, PoolState>) -> MutexGuard<'a, PoolState> {
         pool.changed
             .wait(guard)
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The owning worker for this line, or `None` for the fallback path.
+    /// Exactly one question with a manifest entry routes question-affinely;
+    /// anything else (joint body, unknown question, malformed JSON) falls
+    /// back to any worker, which lazy-prepares the shape.
+    fn routed_worker(pool: &Pool, line: &str) -> Option<usize> {
+        let request: Value = serde_json::from_str(line).ok()?;
+        let questions = request.get("questions")?.as_object()?;
+        if questions.len() != 1 {
+            return None;
+        }
+        let id = questions.keys().next()?;
+        pool.owners.get(id).copied()
+    }
+
+    /// The fallback target: least queued, ties broken by lowest index so the
+    /// choice is deterministic for a given state.
+    fn fallback_worker(state: &PoolState) -> usize {
+        (0..state.queues.len())
+            .min_by_key(|&index| state.queues[index].len())
+            .unwrap_or(0)
     }
 
     /// One popped job: decrements `outstanding` exactly once, including while
@@ -346,19 +635,34 @@ mod live {
 
     impl Drop for Outstanding {
         fn drop(&mut self) {
-            let _state = queue_lock(&self.pool);
+            let _state = state_lock(&self.pool);
             self.pool.outstanding.fetch_sub(1, Ordering::SeqCst);
             self.pool.changed.notify_all();
         }
     }
 
+    /// One worker's load+warm handshake. `load_ms` is the load phase alone;
+    /// the ready line adds `warm_ms` per worker before taking the max, so
+    /// `ready.load_ms` is the wall of load+warm.
+    struct Handshake {
+        load_ms: f64,
+        warm_ms: f64,
+        model_name: String,
+    }
+
     /// N worker threads. Each builds its own `Server`/`LoadedModel` here, on
-    /// this thread, and uses it only here — the model is `!Send` and is never
-    /// shared, moved, or wrapped in a `Mutex`.
-    fn parallel(options: Options) {
+    /// this thread, warms the shapes it owns, and uses it only here — the
+    /// model is `!Send` and is never shared, moved, or wrapped in a `Mutex`.
+    /// The single `ready` is printed by the main thread only after every
+    /// worker's handshake (load **and** warm) has arrived.
+    fn parallel(options: Options, manifest: Option<WarmManifest>) {
         let workers = options.concurrency;
-        let pool = Arc::new(Pool::new(workers));
-        let (handshake_tx, handshake_rx) = mpsc::channel::<Result<(f64, String), String>>();
+        let owners = manifest
+            .as_ref()
+            .map(|manifest| manifest.owners(workers))
+            .unwrap_or_default();
+        let pool = Arc::new(Pool::new(workers, owners));
+        let (handshake_tx, handshake_rx) = mpsc::channel::<Result<Handshake, String>>();
         let (response_tx, response_rx) = mpsc::channel::<String>();
 
         let mut handles = Vec::with_capacity(workers);
@@ -367,10 +671,13 @@ mod live {
             let handshake_tx = handshake_tx.clone();
             let response_tx = response_tx.clone();
             let options = options.clone();
+            let manifest = manifest.clone();
             handles.push(
                 std::thread::Builder::new()
                     .name(format!("decide-worker-{index}"))
-                    .spawn(move || worker(options, pool, handshake_tx, response_tx))
+                    .spawn(move || {
+                        worker(index, options, manifest, pool, handshake_tx, response_tx)
+                    })
                     .expect("spawn decide worker"),
             );
         }
@@ -380,17 +687,16 @@ mod live {
         // the writer sees the channel close once every worker has exited.
         drop(response_tx);
 
-        // Collect one handshake per worker. A worker that dies before its
-        // handshake is noticed through the live counter (or its panic line).
-        let mut load_times = Vec::with_capacity(workers);
-        let mut model_names = Vec::with_capacity(workers);
+        // Collect one handshake per worker (load + pre-ready warm). A worker
+        // that dies before its handshake is noticed through the live counter
+        // (or its panic line).
+        let mut handshakes = Vec::with_capacity(workers);
         let mut received = 0usize;
         let mut failure: Option<String> = None;
         while received < workers && failure.is_none() {
             match handshake_rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(Ok((load_ms, model_name))) => {
-                    load_times.push(load_ms);
-                    model_names.push(model_name);
+                Ok(Ok(handshake)) => {
+                    handshakes.push(handshake);
                     received += 1;
                 }
                 Ok(Err(error)) => {
@@ -416,14 +722,22 @@ mod live {
             fail_start(&error);
         }
 
-        // All workers loaded: one `ready` line from the main thread, with
-        // the slowest load (all workers load concurrently).
-        let model_name = model_names
+        // All workers loaded **and warmed**: one `ready` line from the main
+        // thread. Workers run concurrently, so the wall to ready is the slowest
+        // worker's load+warm; `warm_ms` separates the two (additive).
+        let model_name = handshakes
             .first()
-            .cloned()
+            .map(|handshake| handshake.model_name.clone())
             .unwrap_or_else(|| "metal_d3".into());
-        let load_ms = load_times.iter().copied().fold(0.0, f64::max);
-        if let Err(error) = print_ready(&model_name, load_ms) {
+        let load_ms = handshakes
+            .iter()
+            .map(|handshake| handshake.load_ms + handshake.warm_ms)
+            .fold(0.0, f64::max);
+        let warm_ms = handshakes
+            .iter()
+            .map(|handshake| handshake.warm_ms)
+            .fold(0.0, f64::max);
+        if let Err(error) = print_ready(&model_name, load_ms, warm_ms) {
             pool.close();
             for handle in handles {
                 let _ = handle.join();
@@ -453,7 +767,9 @@ mod live {
                 .expect("spawn decide writer")
         };
 
-        // Main thread: read stdin and dispatch into the bounded queue.
+        // Main thread: read stdin and dispatch into the bounded per-question
+        // queues. Routing is computed before taking the lock (it parses the
+        // request JSON, image and all).
         let capacity = workers;
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
@@ -467,36 +783,38 @@ mod live {
             if line.trim().is_empty() {
                 continue;
             }
-            // Backpressure: block while the queue is full, until shutdown.
-            let mut state = queue_lock(&pool);
-            while state.len() >= capacity
-                && !pool.closed.load(Ordering::SeqCst)
-                && !pool.stdout_broken.load(Ordering::SeqCst)
-                && pool.live.load(Ordering::SeqCst) > 0
-            {
-                state = queue_wait(&pool, state);
+            let routed = routed_worker(&pool, &line);
+            // Backpressure: block while `capacity` requests are waiting,
+            // until shutdown. `queued` is the shared FIFO's old `len()`.
+            let mut state = state_lock(&pool);
+            while state.queued >= capacity && !pool.shutting_down() {
+                state = state_wait(&pool, state);
             }
-            if pool.closed.load(Ordering::SeqCst)
-                || pool.stdout_broken.load(Ordering::SeqCst)
-                || pool.live.load(Ordering::SeqCst) == 0
-            {
+            if pool.shutting_down() {
                 break;
             }
-            state.push_back(line);
+            // A mapped question goes to its owner; anything else (unknown
+            // question/shape, joint body, bad JSON) falls back to the
+            // least-loaded worker, which lazy-prepares.
+            let target = routed.unwrap_or_else(|| fallback_worker(&state));
+            state.queues[target].push_back(line);
+            state.queued += 1;
             Outstanding::claim(&pool);
-            pool.changed.notify_one();
+            // The woken worker may own a different question than the one
+            // just queued, so wake all of them (N is small).
+            pool.changed.notify_all();
         }
 
-        // EOF (or shutdown): close the queue, workers drain it, then wait
+        // EOF (or shutdown): close the queues, workers drain them, then wait
         // for in-flight work to finish. If every worker is gone there is
         // nothing left to drain, so we do not wait forever.
         pool.close();
         {
-            let mut state = queue_lock(&pool);
+            let mut state = state_lock(&pool);
             while pool.outstanding.load(Ordering::SeqCst) > 0
                 && pool.live.load(Ordering::SeqCst) > 0
             {
-                state = queue_wait(&pool, state);
+                state = state_wait(&pool, state);
             }
         }
 
@@ -507,31 +825,53 @@ mod live {
     }
 
     fn worker(
+        index: usize,
         options: Options,
+        manifest: Option<WarmManifest>,
         pool: Arc<Pool>,
-        handshake: Sender<Result<(f64, String), String>>,
+        handshake: Sender<Result<Handshake, String>>,
         responses: Sender<String>,
     ) {
         // A panic anywhere in this worker must still decrement `live` and
         // wake the main thread's drain/dispatch waits.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let (server, load_ms) = match build(&options) {
+            let (mut server, load_ms) = match build(&options) {
                 Ok(loaded) => loaded,
                 Err(error) => {
                     let _ = handshake.send(Err(error));
                     return;
                 }
             };
+            // Warm the shapes this worker owns BEFORE the single `ready`.
+            // The main thread cannot print ready until every handshake
+            // arrives, so the warm wall delays spawn→ready, not decision 1.
+            // With no manifest this is 0 and behaviour is unchanged.
+            let warm_ms = match &manifest {
+                Some(manifest) => {
+                    match warm_owned(&mut server, manifest, options.concurrency, index) {
+                        Ok(milliseconds) => milliseconds,
+                        Err(error) => {
+                            let _ = handshake.send(Err(error));
+                            return;
+                        }
+                    }
+                }
+                None => 0.0,
+            };
             if handshake
-                .send(Ok((load_ms, server.model_name.clone())))
+                .send(Ok(Handshake {
+                    load_ms,
+                    warm_ms,
+                    model_name: server.model_name.clone(),
+                }))
                 .is_err()
             {
                 return;
             }
-            serve_worker(server, &pool, responses);
+            serve_worker(index, server, &pool, responses);
         }));
         {
-            let _state = queue_lock(&pool);
+            let _state = state_lock(&pool);
             pool.live.fetch_sub(1, Ordering::SeqCst);
             pool.changed.notify_all();
         }
@@ -540,21 +880,22 @@ mod live {
         }
     }
 
-    fn serve_worker(mut server: Server, pool: &Arc<Pool>, responses: Sender<String>) {
+    /// Serve from this worker's own queue only. A closed queue still yields
+    /// its queued work before the worker exits.
+    fn serve_worker(index: usize, mut server: Server, pool: &Arc<Pool>, responses: Sender<String>) {
         loop {
-            // Pop one job, or exit once the queue is closed *and* drained:
-            // a closed queue still yields queued work first.
             let job = {
-                let mut state = queue_lock(pool);
+                let mut state = state_lock(pool);
                 loop {
-                    if let Some(job) = state.pop_front() {
+                    if let Some(job) = state.queues[index].pop_front() {
+                        state.queued -= 1;
                         pool.changed.notify_all(); // space for the producer
                         break Some(job);
                     }
                     if pool.closed.load(Ordering::SeqCst) {
                         break None;
                     }
-                    state = queue_wait(pool, state);
+                    state = state_wait(pool, state);
                 }
             };
             let Some(line) = job else { break };
@@ -663,6 +1004,13 @@ mod live {
         let mut vision_ms = 0.0f64;
         let mut forward_ms = 0.0f64;
         let mut sync_ms = 0.0f64;
+        // First-request attribution. `Some` sums the questions that prepared
+        // during this call; `None` (→ JSON null) when none did, i.e. every
+        // steady-state request and every request on an already-warm worker.
+        let mut t1_ms = 0.0f64;
+        let mut t2_ms = 0.0f64;
+        let mut t3_ms = 0.0f64;
+        let mut prepared_any = false;
         for (id, raw_question) in questions {
             let question = decision_question(id, raw_question)?;
             let prepared_at = Instant::now();
@@ -681,6 +1029,12 @@ mod live {
             vision_ms += profile.vision_ms;
             forward_ms += profile.forward_ms;
             sync_ms += profile.sync_ms;
+            if let (Some(t1), Some(t2), Some(t3)) = (profile.t1_ms, profile.t2_ms, profile.t3_ms) {
+                t1_ms += t1;
+                t2_ms += t2;
+                t3_ms += t3;
+                prepared_any = true;
+            }
             let probabilities = prepared.option_probabilities(&output);
             let parsed = format
                 .answer(prepared.normalized(), &probabilities)
@@ -689,12 +1043,16 @@ mod live {
             answers.insert(id.clone(), parsed);
         }
         let latency_ms = started.elapsed().as_secs_f64() * 1e3;
+        // `t₁ − t₂` is the trace/compile cost of the first request of a shape.
         let stages = json!({
             "host_prep_ms": host_prep_ms,
             "layout_ms": layout_ms,
             "vision_ms": vision_ms,
             "forward_ms": forward_ms,
             "sync_ms": sync_ms,
+            "t1_ms": prepared_any.then_some(t1_ms),
+            "t2_ms": prepared_any.then_some(t2_ms),
+            "t3_ms": prepared_any.then_some(t3_ms),
             "questions": questions.len(),
         });
         Ok((
