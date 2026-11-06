@@ -160,18 +160,23 @@ timeline is required in P3; this report leaves the baseline numbers as the
 
 ## 8. Known limitations
 
-- Vision tower not executed (`capabilities() == TEXT_ONLY`); `visual.*` is
-  parsed only for package identity. Multimodal alignment is P1b.
+- Vision tower not executed in this phase (`capabilities() == TEXT_ONLY`);
+  `visual.*` was parsed only for package identity. **Since delivered as P1b:**
+  see the [vision report](d3-lite-metal-vision.md). The text path (and this
+  report's parity/baseline numbers) is unchanged — the P1a gate receipt is
+  reproduced bit for bit.
 - Whole-request MLX compilation is a **new scope** for this family (no prior
   MLX family compiles the entire backbone); it is qualified by the
   compiled/eager acceptance test and by the 48-case gate, not inherited from
   Clef or Qwen3. Each new `(length, candidate_count)` profile traces once, so
   a workload with many distinct lengths pays one trace per length and retains
-  one graph per profile.
+  one graph per profile. (P1b adds a second compiled callable for image
+  requests with its own `(length, candidate_count, image_tokens)` profiles.)
 - `inv_freq` is evaluated on the host at load (`apxinf-mlx` exposes no `log`
   unary); the formula is the reference's `exp(-(i/d)·log(base))` in F32. Any
   ulp-level difference from the device-side evaluation is inside the reported
-  parity budget.
+  parity budget. The P1b vision path uses the reference's `powf` form instead
+  (bit-exact), deliberately leaving this text formula untouched.
 - Per-case timing reflects this host's current background load; the clean
   Swapouts window is recorded, but the suite is not a cross-machine claim.
 

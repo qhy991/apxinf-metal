@@ -106,7 +106,7 @@ Metal; Qwen3 checkpoint detection still works.
 | MiniCPM5 `bf16-public` | Official 2B BF16 geometry, B1, up to 4096 positions | Ordered device composition; source public SwiGLU remains locally compiled |
 | MiniCPM5 `bf16-compiled` (default) | Same profile | Local norm/RoPE and complete decode-step compilation, including the packed residual/RMSNorm kernel |
 | MiniCPM5 `dspark` | Same target plus the pinned official BF16 drafter; 1–256 output tokens within the context profile | Compiled five-layer draft and sequential Markov-head proposal chain, plus compiled target verification for up to eight rows; explicit accept/trim/pending-token schedule |
-| d3-lite `bf16` (default), also `auto` / `bf16-compiled` | `vllm-sr/d3-lite` BF16 text path: hidden 1024, 24 layers (18 GDN + 6 non-causal full attention), B1, up to 262144 positions, 255-code FP32 readout | Whole-request `Compiled` forward (`ids [1,L]`, `candidate_count [1]` → masked FP32 probabilities); one `(length, candidate_count)` profile traced on first use via `Compiled::prepare` and replayed without retracing; eager lazy graph retained for the compiled/eager acceptance test |
+| d3-lite `bf16` (default), also `auto` / `bf16-compiled` | `vllm-sr/d3-lite` BF16 text path: hidden 1024, 24 layers (18 GDN + 6 non-causal full attention), B1, up to 262144 positions, 255-code FP32 readout; image requests add the `visual.*` tower (12 × 768 blocks + merger to 1024) over **one still image** per request | Text: whole-request `Compiled` forward (`ids [1,L]`, `candidate_count [1]` → masked FP32 probabilities); one `(length, candidate_count)` profile traced on first use and replayed without retracing; eager lazy graph retained for the compiled/eager acceptance test. Image: eager checkpoint-fixed preprocess (`preprocess.rs`) + eager vision tower (`vision.rs`), then a second `Compiled` forward (`ids`, `[3,L]` mRoPE positions, `candidate_count`, merged features, one placeholder-run start) with one `(length, candidate_count, image_tokens)` profile; the text callable and its profiles are untouched. Video and multi-image requests are rejected by name |
 
 These rows describe implemented scopes, not qualified targets. The maintained
 owners are [Qwen3](../crates/apxinf-model/src/metal_qwen3/README.md) and
@@ -165,9 +165,24 @@ once. The same body is available eagerly (`Model::eager_probabilities`) and the
 maintained ignored test compares the two, verifies replay stability and changed
 input propagation. Whole-request compilation is a new scope for this family —
 it is not inherited from Clef or Qwen3 — and is qualified by that test and by
-the 48-case gate rather than by those families' evidence. See the
-[P1a port report](d3-lite-metal.md) and the reusable
-[`d3_lite_bench`](../crates/apxinf-model/examples/d3_lite_bench.rs) entry.
+the 48-case gate rather than by those families' evidence.
+
+Image requests (P1b) keep the text callable intact and add a second one-shot
+graph. The caller passes one still image through `DecisionInput::with_vision`
+(`pixel_values [N,1536]`, `grid_thw [1,h,w]`); the port runs its own
+checkpoint-fixed preprocess (`preprocess.rs`: smart_resize with Python
+banker's rounding, PyTorch's int16 bicubic, fused `(u8−127.5)/127.5`,
+merge-block patchify), the eager 12-block vision tower with its spatial merger
+(`vision.rs`), and then the compiled image callable
+`(ids [1,L], positions [3,L], candidate_count [1], features [1,M,1024], run_start [1])`
+under mRoPE. `(length, candidate_count, image_tokens)` profiles are traced on
+first use and replay without retracing; the features are evaluated before the
+call so the profile stays concrete. `multimodal_layout` reproduces the
+reference's `get_rope_index` positions from the placeholder runs. See the
+[P1b vision report](d3-lite-metal-vision.md) and the
+[P1a port report](d3-lite-metal.md) plus the reusable
+[`d3_lite_bench`](../crates/apxinf-model/examples/d3_lite_bench.rs) entry
+(`--set image` / `--images SUITE`).
 
 ## Native dependency and ABI
 

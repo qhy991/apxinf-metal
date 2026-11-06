@@ -1,6 +1,6 @@
-//! d3-lite checkpoint loading: `language_model.*` BF16 backbone tensors and
-//! the FP32 `readout.safetensors` matrix, mapped into the Metal port's own
-//! typed weight tree.
+//! d3-lite checkpoint loading: `language_model.*` BF16 backbone tensors, the
+//! FP32 `readout.safetensors` matrix, and the `visual.*` vision tower, mapped
+//! into the Metal port's own typed weight trees.
 //!
 //! Fixed transformations happen once at load, never per request:
 //! - Qwen3.5 norms whose stored value is `w` are materialized as `1 + w`
@@ -9,7 +9,11 @@
 //!   left untouched, matching the reference loader.
 //! - `linear_attn.conv1d.weight` is stored `[C, 1, S]` and transposed to the
 //!   MLX conv1d `[C, S, 1]` layout.
-//! The vision tower (`visual.*`) is never read in P1a.
+//! - The vision patch embedding Conv3d weight `[C_out, C_in, T, P, P]` is
+//!   reshaped to the `[C_out, C_in·T·P·P]` matrix its kernel = stride equals.
+//!
+//! The two trees are loaded by separate filtered reads so the text path's
+//! loading contract (and its parity anchor) is unchanged.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,11 +21,47 @@ use std::path::Path;
 use apxinf_core::{Error, Result};
 use apxinf_mlx::{Array, MlxDType, Stream};
 
-use super::config::{Geometry, CODES};
+use super::config::{Geometry, VisionContract, CODES};
 
 #[derive(Clone)]
 pub struct Linear {
     pub weight: Array,
+}
+
+/// A linear layer with the bias the vision tower stores for every projection.
+#[derive(Clone)]
+pub struct BiasedLinear {
+    pub weight: Array,
+    pub bias: Array,
+}
+
+pub struct VisionBlock {
+    pub norm1_weight: Array,
+    pub norm1_bias: Array,
+    pub qkv: BiasedLinear,
+    pub proj: BiasedLinear,
+    pub norm2_weight: Array,
+    pub norm2_bias: Array,
+    pub fc1: BiasedLinear,
+    pub fc2: BiasedLinear,
+}
+
+pub struct VisionMerger {
+    pub norm_weight: Array,
+    pub norm_bias: Array,
+    pub fc1: BiasedLinear,
+    pub fc2: BiasedLinear,
+}
+
+/// The 153 `visual.*` tensors, after the patch-embed reshape.
+pub struct VisionWeights {
+    /// `[embed_dim, in_channels·T·P·P]`, the Conv3d as its kernel=stride matrix.
+    pub patch_weight: Array,
+    pub patch_bias: Array,
+    /// Learned `[num_position_embeddings, embed_dim]` table (48 x 48 grid).
+    pub pos_embed: Array,
+    pub blocks: Vec<VisionBlock>,
+    pub merger: VisionMerger,
 }
 
 pub struct Mlp {
@@ -109,6 +149,13 @@ impl Take {
     fn linear(&mut self, name: &str, output: usize, input: usize) -> Result<Linear> {
         Ok(Linear {
             weight: self.bf16(&format!("{name}.weight"), &[output, input])?,
+        })
+    }
+
+    fn biased(&mut self, name: &str, output: usize, input: usize) -> Result<BiasedLinear> {
+        Ok(BiasedLinear {
+            weight: self.bf16(&format!("{name}.weight"), &[output, input])?,
+            bias: self.bf16(&format!("{name}.bias"), &[output])?,
         })
     }
 
@@ -222,6 +269,71 @@ impl Weights {
             layers,
             norm,
             readout,
+        })
+    }
+}
+
+impl VisionWeights {
+    /// Loads and validates every `visual.*` tensor of the d3-lite package.
+    /// The filter reads the vision tower only, so the text loader's file
+    /// contract is untouched.
+    pub fn load(vision: VisionContract, stream: &Stream, checkpoint: &Path) -> Result<Self> {
+        let files =
+            apxinf_loader::safetensors::safetensors_files(checkpoint).map_err(Error::Other)?;
+        let map = apxinf_mlx::load_safetensors(stream, &files, |name| name.starts_with("visual."))?;
+        let mut take = Take {
+            map,
+            what: "d3-lite Metal vision checkpoint",
+        };
+        let hidden = vision.hidden;
+        let patch_dim = 3 * vision.temporal_patch * vision.patch * vision.patch;
+        let patch_stored = take.bf16(
+            "visual.patch_embed.proj.weight",
+            &[hidden, 3, vision.temporal_patch, vision.patch, vision.patch],
+        )?;
+        let patch_weight = patch_stored.reshape(&[hidden, patch_dim])?;
+        let patch_bias = take.bf16("visual.patch_embed.proj.bias", &[hidden])?;
+        let pos_embed = take.bf16(
+            "visual.pos_embed.weight",
+            &[vision.num_position_embeddings, hidden],
+        )?;
+        debug_assert_eq!(vision.heads * vision.head_dim, hidden);
+        let mut blocks = Vec::with_capacity(vision.depth);
+        for index in 0..vision.depth {
+            let prefix = format!("visual.blocks.{index}");
+            blocks.push(VisionBlock {
+                norm1_weight: take.bf16(&format!("{prefix}.norm1.weight"), &[hidden])?,
+                norm1_bias: take.bf16(&format!("{prefix}.norm1.bias"), &[hidden])?,
+                qkv: take.biased(&format!("{prefix}.attn.qkv"), 3 * hidden, hidden)?,
+                proj: take.biased(&format!("{prefix}.attn.proj"), hidden, hidden)?,
+                norm2_weight: take.bf16(&format!("{prefix}.norm2.weight"), &[hidden])?,
+                norm2_bias: take.bf16(&format!("{prefix}.norm2.bias"), &[hidden])?,
+                fc1: take.biased(
+                    &format!("{prefix}.mlp.linear_fc1"),
+                    vision.intermediate,
+                    hidden,
+                )?,
+                fc2: take.biased(
+                    &format!("{prefix}.mlp.linear_fc2"),
+                    hidden,
+                    vision.intermediate,
+                )?,
+            });
+        }
+        let merged = hidden * vision.spatial_merge * vision.spatial_merge;
+        let merger = VisionMerger {
+            norm_weight: take.bf16("visual.merger.norm.weight", &[hidden])?,
+            norm_bias: take.bf16("visual.merger.norm.bias", &[hidden])?,
+            fc1: take.biased("visual.merger.linear_fc1", merged, merged)?,
+            fc2: take.biased("visual.merger.linear_fc2", vision.out_hidden, merged)?,
+        };
+        take.finish()?;
+        Ok(Self {
+            patch_weight,
+            patch_bias,
+            pos_embed,
+            blocks,
+            merger,
         })
     }
 }

@@ -1,4 +1,4 @@
-//! Native d3-lite on Apple Metal: the checkpoint's text decision path as an
+//! Native d3-lite on Apple Metal: the checkpoint's decision path as an
 //! ApxInf-owned MLX composition.
 //!
 //! This is the Metal port of the d3 family (registry name `metal_d3`, explicit
@@ -9,16 +9,21 @@
 //!
 //! Scope of this module: the **text** path — `language_model.*` (24 layers, 18
 //! GatedDeltaNet + 6 non-causal full attention) and the FP32 255-code readout,
-//! one compiled forward per request, no decode and no KV cache. The `visual.*`
-//! tower (`d3::vision`'s counterpart) is parsed for package identity but is
-//! never read or executed here; multimodal alignment is P1b.
+//! one compiled forward per request, no decode and no KV cache — plus the
+//! **vision** path (P1b): `visual.*` (12 blocks + spatial merger), the
+//! checkpoint's resize/normalize/patchify contract, and the multimodal
+//! placeholder/mRoPE wiring that turns a PNG-backed request into one forward
+//! producing 255 code probabilities. Video inputs are not wired.
 
 mod config;
 mod model;
+mod preprocess;
+mod vision;
 mod weights;
 
-pub use config::{Config, Geometry, VisionContract};
+pub use config::{Config, Geometry, PreprocessorContract, VisionContract};
 pub use model::Model;
+pub use preprocess::{preprocess, smart_resize, PreparedImage};
 pub use weights::Weights;
 
 use std::path::Path;
@@ -32,6 +37,8 @@ use crate::decision::{
 };
 use crate::llm_trait::LlmCapabilities;
 use crate::{LoadOptions, LoadedModel, ModelPrecision};
+
+use weights::VisionWeights;
 
 /// Device-independent option admission, checked before the checkpoint is read.
 /// One BF16 implementation: the checkpoint's own storage, no CUDA tuning,
@@ -101,12 +108,12 @@ pub fn load(
     let config = Config::from_dir(path)?;
     let stream: Stream = native.stream().clone();
     let weights = Weights::load(config.geometry, &stream, path)?;
-    let model = Model::new(&config, stream, weights)?;
+    let vision_weights = VisionWeights::load(config.vision, &stream, path)?;
+    let model = Model::new(&config, stream, weights, vision_weights)?;
     Ok(LoadedModel::Decision(DecisionModel::Code(Box::new(
         D3LiteRunner {
             codes: config.codes.clone(),
             token_ids: config.token_ids.clone(),
-            config,
             model,
         },
     ))))
@@ -118,31 +125,35 @@ pub fn load(
 pub struct D3LiteRunner {
     codes: Vec<String>,
     token_ids: Vec<u32>,
-    config: Config,
     model: Model,
 }
 
 impl D3LiteRunner {
-    /// Profiles prepared on the compiled whole-request callable, in order.
+    /// Text profiles prepared on the compiled whole-request callable, in order.
     pub fn prepared_profiles(&self) -> Vec<(usize, usize)> {
         self.model.prepared_profiles()
+    }
+
+    /// Image profiles `(length, count, image_tokens)` prepared so far.
+    pub fn prepared_image_profiles(&self) -> Vec<(usize, usize, usize)> {
+        self.model.prepared_image_profiles()
     }
 }
 
 impl CodeDecisionRuntime for D3LiteRunner {
     fn capabilities(&self) -> LlmCapabilities {
-        // Text-only until P1b wires `visual.*` through the same request graph.
-        LlmCapabilities::TEXT_ONLY
+        LlmCapabilities::VISION
     }
 
     fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput> {
-        if input.image.is_some() {
-            return Err(Error::Other(
-                "d3-lite Metal text path does not read images; the vision tower is P1b".into(),
-            ));
-        }
         let count = input.candidate_count;
-        let probabilities = self.model.probabilities(input.token_ids, count)?;
+        let probabilities = if let Some(image) = input.image {
+            let pixels = image.pixel_values.to_f32_vec()?;
+            self.model
+                .image_probabilities(&pixels, image.grid_thw, input.token_ids, count)?
+        } else {
+            self.model.probabilities(input.token_ids, count)?
+        };
         if probabilities.len() != count {
             return Err(Error::Other(format!(
                 "d3-lite decision returned {} probabilities for {count} candidates",
