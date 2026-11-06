@@ -82,6 +82,32 @@ KEEP-measurability filters — the candidate pool is dry on this host and
 protocol; see EAGER-EVAL.md §3.3 for the screening table and the three
 follow-ups worth doing instead.
 
+### Relay round 2026-11-06 (auto-tier Tier-1 prefix cache — strict re-measure)
+
+Full record: [AUTO-PREFIX-REMEASURE.md](AUTO-PREFIX-REMEASURE.md). A clean-window start
+(Swapouts flat over a 2 s probe, 65 GiB free) still produced **0/3 clean rounds**:
+arm-process Swapouts were **+81,180 / +791,138 (r0), +16,044 / +18,480 (r1 reversed),
++0 / +50,928 (r2)** for `cache-OFF / cache-ON`. The cache-ON arm was dirty in all three
+rounds; `top` reported the r1 cache-ON worker at **7,395 MB MEM with 4,670 MB compressed** on
+this 16 GB host. D39's NOT-WORTH is therefore downgraded to **INCONCLUSIVE (environment)**,
+exactly as the merged audit (`doc/notworth-audit.md` on main, PR #21) predicted: the D39
+latency range came from all-dirty rounds, and a clean start cannot produce a clean round. Both
+parity readings refuse a KEEP and agree (`disagreement = false`), so no requester decision is
+needed: the literal vs-MLX ≤ 0.035 gate fails structurally for auto (cache-OFF 0.0449,
+cache-ON 0.0404 — cache-ON is *closer* to the reference, so turning it off for parity would be
+worse), while the audit/D39 A/A reading (42/42, max|Δp| 0.03159, identical in all three rounds)
+has no clean rounds to pool. The Tier-1 cache stays default ON; its reference-tier KEEP is
+unaffected. No before/after timeline is recorded for this non-optimization, per the line's
+negative-candidate precedent (`ANE-COLUMN-BALANCE.md` §1). A same-protocol N=12 probe
+produced **1/2 clean rounds with Swapouts 0–508 pages** (vs 16k–791k at N=42) — swap is
+**case-volume-driven**, not structural: cache-ON was clean in both N=12 rounds. That suggests a
+pre-declared small auto suite could yield a KEEP, but switching the declared suite after seeing
+which one is clean is suite-shopping, so the probe is a diagnostic only; the protocol question
+(pre-declared small auto suite, yes/no) is left to the requester. The ranked next direction is
+the reference-tier whole-backbone `mx.compile` candidate: feasibility is in the relay handoff
+(shape-specialized, ~335 production lines in this file, 3 profiles for the 42-case suite,
+~6–7 % ceiling, 0.0022 parity headroom, unknown-profile eager fallback required).
+
 ## Measurement discipline
 
 - Shared Metal locks: take `~/.cache/enginetailor/metal-measure.lock` first, then
