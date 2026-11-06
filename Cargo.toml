@@ -53,3 +53,8 @@ apxinf-tokenizer = { path = "crates/apxinf-tokenizer" }
 clap = { version = "=4.5.23", features = ["derive"] }
 serde_json = "1"
 half = "2"
+# The resident d3-lite decide-server (src/bin/apxinf-decide-server.rs) speaks
+# the demo's base64-PNG JSONL contract. PNG-only: the demo sends PNG crops,
+# and the checkpoint's own preprocessor is bit-exact for PNG.
+base64 = "0.13"
+image = { version = "0.25", default-features = false, features = ["png"] }

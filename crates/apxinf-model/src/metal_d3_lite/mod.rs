@@ -21,24 +21,32 @@
 pub(crate) mod signpost;
 
 mod config;
+pub mod format;
 mod model;
 mod preprocess;
 mod vision;
 mod weights;
 
 pub use config::{Config, Geometry, PreprocessorContract, VisionContract};
+pub use format::{
+    answer, answer_codes, normalize, options, user_prompt, D3LiteFormat, EncodedImageRequest,
+    EncodedRequest, NormalizedQuestion, QuestionOption, FORMAT_ID, MAX_OPTIONS, SYSTEM_PROMPT,
+};
 pub use model::Model;
 pub use preprocess::{preprocess, smart_resize, PreparedImage};
 pub use weights::Weights;
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use apxinf_core::{Backend, Device, Error, Result};
 use apxinf_mlx::{MlxBackend, Stream};
 
 use crate::decision::{
     CodeDecisionRuntime, DecisionInput, DecisionModel, DecisionOutput, DecisionScore,
+    DecisionStageProfile,
 };
 use crate::llm_trait::LlmCapabilities;
 use crate::{LoadOptions, LoadedModel, ModelPrecision};
@@ -120,17 +128,21 @@ pub fn load(
             codes: config.codes.clone(),
             token_ids: config.token_ids.clone(),
             model,
+            stage_profile: RefCell::new(None),
         },
     ))))
 }
 
-/// Encoded-prompt decision runtime: the caller (CLI / bench) owns tokenization
-/// and the chat template; this runner scores the leading package codes of one
-/// complete prompt.
+/// Encoded-prompt decision runtime: the caller (CLI / bench / decide-server)
+/// owns tokenization and the chat template; this runner scores the leading
+/// package codes of one complete prompt.
 pub struct D3LiteRunner {
     codes: Vec<String>,
     token_ids: Vec<u32>,
     model: Model,
+    /// Attribution of the last `decide` call; `None` before the first call and
+    /// after a failed one.
+    stage_profile: RefCell<Option<DecisionStageProfile>>,
 }
 
 impl D3LiteRunner {
@@ -157,17 +169,28 @@ impl CodeDecisionRuntime for D3LiteRunner {
             input.token_ids.len(),
             usize::from(input.image.is_some())
         );
-        let probabilities = if let Some(image) = input.image {
-            // The pixel tensor is a device array; this is the input readback
-            // the baseline latency includes ("host pixel upload → …").
+        // A failed call must not leave the previous call's attribution behind.
+        self.stage_profile.replace(None);
+        let (probabilities, profile) = if let Some(image) = input.image {
+            // The pixel tensor is a device array; this input readback is part
+            // of the public call and is charged to `layout` (host input
+            // handling) so the stored profile closes over all of `decide`.
+            let readback = Instant::now();
             let pixels = {
                 let _sp = signpost_interval!(signpost::INPUT, image.pixel_values.numel());
                 image.pixel_values.to_f32_vec()?
             };
-            self.model
-                .image_probabilities(&pixels, image.grid_thw, input.token_ids, count)?
+            let input_ms = readback.elapsed().as_secs_f64() * 1e3;
+            let (probabilities, mut profile) = self.model.image_probabilities_profiled(
+                &pixels,
+                image.grid_thw,
+                input.token_ids,
+                count,
+            )?;
+            profile.layout_ms += input_ms;
+            (probabilities, profile)
         } else {
-            self.model.probabilities(input.token_ids, count)?
+            self.model.probabilities_profiled(input.token_ids, count)?
         };
         if probabilities.len() != count {
             return Err(Error::Other(format!(
@@ -197,6 +220,9 @@ impl CodeDecisionRuntime for D3LiteRunner {
                 probability,
             })
             .collect();
+        // Publish the attribution only after every output check passed, so a
+        // failed call leaves `None` as documented.
+        self.stage_profile.replace(Some(profile));
         Ok(DecisionOutput {
             selected_index,
             scores,
@@ -209,6 +235,10 @@ impl CodeDecisionRuntime for D3LiteRunner {
 
     fn token_ids(&self) -> &[u32] {
         &self.token_ids
+    }
+
+    fn last_stage_profile(&self) -> Option<DecisionStageProfile> {
+        *self.stage_profile.borrow()
     }
 }
 

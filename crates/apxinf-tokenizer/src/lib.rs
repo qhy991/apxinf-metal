@@ -185,6 +185,17 @@ fn hf_tojson(
     ))
 }
 
+/// `json.dumps(value, ensure_ascii=False)` — Python's default separators
+/// (`, ` / `: `), insertion order and float repr, without HTML escaping.
+///
+/// The d3 prompt contract's `describe()` emits this exact spelling for every
+/// non-string state or option description, so its bytes are part of the model
+/// input.
+pub fn json_dumps(value: &serde_json::Value) -> std::result::Result<String, minijinja::Error> {
+    use minijinja::value::Rest;
+    hf_tojson(minijinja::Value::from_serialize(value), Rest(Vec::new()))
+}
+
 #[cfg(feature = "sentencepiece")]
 use sentencepiece::SentencePieceProcessor;
 
@@ -286,7 +297,11 @@ impl Tokenizer {
     }
 
     /// Encode text, optionally applying the tokenizer's post-processor.
-    pub fn encode_with_special_tokens(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+    pub fn encode_with_special_tokens(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> Result<Vec<u32>> {
         let encoding = self
             .inner
             .encode(text, add_special_tokens)
@@ -307,6 +322,15 @@ impl Tokenizer {
     /// Resolve one token to its vocabulary ID.
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
         self.inner.token_to_id(token)
+    }
+
+    /// Resolve one vocabulary ID back to its token string.
+    ///
+    /// Protocol markers such as `<|vision_start|>` are added tokens whose literal
+    /// spelling must be placed in a rendered prompt; callers that know the ID
+    /// (the checkpoint's `config.json`) need the string the tokenizer expects.
+    pub fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id)
     }
 
     /// Decode token IDs to text.
@@ -575,6 +599,20 @@ mod tests {
         .unwrap();
         env.render_str(template, serde_json::json!({"data":data}))
             .unwrap()
+    }
+
+    #[test]
+    fn json_dumps_matches_python_default_spelling() {
+        // Checked against `json.dumps(v, ensure_ascii=False)` on the host.
+        let value = serde_json::json!({
+            "game": "Super Mario Bros.", "level": "1-1", "mario_x": 40,
+            "ok": true, "n": null, "f": 1.5, "s": "马里奥",
+            "tiny": 1e-05, "big": 1e20,
+        });
+        assert_eq!(
+            json_dumps(&value).unwrap(),
+            r#"{"game": "Super Mario Bros.", "level": "1-1", "mario_x": 40, "ok": true, "n": null, "f": 1.5, "s": "马里奥", "tiny": 1e-05, "big": 1e+20}"#
+        );
     }
 
     #[test]

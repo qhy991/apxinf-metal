@@ -84,8 +84,10 @@ dependencies = [
  "apxinf-mlx",
  "apxinf-model",
  "apxinf-tokenizer",
+ "base64",
  "clap",
  "half",
+ "image",
  "serde_json",
 ]
 
