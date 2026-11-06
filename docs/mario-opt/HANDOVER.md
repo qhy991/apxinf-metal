@@ -103,7 +103,13 @@ produced **1/2 clean rounds with Swapouts 0–508 pages** (vs 16k–791k at N=42
 **case-volume-driven**, not structural: cache-ON was clean in both N=12 rounds. That suggests a
 pre-declared small auto suite could yield a KEEP, but switching the declared suite after seeing
 which one is clean is suite-shopping, so the probe is a diagnostic only; the protocol question
-(pre-declared small auto suite, yes/no) is left to the requester. The ranked next direction is
+(pre-declared small auto suite, yes/no) is left to the requester. **Ruling received**
+(`da596f8d`): the fixed first-12 subset is authorized for auto only, labeled `auto@N12`, with
+3/3 clean rounds mandatory and parity still evaluated on the full 42. Attempt 1 still could not
+produce a 3/3-clean round (r0-base +19,160 Swapouts; r0-cache thrashed against a concurrent demo
+session and was stopped) → INCONCLUSIVE. The demo server takes no Metal locks and one auto
+process already occupies ≈11 GB, so campaign and demo cannot overlap in 16 GB — see the record
+§6. The ranked next direction is
 the reference-tier whole-backbone `mx.compile` candidate: feasibility is in the relay handoff
 (shape-specialized, ~335 production lines in this file, 3 profiles for the 42-case suite,
 ~6–7 % ceiling, 0.0022 parity headroom, unknown-profile eager fallback required).

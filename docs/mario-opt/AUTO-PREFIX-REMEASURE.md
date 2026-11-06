@@ -140,6 +140,10 @@ latency**。
   （`env_key: arm_value` 写在固定 `"APXINF_CLEF_PREFIX_CACHE": "1"` 之前 → 两臂都会跑
   cache-on，与当年 prep-cache 首轮作废同款）。本记录已改为 arm 值最后写入，并在
   `run_meta.json` 落盘 `gate_env` 自证两臂 env 只差 prefix 两键。
+- **臂 env 自证断言（requester §3 提醒）**：runner 每轮结束后调用 `assert_arm_env_diffs`——
+  该轮所有臂的 `gate_env` 对称差必须 == 预期集合（`env_key`；prefix campaign 另含耦合的
+  `PREFIX_CACHE_TIER2`），否则 `SystemExit` 直接 fail 整个 campaign。已用「两臂都 cache-on」
+  的病态输入单测确认会触发。
 
 ```bash
 export MLX_ROOT="$HOME/apxinf-runtime/mlx-sdk"
@@ -150,8 +154,57 @@ python3 run_column_campaign.py --run --env-key APXINF_CLEF_PREFIX_CACHE \
   --arms base=0 --arms cache=1 --rounds 3 --warmup --measured 1 \
   --variant auto --suite 42 --run-root auto-prefix-strict
 python3 analyze_auto_prefix.py
+
+# auto@N12 (requester-authorized protocol; exclusive window required, see §6):
+python3 run_column_campaign.py --run --env-key APXINF_CLEF_PREFIX_CACHE \
+  --arms base=0 --arms cache=1 --rounds 3 --warmup --measured 1 \
+  --variant auto --suite "$PWD/suite-12.json" --run-root auto-at-n12
+python3 analyze_auto_n12.py
 ```
 
 ANE cache（binary-bound，全新目录）：`/tmp/clef-ane-cache-notworth-audit`。首臂（r0-base）负责
 编译 ~32 个 program，其 +81,180 含编译期换页；即便豁免该臂，r0-cache 的 +791,138 仍使 r0
 不干净，故 0/3 干净轮的判定不受此影响。
+
+## 6. `auto@N12` 重判（requester 协议裁决后，attempt 1）
+
+裁决（issue #11 [`da596f8d`](https://github.com/qhy991/apxinf-metal/issues/11#issuecomment-6680685695)）：
+允许预声明 N=12 判定套件（**仅 auto 档**）——子集 = 42 案套件**前 12 案、原序、固定**；
+3 轮反序、每臂 vm_stat，**要求 3/3 干净，否则 INCONCLUSIVE（不接受 2/3）**；KEEP 门槛不变；
+parity **仍在完整 42 案上算**（决策 + max|Δp| ≤0.035）；标注 `auto@N12`；写明统计功效限制。
+
+固定套件已核验：`devlocal/.../clef-campaign/suite-12.json` == 前 12 案原序
+（`f0000/f0009/f0012/f0013` 各 3 问）✓。
+
+### 6.1 attempt 1（2026-11-06 16:45）— **INCONCLUSIVE**
+
+| 轮 | 臂 | 结果 |
+| --- | --- | --- |
+| 0 | base（cache-OFF） | exit 0，wall 59.9 s，**Swapouts +19,160** → 脏 |
+| 0 | cache（cache-ON） | **中止**：进程陷入 swap 抖动（6,443 MB 常驻 + 4,576 MB 压缩，`top` state `stuck`），campaign 随即被停掉 |
+
+- 判定：r0-base 已脏 → **3/3 干净逻辑上不可能** → 按裁决 = **INCONCLUSIVE**。
+  （停在 r0 不影响结论：3/3 要求 r0 干净，r0 已不满足。）
+- 中止原因（环境，非候选）：r0-cache 运行期间另一会话（P4 demo 测试，PR #24）启动
+  `apxinf-decide-server`（6,761 MB + 4,570 MB 压缩，pgrp 55021，非本 ticket），
+  系统 swap 从 4 GB 涨到 **11 GB**，两进程均 `stuck`。只停了自己的 campaign，
+  未动他人进程。
+- **r0-base 的 +19,160 发生在 demo 启动之前**（campaign 16:45:05 起，demo server
+  16:46:10 起）→ 本机 N=12 也会出 10⁴ 页级 blip（leg 2 同协议为 +508），
+  **exact-zero 门的轮间方差极大**。
+- 坐标缺口（写给下根棒）：`apxinf-decide-server` **不取双 Metal 锁**
+  （`src/bin/apxinf-decide-server.rs` 无 flock；实测 demo 运行时 `LOCK_FREE`），
+  而一个 auto 进程 ≈ 6.5 GB 常驻 + 4.5 GB 压缩 ≈ 11 GB —— **16 GB 上两个 auto
+  进程必然互踩**。campaign 的锁只序列化 campaign，不挡 demo。要拿到 auto@N12 的
+  3/3 干净，必须让 demo 参与锁（或 runner 在启动前探测并发 auto 进程并等待）。
+
+### 6.2 统计功效与现状结论
+
+- N=12 = 每轮 12 对、3 轮 36 对（裁决要求写明）：点估计必须**明显大于 2%** 且 CI
+  **明显离开 0** 才可称稳健；贴着 2% 的 KEEP 在 N=12 上证据弱。
+- **本候选（Tier-1 前缀缓存）的 `auto@N12` 裁决 = INCONCLUSIVE**：attempt 1 未达成
+  3/3 干净且被并发 demo 打断。加上 leg 2（42 案 0/3）→ 结论不是「候选不值」，而是
+  「**auto 档 KEEP 在本机需要独占/协调窗口**」；在此之前火力放 reference 档与 D3 线。
+- 可重试 attempt 2（封顶 2 次，避免空转），前提：独占窗（无并发 auto 进程、swap
+  rate 0、双锁空闲）。完整 42 案 parity 读数沿用 §2（Reading A 0.0449/0.0404 双 fail、
+  Reading B A/A 0.03159 pass），本 attempt 未改变它们。
