@@ -198,6 +198,10 @@ enum Commands {
         #[arg(long, default_value_t = 40)]
         steps: usize,
 
+        /// TeaCache-style step reuse: 0 disables, unset uses the family default
+        #[arg(long)]
+        step_cache_ratio: Option<f32>,
+
         /// Output file (binary PPM, P6)
         #[arg(short, long)]
         output: PathBuf,
@@ -337,6 +341,7 @@ fn main() {
             height,
             seed,
             steps,
+            step_cache_ratio,
             output,
             device,
         } => {
@@ -346,6 +351,7 @@ fn main() {
                 height,
                 seed,
                 steps,
+                step_cache_ratio,
             };
             let result = parse_device(&device).and_then(|device| {
                 run_generate_image(
@@ -587,6 +593,7 @@ mod device_tests {
             height: 512,
             seed: 7,
             steps: 40,
+            step_cache_ratio: None,
         };
         let error = run_generate_image(
             &"/missing-qwen-image-checkpoint".into(),

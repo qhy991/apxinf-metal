@@ -13,6 +13,56 @@ const EPS: f32 = 1e-6;
 /// switches to another reduction for small output grids (observed on M4 at
 /// 64 tokens), where MPP no longer reproduces it.
 pub const MPP_MIN_TOKENS: usize = 1024;
+/// mflux `StepCache.MIN_STEPS`: shorter runs skip nothing.
+const STEP_CACHE_MIN_STEPS: usize = 10;
+/// mflux `StepCache.PROTECTED_FRACTION`: the first and last 10% of a run are
+/// always computed.
+const STEP_CACHE_PROTECTED_FRACTION: f64 = 0.1;
+
+/// Select the steps a TeaCache-style cache skips, from row-major per-step
+/// signals `[steps, dim]`. This mirrors mflux `StepCache.select_skip_steps`:
+/// the consecutive L2 distance (index 0 is `inf`), a protected first/last 10%
+/// window, and `round(ratio * steps)` picks of the smallest distances with
+/// Python's ties-to-even rounding. A non-finite or out-of-range ratio and runs
+/// under `STEP_CACHE_MIN_STEPS` skip nothing.
+fn select_skip_steps(signals: &[f32], dim: usize, ratio: f32) -> Vec<bool> {
+    if dim == 0 {
+        return Vec::new();
+    }
+    let total = signals.len() / dim;
+    let mut skip = vec![false; total];
+    if !ratio.is_finite() || !(0.0 < ratio && ratio < 1.0) || total < STEP_CACHE_MIN_STEPS {
+        return skip;
+    }
+    let mut diffs = Vec::with_capacity(total);
+    diffs.push(f32::INFINITY);
+    for i in 1..total {
+        let mut acc = 0f64;
+        for j in 0..dim {
+            let delta = signals[i * dim + j] - signals[(i - 1) * dim + j];
+            acc += f64::from(delta) * f64::from(delta);
+        }
+        diffs.push((acc as f32).sqrt());
+    }
+    let protected = (f64::from(total as u32) * STEP_CACHE_PROTECTED_FRACTION) as usize;
+    let start = protected.max(1);
+    let end = total.saturating_sub(protected);
+    if start >= end {
+        return skip;
+    }
+    let count = ((f64::from(ratio) * f64::from(total as u32)).round_ties_even() as usize)
+        .min(end - start);
+    let mut eligible: Vec<usize> = (start..end).collect();
+    eligible.sort_by(|&a, &b| {
+        diffs[a]
+            .partial_cmp(&diffs[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for &i in eligible.iter().take(count) {
+        skip[i] = true;
+    }
+    skip
+}
 
 pub struct Dit {
     w: Transformer,
@@ -56,15 +106,26 @@ impl Dit {
         }
     }
 
-    /// `Qwen21TimeTextEmbed` for FP32 timestep rows `[2]`: BF16 `[2, 4096]`.
+    /// `Qwen21TimeTextEmbed` for FP32 timestep rows `[n]`: BF16 `[n, 4096]`.
     fn time_embedding(&self, rows: &Array) -> Result<Array> {
+        let count = rows.numel().max(1);
         let args = rows
-            .reshape(&[2, 1])?
+            .reshape(&[count, 1])?
             .mul(&self.ops.f32(1000.0)?)?
             .mul(&self.freqs)?;
         let projected = Array::concat(&[&args.cos()?, &args.sin()?], 1)?.cast(MlxDType::BF16)?;
         let hidden = self.ops.silu(&self.w.time_1.apply(&projected)?)?;
         self.w.time_2.apply(&hidden)
+    }
+
+    /// One batched `time_text_embed` over every step's sigma, then the mflux
+    /// skip selection on the host. `step_sigmas` is FP32 `[steps]`; the cost is
+    /// one tiny evaluated matmul per request, independent of resolution.
+    pub fn select_skip_steps(&self, step_sigmas: &Array, ratio: f32) -> Result<Vec<bool>> {
+        let signals = self.time_embedding(step_sigmas)?;
+        signals.eval()?;
+        let dim = signals.shape()[1];
+        Ok(select_skip_steps(&signals.to_f32_vec()?, dim, ratio))
     }
 
     /// Shared modulation split into `(mod1, mod2)` rows `[2, 8192]`.
@@ -254,5 +315,65 @@ impl Step {
 
     pub fn call(&self, inputs: &[Array]) -> Result<Array> {
         Ok(self.compiled.call(inputs)?.remove(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Row-major scalar signals whose consecutive distances are
+    /// `[inf, 5, .5, 4, .5, 3, .5, 2, .5, 6, .5, 7]`. With 12 steps the
+    /// protected window is one step on each side, leaving indices 1..=10, and
+    /// r=0.25 selects three — the ties resolve in eligible order.
+    #[test]
+    fn skip_selection_picks_smallest_changes_outside_the_protected_window() {
+        let diffs = [5.0, 0.5, 4.0, 0.5, 3.0, 0.5, 2.0, 0.5, 6.0, 0.5, 7.0];
+        let mut signals = Vec::with_capacity(diffs.len() + 1);
+        signals.push(0.0);
+        for delta in diffs {
+            signals.push(signals.last().copied().unwrap() + delta);
+        }
+        let skip = select_skip_steps(&signals, 1, 0.25);
+        assert_eq!(
+            skip.iter().enumerate().filter(|(_, &s)| s).map(|(i, _)| i).collect::<Vec<_>>(),
+            vec![2, 4, 6],
+            "signal distances {diffs:?}"
+        );
+        // Indices 0, 1 and 11 sit in the protected first/last 10%.
+        assert!(!skip[0] && !skip[1] && !skip[11]);
+    }
+
+    /// Ten steps at r=0.25 is 2.5, which Python rounds ties-to-even to 2 —
+    /// not the 3 `f32::round` would give. The protected window is one step.
+    #[test]
+    fn skip_selection_count_uses_ties_to_even_rounding() {
+        let signals: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let skip = select_skip_steps(&signals, 1, 0.25);
+        assert_eq!(skip.iter().filter(|&&s| s).count(), 2);
+    }
+
+    #[test]
+    fn skip_selection_short_runs_and_invalid_ratios_skip_nothing() {
+        let signals: Vec<f32> = (0..STEP_CACHE_MIN_STEPS - 1).map(|i| i as f32).collect();
+        assert!(select_skip_steps(&signals, 1, 0.25).iter().all(|&s| !s));
+        let signals: Vec<f32> = (0..40).map(|i| i as f32).collect();
+        for ratio in [0.0, 1.0, -0.1, f32::NAN, f32::INFINITY] {
+            assert!(
+                select_skip_steps(&signals, 1, ratio).iter().all(|&s| !s),
+                "ratio {ratio} skipped a step"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_selection_is_deterministic_and_resolution_independent() {
+        // A schedule-only signal: the same (steps, ratio) yields one skip set
+        // regardless of which request asks for it.
+        let signals: Vec<f32> = (0..40).map(|i| (i as f32).sin()).collect();
+        let first = select_skip_steps(&signals, 1, 0.25);
+        let second = select_skip_steps(&signals, 1, 0.25);
+        assert_eq!(first, second);
+        assert_eq!(first.iter().filter(|&&s| s).count(), 10);
     }
 }

@@ -27,6 +27,9 @@ use weights::{Decoder, TextEncoderFiles, Transformer, LATENT, MLP};
 
 /// The only schedule this family has validated: 40 linear steps, guidance 1.
 pub const STEPS: usize = 40;
+/// Owner-selected runtime tier for the TeaCache-style step cache; `0` on the
+/// request disables it (rollback to the unchanged denoise loop).
+pub const DEFAULT_STEP_CACHE_RATIO: f32 = 0.25;
 /// Pixels per latent; the RoPE tables cover 2048 latent rows or columns.
 const SCALE: usize = 16;
 const MAX_SIDE: usize = 2048 * SCALE;
@@ -302,15 +305,36 @@ impl ImageRuntime for QwenImage {
         );
         latents.eval()?;
         let sigma = |i: usize| sigmas.slice(&[i], &[i + 1]);
+        // TeaCache-style step reuse (mflux StepCache semantics): select the
+        // steps whose consecutive sigma gap is smallest, outside the protected
+        // head/tail window, then reuse the previous step's velocity there.
+        let step_cache_ratio = match request.step_cache_ratio {
+            Some(ratio) => ratio,
+            None => DEFAULT_STEP_CACHE_RATIO,
+        };
+        let skip_steps = if step_cache_ratio > 0.0 {
+            dit.select_skip_steps(&sigmas.slice(&[0], &[request.steps])?, step_cache_ratio)?
+        } else {
+            vec![false; request.steps]
+        };
         let (step, first) = dit::Step::prepare(
             dit,
             &dit::Step::inputs(&latents, &sigma(0)?, &cos, &sin, &cache),
         )?;
         let mut first = Some(first);
+        let mut previous_velocity: Option<Array> = None;
         for t in 0..request.steps {
-            let velocity = match first.take() {
-                Some(velocity) => velocity,
-                None => step.call(&dit::Step::inputs(&latents, &sigma(t)?, &cos, &sin, &cache))?,
+            let velocity = match previous_velocity.clone() {
+                Some(velocity) if skip_steps[t] => velocity,
+                _ => {
+                    let velocity = match first.take() {
+                        Some(velocity) => velocity,
+                        None => step
+                            .call(&dit::Step::inputs(&latents, &sigma(t)?, &cos, &sin, &cache))?,
+                    };
+                    previous_velocity = Some(velocity.clone());
+                    velocity
+                }
             };
             let dt = sigma(t + 1)?
                 .sub(&sigma(t)?)?
