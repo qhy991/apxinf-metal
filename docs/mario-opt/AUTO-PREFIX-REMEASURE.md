@@ -10,7 +10,7 @@ D39 曾判 auto 档 Tier-1 前缀缓存 **NOT-WORTH**（+1.68～2.15%，幅度 <
 - 测量机：Apple M1 Pro 16 GB，macOS 27.0.1，MLX 0.32.3（`applegpu_g13s`）
 - 代码：本 worktree @ `origin/showcase/clef-vision` tip（`agent/notworth-audit-ee3c4e7da150`）
 - 工作负载：42 案 `suite/separate/separate-proto14.json`，variant = **auto**（GPU+ANE）
-- 时间线图：_（待回填）_
+- 时间线图：不录制（无可 KEEP 的实测优化，见 §3）
 
 ## 1. 协议（测量前声明）
 
@@ -49,11 +49,16 @@ arm-process `vm_stat`（每轮一个双锁单窗；r0 正序 base→cache，r1 �
 
 读数：
 
-- **cache-ON 臂三轮全脏**（+791,138 / +18,480 / +50,928）；cache-OFF 臂 r2 干净（+0），
-  r0/r1 脏。→ 换页更像**由 cache-ON 路径的内存形态驱动**，而非纯案量（否则 r2-base 不会
-  干净）。但 r1 两臂相近（18k/16k），归因仍需 §2.1 的 N=12 探针收敛。
+- **cache-ON 臂三轮全脏**（+791,138 / +18,480 / +50,928）且每轮 wall 都比 cache-OFF 长
+  （177.9–212.4 s vs 152.9–188.9 s，ANE 层组多 26 %）→ 42 案上 cache-ON 更容易脏。但
+  **归因由 §2.1 的 N=12 探针收敛到案量**：N=12 时 cache-ON 两轮全干净、swap 低三个数量级，
+  cache-OFF r2 的干净只是量减后的残余波动。
 - cache-ON 臂的 ANE 层组数 3,392 = 106×32，cache-OFF 为 84×32=2,688 → cache-ON 下 84 个
   请求中有 **22 个走了 chunk0 fill + chunk1 双趟**（64 层组），其余 62 个为命中单趟。
+- **双峰结构**：r2 的 42 个 measured 案不是均匀小增益——约 **12 个 miss**（chunk0 fill，
+  单案比 base 慢 60–108 %）与约 **30 个 hit**（快 2–15 %）；median +1.86 % 是两极的中位。
+  miss 数 ≈ 套件唯一图数（14）→ 提示 Tier-1 key 含图像身份（未单独核实）。这正是 pooled
+  case-level CI 盖不住、而 KEEP 门又最敏感的结构。
 - 池化延迟：0 个干净轮 → `gains_vs_base.cache.ci = {n: 0}`，**无 KEEP 可用的 latency 数**。
   污染轮的配对中位（仅作区间参考）逐轮 **−0.569 / +0.280 / +1.859 %**，池化 median
   **+0.402 %**，CI [−1.617, +2.204]，51.6 % 更快 —— 与 D39 的 +1.68~2.15 % 相差一个门
