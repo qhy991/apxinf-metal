@@ -334,6 +334,23 @@ parity 越门。
 - **预期**：~4%（Graft ~1/24）；纯删 FLOPs。
 - **parity 风险**：中（GEMM shape 变 → 漂移）；falsifier = parity 越门或 <2%。
 
+**本 leg 结果**（完整证据与时间线见 `doc/d3-lite-metal-last-row.md`）：
+- 实现 `APXINF_D3_LAST_ROW=full`（现为默认）/`off`/`attn`：末层（layer 23，full attention）
+  只算 readout 行 —— 单行 q/gate 投影、单 query 行 SDPA（K/V 仍全 prompt）、单行 o_proj 与
+  MLP；K/V 与 0..22 层不变。契约由代码复核（末层之后只有 row-local final norm + last-position
+  readout；GDN 层循环不可剪），并用单测钉住位置切片 = `L−1`（不是 0）。
+- parity：text **48/48**（worst max|Δp| 0.023195 vs 预算 0.037659；mean KL 2.02e-4 vs
+  3.98e-4），image **8/8**（worst 0.055251 vs 预算 0.06，本方向预声明的严格门 0.0575 也过；
+  头寸 0.004749，比基线 0.004615 略**宽**）；与 `off` 的最坏逐案漂移 text 0.004889 /
+  image 0.001547，无决策翻转；`off` 与改动前回执 **bit 相同**（0.0 / 0.0）。
+- latency：3 轮反序配对（2/3 干净轮；round 0 的 `full` 臂 Swapouts +4071 被排除），
+  **+4.374 %**，CI95 **[4.124, 4.511]**，16/16 对更快；逐轮 +4.17 / +4.50 %；逐案
+  2.31–4.97 %（随 prompt 长度上升）。
+- before/after 时间线（双臂 Swapouts +0）：window 1066.1 → 1019.2 ms（−46.9，−4.40 %），
+  降幅全部落在 `forward`；GPU busy 99.56 → 98.86 %，真气泡恒 0，CB 62 → 59 → 机制是
+  **删 GPU 工作**，不是调度变化。
+- 裁决 **KEEP**，默认值翻为 `full`；图像路径未单独计时（预期小），只做了 parity。
+
 #### D3-C：GDN fused prep 移植（vendor Graft 内核）
 
 - **机制**：一个 kernel 完成 conv+SiLU+split+l2norm，中间保持 FP32、每输出一次 BF16
@@ -384,6 +401,11 @@ kernel 名）。
   逐轮 4.20–4.86%，24/24 对更快，3/3 轮 clean，全部门通过）；text parity 改善
   （0.02435 vs 0.02918，预算 0.03766）；image parity = P1b 回执 **bit 相同**；单旋钮 `text8`
   latency **INCONCLUSIVE**（demo server 占 ~10 GB，0/3 干净轮）
+- 本 leg（D3-B，详见 `doc/d3-lite-metal-last-row.md`）：末层行剪枝 **+4.374 %**（CI95
+  [4.124, 4.511]，16/16 对更快，2/3 干净轮，第 3 轮因单臂 Swapouts +4071 被排除）；text
+  48/48 worst 0.023195、image 8/8 worst 0.055251（预算 0.06 / 严格门 0.0575，头寸未减少），
+  `off` 与改动前回执 bit 相同；时间线 window 1066.1 → 1019.2 ms（−4.40 %），气泡恒 0、
+  CB 62 → 59
 
 **外推（EXTRAPOLATED，降级为待验证）**：
 - 「A2 只会中性偏正 → A1 单独上限 ≈ 组合值」（latency 方向成立，parity 方向不成立）
