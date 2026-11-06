@@ -31,6 +31,15 @@ After the stop: no `bench_local` / decide-server / `d3_lite_bench` processes, `S
 0 over 3 s, both Metal locks free. The pre-existing tmux demo page on `:8766` is a 1.9 KB idle
 `server.py` (no model) and is not a Metal user.
 
+**Respawn:** the harness came back ~10 minutes after the stop — new process
+group 60863 at 17:46:43, launched by `caffeinate -dimsu ./run-bench.sh
+--repeats 3 --hold 7 --stall-limit 60 --policy single_structured …` under
+`~/Agent4Kernel/mario-harness-m1pro/`, with the same Clef proxy + auto
+decide-server children. The clean receipts above were completed before the
+respawn and are unaffected, but any **future** demo/campaign window on this
+host is at risk until the harness either takes the Metal locks or the
+campaign's foreign-process gate waits it out.
+
 ## 2. Runner adaptations (all recorded, none hidden)
 
 Copied P4's `real_d3lite_run.sh` to this ticket's
