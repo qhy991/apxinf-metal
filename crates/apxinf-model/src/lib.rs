@@ -10,6 +10,7 @@ mod generation_config;
 pub mod gr00t;
 #[cfg(feature = "hip")]
 pub mod hip_pi05;
+pub mod image;
 pub mod llama;
 pub mod llm_trait;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -20,6 +21,8 @@ pub mod metal_d3_lite;
 pub mod metal_minicpm5;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_qwen3;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_qwen_image;
 pub mod pi05;
 pub mod pi0fast;
 pub mod profiling;
@@ -45,6 +48,7 @@ pub use decision::{
     DecisionRuntime, DecisionSchema, DecisionScore, DecisionStageProfile, SchemaDecisionAnswer,
     SchemaDecisionOutput, SchemaDecisionRuntime, SchemaDecisionScore,
 };
+pub use image::{GeneratedImage, ImageRequest, ImageRuntime};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};
 #[cfg(feature = "cuda")]
 pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};
