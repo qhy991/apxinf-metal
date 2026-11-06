@@ -12,22 +12,95 @@
 //! last position.
 //!
 //! The apxinf kernels are the maintained device implementations of the same
-//! primitives: `GatedDeltaRecurrence` (four value rows per SIMD group) and
-//! `HalfSplitRope` (FP32 angles, one rounding to the input dtype). The causal
-//! convolution is composed from MLX `conv1d` with an explicit zero history;
-//! an ApxInf causal-conv kernel exists only in the private EngineTailor
-//! reference and is a P3 candidate, not part of this unoptimized baseline.
+//! primitives: `GatedDeltaRecurrence` (four value rows per SIMD group, or
+//! eight behind `APXINF_D3_GDN_CORE`, which now defaults to `eight_lanes`
+//! after this leg's KEEP; the image callable keeps its own
+//! `APXINF_D3_GDN_CORE_IMAGE` defaulting to `four_values` because its parity
+//! budget has no headroom) and `HalfSplitRope` (FP32 angles, one rounding to
+//! the input dtype). The causal convolution defaults to
+//! `APXINF_D3_CONV1D=apxinf` (the ApxInf one-thread-per-output kernel: FP32
+//! tap order, its own zero history, one launch, bit-identical to stock);
+//! `APXINF_D3_CONV1D=stock` restores the composed MLX `conv1d` over an
+//! explicit zero history. See `doc/d3-lite-metal-gdn.md` (P3, D3-A) and
+//! `doc/notworth-audit.md` §4.2.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use apxinf_core::{Error, Result};
-use apxinf_mlx::fusions::{GatedDeltaRecurrence, HalfSplitRope};
+use apxinf_mlx::fusions::{
+    CausalDepthwiseConv, GatedDeltaLayout, GatedDeltaRecurrence, HalfSplitRope,
+};
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 
 use super::config::{Config, Geometry, MAX_INPUT_TOKENS};
+use super::signpost;
 use super::vision::Vision;
 use super::weights::{Attention, GatedDelta, Mixer, Mlp, VisionWeights, Weights};
+
+/// EngineTailor's `conv1d` option over the GDN causal convolution. `stock`
+/// keeps the composed MLX `conv1d` over an explicit zero history; `apxinf`
+/// runs the ApxInf one-thread-per-output kernel (FP32 tap order, own zero
+/// history, one launch). The list is ordered **default first**: this leg's
+/// KEEP configuration is `apxinf` (bit-identical to `stock`, +0.53 % on its
+/// own and part of the +4.27 % combined result — see
+/// `doc/d3-lite-metal-gdn.md`). To reproduce the P1a/P1b anchor set
+/// `APXINF_D3_CONV1D=stock`.
+const CONV1D_VALUES: &[&str] = &["apxinf", "stock"];
+/// The recurrence layout. The native port's base is EngineTailor's
+/// `apxinf_four_values`; there is no vendored mlx-lm stock kernel in this
+/// port, so the values name the two ApxInf layouts.
+///
+/// [`GDN_CORE`] selects the **text** callable; [`GDN_CORE_IMAGE`] selects the
+/// **image** callable with its own list, because the two paths have different
+/// parity headroom: the image budget (0.06) has none (P1b's worst case was
+/// 0.0554), so a layout change the text gate welcomes can still fail it. For
+/// each gate the **first value is that gate's default** (the reference
+/// executor's "absent takes the first value" convention), so the text default
+/// can be `eight_lanes` (this leg's KEEP) while the image default stays
+/// `four_values` (the P1a/P1b anchor).
+const GDN_CORE_VALUES: &[&str] = &["eight_lanes", "four_values"];
+const GDN_CORE_IMAGE_VALUES: &[&str] = &["four_values", "eight_lanes"];
+const GDN_CORE: &str = "APXINF_D3_GDN_CORE";
+const GDN_CORE_IMAGE: &str = "APXINF_D3_GDN_CORE_IMAGE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Conv1d {
+    Stock,
+    ApxInf,
+}
+
+/// Resolve one env gate against its value list: `None` (unset) selects index
+/// 0, `Some` must name a value exactly. Kept pure so the gate contract is
+/// unit-testable without a device; [`env_gate`] wraps it with the real env.
+fn parse_gate(given: Option<&str>, values: &[&str], name: &str) -> Result<usize> {
+    match given {
+        None => Ok(0),
+        Some(value) => values
+            .iter()
+            .position(|known| *known == value)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "{name}={value:?} is not one of {}",
+                    values.join(", ")
+                ))
+            }),
+    }
+}
+
+fn env_gate(name: &str, values: &[&str]) -> Result<usize> {
+    let given = match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(Error::Other(format!(
+                "{name} must be one of {} (the value is not valid UTF-8)",
+                values.join(", ")
+            )))
+        }
+    };
+    parse_gate(given.as_deref(), values, name)
+}
 
 /// Everything the compiled callables capture: immutable geometry, evaluated
 /// weights, registered kernels, the eager vision tower and the
@@ -41,7 +114,16 @@ struct Parts {
     image_token_id: u32,
     video_token_id: u32,
     vision_merge: usize,
+    /// The text callable's recurrence layout (`APXINF_D3_GDN_CORE`).
     recurrence: GatedDeltaRecurrence,
+    /// The image callable's recurrence layout (`APXINF_D3_GDN_CORE_IMAGE`).
+    /// Kept separate so an image request can stay on the parity-safe anchor
+    /// while the text path takes the faster layout.
+    recurrence_image: GatedDeltaRecurrence,
+    /// The gate-selected causal-conv implementation; `None` when `stock`
+    /// composes it from MLX primitives inside `gated_delta_forward`.
+    conv1d: Conv1d,
+    causal_conv: Option<CausalDepthwiseConv>,
     rope: HalfSplitRope,
     inv_freq: Array,
     stream: Stream,
@@ -99,6 +181,34 @@ impl Model {
     ) -> Result<Self> {
         let geometry = config.geometry;
         let vision = Vision::new(config, stream.clone(), vision_weights)?;
+        // All gates are read once, here: the compiled trace closures must see
+        // a fixed configuration, and a campaign runs its arms in separate
+        // processes with different env.
+        let conv1d = match CONV1D_VALUES[env_gate("APXINF_D3_CONV1D", CONV1D_VALUES)?] {
+            "stock" => Conv1d::Stock,
+            "apxinf" => Conv1d::ApxInf,
+            other => unreachable!("the conv1d list only names known kernels: {other}"),
+        };
+        // Resolve by the selected *name*, not the list index, so a gate's
+        // default can move by reordering its value list without silently
+        // selecting the wrong kernel.
+        let make_recurrence = |gate: &str, values: &[&str]| -> Result<GatedDeltaRecurrence> {
+            match values[env_gate(gate, values)?] {
+                "four_values" => GatedDeltaRecurrence::new(&stream),
+                "eight_lanes" => {
+                    GatedDeltaRecurrence::with_layout(&stream, GatedDeltaLayout::EightLanes)
+                }
+                other => {
+                    unreachable!("the layout list only names known layouts: {other}")
+                }
+            }
+        };
+        let recurrence = make_recurrence(GDN_CORE, GDN_CORE_VALUES)?;
+        let recurrence_image = make_recurrence(GDN_CORE_IMAGE, GDN_CORE_IMAGE_VALUES)?;
+        let causal_conv = match conv1d {
+            Conv1d::Stock => None,
+            Conv1d::ApxInf => Some(CausalDepthwiseConv::new(&stream)?),
+        };
         let parts = Rc::new(Parts {
             geometry,
             weights,
@@ -106,7 +216,10 @@ impl Model {
             image_token_id: config.image_token_id,
             video_token_id: config.video_token_id,
             vision_merge: config.vision.spatial_merge,
-            recurrence: GatedDeltaRecurrence::new(&stream)?,
+            recurrence,
+            recurrence_image,
+            conv1d,
+            causal_conv,
             rope: HalfSplitRope::new(&stream, geometry.rope_dims)?,
             inv_freq: inverse_frequencies(&stream, geometry)?,
             stream: stream.clone(),
@@ -239,8 +352,13 @@ impl Model {
         self.validate(token_ids, count)?;
         self.prepare_for(token_ids, count)?;
         let (ids, candidate_count) = self.inputs(token_ids, count)?;
+        let _fwd = signpost_interval!(signpost::FORWARD, token_ids.len(), 0usize);
         let outputs = self.compiled.call_and_eval(&[ids, candidate_count])?;
-        read_probabilities(&outputs[0], count)
+        drop(_fwd);
+        let _sync = signpost_interval!(signpost::SYNC, count);
+        let probabilities = read_probabilities(&outputs[0], count)?;
+        drop(_sync);
+        Ok(probabilities)
     }
 
     /// Eager lazy-graph execution of the same `forward`, used to compare the
@@ -359,8 +477,22 @@ impl Model {
                     .into(),
             ));
         }
+        // `vision` spans the tower's host graph build AND its blocking eval:
+        // the lazy graph contributes no device time until it is evaluated, so
+        // an eval left outside the span would leave the stage sum unable to
+        // close.
+        let _vision = signpost_interval!(signpost::VISION, image_tokens);
         let features = self.parts.vision.forward(pixel_values, grids)?;
         let features = features.reshape(&[1, image_tokens, self.parts.geometry.hidden])?;
+        // Evaluate before the compiled callable sees it: preparation passes
+        // concrete zero arrays, so a concrete input keeps the profile
+        // replaying without re-tracing. Placing the eval directly after the
+        // tower lets the span own the tower's full wall time; it still
+        // precedes `prepare_image_for` and `call_and_eval`, which consume no
+        // real feature value.
+        self.stream().eval(&[features.clone()])?;
+        drop(_vision);
+
         self.prepare_image_for(length, count, image_tokens)?;
 
         let ids = token_ids
@@ -377,10 +509,7 @@ impl Model {
         let positions = Array::from_i32(self.stream(), &[3, length], &positions)?;
         let count_array = Array::from_i32(self.stream(), &[1], &[count as i32])?;
         let run_start = Array::from_i32(self.stream(), &[1], &[run_start])?;
-        // Evaluate the eager vision tower before the compiled callable sees
-        // it: preparation passes concrete zero arrays, so a concrete input
-        // here keeps the profile replaying without re-tracing.
-        self.stream().eval(&[features.clone()])?;
+        let _fwd = signpost_interval!(signpost::FORWARD, length, image_tokens);
         let outputs = self.image_compiled.call_and_eval(&[
             ids,
             positions,
@@ -388,7 +517,11 @@ impl Model {
             features,
             run_start,
         ])?;
-        read_probabilities(&outputs[0], count)
+        drop(_fwd);
+        let _sync = signpost_interval!(signpost::SYNC, count);
+        let probabilities = read_probabilities(&outputs[0], count)?;
+        drop(_sync);
+        Ok(probabilities)
     }
 
     /// `(length, count, image_tokens)` image profiles warmed so far.
@@ -548,7 +681,12 @@ fn forward(parts: &Parts, ids: &Array, candidate_count: &Array) -> Result<Vec<Ar
     let hidden = parts.weights.embed.take(ids, 0)?;
     let positions = Array::arange(&parts.stream, 0.0, length as f32, 1.0, MlxDType::I32)?
         .reshape(&[1, length])?;
-    let hidden = stack(parts, hidden, &RopeMode::HalfSplit(&positions))?;
+    let hidden = stack(
+        parts,
+        hidden,
+        &RopeMode::HalfSplit(&positions),
+        &parts.recurrence,
+    )?;
     readout_tail(parts, &hidden, candidate_count)
 }
 
@@ -606,14 +744,21 @@ fn image_forward(
             cos: &cos,
             sin: &sin,
         },
+        &parts.recurrence_image,
     )?;
     readout_tail(parts, &hidden, candidate_count)
 }
 
-/// The 24-layer stack under one rotary contract, ending at the final RMSNorm.
-/// The op order is shared by the text and image callables; only the rotary
-/// arguments differ.
-fn stack(parts: &Parts, mut hidden: Array, rope: &RopeMode<'_>) -> Result<Array> {
+/// The 24-layer stack under one rotary contract and one recurrence layout,
+/// ending at the final RMSNorm. The op order is shared by the text and image
+/// callables; they differ in the rotary arguments and, independently, in the
+/// GDN recurrence layout each path is allowed to use.
+fn stack(
+    parts: &Parts,
+    mut hidden: Array,
+    rope: &RopeMode<'_>,
+    recurrence: &GatedDeltaRecurrence,
+) -> Result<Array> {
     let geometry = parts.geometry;
     let length = hidden.shape()[1];
     for (index, layer) in parts.weights.layers.iter().enumerate() {
@@ -627,7 +772,7 @@ fn stack(parts: &Parts, mut hidden: Array, rope: &RopeMode<'_>) -> Result<Array>
             let Mixer::GatedDelta(gated_delta) = &layer.mixer else {
                 unreachable!("the validated schedule selects gated delta here")
             };
-            gated_delta_forward(parts, &normalized, gated_delta, length)?
+            gated_delta_forward(parts, recurrence, &normalized, gated_delta, length)?
         };
         let residual = hidden.add(&mixed)?;
         let mlp_input = residual.fast_rms_norm(&layer.post_norm, geometry.eps)?;
@@ -736,6 +881,7 @@ fn mlp_forward(input: &Array, mlp: &Mlp) -> Result<Array> {
 
 fn gated_delta_forward(
     parts: &Parts,
+    recurrence: &GatedDeltaRecurrence,
     input: &Array,
     gated_delta: &GatedDelta,
     length: usize,
@@ -753,15 +899,35 @@ fn gated_delta_forward(
     ])?;
     let b = project(input, &gated_delta.b.weight)?;
     let a = project(input, &gated_delta.a.weight)?;
-    // Stock reference: a depthwise causal convolution over `S - 1` zero rows.
-    let history = Array::zeros(
-        &parts.stream,
-        &[1, geometry.conv_kernel - 1, conv_dim],
-        qkv.dtype(),
-    )?;
-    let convolved =
-        Array::concat(&[&history, &qkv], 1)?.conv1d(&gated_delta.conv, 1, 0, 1, conv_dim)?;
-    let convolved = silu(&convolved)?;
+    let convolved = match parts.conv1d {
+        Conv1d::Stock => {
+            // Stock reference: a depthwise causal convolution over `S - 1`
+            // zero rows, composed from MLX primitives.
+            let history = Array::zeros(
+                &parts.stream,
+                &[1, geometry.conv_kernel - 1, conv_dim],
+                qkv.dtype(),
+            )?;
+            let convolved = Array::concat(&[&history, &qkv], 1)?.conv1d(
+                &gated_delta.conv,
+                1,
+                0,
+                1,
+                conv_dim,
+            )?;
+            silu(&convolved)?
+        }
+        Conv1d::ApxInf => {
+            let kernel = parts.causal_conv.as_ref().ok_or_else(|| {
+                Error::Contract("APXINF_D3_CONV1D=apxinf was selected without its kernel")
+            })?;
+            // Same arithmetic contract — causal depthwise conv with zero
+            // history, FP32 accumulation in tap order, one BF16 rounding —
+            // but one launch with no zero-history concat and no im2col-style
+            // padding materialization.
+            silu(&kernel.call(&qkv, &gated_delta.conv)?)?
+        }
+    };
     let queries = convolved.slice_axis(2, 0, key_dim)?.reshape(&[
         1,
         length,
@@ -798,9 +964,8 @@ fn gated_delta_forward(
         &[1, geometry.v_heads, geometry.v_dim, geometry.k_dim],
         MlxDType::F32,
     )?;
-    let (recurrent, _next_state) = parts
-        .recurrence
-        .call(&queries, &keys, &values, &decay, &beta, &state)?;
+    let (recurrent, _next_state) =
+        recurrence.call(&queries, &keys, &values, &decay, &beta, &state)?;
     let normalized = recurrent.fast_rms_norm(&gated_delta.norm, geometry.eps)?;
     // Gated norm in FP32, rounded once to BF16 before the output projection.
     let gated = silu(&z.cast(MlxDType::F32)?)?
@@ -877,6 +1042,33 @@ mod tests {
 
     fn stream() -> Stream {
         Stream::cpu().expect("CPU stream for eager semantics")
+    }
+
+    #[test]
+    fn engine_gates_default_to_the_first_value() {
+        for (name, values) in [
+            ("APXINF_D3_CONV1D", CONV1D_VALUES),
+            (GDN_CORE, GDN_CORE_VALUES),
+            (GDN_CORE_IMAGE, GDN_CORE_IMAGE_VALUES),
+        ] {
+            assert_eq!(parse_gate(None, values, name).unwrap(), 0, "{name} unset");
+            for (index, value) in values.iter().enumerate() {
+                assert_eq!(
+                    parse_gate(Some(value), values, name).unwrap(),
+                    index,
+                    "{name}={value}"
+                );
+            }
+            let error = parse_gate(Some("true"), values, name)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(name) && error.contains(&values.join(", ")),
+                "{name} rejected value must name itself and the list: {error}"
+            );
+        }
+        // The two D3 gates have distinct value lists; the parse is generic.
+        assert_ne!(CONV1D_VALUES, GDN_CORE_VALUES);
     }
 
     #[test]

@@ -15,6 +15,11 @@
 //! placeholder/mRoPE wiring that turns a PNG-backed request into one forward
 //! producing 255 code probabilities. Video inputs are not wired.
 
+// The macro must be imported before every module that expands it: `macro_use`
+// makes `signpost_interval!` visible to `model` and this module.
+#[macro_use]
+pub(crate) mod signpost;
+
 mod config;
 mod model;
 mod preprocess;
@@ -147,8 +152,18 @@ impl CodeDecisionRuntime for D3LiteRunner {
 
     fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput> {
         let count = input.candidate_count;
+        let _sp = signpost_interval!(
+            signpost::REQUEST,
+            input.token_ids.len(),
+            usize::from(input.image.is_some())
+        );
         let probabilities = if let Some(image) = input.image {
-            let pixels = image.pixel_values.to_f32_vec()?;
+            // The pixel tensor is a device array; this is the input readback
+            // the baseline latency includes ("host pixel upload → …").
+            let pixels = {
+                let _sp = signpost_interval!(signpost::INPUT, image.pixel_values.numel());
+                image.pixel_values.to_f32_vec()?
+            };
             self.model
                 .image_probabilities(&pixels, image.grid_thw, input.token_ids, count)?
         } else {
