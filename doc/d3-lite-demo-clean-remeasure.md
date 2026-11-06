@@ -118,8 +118,24 @@ not merely noisier.
 
 ## 6. First-frame cost (reported separately, as requested)
 
-Decision 1 = worker start (model load) + the first request of each of the three
-`(length, candidate_count, image_tokens)` shapes.
+Decision 1 is the first request of each of the three
+`(length, candidate_count, image_tokens)` shapes, so it pays each shape's
+compiled-profile trace in `forward`.
+
+**Correction (2026-11-06, P4 ticket):** the reported decision-1 `latency_ms`
+does **not** include worker start. `ClefLocalWorker.ask` calls
+`_ensure_started()` *before* it starts its own clock, so `steps.json`
+`latency_ms` sums only per-request time and the `probe_load` column below is
+measured separately precisely because it sits outside that sum. An independent
+clean window (P4 ticket, `d3lite-clean-001`, `Swapouts` delta 0, foreign 0,
+`harness_killed=0`) decomposes its 1459.23 ms decision as three cold requests
+**1438.08 ms** (enemy 479.40 / obstacle 437.94 / gap 520.75) + 21.14 ms
+client/IPC residual (1.45 %), with worker load (702.0 ms server-self /
+1321.1 ms external) excluded; P4's page check shows the same boundary
+(`latency_ms` 2117.8 ms vs first-step wall 3546.3 ms). So read the table
+below as **per-request first-decision time** — page-cache warmth and the trace
+both land inside the three requests — and add the spawn→ready column when
+quoting the player-visible first click (≈ 2.8 s on that window, n = 1).
 
 | window | decision 1 | `probe_load` start-to-ready | note |
 | --- | ---: | ---: | --- |

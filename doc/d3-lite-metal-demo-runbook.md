@@ -57,7 +57,7 @@ is the text layers + FP32 readout.
 (`MARIO_CLEF_PROTOCOL=separate`, one crop + one question) is the supported
 shape; `joint` sends three images and is rejected by name.
 
-## 2. Episode (the 11-decision measurement)
+## 2. Episode (the demo measurement)
 
 Same startup parameters as the Clef reference:
 
@@ -72,9 +72,19 @@ $DEMO_PY examples/mario_demo/evaluate.py \
   --policy clef --max-decisions 12 --out <new-output-dir>
 ```
 
-The episode ends on death (11 decisions on this trajectory). Output:
-`summary.json` (median/min/max latency, wall, confusion), `steps.json`
-(per-decision probabilities and actions), `step-*/` crops and annotations.
+The episode runs until the game ends or the decision cap. On the Clef
+reference trajectory it ends in death at 11 decisions; d3-lite runs the full
+**12-decision cap** (x=213) because its Noul probabilities stay below the 0.5
+jump threshold on this all-negative trajectory. Output: `summary.json`
+(median/min/max latency, wall, confusion), `steps.json` (per-decision
+probabilities and actions), `step-*/` crops and annotations.
+
+**What `steps.json` `latency_ms` measures.** The worker's per-request clock
+starts *after* `_ensure_started()`, so the first decision's recorded latency
+**excludes the resident worker's model load** (spawn → ready ≈ 1.3 s
+externally). It contains the three cold requests, each paying that shape's
+first compiled-profile trace. The player-visible first-step wall on the page
+*does* include the load.
 
 ## 3. Browser page
 
@@ -102,9 +112,43 @@ client-measured wall per decision. Cloud usage stays at 0 / 400 and
 - **No optimization claims.** Different models (Clef Flash 9B vs d3-lite
   0.8B): report each side's latency only, no speedup ratio.
 
-The reference script used for the reported P4 window is
-`devlocal/mario-demo-adapt/scripts/real_d3lite_run.sh <run-name>` (ignored
-working copy; the command sequence above is the maintained form).
+### 4.1 Clean-window rerun — the reported baseline
+
+The maintained clean-window protocol (used for the independent confirmation
+recorded in report §6) comes from
+`devlocal/mario-demo-adapt/scripts/real_d3lite_clean_run.sh <run-name>`, which
+enforces the gates in order:
+
+1. acquire both locks (wait, never kill);
+2. wait for any lock-ignoring foreign harness to finish **on its own**. If it
+   does not clear within `FOREIGN_DEADLINE` (default 840 s) or stops making log
+   progress for `HUNG_AFTER_S` (default 320 s), **abort (92)** and ask the
+   requester to stop it — the script refuses to kill a live campaign;
+3. 60 s idle `Swapouts` baseline — abort (93) if non-zero;
+4. confirm no foreign model process, then snapshot;
+5. `probe_load.py`, then `evaluate.py` under the 200 ms `vm_stat` sampler with
+   timestamped output;
+6. build a receipt from the episode's 36 crops (`make_episode_receipt.py`) and
+   replay them through a **fresh** server (`run_correctness.py`) in the same
+   window to collect the server's per-request `stages`;
+7. snapshot and write `verdict.txt`; `contaminated=0` is required.
+
+After releasing the locks, run (host-only):
+
+```sh
+$DEMO_PY devlocal/mario-demo-adapt/scripts/analyze_clean_run.py \
+  --clean devlocal/mario-demo-adapt/runs/<clean-run> \
+  --p4 devlocal/mario-demo-adapt/runs/<prior-run> \
+  --out devlocal/mario-demo-adapt/runs/<clean-run>/analysis.json
+```
+
+for the per-decision table with Swapouts, the crop-hash reproducibility check,
+the replay-vs-episode falsifier, stage shares and the first-decision
+decomposition.
+
+The script used for the original **contaminated** P4 window is
+`devlocal/mario-demo-adapt/scripts/real_d3lite_run.sh <run-name>`; the command
+sequence in §2 is the maintained form.
 
 ## 5. Expected environment limits
 
