@@ -26,32 +26,39 @@ use apxinf_mlx::fusions::{GatedDeltaRecurrence, HalfSplitRope};
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 
 use super::config::{Config, Geometry, MAX_INPUT_TOKENS};
-use super::weights::{Attention, GatedDelta, Mixer, Mlp, Weights};
+use super::vision::Vision;
+use super::weights::{Attention, GatedDelta, Mixer, Mlp, VisionWeights, Weights};
 
-const EPS: f32 = 1e-6;
-
-/// Everything the compiled callable captures: immutable geometry, evaluated
-/// weights, registered kernels and the request-independent inverse
-/// frequencies. `Rc` lets the trace closure and the runner share one copy
-/// without introducing a second owner for device arrays.
+/// Everything the compiled callables capture: immutable geometry, evaluated
+/// weights, registered kernels, the eager vision tower and the
+/// request-independent inverse frequencies. `Rc` lets the trace closures and
+/// the runner share one copy without introducing a second owner for device
+/// arrays.
 struct Parts {
     geometry: Geometry,
     weights: Weights,
+    vision: Vision,
+    image_token_id: u32,
+    video_token_id: u32,
+    vision_merge: usize,
     recurrence: GatedDeltaRecurrence,
     rope: HalfSplitRope,
     inv_freq: Array,
     stream: Stream,
 }
 
-/// One d3-lite execution over shared weights. `compiled` is a whole-request
-/// callable (`mx.compile` over the forward, inputs `ids [1, L]` and
-/// `count [1]`, output `probabilities [1, 255]`); `prepared` records the exact
-/// `(length, count)` profiles that have been warmed with `Compiled::prepare`,
-/// which is the only operation that may trace.
+/// One d3-lite execution over shared weights. `compiled` is the text
+/// whole-request callable (`ids [1, L]`, `count [1]`); `image_compiled`
+/// adds the multimodal inputs (`positions [3, L]`, `features [1, M, D]`,
+/// `run_start [1]`). `prepared` / `prepared_images` record the exact profiles
+/// that have been warmed with `Compiled::prepare`, which is the only
+/// operation that may trace.
 pub struct Model {
     parts: Rc<Parts>,
     compiled: Compiled,
+    image_compiled: Compiled,
     prepared: RefCell<Vec<(usize, usize)>>,
+    prepared_images: RefCell<Vec<(usize, usize, usize)>>,
 }
 
 fn scalar(like: &Array, value: f64) -> Result<Array> {
@@ -84,11 +91,21 @@ fn decay_beta(a_log: &Array, a: &Array, b: &Array, dt_bias: &Array) -> Result<(A
 }
 
 impl Model {
-    pub fn new(config: &Config, stream: Stream, weights: Weights) -> Result<Self> {
+    pub fn new(
+        config: &Config,
+        stream: Stream,
+        weights: Weights,
+        vision_weights: VisionWeights,
+    ) -> Result<Self> {
         let geometry = config.geometry;
+        let vision = Vision::new(config, stream.clone(), vision_weights)?;
         let parts = Rc::new(Parts {
             geometry,
             weights,
+            vision,
+            image_token_id: config.image_token_id,
+            video_token_id: config.video_token_id,
+            vision_merge: config.vision.spatial_merge,
             recurrence: GatedDeltaRecurrence::new(&stream)?,
             rope: HalfSplitRope::new(&stream, geometry.rope_dims)?,
             inv_freq: inverse_frequencies(&stream, geometry)?,
@@ -103,10 +120,22 @@ impl Model {
             };
             forward(&trace_parts, ids, count)
         })?;
+        let trace_parts = parts.clone();
+        let image_compiled = Compiled::with_shapeless(&stream, 1, false, move |inputs| {
+            let [ids, positions, count, features, run_start] = inputs else {
+                return Err(Error::Contract(
+                    "d3-lite compiled image forward takes ids, mrope positions, candidate \
+                     count, merged image features and the placeholder run start",
+                ));
+            };
+            image_forward(&trace_parts, ids, positions, count, features, run_start)
+        })?;
         Ok(Self {
             parts,
             compiled,
+            image_compiled,
             prepared: RefCell::new(Vec::new()),
+            prepared_images: RefCell::new(Vec::new()),
         })
     }
 
@@ -228,6 +257,243 @@ impl Model {
     pub fn prepared_profiles(&self) -> Vec<(usize, usize)> {
         self.prepared.borrow().clone()
     }
+
+    fn is_image_prepared(&self, length: usize, count: usize, image_tokens: usize) -> bool {
+        self.prepared_images
+            .borrow()
+            .iter()
+            .any(|&(known, known_count, known_tokens)| {
+                known == length && known_count == count && known_tokens == image_tokens
+            })
+    }
+
+    /// Trace and warm one exact image profile. Zero token IDs, positions,
+    /// features and run start keep the warm-up input independent of any
+    /// request; the traced graph depends on shapes, not values.
+    fn prepare_image_profile(
+        &self,
+        length: usize,
+        count: usize,
+        image_tokens: usize,
+    ) -> Result<()> {
+        let geometry = self.parts.geometry;
+        if length == 0 || length > geometry.max_positions || length > MAX_INPUT_TOKENS {
+            return Err(Error::Other(format!(
+                "d3-lite prepared length {length} is outside 1..={MAX_INPUT_TOKENS}"
+            )));
+        }
+        if count == 0 || count > super::config::CODES {
+            return Err(Error::Other(format!(
+                "d3-lite prepared candidate count {count} is outside 1..={}",
+                super::config::CODES
+            )));
+        }
+        if image_tokens == 0 || image_tokens > length {
+            return Err(Error::Other(format!(
+                "d3-lite prepared image token count {image_tokens} is outside 1..={length}"
+            )));
+        }
+        let ids = Array::zeros(self.stream(), &[1, length], MlxDType::I32)?;
+        let positions = Array::zeros(self.stream(), &[3, length], MlxDType::I32)?;
+        let count_array = Array::from_i32(self.stream(), &[1], &[count as i32])?;
+        let features = Array::zeros(
+            self.stream(),
+            &[1, image_tokens, geometry.hidden],
+            MlxDType::BF16,
+        )?;
+        // Start 0 writes the feature run over the head of the warm-up row;
+        // the values do not affect the traced graph.
+        let run_start = Array::zeros(self.stream(), &[1], MlxDType::I32)?;
+        self.image_compiled
+            .prepare(&[ids, positions, count_array, features, run_start])?;
+        if !self.is_image_prepared(length, count, image_tokens) {
+            self.prepared_images
+                .borrow_mut()
+                .push((length, count, image_tokens));
+        }
+        Ok(())
+    }
+
+    fn prepare_image_for(&self, length: usize, count: usize, image_tokens: usize) -> Result<()> {
+        if self.is_image_prepared(length, count, image_tokens) {
+            return Ok(());
+        }
+        self.prepare_image_profile(length, count, image_tokens)
+    }
+
+    /// One image request: the eager vision tower produces merged image
+    /// tokens, the compiled image callable scatters them into the prompt and
+    /// runs the text layers plus FP32 readout in one forward. Returns the
+    /// first `count` option probabilities, in package code order.
+    pub fn image_probabilities(
+        &self,
+        pixel_values: &[f32],
+        grids: &[[u32; 3]],
+        token_ids: &[u32],
+        count: usize,
+    ) -> Result<Vec<f32>> {
+        self.validate(token_ids, count)?;
+        let merge = self.parts.vision_merge;
+        if merge == 0 {
+            return Err(Error::Contract(
+                "d3-lite vision merge size must be positive",
+            ));
+        }
+        let (positions, slots) = multimodal_layout(
+            token_ids,
+            grids,
+            self.parts.image_token_id,
+            self.parts.video_token_id,
+            merge,
+        )?;
+        let length = token_ids.len();
+        let image_tokens = slots.len();
+        // The processor expands one image into one contiguous placeholder run;
+        // MLX's dynamic slice_update takes one start index, so that run is the
+        // only scatter this path supports.
+        let run_start = slots[0];
+        if slots.windows(2).any(|window| window[1] != window[0] + 1) {
+            return Err(Error::Other(
+                "d3-lite Metal P1b writes one contiguous image run per request; \
+                 multiple images are not wired"
+                    .into(),
+            ));
+        }
+        let features = self.parts.vision.forward(pixel_values, grids)?;
+        let features = features.reshape(&[1, image_tokens, self.parts.geometry.hidden])?;
+        self.prepare_image_for(length, count, image_tokens)?;
+
+        let ids = token_ids
+            .iter()
+            .map(|&token| {
+                i32::try_from(token).map_err(|_| {
+                    Error::Other(format!(
+                        "d3-lite token ID {token} exceeds the embedding index range"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let ids = Array::from_i32(self.stream(), &[1, length], &ids)?;
+        let positions = Array::from_i32(self.stream(), &[3, length], &positions)?;
+        let count_array = Array::from_i32(self.stream(), &[1], &[count as i32])?;
+        let run_start = Array::from_i32(self.stream(), &[1], &[run_start])?;
+        // Evaluate the eager vision tower before the compiled callable sees
+        // it: preparation passes concrete zero arrays, so a concrete input
+        // here keeps the profile replaying without re-tracing.
+        self.stream().eval(&[features.clone()])?;
+        let outputs = self.image_compiled.call_and_eval(&[
+            ids,
+            positions,
+            count_array,
+            features,
+            run_start,
+        ])?;
+        read_probabilities(&outputs[0], count)
+    }
+
+    /// `(length, count, image_tokens)` image profiles warmed so far.
+    pub fn prepared_image_profiles(&self) -> Vec<(usize, usize, usize)> {
+        self.prepared_images.borrow().clone()
+    }
+}
+
+/// The multimodal request layout the reference builds from `mm_token_type_ids`
+/// and `image_grid_thw`: mRoPE positions `[3, L]` (text positions advance by
+/// one per token; an image run takes its grid's H/W coordinates and advances
+/// by `max(h, w) / merge`) and the placeholder slot indices `[M]` the merged
+/// image tokens scatter into. A run of `image_token_id` is one image, in
+/// request order, and must match the next grid exactly.
+fn multimodal_layout(
+    token_ids: &[u32],
+    grids: &[[u32; 3]],
+    image_token_id: u32,
+    video_token_id: u32,
+    merge: usize,
+) -> Result<(Vec<i32>, Vec<i32>)> {
+    if grids.is_empty() {
+        return Err(Error::Other(
+            "d3-lite image request needs at least one grid".into(),
+        ));
+    }
+    let length = token_ids.len();
+    let mut positions = vec![vec![0i32; length]; 3];
+    let mut slots = Vec::new();
+    let mut current = 0i32;
+    let mut index = 0usize;
+    let mut grid_index = 0usize;
+    while index < length {
+        if token_ids[index] == video_token_id {
+            return Err(Error::Other(
+                "d3-lite Metal image path does not read video tokens; video is not wired".into(),
+            ));
+        }
+        let image_run = token_ids[index] == image_token_id;
+        let mut end = index + 1;
+        while end < length && (token_ids[end] == image_token_id) == image_run {
+            end += 1;
+        }
+        if image_run {
+            let [temporal, grid_h, grid_w] = *grids.get(grid_index).ok_or_else(|| {
+                Error::Other(format!(
+                    "d3-lite prompt has more image runs than grids ({grid_index} grids consumed)"
+                ))
+            })?;
+            grid_index += 1;
+            if temporal != 1 {
+                return Err(Error::Other(
+                    "d3-lite Metal vision runs still images (grid t = 1); video is not wired"
+                        .into(),
+                ));
+            }
+            let merged_h = grid_h as usize / merge;
+            let merged_w = grid_w as usize / merge;
+            let expected = merged_h * merged_w;
+            if merged_h == 0 || merged_w == 0 {
+                return Err(Error::Other(format!(
+                    "d3-lite image grid [{temporal}, {grid_h}, {grid_w}] is smaller than one merge block"
+                )));
+            }
+            if end - index != expected {
+                return Err(Error::Other(format!(
+                    "d3-lite image run at position {index} holds {} placeholders, expected {expected} \
+                     for grid [{temporal}, {grid_h}, {grid_w}]",
+                    end - index
+                )));
+            }
+            for block_row in 0..merged_h {
+                for block_column in 0..merged_w {
+                    let slot = index + block_row * merged_w + block_column;
+                    positions[0][slot] = current;
+                    positions[1][slot] = current + block_row as i32;
+                    positions[2][slot] = current + block_column as i32;
+                    slots.push(slot as i32);
+                }
+            }
+            current += merged_h.max(merged_w) as i32;
+        } else {
+            for offset in index..end {
+                let value = current + (offset - index) as i32;
+                positions[0][offset] = value;
+                positions[1][offset] = value;
+                positions[2][offset] = value;
+            }
+            current += (end - index) as i32;
+        }
+        index = end;
+    }
+    if grid_index != grids.len() {
+        return Err(Error::Other(format!(
+            "d3-lite prompt consumed {grid_index} image grids but the request passed {}",
+            grids.len()
+        )));
+    }
+    if slots.is_empty() {
+        return Err(Error::Other(
+            "d3-lite image request found no image_token_id placeholders".into(),
+        ));
+    }
+    let flat = positions.into_iter().flatten().collect();
+    Ok((flat, slots))
 }
 
 fn read_probabilities(output: &Array, count: usize) -> Result<Vec<f32>> {
@@ -259,28 +525,104 @@ fn inverse_frequencies(stream: &Stream, geometry: Geometry) -> Result<Array> {
     Ok(inv_freq)
 }
 
-/// The whole request graph. `ids` is `[1, L]` I32, `candidate_count` is `[1]`
-/// I32; the returned vector is `[probabilities [1, 255]]` in F32, with every
-/// code at or past `candidate_count` set to `-inf` before the softmax so the
-/// result is exactly the masked softmax the reference produces.
+/// How the attention layers receive rotary positions. The text path uses the
+/// fused half-split kernel with 1-D positions (unchanged from P1a); an image
+/// request uses mRoPE cos/sin recomposed from the `[3, L]` multimodal
+/// positions, exactly as the reference's `Qwen3_5TextRotaryEmbedding` does.
+enum RopeMode<'a> {
+    HalfSplit(&'a Array),
+    Mrope { cos: &'a Array, sin: &'a Array },
+}
+
+/// The whole text request graph. `ids` is `[1, L]` I32, `candidate_count` is
+/// `[1]` I32; the returned vector is `[probabilities [1, 255]]` in F32, with
+/// every code at or past `candidate_count` set to `-inf` before the softmax so
+/// the result is exactly the masked softmax the reference produces.
 fn forward(parts: &Parts, ids: &Array, candidate_count: &Array) -> Result<Vec<Array>> {
-    let geometry = parts.geometry;
     let [1, length] = *ids.shape() else {
         return Err(Error::Contract("d3-lite ids must be [1, L]"));
     };
     if length == 0 {
         return Err(Error::Contract("d3-lite ids must be nonempty"));
     }
-    let mut hidden = parts.weights.embed.take(ids, 0)?;
+    let hidden = parts.weights.embed.take(ids, 0)?;
     let positions = Array::arange(&parts.stream, 0.0, length as f32, 1.0, MlxDType::I32)?
         .reshape(&[1, length])?;
+    let hidden = stack(parts, hidden, &RopeMode::HalfSplit(&positions))?;
+    readout_tail(parts, &hidden, candidate_count)
+}
+
+/// The whole image request graph: embedding lookup, the eager vision tower's
+/// merged tokens written over the single contiguous `image_token_id` run, the
+/// same 24-layer stack under mRoPE, and the FP32 255-code readout. `positions`
+/// is `[3, L]` I32, `features` `[1, M, hidden]` BF16 and `run_start` `[1]` I32
+/// — MLX's dynamic `slice_update` takes one start index per axis, so the
+/// placeholders must form one contiguous run (the processor's expansion of a
+/// single image).
+fn image_forward(
+    parts: &Parts,
+    ids: &Array,
+    positions: &Array,
+    candidate_count: &Array,
+    features: &Array,
+    run_start: &Array,
+) -> Result<Vec<Array>> {
+    let [1, length] = *ids.shape() else {
+        return Err(Error::Contract("d3-lite ids must be [1, L]"));
+    };
+    let [3, position_length] = *positions.shape() else {
+        return Err(Error::Contract("d3-lite mrope positions must be [3, L]"));
+    };
+    if position_length != length {
+        return Err(Error::Other(format!(
+            "d3-lite mrope positions cover {position_length} tokens, ids cover {length}"
+        )));
+    }
+    let [1, image_tokens, hidden_width] = *features.shape() else {
+        return Err(Error::Contract(
+            "d3-lite merged image features must be [1, M, hidden]",
+        ));
+    };
+    if hidden_width != parts.geometry.hidden {
+        return Err(Error::Other(format!(
+            "d3-lite merged image features have width {hidden_width}, expected {}",
+            parts.geometry.hidden
+        )));
+    }
+    if image_tokens == 0 || run_start.shape() != [1] {
+        return Err(Error::Other(format!(
+            "d3-lite image scatter needs a nonempty feature run and a [1] start, got {:?} and {:?}",
+            features.shape(),
+            run_start.shape()
+        )));
+    }
+    let mut embeds = parts.weights.embed.take(ids, 0)?;
+    embeds = embeds.slice_update(features, run_start, &[1])?;
+    let (cos, sin) = mrope_rotary(parts, positions, length)?;
+    let hidden = stack(
+        parts,
+        embeds,
+        &RopeMode::Mrope {
+            cos: &cos,
+            sin: &sin,
+        },
+    )?;
+    readout_tail(parts, &hidden, candidate_count)
+}
+
+/// The 24-layer stack under one rotary contract, ending at the final RMSNorm.
+/// The op order is shared by the text and image callables; only the rotary
+/// arguments differ.
+fn stack(parts: &Parts, mut hidden: Array, rope: &RopeMode<'_>) -> Result<Array> {
+    let geometry = parts.geometry;
+    let length = hidden.shape()[1];
     for (index, layer) in parts.weights.layers.iter().enumerate() {
         let normalized = hidden.fast_rms_norm(&layer.input_norm, geometry.eps)?;
         let mixed = if geometry.is_attention(index) {
             let Mixer::Attention(attention) = &layer.mixer else {
                 unreachable!("the validated schedule selects attention here")
             };
-            attention_forward(parts, &normalized, attention, &positions)?
+            attention_forward(parts, &normalized, attention, rope)?
         } else {
             let Mixer::GatedDelta(gated_delta) = &layer.mixer else {
                 unreachable!("the validated schedule selects gated delta here")
@@ -292,7 +634,13 @@ fn forward(parts: &Parts, ids: &Array, candidate_count: &Array) -> Result<Vec<Ar
         let mlp_output = mlp_forward(&mlp_input, &layer.mlp)?;
         hidden = residual.add(&mlp_output)?;
     }
-    let hidden = hidden.fast_rms_norm(&parts.weights.norm, geometry.eps)?;
+    hidden.fast_rms_norm(&parts.weights.norm, geometry.eps)
+}
+
+/// Last position → FP32 → the 255-code readout → masked FP32 softmax.
+fn readout_tail(parts: &Parts, hidden: &Array, candidate_count: &Array) -> Result<Vec<Array>> {
+    let geometry = parts.geometry;
+    let length = hidden.shape()[1];
     let last = hidden
         .slice_axis(1, length - 1, length)?
         .reshape(&[1, geometry.hidden])?
@@ -311,6 +659,72 @@ fn forward(parts: &Parts, ids: &Array, candidate_count: &Array) -> Result<Vec<Ar
     let logits = masked.where_select(&negative_infinity, &logits)?;
     let probabilities = logits.softmax_with(-1, false)?;
     Ok(vec![probabilities])
+}
+
+/// mRoPE cos/sin for one image request: `[3, L]` positions × the 32 inverse
+/// frequencies, recomposed with the interleaved `[T | H | W]` sections
+/// (`i % 3`) and duplicated over the 64-wide rotary block, all in F32 then
+/// rounded once to the embedding dtype, exactly as the reference does.
+fn mrope_rotary(parts: &Parts, positions: &Array, length: usize) -> Result<(Array, Array)> {
+    let width = parts.geometry.rope_dims;
+    let frequency_count = parts.inv_freq.shape()[0];
+    let frequencies = positions
+        .cast(MlxDType::F32)?
+        .reshape(&[3, length, 1])?
+        .mul(&parts.inv_freq.reshape(&[1, 1, frequency_count])?)?;
+    let text = frequencies
+        .slice_axis(0, 0, 1)?
+        .reshape(&[length, frequency_count])?;
+    let height = frequencies
+        .slice_axis(0, 1, 2)?
+        .reshape(&[length, frequency_count])?;
+    let column = frequencies
+        .slice_axis(0, 2, 3)?
+        .reshape(&[length, frequency_count])?;
+    // mrope_section [11, 11, 10] over 32 frequencies is the interleaved
+    // `i % 3`: T, H, W, T, H, W, ... .
+    let partition_ids = (0..frequency_count as i32)
+        .map(|index| index % 3)
+        .collect::<Vec<_>>();
+    let partition = Array::from_i32(&parts.stream, &[frequency_count], &partition_ids)?;
+    let zero = Array::scalar(&parts.stream, 0.0, MlxDType::I32)?;
+    let one = Array::scalar(&parts.stream, 1.0, MlxDType::I32)?;
+    let is_text = partition.equal(&zero)?;
+    let is_height = partition.equal(&one)?;
+    let spatial = is_height.where_select(&height, &column)?;
+    let recomposed = is_text.where_select(&text, &spatial)?;
+    let duplicate = |values: Array| -> Result<Array> { Array::concat(&[&values, &values], 1) };
+    let cos = duplicate(recomposed.cos()?.cast(MlxDType::BF16)?)?;
+    let sin = duplicate(recomposed.sin()?.cast(MlxDType::BF16)?)?;
+    debug_assert_eq!(cos.shape(), &[length, width]);
+    Ok((cos, sin))
+}
+
+/// Apply mRoPE to one `[B, H, L, D]` tensor: the first `rotary` features are
+/// paired half-and-half and rotated by the recomposed cos/sin (BF16 ops, one
+/// rounding per operation, as the reference's `apply_rotary_pos_emb` does);
+/// the remaining features pass through untouched.
+fn mrope_apply(tensor: &Array, cos: &Array, sin: &Array, rotary: usize) -> Result<Array> {
+    let [batch, heads, length, width] = *tensor.shape() else {
+        return Err(Error::Contract("d3-lite rotary input must be [B, H, L, D]"));
+    };
+    if rotary == 0 || rotary > width || rotary % 2 != 0 || cos.shape() != [length, rotary] {
+        return Err(Error::Other(format!(
+            "d3-lite mrope needs even rotary width {rotary} ≤ {width} and cos/sin [{length}, {rotary}]"
+        )));
+    }
+    let active = tensor.slice_axis(3, 0, rotary)?;
+    let first = active.slice_axis(3, rotary / 2, rotary)?;
+    let second = active.slice_axis(3, 0, rotary / 2)?;
+    let rotated = Array::concat(&[&first.neg()?, &second], 3)?;
+    let cos = cos.reshape(&[1, 1, length, rotary])?;
+    let sin = sin.reshape(&[1, 1, length, rotary])?;
+    let active = active.mul(&cos)?.add(&rotated.mul(&sin)?)?;
+    if rotary == width {
+        debug_assert_eq!(active.shape(), &[batch, heads, length, width]);
+        return Ok(active);
+    }
+    Array::concat(&[&active, &tensor.slice_axis(3, rotary, width)?], 3)
 }
 
 fn mlp_forward(input: &Array, mlp: &Mlp) -> Result<Array> {
@@ -402,7 +816,7 @@ fn attention_forward(
     parts: &Parts,
     input: &Array,
     attention: &Attention,
-    positions: &Array,
+    rope: &RopeMode<'_>,
 ) -> Result<Array> {
     let geometry = parts.geometry;
     let [1, length, _] = *input.shape() else {
@@ -431,8 +845,16 @@ fn attention_forward(
     let values = values
         .reshape(&[1, length, geometry.kv_heads, geometry.head_dim])?
         .transpose(&[0, 2, 1, 3])?;
-    let queries = parts.rope.call(&queries, positions, &parts.inv_freq)?;
-    let keys = parts.rope.call(&keys, positions, &parts.inv_freq)?;
+    let (queries, keys) = match rope {
+        RopeMode::HalfSplit(positions) => (
+            parts.rope.call(&queries, positions, &parts.inv_freq)?,
+            parts.rope.call(&keys, positions, &parts.inv_freq)?,
+        ),
+        RopeMode::Mrope { cos, sin } => (
+            mrope_apply(&queries, cos, sin, geometry.rope_dims)?,
+            mrope_apply(&keys, cos, sin, geometry.rope_dims)?,
+        ),
+    };
     // d3's full-attention layers are explicitly non-causal over the prompt.
     let output = queries.sdpa(
         &keys,
@@ -559,7 +981,8 @@ mod tests {
         let config = Config::from_dir(&directory)?;
         let stream = Stream::metal(0)?;
         let weights = Weights::load(config.geometry, &stream, &directory)?;
-        let model = Model::new(&config, stream.clone(), weights)?;
+        let vision_weights = VisionWeights::load(config.vision, &stream, &directory)?;
+        let model = Model::new(&config, stream.clone(), weights, vision_weights)?;
         let count = config.codes.len();
         let tokens = 37usize;
         let first = vec![1u32; tokens];
@@ -607,6 +1030,313 @@ mod tests {
         assert_eq!(
             model.prepared_profiles(),
             vec![(tokens, count), (64, count)]
+        );
+        Ok(())
+    }
+
+    /// Vision-tower acceptance: the native `visual.*` forward reproduces the
+    /// checkpoint's PyTorch pooler output (`image_features`) on the same
+    /// preprocessed pixels. This localizes image-path drift between the
+    /// vision tower and the text layers + mRoPE + readout.
+    #[test]
+    #[ignore = "requires APXINF_D3_CHECKPOINT, APXINF_D3_VISION_REF and an Apple Metal GPU"]
+    fn vision_tower_matches_pytorch_reference() -> Result<()> {
+        use serde::Deserialize;
+        use std::collections::HashMap;
+
+        #[derive(Deserialize)]
+        struct Receipt {
+            cases: Vec<Case>,
+        }
+        #[derive(Deserialize)]
+        struct Case {
+            id: String,
+            grid_thw: Vec<u32>,
+            arrays: Arrays,
+        }
+        #[derive(Deserialize)]
+        struct Arrays {
+            pixel_values: Option<ArrayFile>,
+            image_features: Option<ArrayFile>,
+        }
+        #[derive(Deserialize)]
+        struct ArrayFile {
+            file: String,
+        }
+        #[derive(Deserialize)]
+        struct StageCase {
+            stages: HashMap<String, ArrayFile>,
+        }
+
+        fn read_f32(base: &std::path::Path, file: &str) -> Result<Vec<f32>> {
+            let path = base.join(file);
+            let bytes = std::fs::read(&path)
+                .map_err(|error| Error::Other(format!("read {}: {error}", path.display())))?;
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect())
+        }
+
+        let checkpoint = std::env::var_os("APXINF_D3_CHECKPOINT")
+            .map(std::path::PathBuf::from)
+            .expect("set APXINF_D3_CHECKPOINT to the d3-lite package directory");
+        let reference = std::env::var_os("APXINF_D3_VISION_REF")
+            .map(std::path::PathBuf::from)
+            .expect("set APXINF_D3_VISION_REF to the reference cases.json");
+        let base = reference
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let receipt: Receipt = serde_json::from_str(
+            &std::fs::read_to_string(&reference)
+                .map_err(|error| Error::Other(format!("read {}: {error}", reference.display())))?,
+        )
+        .map_err(|error| Error::Other(format!("parse {}: {error}", reference.display())))?;
+
+        let config = Config::from_dir(&checkpoint)?;
+        let stream = Stream::metal(0)?;
+        let weights = Weights::load(config.geometry, &stream, &checkpoint)?;
+        let vision_weights = VisionWeights::load(config.vision, &stream, &checkpoint)?;
+        let model = Model::new(&config, stream.clone(), weights, vision_weights)?;
+
+        // Optional per-stage receipt (dump_reference_vision_stages.py), which
+        // localizes a divergence to patch embed, position add, one block or
+        // the merger.
+        let stage_index: HashMap<String, StageCase> =
+            match std::env::var_os("APXINF_D3_VISION_STAGES") {
+                Some(path) => {
+                    let text = std::fs::read_to_string(&path).map_err(|error| {
+                        Error::Other(format!("read {}: {error}", path.to_string_lossy()))
+                    })?;
+                    serde_json::from_str(&text).map_err(|error| {
+                        Error::Other(format!("parse {}: {error}", path.to_string_lossy()))
+                    })?
+                }
+                None => HashMap::new(),
+            };
+
+        let mut worst = 0.0f32;
+        let mut worst_relative = 0.0f32;
+        let mut worst_case = String::new();
+        for case in &receipt.cases {
+            let pixels =
+                case.arrays.pixel_values.as_ref().ok_or_else(|| {
+                    Error::Other(format!("{} has no pixel_values array", case.id))
+                })?;
+            let features =
+                case.arrays.image_features.as_ref().ok_or_else(|| {
+                    Error::Other(format!("{} has no image_features array", case.id))
+                })?;
+            let pixels = read_f32(base, &pixels.file)?;
+            let expected_final = read_f32(base, &features.file)?;
+            if case.grid_thw.len() != 3 {
+                return Err(Error::Other(format!(
+                    "{} grid_thw must have 3 entries",
+                    case.id
+                )));
+            }
+            let grids = [[case.grid_thw[0], case.grid_thw[1], case.grid_thw[2]]];
+            let native_stages = model.parts.vision.forward_stages(&pixels, &grids)?;
+            let stages = stage_index.get(&case.id);
+            let mut case_worst = 0.0f32;
+            println!("{}: grid={grids:?}", case.id);
+            for (name, native_values) in &native_stages {
+                let expected = match *name {
+                    "merged" => Some(expected_final.clone()),
+                    _ => stages
+                        .and_then(|case| case.stages.get(*name))
+                        .map(|file| read_f32(base, &file.file))
+                        .transpose()?,
+                };
+                let Some(expected) = expected else { continue };
+                if native_values.len() != expected.len() {
+                    return Err(Error::Other(format!(
+                        "{} {name}: native has {} values, reference has {}",
+                        case.id,
+                        native_values.len(),
+                        expected.len()
+                    )));
+                }
+                let stage_worst = native_values
+                    .iter()
+                    .zip(&expected)
+                    .map(|(actual, expected)| (*actual - *expected).abs())
+                    .fold(0.0f32, f32::max);
+                let scale = expected
+                    .iter()
+                    .map(|value| value.abs())
+                    .fold(0.0f32, f32::max)
+                    .max(1e-6);
+                println!(
+                    "  {name:<13} max|Δ|={stage_worst:<10.6} rel={}",
+                    stage_worst / scale
+                );
+                if *name == "merged" {
+                    case_worst = stage_worst;
+                    worst_relative = worst_relative.max(stage_worst / scale);
+                }
+            }
+            if case_worst > worst {
+                worst = case_worst;
+                worst_case = case.id.clone();
+            }
+        }
+        // The tower's late residual stream is ill-conditioned: the
+        // checkpoint's own reference moves by 4–46 % across the eight cases
+        // between MPS and CPU, while native Metal moves 8–28 %. Bound native
+        // inside the reference's own device-to-device envelope (46 % → 50 %)
+        // rather than at a rounding-scale delta.
+        assert!(
+            worst_relative < 0.50,
+            "native vision features differ from the reference by {worst} ({worst_relative:.3} relative) in {worst_case}"
+        );
+        Ok(())
+    }
+
+    /// Image-path acceptance through the **public** runtime: registry load →
+    /// `D3LiteRunner::decide` → `Model::image_probabilities`, compared with
+    /// the checkpoint's PyTorch reference. The declared probability budget is
+    /// 3× the reference's own MPS↔CPU noise (0.0201) because the vision
+    /// tower's residual stream amplifies BF16 kernel-order differences.
+    #[test]
+    #[ignore = "requires APXINF_D3_CHECKPOINT, APXINF_D3_VISION_REF and an Apple Metal GPU"]
+    fn image_decision_matches_pytorch_reference_through_the_public_path() -> Result<()> {
+        use crate::{AutoModel, DecisionInput, DecisionModel, ImageInput, LoadOptions};
+
+        const MAX_IMAGE_ABS_DELTA: f32 = 0.06;
+
+        #[derive(serde::Deserialize)]
+        struct Receipt {
+            cases: Vec<Case>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            id: String,
+            token_ids: Vec<u32>,
+            option_count: usize,
+            grid_thw: Vec<u32>,
+            probabilities: Vec<f32>,
+            arrays: Arrays,
+        }
+        #[derive(serde::Deserialize)]
+        struct Arrays {
+            pixel_values: ArrayFile,
+        }
+        #[derive(serde::Deserialize)]
+        struct ArrayFile {
+            file: String,
+        }
+
+        let checkpoint = std::env::var_os("APXINF_D3_CHECKPOINT")
+            .map(std::path::PathBuf::from)
+            .expect("set APXINF_D3_CHECKPOINT to the d3-lite package directory");
+        let reference = std::env::var_os("APXINF_D3_VISION_REF")
+            .map(std::path::PathBuf::from)
+            .expect("set APXINF_D3_VISION_REF to the reference cases.json");
+        let base = reference
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let receipt: Receipt = serde_json::from_str(
+            &std::fs::read_to_string(&reference)
+                .map_err(|error| Error::Other(format!("read {}: {error}", reference.display())))?,
+        )
+        .map_err(|error| Error::Other(format!("parse {}: {error}", reference.display())))?;
+
+        let mut loaded = AutoModel::load_model(
+            apxinf_core::Device::Metal(0),
+            &checkpoint,
+            &LoadOptions::default(),
+        )?;
+        assert_eq!(
+            loaded
+                .decision_capabilities()
+                .map_err(|error| Error::Other(error.to_string()))?,
+            crate::llm_trait::LlmCapabilities::VISION
+        );
+        let DecisionModel::Code(runtime) = loaded
+            .decision_model_mut()
+            .map_err(|error| Error::Other(error.to_string()))?
+        else {
+            return Err(Error::Contract("d3-lite loads as a code decision model"));
+        };
+
+        let mut worst = 0.0f32;
+        let mut worst_case = String::new();
+        let mut flips = Vec::new();
+        for case in &receipt.cases {
+            if case.grid_thw.len() != 3 {
+                return Err(Error::Other(format!(
+                    "{} grid_thw must have 3 entries",
+                    case.id
+                )));
+            }
+            let path = base.join(&case.arrays.pixel_values.file);
+            let bytes = std::fs::read(&path)
+                .map_err(|error| Error::Other(format!("read {}: {error}", path.display())))?;
+            let pixels = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let rows = case.grid_thw[1] as usize * case.grid_thw[2] as usize;
+            if pixels.len() != rows * 1_536 {
+                return Err(Error::Other(format!(
+                    "{}: {} pixel values for {rows} patches",
+                    case.id,
+                    pixels.len()
+                )));
+            }
+            let pixel_tensor = apxinf_core::Tensor::from_f32(vec![rows, 1_536], &pixels)?;
+            let grids = vec![[case.grid_thw[0], case.grid_thw[1], case.grid_thw[2]]];
+            let output = runtime.decide(DecisionInput::with_vision(
+                &case.token_ids,
+                ImageInput::new(&pixel_tensor, &grids),
+                case.option_count,
+            ))?;
+            let probabilities = output
+                .scores
+                .iter()
+                .map(|score| score.probability)
+                .collect::<Vec<_>>();
+            let expected = &case.probabilities[..case.option_count.min(case.probabilities.len())];
+            let decision = {
+                let mut best = 0usize;
+                for (index, value) in probabilities.iter().enumerate() {
+                    if *value > probabilities[best] {
+                        best = index;
+                    }
+                }
+                best
+            };
+            let reference_decision = {
+                let mut best = 0usize;
+                for (index, value) in expected.iter().enumerate() {
+                    if *value > expected[best] {
+                        best = index;
+                    }
+                }
+                best
+            };
+            let delta = probabilities
+                .iter()
+                .zip(expected)
+                .map(|(actual, expected)| (*actual - *expected).abs())
+                .fold(0.0f32, f32::max);
+            println!(
+                "{}: decisions {decision}/{reference_decision} max|Δp|={delta:.6}",
+                case.id
+            );
+            if decision != reference_decision {
+                flips.push(case.id.clone());
+            }
+            if delta > worst {
+                worst = delta;
+                worst_case = case.id.clone();
+            }
+        }
+        assert!(flips.is_empty(), "image decisions flipped: {flips:?}");
+        assert!(
+            worst <= MAX_IMAGE_ABS_DELTA,
+            "image max|Δp| {worst} in {worst_case} exceeds {MAX_IMAGE_ABS_DELTA}"
         );
         Ok(())
     }

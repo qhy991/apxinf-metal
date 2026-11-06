@@ -22,6 +22,14 @@ pub const CODES: usize = 255;
 /// Longest request this port admits; longer requests fail, never truncate.
 pub const MAX_INPUT_TOKENS: usize = 262_144;
 pub const BACKBONE_DTYPE: &str = "bfloat16";
+/// Image pixel budget the checkpoint's own runtime applies at load
+/// (`d3_runtime.load_processor`): it narrows `preprocessor_config.json`'s
+/// `longest_edge` to 1.6 MP while keeping `shortest_edge` at 64 K. The port
+/// copies that contract so a request takes the same resize as the reference.
+pub const IMAGE_MIN_PIXELS: usize = 65_536;
+pub const IMAGE_MAX_PIXELS: usize = 1_638_400;
+/// The vision tower's axial RoPE base (`vision_config.rope_parameters`).
+pub const VISION_ROPE_THETA: f32 = 10_000.0;
 
 /// Immutable numbers every traced computation is keyed by. `Copy` so the
 /// compiled callable can capture one copy without sharing mutable state.
@@ -85,17 +93,43 @@ pub struct Config {
     pub revision: String,
     pub model_sha256: String,
     pub vision: VisionContract,
+    pub preprocessor: PreprocessorContract,
+    pub image_token_id: u32,
+    pub video_token_id: u32,
+    pub vision_start_token_id: u32,
+    pub vision_end_token_id: u32,
 }
 
-/// The vision tower's geometry is parsed and validated so the package
-/// identity is unambiguous, but P1a never executes it (P1b owns `visual.*`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The vision tower's geometry, parsed and validated so the package identity
+/// is unambiguous **and** the port can execute `visual.*` (P1b).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VisionContract {
     pub depth: usize,
     pub hidden: usize,
+    pub intermediate: usize,
+    pub heads: usize,
+    pub head_dim: usize,
     pub out_hidden: usize,
     pub patch: usize,
+    pub temporal_patch: usize,
+    pub spatial_merge: usize,
+    pub num_position_embeddings: usize,
+    pub num_grid_per_side: usize,
+    pub rope_theta: f32,
     pub tensors: usize,
+}
+
+/// Checkpoint-fixed image canonicalization: resize, normalize and patchify.
+/// The runtime owns it because every step is determined by the checkpoint
+/// files, not by the caller (see `model-layer-architecture.md`, "VLA input seam").
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PreprocessorContract {
+    pub min_pixels: usize,
+    pub max_pixels: usize,
+    /// Resize granularity: `patch * spatial_merge` (32 for d3-lite).
+    pub factor: usize,
+    pub image_mean: [f32; 3],
+    pub image_std: [f32; 3],
 }
 
 impl Config {
@@ -123,7 +157,14 @@ impl Config {
                     path.display()
                 ))
             })?;
-        let config = Self::compose(checkpoint, decision, manifest)?;
+        let preprocessor: PreprocessorConfig =
+            serde_json::from_str(&read("preprocessor_config.json")?).map_err(|error| {
+                Error::Other(format!(
+                    "parse {}preprocessor_config.json: {error}",
+                    path.display()
+                ))
+            })?;
+        let config = Self::compose(checkpoint, decision, manifest, preprocessor)?;
         Ok(config)
     }
 
@@ -131,6 +172,7 @@ impl Config {
         checkpoint: CheckpointConfig,
         decision: DecisionConfig,
         manifest: Manifest,
+        processor_file: PreprocessorConfig,
     ) -> Result<Self> {
         let invalid = |message: String| Error::Other(format!("d3-lite config: {message}"));
         if checkpoint.architectures.as_slice() != ["Qwen3_5Model"]
@@ -166,13 +208,41 @@ impl Config {
         let vision = VisionContract {
             depth: checkpoint.vision_config.depth,
             hidden: checkpoint.vision_config.hidden_size,
+            intermediate: checkpoint.vision_config.intermediate_size,
+            heads: checkpoint.vision_config.num_heads,
+            head_dim: checkpoint.vision_config.hidden_size / checkpoint.vision_config.num_heads,
             out_hidden: checkpoint.vision_config.out_hidden_size,
             patch: checkpoint.vision_config.patch_size,
-            // 153 tensors: the checkpoint's `visual.*` tower. P1b reads them;
-            // P1a only pins the package identity.
+            temporal_patch: checkpoint.vision_config.temporal_patch_size,
+            spatial_merge: checkpoint.vision_config.spatial_merge_size,
+            num_position_embeddings: checkpoint.vision_config.num_position_embeddings,
+            // `sqrt(2304) = 48`; the learned table is a 48 x 48 grid.
+            num_grid_per_side: (checkpoint.vision_config.num_position_embeddings as f64).sqrt()
+                as usize,
+            rope_theta: checkpoint.vision_config.rope_parameters.rope_theta,
+            // 153 tensors: 12 blocks x 12 + merger 6 + patch embed 2 + pos embed 1.
             tensors: 153,
         };
         Self::validate_vision(&checkpoint.vision_config, vision)?;
+        let preprocessor = PreprocessorContract {
+            min_pixels: IMAGE_MIN_PIXELS,
+            max_pixels: IMAGE_MAX_PIXELS,
+            factor: vision.patch * vision.spatial_merge,
+            image_mean: float3_array(processor_file.image_mean, "preprocessor image_mean")?,
+            image_std: float3_array(processor_file.image_std, "preprocessor image_std")?,
+        };
+        Self::validate_preprocessor(&preprocessor, &processor_file, vision)?;
+        let image_token_id = checkpoint.image_token_id;
+        let video_token_id = checkpoint.video_token_id;
+        let vision_start_token_id = checkpoint.vision_start_token_id;
+        let vision_end_token_id = checkpoint.vision_end_token_id;
+        Self::validate_tokens(
+            image_token_id,
+            video_token_id,
+            vision_start_token_id,
+            vision_end_token_id,
+            geometry,
+        )?;
         Self::validate_decision(&decision)?;
         let codes = decision.codes;
         let token_ids = decision.token_ids;
@@ -189,6 +259,11 @@ impl Config {
             revision,
             model_sha256: manifest.identity.model_sha256,
             vision,
+            preprocessor,
+            image_token_id,
+            video_token_id,
+            vision_start_token_id,
+            vision_end_token_id,
         })
     }
 
@@ -257,11 +332,89 @@ impl Config {
             || vision.patch_size != 16
             || vision.temporal_patch_size != 2
             || vision.spatial_merge_size != 2
+            || vision.num_position_embeddings != 2_304
             || contract.out_hidden != contract.hidden * 4 / 3
+            || contract.head_dim != 64
+            || contract.num_grid_per_side * contract.num_grid_per_side
+                != contract.num_position_embeddings
+            || vision.rope_parameters.rope_theta != VISION_ROPE_THETA
+            || vision.rope_parameters.rope_type != "axial"
         {
             return Err(invalid(
                 "unsupported d3-lite vision tower geometry (qwen3_5_vision depth 12)".into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_preprocessor(
+        contract: &PreprocessorContract,
+        file: &PreprocessorConfig,
+        vision: VisionContract,
+    ) -> Result<()> {
+        let invalid = |message: String| Error::Other(format!("d3-lite config: {message}"));
+        let size = &file.size;
+        if file.patch_size != vision.patch
+            || file.temporal_patch_size != vision.temporal_patch
+            || file.merge_size != vision.spatial_merge
+            || size.shortest_edge != Some(IMAGE_MIN_PIXELS)
+            || size.longest_edge.is_none_or(|edge| edge < IMAGE_MAX_PIXELS)
+            || contract.factor != vision.patch * vision.spatial_merge
+            || contract.min_pixels != IMAGE_MIN_PIXELS
+            || contract.max_pixels != IMAGE_MAX_PIXELS
+        {
+            return Err(invalid(
+                "unsupported d3-lite image preprocessor contract".into(),
+            ));
+        }
+        for (name, value) in [
+            ("image_mean", contract.image_mean),
+            ("image_std", contract.image_std),
+        ] {
+            if value
+                .iter()
+                .any(|entry| !entry.is_finite() || *entry <= 0.0)
+            {
+                return Err(invalid(format!(
+                    "preprocessor {name} must be finite and positive"
+                )));
+            }
+        }
+        if contract.image_mean != [0.5, 0.5, 0.5] || contract.image_std != [0.5, 0.5, 0.5] {
+            return Err(invalid(
+                "the d3-lite preprocessor normalizes RGB with mean/std 0.5".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The multimodal token IDs `config.json` fixes: image placeholders are
+    /// replaced by vision features, and `vision_start`/`vision_end` delimit
+    /// each image's placeholder run in the rendered chat template.
+    fn validate_tokens(
+        image: u32,
+        video: u32,
+        start: u32,
+        end: u32,
+        geometry: Geometry,
+    ) -> Result<()> {
+        let invalid = |message: String| Error::Other(format!("d3-lite config: {message}"));
+        if image != 248_056 || video != 248_057 || start != 248_053 || end != 248_054 {
+            return Err(invalid(
+                "unsupported d3-lite multimodal token IDs (image 248056, vision_start 248053, \
+                 vision_end 248054)"
+                    .into(),
+            ));
+        }
+        for (name, token) in [
+            ("image_token_id", image),
+            ("video_token_id", video),
+            ("vision_start_token_id", start),
+            ("vision_end_token_id", end),
+        ] {
+            if token as usize >= geometry.vocab {
+                return Err(invalid(format!("{name} {token} is outside the vocabulary")));
+            }
         }
         Ok(())
     }
@@ -360,10 +513,14 @@ impl Config {
 struct CheckpointConfig {
     architectures: Vec<String>,
     dtype: String,
+    image_token_id: u32,
     model_type: String,
     text_config: TextConfig,
     tie_word_embeddings: bool,
+    video_token_id: u32,
     vision_config: VisionConfig,
+    vision_end_token_id: u32,
+    vision_start_token_id: u32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -405,10 +562,43 @@ struct VisionConfig {
     hidden_size: usize,
     intermediate_size: usize,
     num_heads: usize,
+    num_position_embeddings: usize,
     out_hidden_size: usize,
     patch_size: usize,
+    rope_parameters: VisionRopeParameters,
     spatial_merge_size: usize,
     temporal_patch_size: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct VisionRopeParameters {
+    rope_theta: f32,
+    rope_type: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PreprocessorConfig {
+    image_mean: [f32; 3],
+    image_std: [f32; 3],
+    merge_size: usize,
+    patch_size: usize,
+    size: PreprocessorSize,
+    temporal_patch_size: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PreprocessorSize {
+    longest_edge: Option<usize>,
+    shortest_edge: Option<usize>,
+}
+
+fn float3_array(values: [f32; 3], name: &str) -> Result<[f32; 3]> {
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(Error::Other(format!(
+            "d3-lite config: {name} must be finite"
+        )));
+    }
+    Ok(values)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -470,12 +660,16 @@ struct ManifestParameters {
 mod tests {
     use super::*;
 
-    fn package_json() -> (String, String, String) {
+    fn package_json() -> (String, String, String, String) {
         let checkpoint = r#"{
             "architectures": ["Qwen3_5Model"],
             "dtype": "bfloat16",
+            "image_token_id": 248056,
             "model_type": "qwen3_5",
             "tie_word_embeddings": true,
+            "video_token_id": 248057,
+            "vision_end_token_id": 248054,
+            "vision_start_token_id": 248053,
             "text_config": {
                 "attention_bias": false,
                 "attn_output_gate": true,
@@ -516,12 +710,23 @@ mod tests {
                 "hidden_size": 768,
                 "intermediate_size": 3072,
                 "num_heads": 12,
+                "num_position_embeddings": 2304,
                 "out_hidden_size": 1024,
                 "patch_size": 16,
+                "rope_parameters": {"rope_theta": 10000.0, "rope_type": "axial"},
                 "spatial_merge_size": 2,
                 "temporal_patch_size": 2
             }
         }"#;
+        let preprocessor = serde_json::json!({
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "merge_size": 2,
+            "patch_size": 16,
+            "size": {"longest_edge": 16_777_216usize, "shortest_edge": 65_536usize},
+            "temporal_patch_size": 2,
+        })
+        .to_string();
         let codes: Vec<String> = (0..CODES).map(|i| format!("C{i}")).collect();
         let token_ids: Vec<u32> = (0..CODES).map(|i| 1_000 + i as u32).collect();
         let decision = serde_json::json!({
@@ -555,15 +760,16 @@ mod tests {
                             "readout": 261_120u64, "loaded": 853_247_040u64}
         })
         .to_string();
-        (checkpoint.into(), decision, manifest)
+        (checkpoint.into(), decision, manifest, preprocessor)
     }
 
     fn compose() -> Result<Config> {
-        let (checkpoint, decision, manifest) = package_json();
+        let (checkpoint, decision, manifest, preprocessor) = package_json();
         Config::compose(
             serde_json::from_str(&checkpoint).unwrap(),
             serde_json::from_str(&decision).unwrap(),
             serde_json::from_str(&manifest).unwrap(),
+            serde_json::from_str(&preprocessor).unwrap(),
         )
     }
 
@@ -578,17 +784,28 @@ mod tests {
         assert!(!config.geometry.is_attention(0));
         assert!(config.geometry.is_attention(3));
         assert_eq!(config.vision.depth, 12);
+        assert_eq!(config.vision.head_dim, 64);
+        assert_eq!(config.vision.num_grid_per_side, 48);
+        assert_eq!(config.vision.rope_theta, 10_000.0);
+        assert_eq!(config.image_token_id, 248_056);
+        assert_eq!(config.vision_start_token_id, 248_053);
+        assert_eq!(config.vision_end_token_id, 248_054);
+        assert_eq!(config.preprocessor.factor, 32);
+        assert_eq!(config.preprocessor.min_pixels, IMAGE_MIN_PIXELS);
+        assert_eq!(config.preprocessor.max_pixels, IMAGE_MAX_PIXELS);
+        assert_eq!(config.preprocessor.image_mean, [0.5, 0.5, 0.5]);
     }
 
     #[test]
     fn rejects_the_d3_mini_geometry_with_the_offending_identity() {
-        let (checkpoint, decision, manifest) = package_json();
+        let (checkpoint, decision, manifest, preprocessor) = package_json();
         let mut value: serde_json::Value = serde_json::from_str(&checkpoint).unwrap();
         value["text_config"]["hidden_size"] = serde_json::json!(2560);
         let error = Config::compose(
             serde_json::from_value(value).unwrap(),
             serde_json::from_str(&decision).unwrap(),
             serde_json::from_str(&manifest).unwrap(),
+            serde_json::from_str(&preprocessor).unwrap(),
         )
         .unwrap_err()
         .to_string();
@@ -597,13 +814,14 @@ mod tests {
 
     #[test]
     fn rejects_a_wrong_layer_schedule() {
-        let (checkpoint, decision, manifest) = package_json();
+        let (checkpoint, decision, manifest, preprocessor) = package_json();
         let mut value: serde_json::Value = serde_json::from_str(&checkpoint).unwrap();
         value["text_config"]["layer_types"][3] = serde_json::json!("linear_attention");
         let error = Config::compose(
             serde_json::from_value(value).unwrap(),
             serde_json::from_str(&decision).unwrap(),
             serde_json::from_str(&manifest).unwrap(),
+            serde_json::from_str(&preprocessor).unwrap(),
         )
         .unwrap_err()
         .to_string();
@@ -621,13 +839,14 @@ mod tests {
             ("temperature", serde_json::json!(0.5), "decision contract"),
             ("pooling", serde_json::json!("mean"), "decision contract"),
         ] {
-            let (checkpoint, decision, manifest) = package_json();
+            let (checkpoint, decision, manifest, preprocessor) = package_json();
             let mut decision: serde_json::Value = serde_json::from_str(&decision).unwrap();
             decision[field] = value;
             let error = Config::compose(
                 serde_json::from_str(&checkpoint).unwrap(),
                 serde_json::from_value(decision).unwrap(),
                 serde_json::from_str(&manifest).unwrap(),
+                serde_json::from_str(&preprocessor).unwrap(),
             )
             .unwrap_err()
             .to_string();
@@ -637,16 +856,46 @@ mod tests {
 
     #[test]
     fn rejects_a_manifest_parameter_mismatch() {
-        let (checkpoint, decision, manifest) = package_json();
+        let (checkpoint, decision, manifest, preprocessor) = package_json();
         let mut manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
         manifest["parameters"]["loaded"] = serde_json::json!(1u64);
         let error = Config::compose(
             serde_json::from_str(&checkpoint).unwrap(),
             serde_json::from_str(&decision).unwrap(),
             serde_json::from_value(manifest).unwrap(),
+            serde_json::from_str(&preprocessor).unwrap(),
         )
         .unwrap_err()
         .to_string();
         assert!(error.contains("manifest"), "{error}");
+    }
+
+    #[test]
+    fn rejects_wrong_multimodal_tokens_and_preprocessor_budgets() {
+        let (checkpoint, decision, manifest, preprocessor) = package_json();
+        let mut checkpoint: serde_json::Value = serde_json::from_str(&checkpoint).unwrap();
+        checkpoint["image_token_id"] = serde_json::json!(1);
+        let error = Config::compose(
+            serde_json::from_value(checkpoint).unwrap(),
+            serde_json::from_str(&decision).unwrap(),
+            serde_json::from_str(&manifest).unwrap(),
+            serde_json::from_str(&preprocessor).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("multimodal token IDs"), "{error}");
+
+        let (checkpoint, decision, manifest, preprocessor) = package_json();
+        let mut preprocessor: serde_json::Value = serde_json::from_str(&preprocessor).unwrap();
+        preprocessor["size"]["shortest_edge"] = serde_json::json!(3_136usize);
+        let error = Config::compose(
+            serde_json::from_str(&checkpoint).unwrap(),
+            serde_json::from_str(&decision).unwrap(),
+            serde_json::from_str(&manifest).unwrap(),
+            serde_json::from_value(preprocessor).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("preprocessor"), "{error}");
     }
 }
