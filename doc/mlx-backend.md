@@ -79,12 +79,13 @@ placing a model-name switch in the backend. Reuse the existing registry,
 
 ### Implemented text selections
 
-The `mlx` Cargo feature registers `metal_qwen3` and `metal_minicpm5` with
-`AutoModel`. `Device::Metal(N)` resolves a `metal_<family>` implementation; the CLI
-accepts `metal[:N]` and `mlx[:N]`, and displays `metal:N`; native MLX currently
-accepts only index 0 and rejects other indices before creating a stream. A missing feature,
-unsupported device or absent family implementation fails explicitly. Existing
-CPU/CUDA models do not silently execute a Metal request on CPU.
+The `mlx` Cargo feature registers `metal_qwen3`, `metal_minicpm5`, `metal_clef`
+and `metal_d3` with `AutoModel`. `Device::Metal(N)` resolves a `metal_<family>`
+implementation; the CLI accepts `metal[:N]` and `mlx[:N]`, and displays `metal:N`;
+native MLX currently accepts only index 0 and rejects other indices before
+creating a stream. A missing feature, unsupported device or absent family
+implementation fails explicitly. Existing CPU/CUDA models do not silently
+execute a Metal request on CPU.
 
 Metal admission requires a registered `metal_` factory and is resolved before
 device construction or checkpoint loading. It does not fall back to a legacy
@@ -92,8 +93,10 @@ generic model factory; CPU/CUDA registry fallback remains unchanged. Only the
 selected family parses `model_variant`, so adding a Metal family does not edit
 a central variant list. Explicit
 `--model-name metal_qwen3` and `--model-name metal_minicpm5` select these
-implementations. The original `qwen3`/`minicpm5` and `qwen3-mlx`/`minicpm5-mlx`
-selectors remain aliases on Metal; Qwen3 checkpoint detection still works.
+implementations, as does `--model-name metal_d3_lite` for the d3-lite port (the
+detected `d3` name already resolves to `metal_d3`). The original
+`qwen3`/`minicpm5` and `qwen3-mlx`/`minicpm5-mlx` selectors remain aliases on
+Metal; Qwen3 checkpoint detection still works.
 
 | Family selection | Profile admitted by current code | Actual prepared execution |
 | --- | --- | --- |
@@ -103,6 +106,7 @@ selectors remain aliases on Metal; Qwen3 checkpoint detection still works.
 | MiniCPM5 `bf16-public` | Official 2B BF16 geometry, B1, up to 4096 positions | Ordered device composition; source public SwiGLU remains locally compiled |
 | MiniCPM5 `bf16-compiled` (default) | Same profile | Local norm/RoPE and complete decode-step compilation, including the packed residual/RMSNorm kernel |
 | MiniCPM5 `dspark` | Same target plus the pinned official BF16 drafter; 1–256 output tokens within the context profile | Compiled five-layer draft and sequential Markov-head proposal chain, plus compiled target verification for up to eight rows; explicit accept/trim/pending-token schedule |
+| d3-lite `bf16` (default), also `auto` / `bf16-compiled` | `vllm-sr/d3-lite` BF16 text path: hidden 1024, 24 layers (18 GDN + 6 non-causal full attention), B1, up to 262144 positions, 255-code FP32 readout | Whole-request `Compiled` forward (`ids [1,L]`, `candidate_count [1]` → masked FP32 probabilities); one `(length, candidate_count)` profile traced on first use via `Compiled::prepare` and replayed without retracing; eager lazy graph retained for the compiled/eager acceptance test |
 
 These rows describe implemented scopes, not qualified targets. The maintained
 owners are [Qwen3](../crates/apxinf-model/src/metal_qwen3/README.md) and
@@ -123,6 +127,9 @@ cargo run --features mlx -- generate --model /path/to/MiniCPM5-2B \
   --asset draft=/path/to/official-DSpark --greedy \
   --chat-options '{"enable_thinking":false}' --max-tokens 80 \
   --prompt 'Explain gravity briefly.'
+
+cargo run --features mlx -- decide --model /path/to/d3-lite-9c10703 \
+  --device metal:0 --prompt 'Which option is correct?' --candidates 255
 ```
 
 The CLI renders the checkpoint chat template with the supplied options.
@@ -145,6 +152,22 @@ do not certify native shader/JIT behavior for every length. Qualification must
 separately check changed operands, unseen lengths, Metal parity, retained
 outputs and warm resources. The non-generative `SchemaDecisionRuntime` does not
 borrow the text runtime's readiness status or advertise a fabricated `Ready`.
+
+## d3-lite decision execution
+
+The `metal_d3` family compiles the **whole request** rather than a local seam:
+the forward is a single one-shot graph (embedding, 24 layers, final norm, FP32
+readout, masked softmax) with no decode and no KV cache, so there is no smaller
+repeated unit to qualify. `Compiled::prepare` traces and warms one exact
+`(length, candidate_count)` profile on first use; later requests with the same
+profile replay without a Rust trace callback, and a new length traces exactly
+once. The same body is available eagerly (`Model::eager_probabilities`) and the
+maintained ignored test compares the two, verifies replay stability and changed
+input propagation. Whole-request compilation is a new scope for this family —
+it is not inherited from Clef or Qwen3 — and is qualified by that test and by
+the 48-case gate rather than by those families' evidence. See the
+[P1a port report](d3-lite-metal.md) and the reusable
+[`d3_lite_bench`](../crates/apxinf-model/examples/d3_lite_bench.rs) entry.
 
 ## Native dependency and ABI
 
