@@ -264,6 +264,18 @@ Swapouts are dominated by the resident foreign Clef campaign; the sampler's
 episode-window total (+320 844 pages) differs from the snapshot delta (+586
 266) because the latter also covers the page/UI stage.
 
+**Same-image traffic preflight (vision-prefix reuse).** The closure audit asked
+P4 to quantify demo traffic before anyone implements the D3 counterpart of
+Clef's Tier-2 vision-prefix cache. SHA-256 over all 36 crops of this episode:
+**34 unique, 2 repeat occurrences (5.6 % of requests)** — under the `separate`
+protocol every request carries a different crop. Upper bound on end-to-end
+gain: 5.6 % hit rate × ≈34 % vision share ≈ **1.9 % < the 2 % KEEP gate** →
+**NOT-WORTH by hard bound on this workload**; no implementation follows.
+Caveats: one 12-decision no-jump trajectory, and a workload that asks several
+questions about the same frame (the `joint` protocol) is exactly what the
+one-image-per-request contract rejects today, so it would need re-measuring if
+that contract ever widens.
+
 ## 6. Comparison table — no speedup claim
 
 The two rows are different models — Clef Flash 9B (4-bit) and d3-lite
