@@ -26,6 +26,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Instant;
 
 use apxinf_core::{Error, Result};
 use apxinf_mlx::fusions::{
@@ -37,6 +38,7 @@ use super::config::{Config, Geometry, MAX_INPUT_TOKENS};
 use super::signpost;
 use super::vision::Vision;
 use super::weights::{Attention, GatedDelta, Mixer, Mlp, VisionWeights, Weights};
+use crate::decision::DecisionStageProfile;
 
 /// EngineTailor's `conv1d` option over the GDN causal convolution. `stock`
 /// keeps the composed MLX `conv1d` over an explicit zero history; `apxinf`
@@ -349,16 +351,40 @@ impl Model {
     /// One request: prepared compiled execution. The returned vector holds the
     /// first `count` option probabilities, in package code order.
     pub fn probabilities(&self, token_ids: &[u32], count: usize) -> Result<Vec<f32>> {
+        self.probabilities_profiled(token_ids, count)
+            .map(|(values, _)| values)
+    }
+
+    /// [`probabilities`](Self::probabilities) plus the host wall-clock
+    /// attribution of this call. `layout`/`vision` are zero and `forward +
+    /// sync` close against the call's own wall time.
+    pub fn probabilities_profiled(
+        &self,
+        token_ids: &[u32],
+        count: usize,
+    ) -> Result<(Vec<f32>, DecisionStageProfile)> {
         self.validate(token_ids, count)?;
+        let request = Instant::now();
         self.prepare_for(token_ids, count)?;
         let (ids, candidate_count) = self.inputs(token_ids, count)?;
         let _fwd = signpost_interval!(signpost::FORWARD, token_ids.len(), 0usize);
         let outputs = self.compiled.call_and_eval(&[ids, candidate_count])?;
         drop(_fwd);
+        let forward_ms = request.elapsed().as_secs_f64() * 1e3;
+        let sync = Instant::now();
         let _sync = signpost_interval!(signpost::SYNC, count);
         let probabilities = read_probabilities(&outputs[0], count)?;
         drop(_sync);
-        Ok(probabilities)
+        let sync_ms = sync.elapsed().as_secs_f64() * 1e3;
+        Ok((
+            probabilities,
+            DecisionStageProfile {
+                layout_ms: 0.0,
+                vision_ms: 0.0,
+                forward_ms,
+                sync_ms,
+            },
+        ))
     }
 
     /// Eager lazy-graph execution of the same `forward`, used to compare the
@@ -450,6 +476,24 @@ impl Model {
         token_ids: &[u32],
         count: usize,
     ) -> Result<Vec<f32>> {
+        self.image_probabilities_profiled(pixel_values, grids, token_ids, count)
+            .map(|(values, _)| values)
+    }
+
+    /// [`image_probabilities`](Self::image_probabilities) plus the host
+    /// wall-clock attribution of this call: `layout` is request validation
+    /// plus the multimodal layout walk, `vision` the eager tower's graph build
+    /// and blocking eval, `forward` the one-time profile trace, input uploads
+    /// and compiled call, and `sync` the probability readback. The four close
+    /// against the call's own wall time.
+    pub fn image_probabilities_profiled(
+        &self,
+        pixel_values: &[f32],
+        grids: &[[u32; 3]],
+        token_ids: &[u32],
+        count: usize,
+    ) -> Result<(Vec<f32>, DecisionStageProfile)> {
+        let layout = Instant::now();
         self.validate(token_ids, count)?;
         let merge = self.parts.vision_merge;
         if merge == 0 {
@@ -477,10 +521,12 @@ impl Model {
                     .into(),
             ));
         }
+        let layout_ms = layout.elapsed().as_secs_f64() * 1e3;
         // `vision` spans the tower's host graph build AND its blocking eval:
         // the lazy graph contributes no device time until it is evaluated, so
         // an eval left outside the span would leave the stage sum unable to
         // close.
+        let vision = Instant::now();
         let _vision = signpost_interval!(signpost::VISION, image_tokens);
         let features = self.parts.vision.forward(pixel_values, grids)?;
         let features = features.reshape(&[1, image_tokens, self.parts.geometry.hidden])?;
@@ -492,7 +538,9 @@ impl Model {
         // real feature value.
         self.stream().eval(&[features.clone()])?;
         drop(_vision);
+        let vision_ms = vision.elapsed().as_secs_f64() * 1e3;
 
+        let forward = Instant::now();
         self.prepare_image_for(length, count, image_tokens)?;
 
         let ids = token_ids
@@ -518,10 +566,22 @@ impl Model {
             run_start,
         ])?;
         drop(_fwd);
+        let forward_ms = forward.elapsed().as_secs_f64() * 1e3;
+
+        let sync = Instant::now();
         let _sync = signpost_interval!(signpost::SYNC, count);
         let probabilities = read_probabilities(&outputs[0], count)?;
         drop(_sync);
-        Ok(probabilities)
+        let sync_ms = sync.elapsed().as_secs_f64() * 1e3;
+        Ok((
+            probabilities,
+            DecisionStageProfile {
+                layout_ms,
+                vision_ms,
+                forward_ms,
+                sync_ms,
+            },
+        ))
     }
 
     /// `(length, count, image_tokens)` image profiles warmed so far.

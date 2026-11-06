@@ -198,6 +198,26 @@ pub struct SchemaDecisionOutput {
     pub answers: Vec<SchemaDecisionAnswer>,
 }
 
+/// Host wall-clock attribution of one decision call, in milliseconds.
+///
+/// The stages close: `layout + vision + forward + sync` matches
+/// [`CodeDecisionRuntime::decide`]'s own wall time up to the clock reads
+/// between stages (well under 1 µs). On an image request `layout` starts with
+/// the device→host pixel readback and then covers request validation and the
+/// multimodal layout walk; `vision` is the eager tower's graph build plus its
+/// blocking eval; `forward` is the one-time compiled-profile trace, the
+/// input-array uploads and the compiled call (text layers + FP32 readout);
+/// `sync` is the probability readback. On a text request `layout` and `vision`
+/// are zero, and `forward` carries validation, profile preparation and the
+/// compiled call.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DecisionStageProfile {
+    pub layout_ms: f64,
+    pub vision_ms: f64,
+    pub forward_ms: f64,
+    pub sync_ms: f64,
+}
+
 /// Encoded-prompt decisions: the caller tokenizes a complete prompt and the
 /// runtime scores the leading entries of its package code table (d3).
 pub trait CodeDecisionRuntime {
@@ -207,6 +227,11 @@ pub trait CodeDecisionRuntime {
     fn code_names(&self) -> &[String];
     /// Token IDs for each package code.
     fn token_ids(&self) -> &[u32];
+    /// Attribution of the most recent [`decide`](Self::decide) call, when the
+    /// runtime records stages. Defaults to `None`.
+    fn last_stage_profile(&self) -> Option<DecisionStageProfile> {
+        None
+    }
 }
 
 /// Named-schema decisions: the runtime encodes the state and typed questions

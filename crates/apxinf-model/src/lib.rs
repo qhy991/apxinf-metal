@@ -4,8 +4,8 @@ mod accelerator;
 pub mod auto;
 pub mod builtin;
 pub mod d3;
-pub mod decision;
 pub mod debug;
+pub mod decision;
 mod generation_config;
 pub mod gr00t;
 #[cfg(feature = "hip")]
@@ -39,12 +39,12 @@ pub use d3::{
     D3Config, D3DecisionConfig, D3PackageConfig, D3TextConfig, D3VisionConfig,
     D3_DEFAULT_TEXT_PROFILE_LIMIT, D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
 };
+pub use debug::{DebugCapture, DebugConfig};
 pub use decision::{
     CodeDecisionRuntime, DecisionInput, DecisionModel, DecisionOutput, DecisionQuestion,
-    DecisionRuntime, DecisionSchema, DecisionScore, SchemaDecisionAnswer, SchemaDecisionOutput,
-    SchemaDecisionRuntime, SchemaDecisionScore,
+    DecisionRuntime, DecisionSchema, DecisionScore, DecisionStageProfile, SchemaDecisionAnswer,
+    SchemaDecisionOutput, SchemaDecisionRuntime, SchemaDecisionScore,
 };
-pub use debug::{DebugCapture, DebugConfig};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};
 #[cfg(feature = "cuda")]
 pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};
