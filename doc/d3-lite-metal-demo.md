@@ -299,7 +299,8 @@ than estimated.
 
 | Check | Result |
 | --- | --- |
-| `cargo check --locked --features mlx` (root, bins) | **pass** on this host. The Linux feature-isolation CI job runs the same command; there the server's live body is cfg-gated out (Apple Silicon + `mlx`) and the documented stub compiles instead |
+| `cargo check --locked --features mlx` (root, bins) | **pass** here **and in CI** — `linux-feature-isolation` (Ubuntu) **pass, 1 m 8 s**: there the server's live body is cfg-gated out (Apple Silicon + `mlx`) and the documented refusing stub compiles |
+| `cpu-contracts` / `layering` CI jobs | **pass** (15 s / 7 s) |
 | `cargo check --locked -p apxinf-model --features mlx --lib --examples` | **pass** |
 | `cargo test -p apxinf-tokenizer --lib` | **pass — 9/9**, incl. `json_dumps_matches_python_default_spelling` |
 | `cargo test -p apxinf-model --features mlx --lib metal_d3_lite::format::tests` | **pass — 10 passed, 1 ignored** (the reference test) |
