@@ -17,10 +17,11 @@ operator timeline for the Clef side).
 - Clean campaign, 3/3 rounds, all six arms `Swapouts = 0`, decision sequences identical:
   serial **643 ms** vs pooled **590 ms** per decision → **+8.42 %**, CI **[+7.97, +8.94]**
   on decisions 2–12 (Opus's pre-declared judged set). `p_bits` bitwise-equal for every request.
-- **Cost carried, not hidden:** decision 1 is **−33 %** (≈ +500 ms) because each worker thread
-  independently fills the Tier-1 prefix; the all-12 CI consequently crosses zero
-  ([−28.4, +8.9]). Removing the startup penalty (a shared or prewarmed fill) is the immediate
-  next optimization target and would make the all-decisions gate pass too.
+- **Cost carried, not hidden:** decision 1 is **−33 %** (≈ +500 ms); the all-12 CI
+  consequently crosses zero ([−28.4, +8.9]). The mechanism was later corrected — see §10: it
+  is the first-use compiled-profile setup, not a prefix fill (`metal_d3_lite` has no prefix
+  cache). The §10 follow-up removes it with a **symmetric** load-time warm, after which the
+  all-decisions gate passes at **+9.40 % [9.10, 9.80]**.
 - Activation is opt-in: `--concurrency N` / `APXINF_DECIDE_CONCURRENCY` on the decide-server and
   `MARIO_CLEF_PARALLEL=1` on the bridge; memory cost is **N × model** (~5.7 GiB at N = 3).
 - Clef auto-tier: one decision recorded; `f` = 11.5–55 % (above Opus's pursue bar) but
@@ -204,10 +205,10 @@ rounds only.
 
 - **clean rounds = [0] (1/3)** → the ≥2-clean rule is not met; `keep: false` → **INCONCLUSIVE**.
 - The clean round-0 pair gives **median paired gain +6.743 %** (12 decisions, 58.3 % faster),
-  CI [−48.013, +9.106]. The lower tail is the Tier-1 **miss** decisions: a chunk0 fill is paid
-  on the concurrent arm's worker (up to 2381 ms vs 1515 ms serial) — the same bimodal
-  hit/miss structure recorded in the clean re-measure §2. With only 12 decisions the bootstrap
-  median can land in the miss mass; that is a power problem, not evidence against the effect.
+  CI [−48.013, +9.106]. The lower tail is the cold **decision-1** rows: the first-use
+  compiled-profile setup costs more when the three workers contend (up to 2381 ms vs 1515 ms
+  serial; the mechanism and fix are §10). With only 12 decisions the bootstrap median can
+  land in that mass; that is a power problem, not evidence against the effect.
 - **All six arms produced the same decision sequence** (`all_decision_sequences_identical:
   true`), and the implementation's `p_bits` comparison was bitwise-equal for all six requests
   (§5.1).
@@ -247,16 +248,19 @@ sequence.
   `host_prep` passes (~13 ms each) hide behind the first request's GPU window, and MLX's
   thread-local default streams give the three requests **separate Metal command queues** (§4)
   so their GPU work is eligible to interleave.
-- **Decision 1 is 33 % slower** because each worker thread owns its own prefix cache and
-  independently performs the chunk0 fill; the serial arm fills once and hits thereafter. This
-  is a one-time per-process startup cost, not a steady-state cost.
-- The all-12 CI crosses zero for exactly that reason: ~1/3 of the 36 decisions are the three
-  decision-1 rows (and the few cache misses), and bootstrap resamples that over-represent
-  them drag the lower tail to −28 %. The median itself never goes negative.
+- **Decision 1 is 33 % slower** — a one-time per-process startup cost, not a steady-state
+  cost. (The mechanism was later corrected in §10: `metal_d3_lite` has no prefix cache; the
+  cost is the first-use compiled-profile setup, which becomes ~2× more expensive when three
+  workers contend on the GPU — t₂/vision/t₃, not the compile lock.)
+- The all-12 CI crosses zero for exactly that reason: 3 of the 36 decisions are the
+  decision-1 rows, and bootstrap resamples that over-represent them drag the lower tail to
+  −28 %. The median itself never goes negative.
 - **Verdict: KEEP on the pre-declared steady-state set** (`median ≥ 2 %`, `CI lower > 0`,
   `3/3 clean`, exact decision-sequence and `p_bits` parity). The startup penalty is a material
-  cost reported alongside it, not hidden; it also sets the next optimization target (a shared
-  or prewarmed prefix fill would remove it and make the all-12 CI pass as well).
+  cost reported alongside it, not hidden; it also sets the next optimization target — which
+  §10 then executes: the penalty turns out to be the first-use compiled-profile setup (there is
+  no prefix cache in `metal_d3_lite`), and a symmetric load-time warm removes it so the all-12
+  CI passes as well.
 
 ## 7. Clef auto-tier decision timeline
 
@@ -365,3 +369,146 @@ the original is preserved at `bridge/clef_local.orig.py`, its sha256
 (`125c0dae…9fac3c`) is recorded, and the change is reproducible from this report. The Clef
 auto-tier cache used by the timeline lives at `/tmp/clef-ane-cache-notworth-reqpar` (task-specific,
 regenerable).
+
+## 10. Symmetric load-time warmup — removing the decision-1 penalty (assignments 6–7, 2026-11-06)
+
+§6's pooled arm improved decisions 2–12 but decision 1 was **−33 %** (1507 → ~2000 ms), which
+pulled the all-12 CI across zero. The first code inspection of this follow-up found the earlier
+diagnosis was **wrong**: `metal_d3_lite` has *no* prefix/KV cache ("no decode and no KV cache"),
+so there were no "three independent prefix fills" to share. The penalty is the first-use
+compiled-profile setup — `Compiled::prepare` traces, compiles, Metal-JITs and runs the forward
+twice on zero inputs, all in `forward_ms` — and there are exactly **3 shapes** (one per question:
+crop size and prompt text are fixed).
+
+### 10.1 Opus adjudication
+
+One call this leg: brief 2629 B, `-e medium -t 300` → **success in 178 s, 7867 B**
+(`~/apxinf-runtime/opus-calls.log`: `2026-11-06T12:59:36Z effort=medium prompt_bytes=2629
+out_bytes=7867 dur=178s rc=0`; full text `devlocal/notworth-audit/firstframe/opus-design.md`).
+
+| Rank | Option | Disposition |
+| --- | --- | --- |
+| **1** | Question-affine workers + load-time warm (each worker runs **one full synthetic `decide`** per owned shape before the single `ready`; serial warms all 3) | **Adopted** |
+| **2** | Session-start warmup in the bridge | **Adopted with #1** (the actual player win) |
+| 3 | Any worker + warm all 3 shapes on every worker (9 warms) | Declined — same Δ, +2–3 s to `ready` |
+| 4 | Shape bucketing / padded crops | **Rejected** — padding changes the resize grid, `image_tokens`, vision attention and text length, so `p_bits` cannot stay bit-identical to unpadded serial |
+
+**Fairness rule (adopted):** whatever warmup the pooled arm gets, the serial arm gets the **same
+on the same clock** — warming only pooled would show +17 % that is an accounting artifact, not
+parallelism. Opus also required the t₁/t₂/t₃ instrumentation below and a product falsifier: if,
+with warm-start shipped, the pooled median first click is worse than serial's, the parallelism
+gain is eaten by startup in the case the player actually experiences.
+
+### 10.2 Implementation
+
+Additive, 4 tracked files (**+517 / −95**), no other crate's public behaviour changed:
+
+| Site | Change |
+| --- | --- |
+| `apxinf-mlx/src/array.rs` | `Compiled::prepare_timed` — existing `prepare` plus the host wall of its two `call_and_eval`s `(t₁, t₂)` |
+| `apxinf-model/src/decision.rs` | `DecisionStageProfile` gains additive `t1_ms/t2_ms/t3_ms: Option<f64>` (set only on the first request of a shape) |
+| `metal_d3_lite/model.rs` | `prepare_profile_timed` / `prepare_image_profile` return `(t₁, t₂)`; the real request call is timed as t₃; no behaviour change |
+| `src/bin/apxinf-decide-server.rs` | `--warm-shapes <file>` / `APXINF_DECIDE_WARM_SHAPES`; load-time full synthetic `decide` per owned shape before `ready` (serial warms all 3, pooled worker `i` owns shape `i` mod N); **per-question worker queues** with least-loaded lazy-prepare fallback for unknown shapes; `ready` gains `warm_ms`, `load_ms` now reports load+warm |
+| demo `clef_local.py` (external WIP; original snapshotted `0d4a8143…`) | spawn/ready/first-response epochs written to `APXINF_DECIDE_TIMING_FILE` on close; `MARIO_CLEF_WARM_START=1` starts the worker at backend init (`Session.reset`) |
+| campaign runner (devlocal) | `--warm-shapes` + `MARIO_CLEF_WARM_START=1` on **both** arms; gate = all-12 median ≥2 % AND CI lower >0 AND decisions 2–12 CI lower ≥ +6 % AND all sequences identical AND ≥2 clean rounds; first-click and per-run Δ reported |
+
+The warm manifest (`devlocal/notworth-audit/firstframe/warm-shapes.json`) is **derived** from
+the demo's checked-in `bridge.CROP_SPECS` (enemy 64×80, obstacle 64×48, gap 96×64) upscaled by
+the demo's `scale = ceil(280/min)`, plus `clef_local.DEFAULT_STATE` and the per-question
+instructions; the derivation records source paths, sha256s and the demo revision (`08a3aa3`). A
+full synthetic request is used — not a zero-feature `prepare_image_profile` — because the vision
+tower is eager and a zero-feature prepare does not warm its first-use Metal JIT.
+
+### 10.3 t₁/t₂/t₃ attribution — explanation (B), GPU contention
+
+Ten deliberately **unwarmed** sessions (5 serial + 5 pooled) in a clean window
+(`devlocal/notworth-audit/firstframe/attribution/summary.json`: 10/10, `clean_window: true`,
+`p_bits` equal in every session). Slowest-worker medians:
+
+| term | serial | pooled | excess |
+| --- | ---: | ---: | ---: |
+| trace/compile (`t₁ − t₂`) | 14.79 ms | 97.65 ms | **+82.9 ms** |
+| prepare replay GPU (`t₂`) | 142.48 ms | 413.63 ms | **+271.2 ms** |
+| real request (`t₃`) | 142.74 ms | 242.06 ms | **+99.3 ms** |
+| vision | 82.03 ms | 211.72 ms | **+129.7 ms** |
+| request latency | 527.32 ms | 1322.69 ms | +795.4 ms |
+
+Opus's rule was "traces explain the +500 ms if pooled `t₁−t₂` exceeds serial by ~+400–500 ms; it
+is GPU contention if the excess sits in t₂, t₃ or vision". The compile excess is only **+83 ms**;
+the excess is in **t₂ (+271** — prepare's zero-input forwards competing with the other
+workers**)**, vision (+130) and t₃ (+99). **Explanation (B) holds.** Warm-at-load fixes
+decision 1 in either case, but the earlier "compile is serialized" story is corrected to what
+was measured.
+
+### 10.4 Campaign — serial vs pooled, both warmed (the gate)
+
+`devlocal/notworth-audit/req-parallel/campaigns/warm-affine/summary.json`: **3/3 clean rounds,
+all six arms `Swapouts = 0`**, `all_decision_sequences_identical: true`, every decision faster.
+
+| arm | r0 median | r1 median | r2 median | steady (2–12) |
+| --- | ---: | ---: | ---: | ---: |
+| serial (N=1, warmed) | 612.62 | 613.62 | 613.89 | 613.61 |
+| pooled (N=3, warmed) | **553.67** | **554.76** | **558.35** | 553.29 |
+
+| statistic | median | CI 95 % | faster |
+| --- | ---: | ---: | ---: |
+| **all 12 decisions (the gate)** | **+9.402 %** | **[+9.098, +9.796]** | 36/36 |
+| decisions 2–12 | +9.599 % | [+9.101, +9.941] | 33/33 |
+| per-run Δ (sum 1–12) | +9.13 % | — | 3/3 |
+
+All five gate conditions hold (`clean_rounds_ge_2`, `all12_median_ge_2pct`,
+`all12_ci_lo_gt_0`, `steady2_12_ci_lo_ge_6pct`, `all_decision_sequences_identical`) →
+**`keep: true`**. The decision-1 penalty is gone: with symmetric warming both arms' decision 1
+is steady, so **all 12** decisions are faster and the all-12 CI that failed at [−28.4, +8.9] in
+§6 is now [9.10, 9.80]. `p_bits` were bitwise-equal for all six requests in the warmed battery
+runs (same `3e3f8b40` / `3e2dc0f7` / `3e4c3fe0` as the pre-warm baseline), and the pooled arms
+completed out of request order (`[1,4,5,3,2,6]`, `[1,3,2,…]`) while staying bit-exact.
+
+### 10.5 Before / after operator timeline (refreshed)
+
+[`doc/d3-request-parallelism-timeline.png`](d3-request-parallelism-timeline.png) (1856 × 1166) is
+re-recorded from the **warmed** configuration of both arms (same recorder, same 6 file-fed
+requests; both recordings `Swapouts`-clean: 0 / 0). The lane picture shows three request bars
+sequential before and overlapping after, now with decision 1 steady on both sides.
+
+**Caveat carried in the figure:** under `xctrace` the pooled arm's window is still inflated
+(tracer overhead on three in-flight command queues: ~450 ms/request in the recording vs ~185 ms
+in the campaign), so the panel's metric table is **structural evidence, not a latency verdict**;
+§10.4 is the verdict.
+
+### 10.6 First click — the material limitation
+
+The timing side-channel (`APXINF_DECIDE_TIMING_FILE`), medians over the 3 clean rounds:
+
+| arm | median spawn→ready | median reset→ready | median first response |
+| --- | ---: | ---: | ---: |
+| serial | 1861 ms | 1863 ms | **2061 ms** |
+| pooled | 2045 ms | 2047 ms | **2511 ms** |
+
+The pooled mode's **first response is ~450 ms (22 %) worse** than serial's even with symmetric
+warm-start: three model loads add ~180 ms to `ready`, and the first request contends 3-way. This
+is Opus's product falsifier. The §10.4 KEEP is therefore a **steady-state / long-session KEEP,
+not a reason to default the mode on**: `--concurrency` and `MARIO_CLEF_PARALLEL` stay opt-in,
+and the enabling fix is to move the pooled spawn+warm off the player's critical path (spawn at
+page load rather than `Session.reset`, or load earlier/in parallel). The headless
+`evaluate.py` path cannot absorb the startup wait the way a page-load-to-first-click gap can, so
+this was not measured beyond the numbers above.
+
+### 10.7 Verification and cost
+
+- `cargo check --locked --features mlx`, release build, `rustfmt --check` on all 4 changed files:
+  **pass**.
+- Battery (`devlocal/notworth-audit/firstframe/results/battery.json`): `--concurrency 0`
+  rejected; serial-warm ready `load_ms` 2267.4 / `warm_ms` 1567.5 with steady
+  197.9/190.2/232.4 ms requests; pooled-warm and pooled-env-warm (env-activated pool) both give
+  6 responses with equal `p_bits`; bad checkpoint at N=3 → one error line, exit 1.
+- Demo tests `test_clef_local test_backend`: **21/21 pass** (19 pre-existing + 2 new), re-run
+  after the host restart.
+- Attribution 10/10 in a clean window (§10.3); both warmed xctrace recordings `Swapouts` 0; PNG
+  re-rendered with the caveat.
+- **Opus: 1 call** this leg (medium, 178 s, 7867 B). The assignment-5 240 s gateway timeout is
+  not part of this leg.
+- Cost: 4 tracked files +517/−95; 3-round campaign (6 episodes) + 10 attribution sessions + 2
+  warmed xctrace recordings; one host restart interrupted the session and was recovered
+  (assignment 7) **without repeating** the completed Opus call, implementation, attribution or
+  campaign.
