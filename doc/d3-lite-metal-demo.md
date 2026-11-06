@@ -256,8 +256,15 @@ episode decision 1 read 6100 ms.
 | 11 | 177 | run | 617.0 | 2 344 | 0.096 / 0.255 / 0.136 |
 | 12 | 195 | run | 619.6 | 5 208 | 0.142 / 0.224 / 0.102 |
 
-Decision 1 includes worker start (model load) plus the first trace of all three
-`(length, count, image_tokens)` profiles; decisions 2–12 are steady-state.
+Decision 1 is the first request of each of the three
+`(length, candidate_count, image_tokens)` shapes, so it pays each shape's
+compiled-profile trace; decisions 2–12 are steady-state. **Correction
+(2026-11-06):** it does **not** include the resident worker's model load —
+`ClefLocalWorker.ask` calls `_ensure_started()` *before* it starts its own
+clock, so `steps.json` `latency_ms` sums only per-request time. The load
+instead lands in the player-visible first-step wall; P4's own page check shows
+the split directly (`latency_ms` 2117.8 ms vs first-step wall 3546.3 ms, i.e.
+≈1.4 s of spawn→ready).
 **Every decision's window recorded Swapouts > 0**, so the whole episode is
 contaminated and the median is a reference, not a clean-window baseline. The
 Swapouts are dominated by the resident foreign Clef campaign; the sampler's
@@ -300,6 +307,30 @@ episode in a clean window (`Swapouts` delta 0, foreign processes 0):
 **613.6 ms** median per decision and a **197.6 ms** request median. See
 [d3-lite-demo-clean-remeasure.md](d3-lite-demo-clean-remeasure.md); the clean
 numbers above supersede the contaminated row for baseline purposes.
+
+**Independent confirmation (P4 ticket, `d3lite-clean-001`, also `Swapouts`
+delta 0 / foreign 0 / `harness_killed=0`):** median **615.07 ms** per
+decision (steady 614.60; 610.13–622.59), 613.37 ms derived from its stage
+replay — **0.24 % above** the merged 613.6 ms, with all **36/36 crop
+SHA-256 hashes and probabilities byte-identical** to P4 and to the re-measure
+trajectory. Two independent clean windows agreeing to <0.3 % is the A/A check
+the baseline lacked; its stage medians (host prep 12.35 / vision 58.91 /
+compiled forward 122.88 ms → shares 6.4 / 30.3 / 63.2 %) match the re-measure
+within 1 ms per stage. Evidence: `devlocal/mario-demo-adapt/runs/
+d3lite-clean-001/{verdict.txt,analysis.json,stages-replay/}` (ignored;
+`analysis.json` is byte-reproducible from its harness script).
+
+**First-frame boundary (applies to both clean records).** The reported
+first-decision `latency_ms` **excludes worker load**; in the independent run
+1459.23 ms decomposes as three cold requests **1438.08 ms** (enemy 479.40 /
+obstacle 437.94 / gap 520.75) + 21.14 ms client/IPC residual (1.45 %), of
+which **825.41 ms is the compiled-profile trace** — all in `forward`,
+`host_prep` unchanged (n = 1). Worker spawn → ready (702.0 ms server-self /
+1321.1 ms external in that window) is what the page's first click pays, so the
+real first-frame cost is ≈ **2.8 s** before python/session/crop setup, not
+"load + 1459 ms inside the reported latency". P4's 6100.5 ms was the same
+cold requests while the window evicted 235 708 pages to swap (≈4.6 s of swap
+I/O) — contamination, not a cold-start property.
 
 ## 7. Verification
 
