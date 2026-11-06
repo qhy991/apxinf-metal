@@ -66,6 +66,34 @@ const GDN_CORE_IMAGE_VALUES: &[&str] = &["four_values", "eight_lanes"];
 const GDN_CORE: &str = "APXINF_D3_GDN_CORE";
 const GDN_CORE_IMAGE: &str = "APXINF_D3_GDN_CORE_IMAGE";
 
+/// How much of the final layer the single readout row is allowed to delete.
+///
+/// The readout pools the **last** position (`POOLING: last`), so no later
+/// layer and no consumer reads rows `0..L-1` of the final layer's output. The
+/// final layer is a full-attention layer, and it is the only layer that can
+/// be reduced to one row: the GatedDeltaNet layers are recurrent over the
+/// prompt, so each of their output rows feeds the next row's state.
+///
+/// - `full` (default) projects only the last token's q / gate, runs one
+///   attention row against the **whole** prompt's k / v (the final attention
+///   is non-causal, so the readout row must attend to every token) and then
+///   one row of `o_proj` and the MLP. It deletes the most work, turns five
+///   GEMMs (q, o_proj and the three MLP projections) into GEMVs, and is this
+///   leg's KEEP configuration (`doc/d3-lite-metal-last-row.md`).
+/// - `off` keeps the reference shape end to end.
+/// - `attn` keeps the full attention output and slices it before `o_proj`, so
+///   only `o_proj` and the MLP shrink. It exists to separate a GEMV-rounding
+///   drift from a different one-row SDPA kernel if `full` misses a gate.
+const LAST_ROW_VALUES: &[&str] = &["full", "off", "attn"];
+const LAST_ROW: &str = "APXINF_D3_LAST_ROW";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LastRow {
+    Off,
+    Full,
+    Attn,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Conv1d {
     Stock,
@@ -126,6 +154,10 @@ struct Parts {
     /// composes it from MLX primitives inside `gated_delta_forward`.
     conv1d: Conv1d,
     causal_conv: Option<CausalDepthwiseConv>,
+    /// How far the final layer may shrink to the readout's single row
+    /// (`APXINF_D3_LAST_ROW`); both callables share it, because the text and
+    /// image paths run the same `stack` under different rotary arguments.
+    last_row: LastRow,
     rope: HalfSplitRope,
     inv_freq: Array,
     stream: Stream,
@@ -207,6 +239,22 @@ impl Model {
         };
         let recurrence = make_recurrence(GDN_CORE, GDN_CORE_VALUES)?;
         let recurrence_image = make_recurrence(GDN_CORE_IMAGE, GDN_CORE_IMAGE_VALUES)?;
+        let last_row = match LAST_ROW_VALUES[env_gate(LAST_ROW, LAST_ROW_VALUES)?] {
+            "off" => LastRow::Off,
+            "full" => LastRow::Full,
+            "attn" => LastRow::Attn,
+            other => unreachable!("the last-row list only names known depths: {other}"),
+        };
+        // The prune is exact only for a full-attention final layer; the
+        // recurrent layers would need every row's state. d3-lite's layer 23
+        // is attention, so this rejects a checkpoint whose schedule differs
+        // rather than silently keeping the reference shape with the gate on.
+        if last_row != LastRow::Off && !geometry.is_attention(geometry.layers - 1) {
+            return Err(Error::Contract(
+                "APXINF_D3_LAST_ROW needs a full-attention final layer; the final GatedDeltaNet \
+                 layer's state is recurrent over the prompt",
+            ));
+        }
         let causal_conv = match conv1d {
             Conv1d::Stock => None,
             Conv1d::ApxInf => Some(CausalDepthwiseConv::new(&stream)?),
@@ -222,6 +270,7 @@ impl Model {
             recurrence_image,
             conv1d,
             causal_conv,
+            last_row,
             rope: HalfSplitRope::new(&stream, geometry.rope_dims)?,
             inv_freq: inverse_frequencies(&stream, geometry)?,
             stream: stream.clone(),
@@ -849,6 +898,12 @@ fn image_forward(
 /// ending at the final RMSNorm. The op order is shared by the text and image
 /// callables; they differ in the rotary arguments and, independently, in the
 /// GDN recurrence layout each path is allowed to use.
+///
+/// The last layer may shrink to the readout's single row (`APXINF_D3_LAST_ROW`):
+/// its mixer returns one row, the residual stream is sliced to that row, and
+/// `post_norm`, the MLP and the final norm run on `[1, 1, hidden]` instead of
+/// `[1, L, hidden]`. Every earlier layer still sees the full prompt, because
+/// the final attention's k / v come from the whole sequence.
 fn stack(
     parts: &Parts,
     mut hidden: Array,
@@ -857,20 +912,35 @@ fn stack(
 ) -> Result<Array> {
     let geometry = parts.geometry;
     let length = hidden.shape()[1];
+    let final_layer = parts.weights.layers.len() - 1;
     for (index, layer) in parts.weights.layers.iter().enumerate() {
+        // A one-token prompt has no rows to delete; keep the reference shape
+        // so the pruned callable is still defined for it.
+        let prune = if index == final_layer && length > 1 {
+            parts.last_row
+        } else {
+            LastRow::Off
+        };
         let normalized = hidden.fast_rms_norm(&layer.input_norm, geometry.eps)?;
         let mixed = if geometry.is_attention(index) {
             let Mixer::Attention(attention) = &layer.mixer else {
                 unreachable!("the validated schedule selects attention here")
             };
-            attention_forward(parts, &normalized, attention, rope)?
+            attention_forward(parts, &normalized, attention, rope, prune)?
         } else {
             let Mixer::GatedDelta(gated_delta) = &layer.mixer else {
                 unreachable!("the validated schedule selects gated delta here")
             };
             gated_delta_forward(parts, recurrence, &normalized, gated_delta, length)?
         };
-        let residual = hidden.add(&mixed)?;
+        let residual = if prune == LastRow::Off {
+            hidden.add(&mixed)?
+        } else {
+            // Only the readout row survives, so drop the other residual rows
+            // now instead of carrying them through the MLP and the final norm.
+            debug_assert_eq!(mixed.shape()[1], 1, "the pruned mixer returns one row");
+            hidden.slice_axis(1, length - 1, length)?.add(&mixed)?
+        };
         let mlp_input = residual.fast_rms_norm(&layer.post_norm, geometry.eps)?;
         let mlp_output = mlp_forward(&mlp_input, &layer.mlp)?;
         hidden = residual.add(&mlp_output)?;
@@ -1078,22 +1148,37 @@ fn attention_forward(
     input: &Array,
     attention: &Attention,
     rope: &RopeMode<'_>,
+    prune: LastRow,
 ) -> Result<Array> {
     let geometry = parts.geometry;
     let [1, length, _] = *input.shape() else {
         return Err(Error::Contract("d3-lite attention input must be [1, L, H]"));
     };
-    // One packed projection yields queries and the output gate: `[B, L, 2*heads*head_dim]`.
-    let projected = project(input, &attention.q.weight)?.reshape(&[
+    // `full` projects only the readout token's q / gate. The rotary position
+    // must be the *last* one (`L - 1`), never a fresh `arange(0, 1)`: a
+    // position-0 readout rotates the query by the wrong angle and drifts
+    // quietly instead of failing.
+    let last_row = matches!(prune, LastRow::Full);
+    let query_input = if last_row {
+        last_row_slice(input, length, 1)?
+    } else {
+        input.clone()
+    };
+    let query_length = query_input.shape()[1];
+    // One packed projection yields queries and the output gate: `[B, T, 2*heads*head_dim]`.
+    let projected = project(&query_input, &attention.q.weight)?.reshape(&[
         1,
-        length,
+        query_length,
         geometry.q_heads,
         2 * geometry.head_dim,
     ])?;
     let queries = projected.slice_axis(3, 0, geometry.head_dim)?;
     let gate = projected
         .slice_axis(3, geometry.head_dim, 2 * geometry.head_dim)?
-        .reshape(&[1, length, geometry.q_heads * geometry.head_dim])?;
+        .reshape(&[1, query_length, geometry.q_heads * geometry.head_dim])?;
+    // k / v always cover the whole prompt: the final attention is non-causal,
+    // so the readout row attends to every token, and earlier layers are
+    // unaffected because they run before this one.
     let keys = project(input, &attention.k.weight)?;
     let values = project(input, &attention.v.weight)?;
     let queries = queries
@@ -1107,14 +1192,41 @@ fn attention_forward(
         .reshape(&[1, length, geometry.kv_heads, geometry.head_dim])?
         .transpose(&[0, 2, 1, 3])?;
     let (queries, keys) = match rope {
-        RopeMode::HalfSplit(positions) => (
-            parts.rope.call(&queries, positions, &parts.inv_freq)?,
-            parts.rope.call(&keys, positions, &parts.inv_freq)?,
-        ),
-        RopeMode::Mrope { cos, sin } => (
-            mrope_apply(&queries, cos, sin, geometry.rope_dims)?,
-            mrope_apply(&keys, cos, sin, geometry.rope_dims)?,
-        ),
+        RopeMode::HalfSplit(positions) => {
+            let query_positions;
+            let positions_for_queries: &Array = if last_row {
+                query_positions = last_row_slice(positions, length, 1)?;
+                &query_positions
+            } else {
+                positions
+            };
+            (
+                parts
+                    .rope
+                    .call(&queries, positions_for_queries, &parts.inv_freq)?,
+                parts.rope.call(&keys, positions, &parts.inv_freq)?,
+            )
+        }
+        RopeMode::Mrope { cos, sin } => {
+            let query_cos;
+            let query_sin;
+            let (cos_for_queries, sin_for_queries): (&Array, &Array) = if last_row {
+                query_cos = last_row_slice(cos, length, 0)?;
+                query_sin = last_row_slice(sin, length, 0)?;
+                (&query_cos, &query_sin)
+            } else {
+                (cos, sin)
+            };
+            (
+                mrope_apply(
+                    &queries,
+                    cos_for_queries,
+                    sin_for_queries,
+                    geometry.rope_dims,
+                )?,
+                mrope_apply(&keys, cos, sin, geometry.rope_dims)?,
+            )
+        }
     };
     // d3's full-attention layers are explicitly non-causal over the prompt.
     let output = queries.sdpa(
@@ -1126,10 +1238,28 @@ fn attention_forward(
     )?;
     let output = output.transpose(&[0, 2, 1, 3])?.reshape(&[
         1,
-        length,
+        query_length,
         geometry.q_heads * geometry.head_dim,
     ])?;
+    // `attn` has already paid for the full attention; the readout needs only
+    // its last row, so `o_proj` and the MLP shrink and nothing else changes.
+    let (output, gate) = if prune == LastRow::Attn {
+        (
+            last_row_slice(&output, length, 1)?,
+            last_row_slice(&gate, length, 1)?,
+        )
+    } else {
+        (output, gate)
+    };
     project(&output.mul(&gate.sigmoid()?)?, &attention.o.weight)
+}
+
+/// Slice the final row off `tensor`'s `axis`: the rotary position (or the
+/// hidden row) the readout actually consumes. Slicing the real tensor keeps
+/// the token's index (`L − 1`); building a fresh one-row range here would
+/// silently rotate it as position 0.
+fn last_row_slice(tensor: &Array, length: usize, axis: usize) -> Result<Array> {
+    tensor.slice_axis(axis, length - 1, length)
 }
 
 #[cfg(test)]
@@ -1146,6 +1276,7 @@ mod tests {
             ("APXINF_D3_CONV1D", CONV1D_VALUES),
             (GDN_CORE, GDN_CORE_VALUES),
             (GDN_CORE_IMAGE, GDN_CORE_IMAGE_VALUES),
+            (LAST_ROW, LAST_ROW_VALUES),
         ] {
             assert_eq!(parse_gate(None, values, name).unwrap(), 0, "{name} unset");
             for (index, value) in values.iter().enumerate() {
@@ -1165,6 +1296,36 @@ mod tests {
         }
         // The two D3 gates have distinct value lists; the parse is generic.
         assert_ne!(CONV1D_VALUES, GDN_CORE_VALUES);
+        // This leg's KEEP configuration is the default; `off` reproduces the
+        // reference shape for the gate-off drift probe.
+        assert_eq!(LAST_ROW_VALUES[0], "full");
+    }
+
+    /// The pruned final layer must rotate its query with the prompt's last
+    /// position. A fresh one-row range (position 0) is the silent failure this
+    /// slice exists to prevent, so the test pins both shape and value.
+    #[test]
+    fn last_row_slice_keeps_the_final_position() {
+        let stream = stream();
+        let positions = Array::arange(&stream, 0.0, 7.0, 1.0, MlxDType::I32)
+            .unwrap()
+            .reshape(&[1, 7])
+            .unwrap();
+        let sliced = last_row_slice(&positions, 7, 1).unwrap();
+        stream.eval(&[sliced.clone()]).unwrap();
+        assert_eq!(sliced.shape(), &[1, 1]);
+        let values = sliced.cast(MlxDType::F32).unwrap().to_f32_vec().unwrap();
+        assert_eq!(values, vec![6.0]);
+
+        // The mRoPE cos/sin tables slice on axis 0 with the same rule.
+        let table = Array::arange(&stream, 0.0, 21.0, 1.0, MlxDType::F32)
+            .unwrap()
+            .reshape(&[7, 3])
+            .unwrap();
+        let row = last_row_slice(&table, 7, 0).unwrap();
+        stream.eval(&[row.clone()]).unwrap();
+        assert_eq!(row.shape(), &[1, 3]);
+        assert_eq!(row.to_f32_vec().unwrap(), vec![18.0, 19.0, 20.0]);
     }
 
     #[test]

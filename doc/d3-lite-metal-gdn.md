@@ -23,6 +23,7 @@ discipline, and land the configuration that passes every declared gate.
 | `APXINF_D3_CONV1D` | `apxinf`, `stock` | GDN causal convolution: the ApxInf one-thread-per-output kernel (FP32 tap order, own zero history, one launch) or the composed MLX `conv1d` over an explicit `S−1` zero history |
 | `APXINF_D3_GDN_CORE` | `eight_lanes`, `four_values` | The **text** callable's GDN recurrence layout |
 | `APXINF_D3_GDN_CORE_IMAGE` | `four_values`, `eight_lanes` | The **image** callable's GDN recurrence layout — independent, because its parity budget has no headroom |
+| `APXINF_D3_LAST_ROW` | `full`, `off`, `attn` | How much of the final layer shrinks to the readout's single row (D3-B; added after this PR — see [`d3-lite-metal-last-row.md`](d3-lite-metal-last-row.md)) |
 | `APXINF_D3_SIGNPOST` | unset (off), `1` (on) | The `os_signpost` operator timeline (`request`/`input`/`vision`/`forward`/`sync`); off for statistics runs |
 
 The two Metal sources and `src/causal_conv.rs` are restored **verbatim** from
