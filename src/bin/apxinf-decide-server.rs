@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! apxinf-decide-server --model <checkpoint> [--model-name NAME] [--device metal:N]
+//!                       [--concurrency N]
 //! ```
 //!
 //! One checkpoint, one `{"type":"ready",…}` line on stdout, then one JSONL
@@ -11,7 +12,7 @@
 //! {"id":1,"state":"…","questions":{"enemy":{"type":"noul","instructions":"…"}},
 //!  "images":["<base64 png>"]}
 //! {"id":1,"answers":{"enemy":{"type":"noul","noul":0.42}},
-//!  "latency_ms":184.2,"stages":{…}}
+//!  "p_bits":{"enemy":"3e20e560"},"latency_ms":184.2,"stages":{…}}
 //! ```
 //!
 //! This is the Clef `apxinf-decide-server` protocol, so the demo's
@@ -19,6 +20,21 @@
 //! Clef bridge's behaviour is untouched. A malformed request answers
 //! `{"id":…,"error":"…"}` and the process keeps serving; only a load failure,
 //! exhausted stdin or a closed stdout ends it.
+//!
+//! **`p_bits`.** Every successful response also carries `p_bits`: one
+//! 8-hex-digit `f32::to_bits` per question key in `answers`, taken from the
+//! reported `noul` probability (`confidence` for `choice`, which reports no
+//! `noul` field). It exists so two runs can be compared bitwise; it changes
+//! no existing field.
+//!
+//! **Concurrency.** `--concurrency N` (env `APXINF_DECIDE_CONCURRENCY`,
+//! default 1) starts N worker threads. Each worker builds and owns its own
+//! `Server`/`LoadedModel` entirely on that thread — the model is `!Send`
+//! (`Rc` handles, `RefCell` caches, thread-local MLX stream) and is never
+//! shared or locked. The main thread reads stdin and dispatches request
+//! `String`s into a bounded queue of capacity N; one writer thread emits
+//! responses under a single stdout lock, in completion order. Memory cost is
+//! N × model, which is expected. N = 1 stays on the original serial path.
 //!
 //! **Image contract.** d3-lite writes one contiguous image-placeholder run
 //! (P1b), so one request carries at most one image. The demo's separate
@@ -36,9 +52,13 @@
 
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 mod live {
+    use std::collections::VecDeque;
     use std::io::{BufRead, Write};
     use std::path::PathBuf;
-    use std::time::Instant;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
 
     use apxinf_core::{Device, Tensor};
     use apxinf_model::metal_d3_lite::{preprocess, D3LiteFormat};
@@ -51,34 +71,50 @@ mod live {
 
     type Fallible<T> = Result<T, String>;
 
+    /// The compiled whole-request callable always runs over BF16 weights with
+    /// the FP32 readout (`admit` accepts no other precision).
+    const VARIANT: &str = "bf16-compiled";
+
     pub fn main() {
-        match load() {
-            Ok(mut server) => serve(&mut server),
-            Err(error) => {
-                // The demo client reads this as a failed start-up and shows
-                // the text.
-                let _ = writeln!(
-                    std::io::stdout(),
-                    "{}",
-                    json!({"type": "error", "error": error})
-                );
-                let _ = std::io::stdout().flush();
-                std::process::exit(1);
-            }
+        let options = match parse_options() {
+            Ok(options) => options,
+            Err(error) => fail_start(&error),
+        };
+        if options.concurrency == 1 {
+            serial(&options);
+        } else {
+            parallel(options);
         }
     }
 
-    #[derive(Debug)]
+    /// A start-up failure: print the demo's failed-start line and exit 1.
+    fn fail_start(error: &str) -> ! {
+        let _ = writeln!(
+            std::io::stdout(),
+            "{}",
+            json!({"type": "error", "error": error})
+        );
+        let _ = std::io::stdout().flush();
+        std::process::exit(1);
+    }
+
+    #[derive(Clone, Debug)]
     struct Options {
         model: PathBuf,
         model_name: Option<String>,
         device: Device,
+        concurrency: usize,
     }
 
     fn parse_options() -> Fallible<Options> {
         let mut model = None;
         let mut model_name = None;
         let mut device = Device::Metal(0);
+        // The flag wins over the environment; the environment wins over 1.
+        let mut concurrency = match std::env::var("APXINF_DECIDE_CONCURRENCY") {
+            Ok(value) => parse_concurrency("APXINF_DECIDE_CONCURRENCY", &value)?,
+            Err(_) => 1,
+        };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -92,9 +128,14 @@ mod live {
                     let value = args.next().ok_or("--device needs a value")?;
                     device = parse_device(&value)?
                 }
+                "--concurrency" => {
+                    let value = args.next().ok_or("--concurrency needs a value")?;
+                    concurrency = parse_concurrency("--concurrency", &value)?
+                }
                 "--help" | "-h" => {
                     return Err("usage: apxinf-decide-server --model <checkpoint> \
-                                 [--model-name NAME] [--device metal:N]"
+                                 [--model-name NAME] [--device metal:N] \
+                                 [--concurrency N]"
                         .into())
                 }
                 other if model.is_none() && !other.starts_with('-') => {
@@ -107,7 +148,18 @@ mod live {
             model: model.ok_or("--model <checkpoint> is required")?,
             model_name,
             device,
+            concurrency,
         })
+    }
+
+    fn parse_concurrency(flag: &str, value: &str) -> Fallible<usize> {
+        let concurrency = value
+            .parse::<usize>()
+            .map_err(|_| format!("{flag} must be a positive integer, got {value:?}"))?;
+        if concurrency == 0 {
+            return Err(format!("{flag} must be at least 1"));
+        }
+        Ok(concurrency)
     }
 
     fn parse_device(value: &str) -> Fallible<Device> {
@@ -125,16 +177,16 @@ mod live {
         }
     }
 
-    /// Load the resident model and the prompt contract, verify the package's
-    /// code→token mapping against the tokenizer, print the one `ready` line.
+    /// Load the resident model and the prompt contract, and verify the
+    /// package's code→token mapping against the tokenizer. Printing the
+    /// `ready` line is the caller's job (one line, from one thread).
     struct Server {
         model: LoadedModel,
         format: D3LiteFormat,
         model_name: String,
     }
 
-    fn load() -> Fallible<Server> {
-        let options = parse_options()?;
+    fn build(options: &Options) -> Fallible<(Server, f64)> {
         let started = Instant::now();
         let format = D3LiteFormat::from_checkpoint(&options.model)
             .map_err(|error| format!("format: {error}"))?;
@@ -158,17 +210,26 @@ mod live {
             .model_name
             .or_else(|| AutoModel::detect_model_name(&options.model).ok())
             .unwrap_or_else(|| "metal_d3".into());
-        // The Metal port always executes the compiled whole-request callable
-        // over BF16 weights with the FP32 readout (`admit` accepts no other
-        // precision), so `bf16-compiled` is the effective variant.
-        let variant = "bf16-compiled";
+        Ok((
+            Server {
+                model,
+                format,
+                model_name,
+            },
+            load_ms,
+        ))
+    }
+
+    /// The one `ready` line, printed by whichever thread owns the startup
+    /// decision — the main thread in both the serial and pooled paths.
+    fn print_ready(model_name: &str, load_ms: f64) -> Fallible<()> {
         writeln!(
             std::io::stdout(),
             "{}",
             json!({
                 "type": "ready",
                 "model": model_name,
-                "variant": variant,
+                "variant": VARIANT,
                 "load_ms": load_ms,
                 "codes_verified": true,
             })
@@ -176,15 +237,23 @@ mod live {
         .map_err(|error| format!("write ready: {error}"))?;
         std::io::stdout()
             .flush()
-            .map_err(|error| format!("flush ready: {error}"))?;
-        Ok(Server {
-            model,
-            format,
-            model_name,
-        })
+            .map_err(|error| format!("flush ready: {error}"))
     }
 
-    fn serve(server: &mut Server) {
+    /// N = 1: the original serial path — build on the main thread, print
+    /// `ready`, then read a line, answer it, write the response.
+    fn serial(options: &Options) {
+        let (server, load_ms) = match build(options) {
+            Ok(loaded) => loaded,
+            Err(error) => fail_start(&error),
+        };
+        if let Err(error) = print_ready(&server.model_name, load_ms) {
+            fail_start(&error);
+        }
+        serve(server);
+    }
+
+    fn serve(mut server: Server) {
         let stdin = std::io::stdin();
         let mut stdout = std::io::stdout();
         for line in stdin.lock().lines() {
@@ -205,6 +274,314 @@ mod live {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Request-level concurrency (N > 1)
+    // ------------------------------------------------------------------
+
+    /// Shared pool state: a bounded FIFO of request lines, the in-flight
+    /// counter, and the live-worker counter. A `Mutex<VecDeque>` + condvar
+    /// stands in for a multi-consumer bounded mpsc (std's `Receiver` cannot
+    /// be cloned); the lock is held only for queue bookkeeping, never across
+    /// a model call. `close()` is the shutdown signal.
+    struct Pool {
+        queue: Mutex<VecDeque<String>>,
+        closed: AtomicBool,
+        changed: Condvar,
+        /// Queued + currently processing; reaches 0 when all work is done.
+        outstanding: AtomicUsize,
+        /// Workers that have not yet exited; 0 means nobody can drain more.
+        live: AtomicUsize,
+        /// Set by the writer when stdout breaks.
+        stdout_broken: AtomicBool,
+    }
+
+    impl Pool {
+        fn new(workers: usize) -> Self {
+            Self {
+                queue: Mutex::new(VecDeque::new()),
+                closed: AtomicBool::new(false),
+                changed: Condvar::new(),
+                outstanding: AtomicUsize::new(0),
+                live: AtomicUsize::new(workers),
+                stdout_broken: AtomicBool::new(false),
+            }
+        }
+
+        /// Stop accepting work. Workers drain whatever is queued, then exit.
+        fn close(&self) {
+            self.closed.store(true, Ordering::SeqCst);
+            self.changed.notify_all();
+        }
+    }
+
+    /// Lock the queue, recovering from a poisoned mutex left by a panicked
+    /// worker: the queue itself is still usable.
+    fn queue_lock(pool: &Pool) -> MutexGuard<'_, VecDeque<String>> {
+        pool.queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn queue_wait<'a>(
+        pool: &Pool,
+        guard: MutexGuard<'a, VecDeque<String>>,
+    ) -> MutexGuard<'a, VecDeque<String>> {
+        pool.changed
+            .wait(guard)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// One popped job: decrements `outstanding` exactly once, including while
+    /// unwinding a worker panic. It takes the queue lock before notifying so
+    /// a drain waiter that has checked the counter can never miss the signal.
+    struct Outstanding {
+        pool: Arc<Pool>,
+    }
+
+    impl Outstanding {
+        fn claim(pool: &Pool) {
+            pool.outstanding.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for Outstanding {
+        fn drop(&mut self) {
+            let _state = queue_lock(&self.pool);
+            self.pool.outstanding.fetch_sub(1, Ordering::SeqCst);
+            self.pool.changed.notify_all();
+        }
+    }
+
+    /// N worker threads. Each builds its own `Server`/`LoadedModel` here, on
+    /// this thread, and uses it only here — the model is `!Send` and is never
+    /// shared, moved, or wrapped in a `Mutex`.
+    fn parallel(options: Options) {
+        let workers = options.concurrency;
+        let pool = Arc::new(Pool::new(workers));
+        let (handshake_tx, handshake_rx) = mpsc::channel::<Result<(f64, String), String>>();
+        let (response_tx, response_rx) = mpsc::channel::<String>();
+
+        let mut handles = Vec::with_capacity(workers);
+        for index in 0..workers {
+            let pool = Arc::clone(&pool);
+            let handshake_tx = handshake_tx.clone();
+            let response_tx = response_tx.clone();
+            let options = options.clone();
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("decide-worker-{index}"))
+                    .spawn(move || worker(options, pool, handshake_tx, response_tx))
+                    .expect("spawn decide worker"),
+            );
+        }
+        // Only the workers produce responses from here on.
+        drop(handshake_tx);
+        // The main thread never writes response lines; drop its sender so
+        // the writer sees the channel close once every worker has exited.
+        drop(response_tx);
+
+        // Collect one handshake per worker. A worker that dies before its
+        // handshake is noticed through the live counter (or its panic line).
+        let mut load_times = Vec::with_capacity(workers);
+        let mut model_names = Vec::with_capacity(workers);
+        let mut received = 0usize;
+        let mut failure: Option<String> = None;
+        while received < workers && failure.is_none() {
+            match handshake_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Ok((load_ms, model_name))) => {
+                    load_times.push(load_ms);
+                    model_names.push(model_name);
+                    received += 1;
+                }
+                Ok(Err(error)) => {
+                    failure = Some(error);
+                    received += 1;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if pool.live.load(Ordering::SeqCst) + received < workers {
+                        failure = Some("worker exited before handshake".into());
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    failure = Some("worker channel closed before handshake".into());
+                }
+            }
+        }
+
+        if let Some(error) = failure {
+            pool.close();
+            for handle in handles {
+                let _ = handle.join();
+            }
+            fail_start(&error);
+        }
+
+        // All workers loaded: one `ready` line from the main thread, with
+        // the slowest load (all workers load concurrently).
+        let model_name = model_names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "metal_d3".into());
+        let load_ms = load_times.iter().copied().fold(0.0, f64::max);
+        if let Err(error) = print_ready(&model_name, load_ms) {
+            pool.close();
+            for handle in handles {
+                let _ = handle.join();
+            }
+            fail_start(&error);
+        }
+
+        // One writer owns the stdout lock for its whole life and emits
+        // responses in completion order.
+        let writer = {
+            let pool = Arc::clone(&pool);
+            std::thread::Builder::new()
+                .name("decide-writer".into())
+                .spawn(move || {
+                    let stdout = std::io::stdout();
+                    let mut out = stdout.lock();
+                    for response in response_rx {
+                        if writeln!(out, "{response}").is_err() || out.flush().is_err() {
+                            // Broken stdout: stop the producer and the
+                            // dispatcher; in-flight work still drains.
+                            pool.stdout_broken.store(true, Ordering::SeqCst);
+                            pool.close();
+                            break;
+                        }
+                    }
+                })
+                .expect("spawn decide writer")
+        };
+
+        // Main thread: read stdin and dispatch into the bounded queue.
+        let capacity = workers;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    eprintln!("stdin: {error}");
+                    break;
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            // Backpressure: block while the queue is full, until shutdown.
+            let mut state = queue_lock(&pool);
+            while state.len() >= capacity
+                && !pool.closed.load(Ordering::SeqCst)
+                && !pool.stdout_broken.load(Ordering::SeqCst)
+                && pool.live.load(Ordering::SeqCst) > 0
+            {
+                state = queue_wait(&pool, state);
+            }
+            if pool.closed.load(Ordering::SeqCst)
+                || pool.stdout_broken.load(Ordering::SeqCst)
+                || pool.live.load(Ordering::SeqCst) == 0
+            {
+                break;
+            }
+            state.push_back(line);
+            Outstanding::claim(&pool);
+            pool.changed.notify_one();
+        }
+
+        // EOF (or shutdown): close the queue, workers drain it, then wait
+        // for in-flight work to finish. If every worker is gone there is
+        // nothing left to drain, so we do not wait forever.
+        pool.close();
+        {
+            let mut state = queue_lock(&pool);
+            while pool.outstanding.load(Ordering::SeqCst) > 0
+                && pool.live.load(Ordering::SeqCst) > 0
+            {
+                state = queue_wait(&pool, state);
+            }
+        }
+
+        for handle in handles {
+            let _ = handle.join();
+        }
+        let _ = writer.join();
+    }
+
+    fn worker(
+        options: Options,
+        pool: Arc<Pool>,
+        handshake: Sender<Result<(f64, String), String>>,
+        responses: Sender<String>,
+    ) {
+        // A panic anywhere in this worker must still decrement `live` and
+        // wake the main thread's drain/dispatch waits.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (server, load_ms) = match build(&options) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    let _ = handshake.send(Err(error));
+                    return;
+                }
+            };
+            if handshake
+                .send(Ok((load_ms, server.model_name.clone())))
+                .is_err()
+            {
+                return;
+            }
+            serve_worker(server, &pool, responses);
+        }));
+        {
+            let _state = queue_lock(&pool);
+            pool.live.fetch_sub(1, Ordering::SeqCst);
+            pool.changed.notify_all();
+        }
+        if let Err(payload) = outcome {
+            eprintln!("decide worker panicked: {}", panic_message(payload));
+        }
+    }
+
+    fn serve_worker(mut server: Server, pool: &Arc<Pool>, responses: Sender<String>) {
+        loop {
+            // Pop one job, or exit once the queue is closed *and* drained:
+            // a closed queue still yields queued work first.
+            let job = {
+                let mut state = queue_lock(pool);
+                loop {
+                    if let Some(job) = state.pop_front() {
+                        pool.changed.notify_all(); // space for the producer
+                        break Some(job);
+                    }
+                    if pool.closed.load(Ordering::SeqCst) {
+                        break None;
+                    }
+                    state = queue_wait(pool, state);
+                }
+            };
+            let Some(line) = job else { break };
+            let guard = Outstanding {
+                pool: Arc::clone(pool),
+            };
+            let response =
+                handle(&mut server.model, &server.format, &server.model_name, &line).to_string();
+            if responses.send(response).is_err() {
+                break; // writer gone; other workers drain the rest
+            }
+            drop(guard);
+        }
+    }
+
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "non-string panic payload".into()
+        }
+    }
+
+    // ------------------------------------------------------------------
+
     /// One request line in, one response line out; never fails the process.
     fn handle(
         model: &mut LoadedModel,
@@ -220,9 +597,10 @@ mod live {
         };
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         match answer(model, format, &request) {
-            Ok((answers, latency_ms, stages)) => json!({
+            Ok((answers, p_bits, latency_ms, stages)) => json!({
                 "id": id,
                 "answers": answers,
+                "p_bits": p_bits,
                 "latency_ms": latency_ms,
                 "stages": stages,
                 "model": format_package(format, model_name),
@@ -242,11 +620,14 @@ mod live {
     /// One request: every question is one prompt; with an image, every
     /// question sees the request's single image (the separate protocol asks
     /// one question per image).
+    ///
+    /// Returns the answers, the matching `p_bits` object, the latency and
+    /// the stage split.
     fn answer(
         model: &mut LoadedModel,
         format: &D3LiteFormat,
         request: &Value,
-    ) -> Fallible<(Value, f64, Value)> {
+    ) -> Fallible<(Value, Value, f64, Value)> {
         let started = Instant::now();
         let state = request.get("state").ok_or("request needs state")?;
         let questions = request
@@ -276,6 +657,7 @@ mod live {
             .transpose()?;
 
         let mut answers = Map::with_capacity(questions.len());
+        let mut p_bits = Map::with_capacity(questions.len());
         let mut host_prep_ms = 0.0f64;
         let mut layout_ms = 0.0f64;
         let mut vision_ms = 0.0f64;
@@ -303,6 +685,7 @@ mod live {
             let parsed = format
                 .answer(prepared.normalized(), &probabilities)
                 .map_err(|error| error.to_string())?;
+            p_bits.insert(id.clone(), Value::String(probability_bits(&parsed)));
             answers.insert(id.clone(), parsed);
         }
         let latency_ms = started.elapsed().as_secs_f64() * 1e3;
@@ -314,7 +697,25 @@ mod live {
             "sync_ms": sync_ms,
             "questions": questions.len(),
         });
-        Ok((Value::Object(answers), latency_ms, stages))
+        Ok((
+            Value::Object(answers),
+            Value::Object(p_bits),
+            latency_ms,
+            stages,
+        ))
+    }
+
+    /// 8 hex digits of `f32::to_bits` for the probability a question
+    /// reports: `noul` for noul questions, `confidence` for `choice` (which
+    /// reports no `noul` field). Read back out of the answer object so the
+    /// bits always describe the value that was actually emitted.
+    fn probability_bits(answer: &Value) -> String {
+        let probability = answer
+            .get("noul")
+            .or_else(|| answer.get("confidence"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        format!("{:08x}", (probability as f32).to_bits())
     }
 
     /// A request question in the model-neutral schema shape.
