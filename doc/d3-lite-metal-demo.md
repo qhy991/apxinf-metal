@@ -295,6 +295,12 @@ record available for this phase reports only the aggregated ≈2200 ms/request;
 a Clef stage split is not part of the P4 evidence, so it is left blank rather
 than estimated.
 
+**Follow-up:** the relay leg stopped the contaminating harness and re-ran this
+episode in a clean window (`Swapouts` delta 0, foreign processes 0):
+**613.6 ms** median per decision and a **197.6 ms** request median. See
+[d3-lite-demo-clean-remeasure.md](d3-lite-demo-clean-remeasure.md); the clean
+numbers above supersede the contaminated row for baseline purposes.
+
 ## 7. Verification
 
 | Check | Result |
@@ -332,7 +338,9 @@ than estimated.
   not take the shared Metal lock; where it was resident during the window the
   run is marked contaminated and the numbers are a reference, not a
   clean-window baseline. No KEEP or speedup conclusion is drawn either way
-  (this phase performs no optimization).
+  (this phase performs no optimization). The relay leg later stopped that
+  harness and re-measured the same episode clean (`Swapouts` delta 0, foreign
+  0) — see [d3-lite-demo-clean-remeasure.md](d3-lite-demo-clean-remeasure.md).
 - No Core AI instrument; no operator timeline is claimed (the signpost
   methodology applies once a before/after timeline is required).
 
