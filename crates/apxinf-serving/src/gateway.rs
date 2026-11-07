@@ -297,6 +297,68 @@ fn array<'a>(value: &'a Value, label: &str) -> Result<&'a Vec<Value>, ApiError> 
         .ok_or_else(|| ApiError::invalid(format!("{label} must be an array.")))
 }
 
+/// Accept the OpenAI fields whose default value leaves generation unchanged.
+///
+/// Local clients often send these fields explicitly. A value that would need
+/// behavior this profile does not implement remains an `unsupported_feature`
+/// error instead of being silently ignored.
+fn openai_compatibility(value: &Value) -> Result<(), ApiError> {
+    let unsupported = |message: &str| ApiError::new(400, "unsupported_feature", message);
+    if let Some(n) = value.get("n") {
+        match n.as_u64() {
+            Some(1) => {}
+            Some(_) => return Err(unsupported("This profile returns exactly one choice.")),
+            None => return Err(ApiError::invalid("n must be a positive integer.")),
+        }
+    }
+    for key in ["presence_penalty", "frequency_penalty"] {
+        if let Some(penalty) = value.get(key) {
+            match penalty.as_f64() {
+                Some(0.0) => {}
+                Some(_) => return Err(unsupported(&format!("This profile does not apply {key}."))),
+                None => return Err(ApiError::invalid(format!("{key} must be a number."))),
+            }
+        }
+    }
+    if let Some(logprobs) = value.get("logprobs") {
+        match logprobs {
+            Value::Bool(false) => {}
+            Value::Bool(true) => {
+                return Err(unsupported(
+                    "This profile does not return log probabilities.",
+                ))
+            }
+            _ => return Err(ApiError::invalid("logprobs must be a Boolean.")),
+        }
+    }
+    if let Some(format) = value.get("response_format") {
+        let format = format
+            .as_object()
+            .ok_or_else(|| ApiError::invalid("response_format must be an object."))?;
+        match format.get("type").and_then(Value::as_str) {
+            Some("text") => {}
+            Some(_) => {
+                return Err(unsupported(
+                    "This profile does not provide structured output.",
+                ))
+            }
+            None => return Err(ApiError::invalid("response_format requires a type.")),
+        }
+    }
+    if let Some(parallel) = value.get("parallel_tool_calls") {
+        match parallel {
+            Value::Bool(true) => {}
+            Value::Bool(false) => {
+                return Err(unsupported(
+                    "This profile cannot enforce one tool call per generation.",
+                ))
+            }
+            _ => return Err(ApiError::invalid("parallel_tool_calls must be a Boolean.")),
+        }
+    }
+    Ok(())
+}
+
 fn normalize(
     value: &Value,
     api: Api,
@@ -336,6 +398,12 @@ fn normalize(
             "stop",
             "stream_options",
             "user",
+            "n",
+            "logprobs",
+            "presence_penalty",
+            "frequency_penalty",
+            "response_format",
+            "parallel_tool_calls",
         ]
     };
     unknown(value, &allowed, "Request")?;
@@ -345,6 +413,9 @@ fn normalize(
             "model_not_found",
             "Select the model listed by /v1/models.",
         ));
+    }
+    if api == Api::OpenAi {
+        openai_compatibility(value)?;
     }
     let selection = if service.image_enabled() {
         crate::sampling::Selection::from_vision_request(value)?
@@ -1205,12 +1276,11 @@ mod tests {
         for api in [Api::OpenAi, Api::Anthropic] {
             let value = json!({"model":"test-model","max_tokens":0,"messages":[{"role":"user","content":"hello"}]});
             let error = request_error(service.clone(), value, api).await;
-            assert_eq!((error.status, error.code.as_str()), (400, "invalid_request"));
-            assert!(
-                error.message.contains("at least 1"),
-                "{}",
-                error.message
+            assert_eq!(
+                (error.status, error.code.as_str()),
+                (400, "invalid_request")
             );
+            assert!(error.message.contains("at least 1"), "{}", error.message);
         }
         assert!(matches!(
             observed.try_recv(),
@@ -1220,13 +1290,22 @@ mod tests {
         let (small, mut observed) = gateway_test_service_with_max_output(64);
         let over = json!({"model":"test-model","max_tokens":65,"messages":[{"role":"user","content":"hello"}]});
         let error = request_error(small.clone(), over, Api::OpenAi).await;
-        assert_eq!((error.status, error.code.as_str()), (400, "invalid_request"));
-        assert_eq!(error.message, "max_tokens exceeds the deployment output limit.");
+        assert_eq!(
+            (error.status, error.code.as_str()),
+            (400, "invalid_request")
+        );
+        assert_eq!(
+            error.message,
+            "max_tokens exceeds the deployment output limit."
+        );
 
         let (exhausted, mut observed_exhausted) = gateway_test_service_with_max_output(0);
         let omitted = json!({"model":"test-model","messages":[{"role":"user","content":"hello"}]});
         let error = request_error(exhausted.clone(), omitted.clone(), Api::OpenAi).await;
-        assert_eq!((error.status, error.code.as_str()), (400, "invalid_request"));
+        assert_eq!(
+            (error.status, error.code.as_str()),
+            (400, "invalid_request")
+        );
         // Counting tokens still works without an output budget.
         let (request, _) = normalize(&omitted, Api::Anthropic, true, &exhausted).unwrap();
         assert_eq!(request.max_tokens, 0);
@@ -1240,6 +1319,84 @@ mod tests {
         ));
         assert_eq!(small.metrics.failed.load(Ordering::Relaxed), 0);
         assert_eq!(exhausted.metrics.failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn openai_compatibility_fields_are_accepted_only_at_noops() {
+        let (service, mut observed) = gateway_test_service();
+        let value = json!({
+            "model":"test-model","max_tokens":4,
+            "messages":[{"role":"user","content":"hello"}],
+            "n":1,"presence_penalty":0,"frequency_penalty":0,"logprobs":false,
+            "response_format":{"type":"text"},"parallel_tool_calls":true
+        });
+        let (request, stream) = normalize(&value, Api::OpenAi, false, &service).unwrap();
+        assert_eq!(request.max_tokens, 4);
+        assert!(!stream);
+        assert_eq!(
+            request.messages,
+            vec![json!({"role":"user","content":"hello"})]
+        );
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        for field in [
+            ("n", json!(2)),
+            ("presence_penalty", json!(0.5)),
+            ("frequency_penalty", json!(-0.5)),
+            ("logprobs", json!(true)),
+            ("response_format", json!({"type":"json_object"})),
+            (
+                "response_format",
+                json!({"type":"json_schema","json_schema":{}}),
+            ),
+            ("parallel_tool_calls", json!(false)),
+        ] {
+            let (name, replacement) = field;
+            let mut value = openai_request(json!([{"role":"user","content":"hello"}]));
+            value[name] = replacement;
+            let error = request_error(service.clone(), value, Api::OpenAi).await;
+            assert_eq!(
+                (error.status, error.code.as_str()),
+                (400, "unsupported_feature"),
+                "{name}"
+            );
+        }
+        for field in [
+            ("n", json!("1")),
+            ("n", json!(1.5)),
+            ("presence_penalty", json!("0")),
+            ("frequency_penalty", json!(null)),
+            ("logprobs", json!(0)),
+            ("response_format", json!({"type":3})),
+            ("response_format", json!({})),
+            ("parallel_tool_calls", json!("true")),
+        ] {
+            let (name, replacement) = field;
+            let mut value = openai_request(json!([{"role":"user","content":"hello"}]));
+            value[name] = replacement;
+            let error = request_error(service.clone(), value, Api::OpenAi).await;
+            assert_eq!(
+                (error.status, error.code.as_str()),
+                (400, "invalid_request"),
+                "{name}"
+            );
+        }
+        // The compatibility relaxation is specific to the OpenAI route.
+        let error = request_error(service.clone(), value, Api::Anthropic).await;
+        assert_eq!(
+            (error.status, error.code.as_str()),
+            (400, "unsupported_feature")
+        );
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(service.available.load(Ordering::Acquire));
+        assert_eq!(service.metrics.queued.load(Ordering::Relaxed), 0);
+        assert_eq!(service.metrics.failed.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

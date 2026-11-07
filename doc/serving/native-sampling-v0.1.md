@@ -22,7 +22,8 @@ A positive temperature selects random generation and must not exceed 2.0.
 Random generation requires top-p greater than zero and at most 1.0.
 Both values must remain finite and positive after conversion to binary32.
 An omitted temperature with explicit top-p uses temperature 1.0.
-Reject public top-k, seed, and penalty parameters.
+Reject public top-k and seed parameters, and reject every penalty parameter that would change sampling.
+The shared OpenAI route accepts the default zero penalties because they leave generation unchanged.
 The existing greedy profiles retain their previous defaults and parameter checks.
 
 The internal request holds exactly one selection policy.
