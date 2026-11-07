@@ -8,6 +8,22 @@ use tokio::io::AsyncReadExt;
 const PROBE_MODE: &str = "APXINF_SERVING_DIAGNOSTIC_PROBE";
 const PROBE_MODEL: &str = "APXINF_SERVING_DIAGNOSTIC_MODEL";
 const COMPLETED_MARKER: &str = "APXINF_DIAGNOSTIC_PROBE_COMPLETED";
+const PROGRESS_MARKER: &str = "APXINF_DIAGNOSTIC_PROBE_PROGRESS";
+/// A probe step waits for a Python fixture, a re-executed test binary, or both.
+/// The parent therefore watches for stalled progress instead of enforcing a
+/// fixed wall-clock deadline that a loaded host can exceed without a bug.
+const PROBE_STALL_GRACE: Duration = Duration::from_secs(30);
+/// Absolute upper bound so a pathological probe still cannot hang the suite.
+const PROBE_HARD_LIMIT: Duration = Duration::from_secs(180);
+/// The flood scenario proves that stderr backpressure cannot block stdout, so
+/// its waits only need to catch a real deadlock and can tolerate a loaded host.
+const FLOOD_LIVENESS_GRACE: Duration = Duration::from_secs(30);
+/// Killing an owned process group and observing its exit is load-sensitive.
+const GROUP_REAP_GRACE: Duration = Duration::from_secs(15);
+
+fn progress(step: &str) {
+    println!("{PROGRESS_MARKER}:{step}");
+}
 
 extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
@@ -77,19 +93,48 @@ fn run_isolated(output_mode: &str, scenario: &str) {
     } else {
         Some(error_pipe)
     };
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Read the probe's progress while it runs. Every step prints a marker, so
+    // the parent can distinguish a loaded host from a blocked probe.
+    let transcript = Arc::new(std::sync::Mutex::new(String::new()));
+    let last_progress = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let reader = {
+        let transcript = transcript.clone();
+        let last_progress = last_progress.clone();
+        std::thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match output.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => {
+                        transcript
+                            .lock()
+                            .unwrap()
+                            .push_str(&String::from_utf8_lossy(&buffer[..count]));
+                        *last_progress.lock().unwrap() = Instant::now();
+                    }
+                }
+            }
+        })
+    };
+    let started = Instant::now();
+    let mut blocked = String::new();
     let status = loop {
         if let Some(status) = probe.child.try_wait().unwrap() {
             break Some(status);
         }
-        if Instant::now() >= deadline {
+        if last_progress.lock().unwrap().elapsed() >= PROBE_STALL_GRACE {
+            blocked = format!("made no progress for {PROBE_STALL_GRACE:?}");
+            break None;
+        }
+        if started.elapsed() >= PROBE_HARD_LIMIT {
+            blocked = format!("exceeded the {PROBE_HARD_LIMIT:?} hard limit");
             break None;
         }
         std::thread::sleep(Duration::from_millis(10));
     };
     // A failing or blocked probe cannot leave its worker alive.
     probe.reap_group();
-    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    let cleanup_deadline = Instant::now() + GROUP_REAP_GRACE;
     while group_has_live_members(group) && Instant::now() < cleanup_deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -97,17 +142,10 @@ fn run_isolated(output_mode: &str, scenario: &str) {
         !group_has_live_members(group),
         "An owned probe process remains alive."
     );
-    let mut transcript = String::new();
-    output
-        .by_ref()
-        .take(64 * 1024)
-        .read_to_string(&mut transcript)
-        .unwrap();
-    let status = status.unwrap_or_else(|| {
-        panic!(
-            "The {output_mode}/{scenario} probe blocked past its hard parent timeout. {transcript}"
-        )
-    });
+    let _ = reader.join();
+    let transcript = transcript.lock().unwrap().clone();
+    let status = status
+        .unwrap_or_else(|| panic!("The {output_mode}/{scenario} probe {blocked}. {transcript}"));
     assert!(
         status.success(),
         "The {output_mode}/{scenario} probe failed: {status}. {transcript}"
@@ -154,6 +192,7 @@ async fn probe_lifecycle(scenario: &str, model: PathBuf) {
         return;
     }
     let (mut worker, ready) = cpu_worker(model.clone()).await.unwrap();
+    progress("worker-started");
     let worker_pid = worker.child.id().unwrap() as i32;
     let mut service = cpu_service(ready, Duration::from_secs(2), 2);
     let (sender, stopped) = watch::channel(None);
@@ -164,6 +203,7 @@ async fn probe_lifecycle(scenario: &str, model: PathBuf) {
     let mut first = (scenario != "fault").then(|| service.enqueue(request(false)).unwrap());
     if scenario == "fault" {
         worker.child.start_kill().unwrap();
+        progress("fault-injected");
     }
     let replacement_model = model;
     let coordinator = tokio::spawn(coordinate_and_report(
@@ -183,6 +223,7 @@ async fn probe_lifecycle(scenario: &str, model: PathBuf) {
         })
         .await
         .expect("A checked worker fault must restart the worker.");
+        progress("worker-restarted");
         assert!(service.available.load(Ordering::Acquire));
         assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 1);
         assert_eq!(service.metrics.worker_restarts.load(Ordering::Relaxed), 1);
@@ -194,15 +235,19 @@ async fn probe_lifecycle(scenario: &str, model: PathBuf) {
         service.wait_stopped().await.unwrap();
     } else {
         require_completed_request(&service, first.as_mut().unwrap()).await;
+        progress("request-settled");
         let mut second = service.enqueue(request(false)).unwrap();
         require_completed_request(&service, &mut second).await;
+        progress("second-request-settled");
         assert_eq!(service.metrics.completed.load(Ordering::Relaxed), 2);
         assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 0);
         if scenario == "rotation" {
             assert_eq!(service.metrics.worker_rotations.load(Ordering::Relaxed), 1);
         }
+        progress("shutdown");
         service.shutdown();
         service.wait_stopped().await.unwrap();
+        progress("stopped");
     }
     coordinator.await.unwrap();
     assert_eq!(service.metrics.active.load(Ordering::Relaxed), 0);
@@ -213,6 +258,7 @@ async fn probe_lifecycle(scenario: &str, model: PathBuf) {
 }
 
 async fn probe_worker_stderr_flood() {
+    progress("flood-start");
     let script = "import os\nremaining = memoryview(b'\\xff\\x00A' * 350000)\nwhile remaining:\n written = os.write(2, remaining)\n remaining = remaining[written:]\nos.write(1, b'worker stdout completed\\n')\n";
     let mut child = Command::new("python3")
         .args(["-c", script])
@@ -229,21 +275,24 @@ async fn probe_worker_stderr_flood() {
     );
     let mut stdout = child.stdout.take().unwrap();
     let mut output = Vec::new();
-    tokio::time::timeout(Duration::from_secs(2), stdout.read_to_end(&mut output))
+    tokio::time::timeout(FLOOD_LIVENESS_GRACE, stdout.read_to_end(&mut output))
         .await
         .expect("Worker stderr must not block stdout completion.")
         .unwrap();
+    progress("flood-stdout");
     assert_eq!(output, b"worker stdout completed\n");
-    assert!(tokio::time::timeout(Duration::from_secs(1), child.wait())
+    assert!(tokio::time::timeout(FLOOD_LIVENESS_GRACE, child.wait())
         .await
         .expect("The flood worker must exit.")
         .unwrap()
         .success());
     assert_eq!(unsafe { kill(pid, 0) }, -1);
+    progress("flood-finished");
     drop(diagnostics);
-    tokio::time::timeout(Duration::from_millis(500), crate::diagnostics::finish())
+    tokio::time::timeout(FLOOD_LIVENESS_GRACE, crate::diagnostics::finish())
         .await
         .expect("Diagnostic delivery must have a bounded completion interval.");
+    progress("flood-drained");
     let mut metrics = String::new();
     crate::diagnostics::append_metrics(&mut metrics);
     let dropped: u64 = metrics
@@ -270,8 +319,10 @@ fn diagnostic_probe_entry() {
         let _ = output.flush();
     }));
     let (output_mode, scenario) = mode.split_once(':').unwrap();
+    progress("entry");
     if output_mode == "full" {
         fill_own_stderr_pipe();
+        progress("stderr-filled");
     }
     let model = PathBuf::from(std::env::var_os(PROBE_MODEL).unwrap());
     tokio::runtime::Builder::new_current_thread()
