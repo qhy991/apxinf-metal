@@ -12,6 +12,40 @@ pub(super) fn image_part(block: &Value) -> Result<Value, ApiError> {
     Ok(json!({"type":"image","media":image.descriptor()}))
 }
 
+/// Convert an OpenAI `image_url` part into the owned PNG descriptor.
+pub(super) fn openai_image_part(block: &Value) -> Result<Value, ApiError> {
+    unknown(block, &["type", "image_url"], "Image URL block")?;
+    let url = &block["image_url"];
+    unknown(url, &["url", "detail"], "image_url")?;
+    if let Some(detail) = url.get("detail") {
+        if !matches!(detail.as_str(), Some("auto" | "low" | "high")) {
+            return Err(ApiError::invalid(
+                "image_url detail must be auto, low, or high.",
+            ));
+        }
+    }
+    let url = text(&url["url"], "image_url url")?;
+    let unsupported = || {
+        ApiError::new(
+            400,
+            "unsupported_feature",
+            "OpenAI images require a base64 PNG data URL.",
+        )
+    };
+    let data = url.strip_prefix("data:").ok_or_else(unsupported)?;
+    let (media_type, encoded) = data.split_once(";base64,").ok_or_else(unsupported)?;
+    if media_type != "image/png" {
+        return Err(ApiError::new(
+            400,
+            "unsupported_feature",
+            "This profile accepts only PNG images.",
+        ));
+    }
+    let source = json!({"type":"base64","media_type":media_type,"data":encoded});
+    let image = OwnedPng::from_source(&source).map_err(media_error)?;
+    Ok(json!({"type":"image","media":image.descriptor()}))
+}
+
 pub(super) fn tool_content(block: &Value) -> Result<Value, ApiError> {
     let content = block.get("content");
     let prefix = "[tool_result is_error=true]\n";
@@ -199,6 +233,92 @@ mod tests {
         }
     }
 
+    fn openai_image(name: &str) -> Value {
+        json!({"type":"image_url","image_url":{"url":format!(
+            "data:image/png;base64,{}",
+            descriptor(name)["data_base64"].as_str().unwrap()
+        )}})
+    }
+
+    #[tokio::test]
+    async fn openai_image_parts_keep_order_and_the_contract_shape() {
+        let (service, _) = gateway_test_service_with_protocol(contracts::VISION_PROTOCOL);
+        let value = request(json!([
+            {"role":"user","content":[{"type":"text","text":"before"},openai_image("rgb"),{"type":"text","text":"after"}]}
+        ]));
+        let (normalized, _) = normalize(&value, Api::OpenAi, false, &service).unwrap();
+        assert_eq!(
+            normalized.messages[0]["content"],
+            json!([{"type":"text","text":"before"},{"type":"image","media":descriptor("rgb")},{"type":"text","text":"after"}])
+        );
+        // The gateway encodes this preparation frame before admission.
+        let preparation = json!({
+            "protocol": service.ready["protocol"],
+            "kind": "prepare_input",
+            "worker_epoch": service.ready["worker_epoch"],
+            "command_id": uuid::Uuid::new_v4().to_string(),
+            "model_revision": service.ready["model_revision"],
+            "messages": normalized.messages,
+            "tools": normalized.tools,
+            "template_options": {"enable_thinking": false},
+        });
+        assert!(contracts::encode_frame(&preparation).is_ok());
+
+        let png = |name| descriptor(name)["data_base64"].as_str().unwrap().to_owned();
+        for (part, code) in [
+            (
+                json!({"type":"image_url","image_url":{"url":"https://example.test/image.png"}}),
+                "unsupported_feature",
+            ),
+            (
+                json!({"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{}", png("rgb"))}}),
+                "unsupported_feature",
+            ),
+            (
+                json!({"type":"image_url","image_url":{"url":"data:image/png;base64,aW52YWxpZA=="}}),
+                "invalid_request",
+            ),
+            (
+                json!({"type":"image_url","image_url":{"url":format!("data:image/png;base64,{}", png("rgb")),"detail":"huge"}}),
+                "invalid_request",
+            ),
+        ] {
+            let value = request(json!([{"role":"user","content":[part]}]));
+            let error = normalize(&value, Api::OpenAi, false, &service)
+                .err()
+                .expect("The image part must fail.");
+            assert_eq!(
+                (error.status, error.code.as_str()),
+                (400, code),
+                "{error:?}"
+            );
+        }
+
+        // Images stay out of assistant and tool content.
+        for message in [
+            json!([{"role":"assistant","content":[openai_image("rgb")]}]),
+            json!([{"role":"tool","tool_call_id":"a","content":[openai_image("rgb")]}]),
+        ] {
+            let error = normalize(&request(message), Api::OpenAi, false, &service)
+                .err()
+                .expect("The image role must fail.");
+            assert_eq!(
+                (error.status, error.code.as_str()),
+                (400, "unsupported_feature")
+            );
+        }
+
+        // Four images stay inside the declared media limit.
+        let value = request(json!([{"role":"user","content":[
+            openai_image("rgb"),openai_image("rgba"),openai_image("rgb"),openai_image("rgba")
+        ]}]));
+        let (normalized, _) = normalize(&value, Api::OpenAi, false, &service).unwrap();
+        assert_eq!(
+            normalized.messages[0]["content"].as_array().unwrap().len(),
+            4
+        );
+    }
+
     #[tokio::test]
     async fn openai_text_content_parts_keep_the_vision_order() {
         let (service, _) = gateway_test_service_with_protocol(contracts::VISION_PROTOCOL);
@@ -266,6 +386,10 @@ mod tests {
         assert_eq!(
             body["public_capabilities"]["image_input_restriction"],
             "anthropic_base64_png_user_and_tool_result"
+        );
+        assert_eq!(
+            body["public_capabilities"]["openai_image_input_restriction"],
+            "openai_base64_png_user_only"
         );
         assert_eq!(
             body["public_capabilities"]["media_limits"],

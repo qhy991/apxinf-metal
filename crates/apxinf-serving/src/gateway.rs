@@ -89,6 +89,8 @@ async fn ready(State(service): State<Arc<Service>>) -> Response {
         body["public_capabilities"]["images"] = json!(true);
         body["public_capabilities"]["image_input_restriction"] =
             json!("anthropic_base64_png_user_and_tool_result");
+        body["public_capabilities"]["openai_image_input_restriction"] =
+            json!("openai_base64_png_user_only");
         body["public_capabilities"]["media_limits"] =
             service.ready["capabilities"]["media_limits"].clone();
     }
@@ -781,11 +783,21 @@ fn openai_content(content: &Value, role: &str, service: &Service) -> Result<Valu
                 }
             }
             Some("image_url") => {
-                return Err(ApiError::new(
-                    400,
-                    "unsupported_feature",
-                    "OpenAI image inputs are unsupported.",
-                ))
+                if !service.image_enabled() {
+                    return Err(ApiError::new(
+                        400,
+                        "unsupported_feature",
+                        "OpenAI image inputs are unsupported.",
+                    ));
+                }
+                if !ordered {
+                    return Err(ApiError::new(
+                        400,
+                        "unsupported_feature",
+                        "OpenAI images require user content.",
+                    ));
+                }
+                parts.push(vision::openai_image_part(part)?);
             }
             _ => {
                 return Err(ApiError::new(

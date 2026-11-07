@@ -179,16 +179,18 @@ Neither the model card nor a source-file limit qualifies every processor layout.
 
 ## Normalized messages
 
-The public gateway admits only Anthropic base64 `image/png` source blocks.
-User content and tool-result content can contain these blocks.
+The public gateway admits base64 `image/png` sources from two request forms.
+Anthropic messages use `type: image` source blocks in user content and tool results.
+OpenAI messages use `type: image_url` parts with a base64 PNG data URL in user content.
 The gateway preserves text and image order and each `tool_call_id`.
 It rejects URL sources, other media types, and images in system or assistant content.
-OpenAI image inputs remain unsupported. OpenAI text inputs retain their existing behavior.
+OpenAI `image_url` parts reject remote URLs, non-PNG data URLs, and non-user content.
+The OpenAI `detail` hint accepts `auto`, `low`, or `high` and remains advisory: it does not change processing.
 OpenAI text content-part arrays are accepted in any role.
 On user content, their text parts stay ordered with any supported image parts.
 On other roles, the gateway joins the text parts into the serial string form.
 For tool-result errors, the gateway inserts an ordinary text part before the original content.
-Public readiness must state this image input restriction.
+Public readiness states both image input restrictions.
 
 Message and tool field names retain their serial meanings and bounds.
 System and assistant content remain strings.
