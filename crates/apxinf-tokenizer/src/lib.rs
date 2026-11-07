@@ -252,6 +252,48 @@ pub struct Tokenizer {
     chat_template: Option<String>,
 }
 
+/// Emits stable byte-level segments and checks contextual decoder prefixes.
+pub struct IncrementalDecoder<'a> {
+    tokenizer: &'a Tokenizer,
+    tokens: Vec<u32>,
+    pending: Vec<u32>,
+    emitted: String,
+    skip_special_tokens: bool,
+    byte_level: bool,
+}
+
+impl IncrementalDecoder<'_> {
+    pub fn push(&mut self, token: u32) -> Result<String> {
+        self.tokens.push(token);
+        let text = if self.byte_level {
+            self.pending.push(token);
+            let decoded = self.tokenizer.decode_with_options(&self.pending, self.skip_special_tokens)?;
+            if decoded.ends_with('\u{fffd}') {
+                return Ok(String::new());
+            }
+            self.pending.clear();
+            decoded
+        } else {
+            let decoded = self.tokenizer.decode_with_options(&self.tokens, self.skip_special_tokens)?;
+            if decoded.ends_with('\u{fffd}') {
+                return Ok(String::new());
+            }
+            decoded.strip_prefix(&self.emitted)
+                .ok_or_else(|| Error::Other("tokenizer changed published text".into()))?
+                .to_owned()
+        };
+        self.emitted.push_str(&text);
+        Ok(text)
+    }
+
+    /// Verify the complete output once and return its unpublished suffix.
+    pub fn finish(self) -> Result<String> {
+        let decoded = self.tokenizer.decode_with_options(&self.tokens, self.skip_special_tokens)?;
+        decoded.strip_prefix(&self.emitted).map(str::to_owned)
+            .ok_or_else(|| Error::Other("tokenizer changed published text".into()))
+    }
+}
+
 impl Tokenizer {
     /// Load tokenizer from tokenizer.json, optionally loading tokenizer_config.json
     /// from the same directory for chat template and special tokens.
@@ -436,6 +478,17 @@ impl Tokenizer {
         self.inner
             .decode(tokens, skip_special_tokens)
             .map_err(|e| Error::Other(format!("tokenizer decode: {e}")))
+    }
+
+    pub fn incremental_decoder(&self, skip_special_tokens: bool) -> IncrementalDecoder<'_> {
+        IncrementalDecoder {
+            tokenizer: self,
+            tokens: Vec::new(),
+            pending: Vec::new(),
+            emitted: String::new(),
+            skip_special_tokens,
+            byte_level: matches!(self.inner.get_decoder(), Some(tokenizers::decoders::DecoderWrapper::ByteLevel(_))),
+        }
     }
 
     /// Get the vocabulary size.
@@ -1195,4 +1248,32 @@ mod tests {
             "<function>"
         );
     }
+    #[test]
+    fn incremental_decoder_preserves_semantic_tokens_and_complete_text() {
+        let mut tokenizer = special_token_template(&["hello", "world", "<function>", "</function>"]);
+        tokenizer.inner.add_special_tokens(&[AddedToken::from("<function>", true), AddedToken::from("</function>", true)]);
+        let ids = [0, 2, 1, 3];
+        let expected = tokenizer.decode_with_options(&ids, false).unwrap();
+        let mut decoder = tokenizer.incremental_decoder(false);
+        let mut actual = String::new();
+        for id in ids { actual.push_str(&decoder.push(id).unwrap()); }
+        actual.push_str(&decoder.finish().unwrap());
+        assert_eq!(actual, expected);
+        assert!(actual.contains("<function>"));
+    }
+
+    #[test]
+    fn incremental_decoder_keeps_partial_utf8_until_it_is_complete() {
+        let mut tokenizer = special_token_template(&["<0xE4>", "<0xB8>", "<0xAD>", "<function>"]);
+        tokenizer.inner.with_decoder(Some(tokenizers::decoders::byte_fallback::ByteFallback::new()));
+        let mut decoder = tokenizer.incremental_decoder(false);
+        assert_eq!(decoder.push(0).unwrap(), "");
+        assert_eq!(decoder.push(1).unwrap(), "");
+        assert_eq!(decoder.push(2).unwrap(), "中");
+        assert_eq!(decoder.finish().unwrap(), "");
+        let mut decoder = tokenizer.incremental_decoder(false);
+        assert_eq!(decoder.push(0).unwrap(), "");
+        assert_eq!(decoder.finish().unwrap(), "�");
+    }
+
 }
