@@ -341,6 +341,25 @@ class HttpGatewayTests(GatewayChecks, unittest.TestCase):
         self.assertEqual(self.gateway.request("/readyz")[0], 200)
         self.assertEqual(self.gateway.request("/v1/messages", body())[0], 200)
 
+    def test_worker_declared_failure_status_follows_the_contract(self):
+        # The public status comes from the documented error-code table, not from
+        # a generic backend-failure default.
+        cases = (
+            ("unavailable", 503, "model_unavailable"),
+            ("capacity", 503, "capacity_unavailable"),
+            ("prefix-mismatch", 409, "prefix_mismatch"),
+            ("session-missing", 404, "session_not_found"),
+            ("fail", 500, "internal_error"),
+        )
+        for scenario, status, code in cases:
+            with self.subTest(scenario=scenario):
+                for path in ("/v1/messages", "/v1/chat/completions"):
+                    self.assert_error(self.gateway.request(path, body(scenario)), status, code)
+        # A worker-declared request failure does not fence a healthy worker.
+        self.assertEqual(self.gateway.request("/readyz")[0], 200)
+        self.assertEqual(self.gateway.request("/v1/messages", body())[0], 200)
+        self.gateway.idle()
+
     def test_disconnects_reclaim_waiting_queue_and_active_reservation(self):
         gateway = self.gateway
         active, response = gateway.stream("/v1/messages", body("slow", stream=True, max_tokens=64))

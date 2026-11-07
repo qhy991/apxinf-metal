@@ -40,7 +40,7 @@ const EVENT: &[&str] = &[
     "attempt",
     "event_seq",
 ];
-const ERRORS: &[&str] = &[
+pub(crate) const ERRORS: &[&str] = &[
     "invalid_request",
     "unsupported_feature",
     "context_limit",

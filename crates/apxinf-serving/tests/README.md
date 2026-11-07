@@ -30,6 +30,7 @@ They do not establish real inference, model quality, performance, or Claude Code
 | Tools and stop sequences | Checked arguments become tool blocks. A stop match suppresses the matched text and following text. |
 | Recoverable failure | Preparation errors and failed attempts retain readiness after resource settlement. |
 | Protocol failure | Token counting preserves `protocol_fault`. Streaming emits one error without a success terminal. |
+| Worker-declared failure | A failed worker terminal keeps the documented HTTP status for its error code on both generation APIs and leaves the worker ready. |
 | Queue and disconnect | Overflow returns 429. Waiting and active disconnects release queue capacity and reservations. |
 | Deadline | Expiry emits an error, records one expired outcome, and releases resources after worker settlement. |
 | Worker exit | Readiness returns 503. Health remains available. New generation requests fail. |

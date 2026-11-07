@@ -83,7 +83,8 @@ class Worker:
     def prepare(self, command):
         self.trace("prepared", messages=command["messages"], tools=command["tools"])
         text = command["messages"][-1]["content"]
-        names = ["text", "slow", "fail", "tool", "stop", "exit", "prepare-error", "prepare-fault", "stream-fault"]
+        names = ["text", "slow", "fail", "tool", "stop", "exit", "prepare-error", "prepare-fault", "stream-fault",
+                 "unavailable", "capacity", "prefix-mismatch", "session-missing"]
         scenario = text.removeprefix("fixture:")
         index = names.index(scenario) if scenario in names else 0
         if scenario == "prepare-error":
@@ -137,7 +138,7 @@ class Worker:
             pieces = ["visible ST", "OP hidden"]
         elif scenario == 1:
             pieces = ["waiting "] * command["max_tokens"]
-        elif scenario == 2:
+        elif scenario in (2, 9, 10, 11, 12):
             pieces = ["partial "]
         status, cause = "completed", "length"
         for index, piece in enumerate(pieces[:command["max_tokens"]]):
@@ -159,8 +160,10 @@ class Worker:
                 received = control(2)
                 assert received and received["kind"] == "stop_generation"
                 cause = received["cause"]
-        if scenario == 2:
-            status, cause = "failed", "internal_error"
+        failures = {2: "internal_error", 9: "model_unavailable", 10: "capacity_unavailable",
+                    11: "prefix_mismatch", 12: "session_not_found"}
+        if scenario in failures:
+            status, cause = "failed", failures[scenario]
         fields = {"error": error(cause)} if status == "failed" else {}
         event("terminal", status=status, cause=cause,
               usage={"input_tokens": 2, "output_tokens": count},
