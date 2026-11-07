@@ -12,17 +12,22 @@ lerobot's ``Normalizer``:
 Both steps broadcast over the trailing axis, so a ``[horizon, dim]`` action
 chunk unnormalizes in one call. :meth:`from_norm_stats` reads the quantiles /
 moments straight out of a checkpoint's ``norm_stats.json``.
+
+Widths follow OpenPI's asymmetry: :class:`Unnormalizer` accepts an array *wider*
+than its stats and passes the extra tail through unchanged (a checkpoint's stats
+are the robot's width, the model emits its padded width), while
+:class:`Normalizer` requires an exact match.
 """
 
 from __future__ import annotations
 
 import copy
-import json
 from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
 
+from ..checkpoints.norm_stats import read_norm_stats
 from .base import ProcessorStep
 
 __all__ = ["Normalizer", "Unnormalizer", "load_norm_stats"]
@@ -31,20 +36,31 @@ _QUANTILE = "quantile"
 _MEAN_STD = "mean_std"
 
 
-def load_norm_stats(model_dir, key: str = "actions") -> dict:
+def load_norm_stats(model_dir=None, key: str = "actions", *, path=None) -> dict:
     """Return the raw stats dict for ``key`` (e.g. ``"actions"``/``"state"``).
 
     Handles both the nested ``{"norm_stats": {...}}`` and flat top-level layouts.
+
+    ``path`` names the file directly and is what callers should pass: an openpi
+    PyTorch export keeps its statistics at ``assets/<asset_id>/norm_stats.json``,
+    not in the checkpoint root, so :func:`apxinf.checkpoints.detect_checkpoint`
+    resolves the path and hands it over here. ``model_dir`` remains for the flat
+    layout — it just means ``<model_dir>/norm_stats.json``.
     """
-    document = json.loads((Path(model_dir) / "norm_stats.json").read_text())
-    stats = document.get("norm_stats", document)
+    if path is None:
+        if model_dir is None:
+            raise TypeError("load_norm_stats needs either model_dir or path")
+        path = Path(model_dir) / "norm_stats.json"
+    path = Path(path)
+    stats = read_norm_stats(path)
     if key not in stats:
-        raise KeyError(f"norm_stats.json has no entry {key!r}; keys: {sorted(stats)}")
+        raise KeyError(f"{path} has no entry {key!r}; keys: {sorted(stats)}")
     return stats[key]
 
 
 def _as_vector(values: Sequence[float], name: str, dims: Optional[int]) -> np.ndarray:
-    vector = np.asarray(values, dtype=np.float32)
+    # Store parsed values in float64; each call casts them to its compute dtype.
+    vector = np.asarray(values, dtype=np.float64)
     if vector.ndim != 1:
         raise ValueError(f"{name} must be rank 1, got shape {vector.shape}")
     if dims is not None:
@@ -57,12 +73,15 @@ def _as_vector(values: Sequence[float], name: str, dims: Optional[int]) -> np.nd
 class _AffineStats:
     """Shared statistics + the two-mode affine math for (un)normalization."""
 
-    def __init__(self, *, q01=None, q99=None, mean=None, std=None, mode=_QUANTILE, dims=None, eps=1e-6):
+    def __init__(self, *, q01=None, q99=None, mean=None, std=None, mode=_QUANTILE, dims=None, eps=1e-6, dtype=None):
         if mode not in (_QUANTILE, _MEAN_STD):
             raise ValueError(f"mode must be {_QUANTILE!r} or {_MEAN_STD!r}, got {mode!r}")
         self.mode = mode
         self.dims = None if dims is None else int(dims)
         self.eps = float(eps)
+        self.dtype = None if dtype is None else np.dtype(dtype)
+        # dtype -> (q01, q99, mean, std) downcast to that dtype; see _stats_as.
+        self._cast_cache: dict = {}
         if mode == _QUANTILE:
             if q01 is None or q99 is None:
                 raise ValueError("quantile mode requires q01 and q99")
@@ -86,31 +105,85 @@ class _AffineStats:
     def width(self) -> int:
         return (self.q01 if self.mode == _QUANTILE else self.mean).size
 
-    def _check(self, array: np.ndarray, who: str) -> np.ndarray:
-        array = np.asarray(array, dtype=np.float32)
-        if array.shape[-1] != self.width:
+    def _check(self, array: np.ndarray, who: str, *, allow_wider: bool = False) -> tuple:
+        """Coerce ``array`` and the stats to a common compute dtype, checking width.
+
+        The default dtype is ``result_type(array, float32)``: float32 inputs use
+        float32 statistics, while float64 inputs retain float64 computation.
+        That matters for the pi05 prompt path -- openpi's numpy
+        input chain runs in float64, so a float32 state would discretize to a
+        different bin whenever a normalized value lands within ~1e-7 of a bin
+        edge. An explicit ``dtype=`` pins the compute dtype regardless of the
+        input, which is how a caller reproduces openpi's *output* chain: there
+        the stats stay float64 (they are parsed from JSON and never downcast), so
+        a float32 action array is promoted rather than the stats demoted.
+
+        ``allow_wider`` mirrors openpi's asymmetry: its ``Unnormalize`` widens
+        narrow stats by passing the tail through, its ``Normalize`` does not (a
+        wider array there is a broadcast error). See :meth:`unnormalize`.
+        """
+        array = np.asarray(array)
+        dtype = self.dtype if self.dtype is not None else np.result_type(array.dtype, np.float32)
+        array = array.astype(dtype, copy=False)
+        got = array.shape[-1]
+        if got < self.width or (got != self.width and not allow_wider):
             raise ValueError(
                 f"{who}: last dim must be {self.width}, got array shape {array.shape}"
             )
-        return array
+        return array, dtype
+
+    def _stats_as(self, dtype):
+        cached = self._cast_cache.get(dtype)
+        if cached is None:
+            cached = tuple(
+                None if v is None else v.astype(dtype, copy=False)
+                for v in (self.q01, self.q99, self.mean, self.std)
+            )
+            self._cast_cache[dtype] = cached
+        return cached
 
     def unnormalize(self, array: np.ndarray) -> np.ndarray:
-        array = self._check(array, "Unnormalizer")
+        """Map back to physical units, **passing a wider array's tail through**.
+
+        A checkpoint's ``norm_stats`` is computed from the dataset, so it is the
+        *robot's* width (16 for a Unitree G1) while the model emits its padded
+        width (32). openpi's ``Unnormalize._unnormalize_quantile`` handles that by
+        unnormalizing the head and concatenating ``x[..., dim:]`` verbatim; the
+        padded tail is unused downstream, so the passthrough exists to keep the
+        chain running rather than to produce meaningful numbers. Without it the
+        G1 path cannot serve a real 16-wide ``norm_stats.json`` at all.
+        """
+        array, dtype = self._check(array, "Unnormalizer", allow_wider=True)
+        head, tail = array[..., : self.width], array[..., self.width :]
+        q01, q99, mean, std = self._stats_as(dtype)
+        scalar = dtype.type
         if self.mode == _QUANTILE:
-            span = (self.q99 - self.q01 + np.float32(self.eps)) / np.float32(2.0)
-            out = (array + np.float32(1.0)) * span + self.q01
+            span = (q99 - q01 + scalar(self.eps)) / scalar(2.0)
+            out = (head + scalar(1.0)) * span + q01
         else:
-            out = array * self.std + self.mean
-        return _finite(out.astype(np.float32, copy=False), "Unnormalizer")
+            out = head * std + mean
+        if tail.shape[-1]:
+            out = np.concatenate([out, tail], axis=-1)
+        return _finite(out.astype(dtype, copy=False), "Unnormalizer")
 
     def normalize(self, array: np.ndarray) -> np.ndarray:
-        array = self._check(array, "Normalizer")
+        """Map to the normalized domain. Width must match exactly.
+
+        No tail passthrough here, matching openpi: its ``Normalize`` slices the
+        stats to the array width, which broadcast-fails on an array *wider* than
+        the stats. The input chain never hits that case anyway --
+        ``PadStatesAndActions`` runs after ``Normalize``, so state is still the
+        robot's width when it is normalized.
+        """
+        array, dtype = self._check(array, "Normalizer")
+        q01, q99, mean, std = self._stats_as(dtype)
+        scalar = dtype.type
         if self.mode == _QUANTILE:
-            span = self.q99 - self.q01 + np.float32(self.eps)
-            out = np.float32(2.0) * (array - self.q01) / span - np.float32(1.0)
+            span = q99 - q01 + scalar(self.eps)
+            out = scalar(2.0) * (array - q01) / span - scalar(1.0)
         else:
-            out = (array - self.mean) / self.std
-        return _finite(out.astype(np.float32, copy=False), "Normalizer")
+            out = (array - mean) / std
+        return _finite(out.astype(dtype, copy=False), "Normalizer")
 
 
 def _finite(array: np.ndarray, who: str) -> np.ndarray:
@@ -119,25 +192,36 @@ def _finite(array: np.ndarray, who: str) -> np.ndarray:
     return array
 
 
-def _from_norm_stats(cls, model_dir, key, mode, dims, eps):
-    stats = load_norm_stats(model_dir, key)
+def _from_norm_stats(cls, model_dir, key, mode, dims, eps, dtype, path=None):
+    stats = load_norm_stats(model_dir, key, path=path)
     if mode == _QUANTILE:
-        return cls(q01=stats["q01"], q99=stats["q99"], mode=mode, dims=dims, eps=eps)
-    return cls(mean=stats["mean"], std=stats["std"], mode=mode, dims=dims, eps=eps)
+        return cls(q01=stats["q01"], q99=stats["q99"], mode=mode, dims=dims, eps=eps, dtype=dtype)
+    return cls(mean=stats["mean"], std=stats["std"], mode=mode, dims=dims, eps=eps, dtype=dtype)
 
 
 class Unnormalizer(ProcessorStep):
-    """Map a normalized-domain array back to physical units (last axis)."""
+    """Map a normalized-domain array back to physical units (last axis).
 
-    PARAMS = ("eps",)
+    An array wider than :attr:`width` keeps its tail unchanged, mirroring
+    OpenPI — see :meth:`_AffineStats.unnormalize`. A narrower one is an error.
 
-    def __init__(self, *, q01=None, q99=None, mean=None, std=None, mode=_QUANTILE, dims=None, eps=1e-6):
-        self._stats = _AffineStats(q01=q01, q99=q99, mean=mean, std=std, mode=mode, dims=dims, eps=eps)
+    ``dtype`` pins the compute dtype; the default follows the input (see
+    :meth:`_AffineStats._check`).
+    """
+
+    PARAMS = ("eps", "dtype")
+
+    def __init__(self, *, q01=None, q99=None, mean=None, std=None, mode=_QUANTILE, dims=None, eps=1e-6, dtype=None):
+        self._stats = _AffineStats(
+            q01=q01, q99=q99, mean=mean, std=std, mode=mode, dims=dims, eps=eps, dtype=dtype
+        )
         self.eps = self._stats.eps
+        self.dtype = self._stats.dtype
 
     @classmethod
-    def from_norm_stats(cls, model_dir, key: str = "actions", mode: str = _QUANTILE, dims=None, eps=1e-6):
-        return _from_norm_stats(cls, model_dir, key, mode, dims, eps)
+    def from_norm_stats(cls, model_dir=None, key: str = "actions", mode: str = _QUANTILE, dims=None, eps=1e-6, dtype=None, *, path=None):
+        """Build from a ``norm_stats.json``; ``path`` names the file directly."""
+        return _from_norm_stats(cls, model_dir, key, mode, dims, eps, dtype, path)
 
     @property
     def width(self) -> int:
@@ -149,23 +233,34 @@ class Unnormalizer(ProcessorStep):
     def _apply_overrides(self, overrides: dict) -> None:
         super()._apply_overrides(overrides)
         # ``with_overrides`` shallow-copied us, so ``_stats`` is still shared with
-        # the original; copy it before tweaking eps to avoid mutating the source.
+        # the original; copy it before tweaking the knobs to avoid mutating the
+        # source. ``_cast_cache`` is keyed by dtype, so sharing it stays correct.
         self._stats = copy.copy(self._stats)
         self._stats.eps = self.eps
+        self.dtype = None if self.dtype is None else np.dtype(self.dtype)
+        self._stats.dtype = self.dtype
 
 
 class Normalizer(ProcessorStep):
-    """Map a physical-units array to the normalized domain (last axis)."""
+    """Map a physical-units array to the normalized domain (last axis).
 
-    PARAMS = ("eps",)
+    ``dtype`` pins the compute dtype; the default follows the input (see
+    :meth:`_AffineStats._check`).
+    """
 
-    def __init__(self, *, q01=None, q99=None, mean=None, std=None, mode=_QUANTILE, dims=None, eps=1e-6):
-        self._stats = _AffineStats(q01=q01, q99=q99, mean=mean, std=std, mode=mode, dims=dims, eps=eps)
+    PARAMS = ("eps", "dtype")
+
+    def __init__(self, *, q01=None, q99=None, mean=None, std=None, mode=_QUANTILE, dims=None, eps=1e-6, dtype=None):
+        self._stats = _AffineStats(
+            q01=q01, q99=q99, mean=mean, std=std, mode=mode, dims=dims, eps=eps, dtype=dtype
+        )
         self.eps = self._stats.eps
+        self.dtype = self._stats.dtype
 
     @classmethod
-    def from_norm_stats(cls, model_dir, key: str = "actions", mode: str = _QUANTILE, dims=None, eps=1e-6):
-        return _from_norm_stats(cls, model_dir, key, mode, dims, eps)
+    def from_norm_stats(cls, model_dir=None, key: str = "actions", mode: str = _QUANTILE, dims=None, eps=1e-6, dtype=None, *, path=None):
+        """Build from a ``norm_stats.json``; ``path`` names the file directly."""
+        return _from_norm_stats(cls, model_dir, key, mode, dims, eps, dtype, path)
 
     @property
     def width(self) -> int:
@@ -178,3 +273,5 @@ class Normalizer(ProcessorStep):
         super()._apply_overrides(overrides)
         self._stats = copy.copy(self._stats)
         self._stats.eps = self.eps
+        self.dtype = None if self.dtype is None else np.dtype(self.dtype)
+        self._stats.dtype = self.dtype

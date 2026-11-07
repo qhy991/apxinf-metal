@@ -6,6 +6,18 @@ pub enum DType {
     BF16,
     /// NVIDIA/CUDA FP8 E4M3 finite-number encoding.
     F8E4M3,
+    /// Signed 8-bit integer storage used by pre-quantized GEMM operands.
+    I8,
+    /// Signed 32-bit integer accumulation/output storage.
+    I32,
+    /// A byte holding two FP4 E2M1 values, low nibble first.
+    ///
+    /// The element *is* the byte pair, so a tensor of this dtype carries the
+    /// physical shape `[.., K/2]` while the mathematical operand it encodes has
+    /// width `K`. Keeping the packing in the dtype rather than in a separate
+    /// logical-shape field means every existing size and stride computation
+    /// stays correct without a second notion of shape.
+    E2M1Pair,
 }
 
 impl DType {
@@ -15,6 +27,9 @@ impl DType {
             DType::F32 => 4,
             DType::F16 | DType::BF16 => 2,
             DType::F8E4M3 => 1,
+            DType::I8 => 1,
+            DType::I32 => 4,
+            DType::E2M1Pair => 1,
         }
     }
 }
@@ -26,6 +41,9 @@ impl std::fmt::Display for DType {
             DType::F16 => write!(f, "f16"),
             DType::BF16 => write!(f, "bf16"),
             DType::F8E4M3 => write!(f, "f8_e4m3"),
+            DType::I8 => write!(f, "i8"),
+            DType::I32 => write!(f, "i32"),
+            DType::E2M1Pair => write!(f, "e2m1_pair"),
         }
     }
 }

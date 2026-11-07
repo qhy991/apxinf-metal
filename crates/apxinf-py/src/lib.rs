@@ -6,39 +6,112 @@
 //!
 //! The public inference tier is numpy-in / numpy-out (host):
 //!
-//! * **L1** [`Model::infer_rgb`] — caller supplies resized RGB `uint8` images;
+//! * **L1** [`ModelRunner::infer_rgb`] — caller supplies resized RGB `uint8` images;
 //!   vision→patches runs inside the Rust CUDA graph.
 //!
-//! **L0** [`Model::infer_patches`] (caller supplies pre-computed `patches`,
-//! equivalent to a Rust `Observation(Patches)`) is implemented but **not part of
-//! the public API**: it is exposed to Python only under the private
-//! `_infer_patches` name for L0/L1 consistency tests, and may change or be
-//! removed without notice.
+//! **L0** [`ModelRunner::infer_patches`] (caller supplies pre-computed `patches`,
+//! equivalent to a Rust `Observation(Patches)`) is exposed under the private
+//! `_infer_patches` name. It is the model-policy bridge for families such as
+//! WallOSS whose preprocessing stays in Python, and remains outside the public
+//! end-user API.
 //!
 //! Both return the **normalized-domain** action as a `float32` numpy array of
-//! shape `[action_horizon, action_dim]`. Tokenization, normalization, and noise
-//! sampling stay in Python (the `apxinf` package, Phase 2). No processor lives
-//! here.
+//! shape `[action_horizon, action_dim]`. Inference accepts optional exact
+//! caller-provided noise. When it is omitted, a model-owned counter-based stream
+//! generates the initial latent directly in the runtime's device buffer. The
+//! `*_seeded` variants remain available for explicitly keyed replay. No processor
+//! lives here.
 //!
-//! The pi05 runtime is only registered on CUDA devices, so real inference
+//! The VLA runtimes are only registered on CUDA devices, so real inference
 //! requires the `cuda` feature and a CUDA machine; without it the module still
-//! imports and reports shape contracts, but `load` errors for pi05.
+//! imports and reports shape contracts, but model loading errors.
+//!
 
+use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use numpy::ndarray::Array2;
+use numpy::ndarray::{Array1, Array2};
 use numpy::{
-    IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
+    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
     PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
 
-use apxinf_core::{Device, Shape, Tensor};
+use apxinf_core::{DType, Device, RngKey, Shape, Tensor};
 use apxinf_model::{
-    AutoModel, ImageLayout, LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config,
-    SyntheticWeights, VisionObservation,
+    AutoModel, DecisionAnswer, DecisionInput, DecisionSchema, ImageLayout, LoadOptions,
+    LoadedModel, ModelPrecision, Observation, Pi05Config, SyntheticWeights, VisionObservation,
+    VlaContract, VlaMetadata, VlaRequest,
 };
+use apxinf_tokenizer::{SentencePieceTokenizer as NativeSentencePiece, Tokenizer as NativeHf};
+
+/// Hugging Face `tokenizer.json` runtime backed by the Rust `tokenizers` crate.
+#[pyclass(name = "HfTokenizer", unsendable)]
+pub struct HfTokenizer {
+    inner: NativeHf,
+}
+
+#[pymethods]
+impl HfTokenizer {
+    #[staticmethod]
+    fn from_file(path: PathBuf) -> PyResult<Self> {
+        Ok(Self {
+            inner: NativeHf::from_file(path).map_err(runtime_err)?,
+        })
+    }
+
+    fn encode(&self, text: &str) -> PyResult<Vec<u32>> {
+        self.inner.encode(text).map_err(runtime_err)
+    }
+
+    #[pyo3(name = "encode_with_special_tokens", signature = (text, add_special_tokens))]
+    fn encode_with_special_tokens(&self, text: &str, add_special_tokens: bool) -> PyResult<Vec<u32>> {
+        self.inner
+            .encode_with_special_tokens(text, add_special_tokens)
+            .map_err(runtime_err)
+    }
+
+    fn decode(&self, token_ids: Vec<u32>) -> PyResult<String> {
+        self.inner.decode(&token_ids).map_err(runtime_err)
+    }
+
+    fn add_tokens(&mut self, tokens: Vec<String>) -> usize {
+        self.inner.add_tokens(&tokens)
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+}
+
+/// Native SentencePiece `.model` runtime used by PI0.5 processors.
+#[pyclass(name = "SentencePieceTokenizer", unsendable)]
+pub struct PySentencePieceTokenizer {
+    inner: NativeSentencePiece,
+}
+
+#[pymethods]
+impl PySentencePieceTokenizer {
+    #[staticmethod]
+    fn from_file(path: PathBuf) -> PyResult<Self> {
+        Ok(Self {
+            inner: NativeSentencePiece::from_file(path).map_err(runtime_err)?,
+        })
+    }
+
+    #[pyo3(signature = (text, add_bos=false))]
+    fn encode(&self, text: &str, add_bos: bool) -> PyResult<Vec<u32>> {
+        self.inner.encode(text, add_bos).map_err(runtime_err)
+    }
+}
 
 /// Map any Rust error into a Python `RuntimeError`.
 fn runtime_err<E: std::fmt::Display>(error: E) -> PyErr {
@@ -50,7 +123,7 @@ fn parse_device(spec: &str) -> PyResult<Device> {
         Some((kind, index)) => {
             let index = index.parse::<usize>().map_err(|_| {
                 PyValueError::new_err(format!(
-                    "apxinf_py.load: invalid device index in `{spec}` (expected e.g. `cuda:0`)"
+                    "apxinf_py.load: invalid device index in `{spec}` (expected e.g. `cuda:0` or `metal:0`)"
                 ))
             })?;
             (kind, index)
@@ -59,9 +132,11 @@ fn parse_device(spec: &str) -> PyResult<Device> {
     };
     match kind {
         "cuda" => Ok(Device::Cuda(index)),
+        "hip" => Ok(Device::Hip(index)),
+        "metal" | "mlx" => Ok(Device::Metal(index)),
         "cpu" => Ok(Device::Cpu),
         other => Err(PyValueError::new_err(format!(
-            "apxinf_py.load: unknown device `{other}` (expected cuda|cpu)"
+            "apxinf_py.load: unknown device `{other}` (expected cuda|hip|metal|mlx|cpu)"
         ))),
     }
 }
@@ -106,25 +181,255 @@ fn load_config(checkpoint: &Path) -> PyResult<Pi05Config> {
     }
 }
 
-/// A loaded pi05 model handle. Holds the runtime plus the resolved config used
-/// for shape-contract queries and input validation.
+/// Python binding for a loaded VLA runner. Holds the runtime and its contract,
+/// adapts NumPy inputs/outputs, and supplies default sampling keys.
 ///
-/// The pi05 runtime uses `Rc`/`RefCell` internally and is therefore not `Send`;
+/// The pi05 and MLX runtimes may own thread-bound `Rc`/`RefCell` resources;
 /// the handle is `unsendable` and must be used from the thread that created it.
 #[pyclass(unsendable)]
-pub struct Model {
+pub struct ModelRunner {
     model: LoadedModel,
-    config: Pi05Config,
+    contract: VlaContract,
+    /// `Some` for autoregressive token VLAs (π0-FAST); `None` for continuous ones.
+    action_tokens: Option<[usize; 2]>,
     device: Device,
+    sampling_seed: Cell<u64>,
+    sampling_draw: Cell<u64>,
 }
 
-impl Model {
+/// Request-owned RGB snapshot. This object has no NumPy references and can be
+/// transferred to the model observation exactly once.
+#[pyclass(name = "_PackedRgbU8")]
+struct PackedRgbU8 {
+    bytes: Option<Vec<u8>>,
+}
+
+impl PackedRgbU8 {
+    fn from_slices(parts: &[&[u8]]) -> PyResult<Self> {
+        const MAX_RGB_BYTES: usize = 512 * 1024 * 1024;
+        if parts.is_empty() || parts.len() > 65_535 {
+            return Err(PyValueError::new_err(
+                "RGB frame count must be in 1..=65535",
+            ));
+        }
+        let mut total = 0usize;
+        for part in parts {
+            if part.is_empty() {
+                return Err(PyValueError::new_err("RGB frames must not be empty"));
+            }
+            total = total
+                .checked_add(part.len())
+                .filter(|&n| n <= MAX_RGB_BYTES)
+                .ok_or_else(|| PyValueError::new_err("RGB byte budget exceeded"))?;
+        }
+        let mut packed = Vec::new();
+        packed
+            .try_reserve_exact(total)
+            .map_err(|_| PyValueError::new_err("RGB byte buffer allocation failed"))?;
+        for part in parts {
+            packed.extend_from_slice(part);
+        }
+        Ok(Self {
+            bytes: Some(packed),
+        })
+    }
+
+    fn take_bytes(&mut self) -> PyResult<Vec<u8>> {
+        self.bytes
+            .take()
+            .ok_or_else(|| PyValueError::new_err("packed RGB holder was already consumed"))
+    }
+}
+
+fn decision_answer_to_python<'py>(
+    py: Python<'py>,
+    answer: &DecisionAnswer,
+) -> PyResult<Bound<'py, PyDict>> {
+    let scores = PyList::empty_bound(py);
+    for score in &answer.scores {
+        let score_dict = PyDict::new_bound(py);
+        score_dict.set_item("code", &score.code)?;
+        score_dict.set_item("token_id", score.token_id)?;
+        score_dict.set_item("probability", score.probability)?;
+        scores.append(score_dict)?;
+    }
+    let result = PyDict::new_bound(py);
+    result.set_item("selected_index", answer.selected_index)?;
+    result.set_item("scores", scores)?;
+    Ok(result)
+}
+
+/// Decision model runner (d3-mini, Clef, etc.). Loads via `AutoModel` and exposes
+/// encoded-prompt and schema requests through the same model handle.
+#[pyclass(unsendable)]
+pub struct DecisionRunner {
+    model: LoadedModel,
+    device: Device,
+    model_path: PathBuf,
+}
+
+#[pymethods]
+impl DecisionRunner {
+    /// Load a decision model checkpoint.
+    ///
+    /// * `model_path` — checkpoint directory detected by `AutoModel`.
+    /// * `device` — defaults to `cuda:0`; Clef requires `metal:N` and `mlx` support.
+    /// * `autotune` — tune missing GEMM recipes from the first request.
+    /// * `tuning_dir` — directory to persist tuning recipes.
+    #[staticmethod]
+    #[pyo3(signature = (model_path, device="cuda:0", autotune=false, tuning_dir=None))]
+    fn load(
+        model_path: PathBuf,
+        device: &str,
+        autotune: bool,
+        tuning_dir: Option<PathBuf>,
+    ) -> PyResult<Self> {
+        let device = parse_device(device)?;
+        let options = LoadOptions {
+            autotune,
+            tuning_path: tuning_dir,
+            ..LoadOptions::default()
+        };
+        let model = AutoModel::load_model(device, &model_path, &options).map_err(runtime_err)?;
+        // Verify this is actually a decision model.
+        model.decision_code_names().map_err(|_| {
+            PyValueError::new_err(format!(
+                "apxinf_py.DecisionRunner.load: {:?} is not a decision model",
+                model_path
+            ))
+        })?;
+        Ok(Self {
+            model,
+            device,
+            model_path,
+        })
+    }
+
+    /// Run a text decision and return scored codes.
+    ///
+    /// * `token_ids` — 1-D uint32 numpy array of tokenized prompt.
+    /// * `candidate_count` — number of leading codes to score.
+    ///
+    /// Returns a dict with:
+    /// * `selected_index` — index of the highest-probability code.
+    /// * `scores` — list of `{"code": str, "token_id": int, "probability": float}`.
+    fn decide(
+        &mut self,
+        token_ids: PyReadonlyArray1<'_, u32>,
+        candidate_count: usize,
+    ) -> PyResult<PyObject> {
+        let ids = token_ids.as_slice().map_err(|_| {
+            PyValueError::new_err(
+                "apxinf_py.DecisionRunner.decide: token_ids must be a 1-D uint32 contiguous array",
+            )
+        })?;
+        let output = self
+            .model
+            .decide(DecisionInput::text(ids, candidate_count))
+            .and_then(|output| output.into_single())
+            .map_err(runtime_err)?;
+        Python::with_gil(|py| Ok(decision_answer_to_python(py, &output)?.into()))
+    }
+
+    fn decide_schema(&mut self, request_json: &str) -> PyResult<PyObject> {
+        let schema = DecisionSchema::from_json(request_json)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let output = self
+            .model
+            .decide(DecisionInput::Schema(&schema))
+            .map_err(runtime_err)?;
+        Python::with_gil(|py| {
+            let answers = PyList::empty_bound(py);
+            for answer in &output.answers {
+                let answer_dict = decision_answer_to_python(py, answer)?;
+                answer_dict.set_item("question_id", &answer.question_id)?;
+                answers.append(answer_dict)?;
+            }
+            let result = PyDict::new_bound(py);
+            result.set_item("answers", answers)?;
+            Ok(result.into())
+        })
+    }
+
+    /// Available code names in the package code table.
+    #[getter]
+    fn codes(&self) -> PyResult<Vec<String>> {
+        self.model
+            .decision_code_names()
+            .map(|names| names.to_vec())
+            .map_err(runtime_err)
+    }
+
+    /// Total number of codes in the package.
+    #[getter]
+    fn num_codes(&self) -> PyResult<usize> {
+        self.model
+            .decision_code_names()
+            .map(|names| names.len())
+            .map_err(runtime_err)
+    }
+
+    #[getter]
+    fn device(&self) -> String {
+        self.device.to_string()
+    }
+
+    #[getter]
+    fn model_path(&self) -> String {
+        self.model_path.display().to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        let num = self
+            .model
+            .decision_code_names()
+            .map(|names| names.len())
+            .unwrap_or(0);
+        format!(
+            "DecisionRunner(device={}, codes={num}, path={:?})",
+            self.device(),
+            self.model_path
+        )
+    }
+}
+
+struct PreprocessedVlaInput {
+    observation: Observation,
+    latent: Tensor,
+    attention_mask: Vec<u8>,
+    image_grid_thw: Vec<[u32; 3]>,
+    embodiment_id: Option<usize>,
+}
+
+impl ModelRunner {
+    fn require_rgb_contract(&self, method: &str) -> PyResult<VlaContract> {
+        if !self.contract.accepts_rgb_u8 {
+            Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: loaded model accepts preprocessed patches, not RGB"
+            )))
+        } else if self.contract.num_views == 0 || self.contract.image_size == 0 {
+            Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: variable-grid RGB requires the model policy bridge"
+            )))
+        } else {
+            Ok(self.contract)
+        }
+    }
+
     fn patch_rows(&self) -> usize {
-        self.config.num_views * self.config.patches_per_view()
+        self.contract.patch_shape[0]
     }
 
     fn patch_width(&self) -> usize {
-        3 * self.config.patch_size * self.config.patch_size
+        self.contract.patch_shape[1]
+    }
+
+    fn action_shape(&self) -> [usize; 2] {
+        self.contract.action_shape
+    }
+
+    fn max_token_len_value(&self) -> usize {
+        self.contract.max_token_len
     }
 
     fn validate_tokens(&self, token_ids: &[u32]) -> PyResult<()> {
@@ -133,11 +438,12 @@ impl Model {
                 "apxinf_py.infer: token_ids must be non-empty",
             ));
         }
-        if token_ids.len() > self.config.max_token_len {
+        let max_token_len = self.max_token_len_value();
+        if token_ids.len() > max_token_len {
             return Err(PyValueError::new_err(format!(
                 "apxinf_py.infer: token_ids length {} exceeds max_token_len {}",
                 token_ids.len(),
-                self.config.max_token_len
+                max_token_len
             )));
         }
         Ok(())
@@ -146,7 +452,7 @@ impl Model {
     /// Validate `noise` shape and build a CPU f32 tensor. The runtime normalizes
     /// f32 CPU tensors to its input dtype, so numpy f32 is accepted directly.
     fn noise_tensor(&self, noise: PyReadonlyArray2<'_, f32>) -> PyResult<Tensor> {
-        let expected = [self.config.action_horizon, self.config.action_dim];
+        let expected = self.action_shape();
         let shape = noise.shape();
         if shape.len() != 2 || shape[0] != expected[0] || shape[1] != expected[1] {
             return Err(PyValueError::new_err(format!(
@@ -157,23 +463,40 @@ impl Model {
         let data = noise.as_slice().map_err(|_| {
             PyValueError::new_err("apxinf_py.infer: noise must be C-contiguous float32")
         })?;
-        Tensor::from_f32(
-            Shape::new(vec![expected[0], expected[1]]),
-            data,
-        )
-        .map_err(runtime_err)
+        Tensor::from_f32(Shape::new(vec![expected[0], expected[1]]), data).map_err(runtime_err)
     }
 
-    /// Run inference and marshal the flat host action into a `[horizon, dim]`
-    /// numpy array, rejecting non-finite outputs.
-    fn run<'py>(
+    fn action_mask_tensor(&self, mask: PyReadonlyArray2<'_, f32>) -> PyResult<Tensor> {
+        let expected = self.action_shape();
+        let shape = mask.shape();
+        if shape != expected {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.infer: action_mask expected shape {:?}, got {:?}",
+                expected, shape
+            )));
+        }
+        let data = mask.as_slice().map_err(|_| {
+            PyValueError::new_err("apxinf_py.infer: action_mask must be C-contiguous float32")
+        })?;
+        Tensor::from_f32(Shape::new(expected.to_vec()), data).map_err(runtime_err)
+    }
+
+    fn state_tensor(&self, state: PyReadonlyArray1<'_, f32>) -> PyResult<Tensor> {
+        let data = state
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("state must be C-contiguous float32"))?;
+        if data.is_empty() {
+            return Err(PyValueError::new_err("state must not be empty"));
+        }
+        Tensor::from_f32(Shape::new(vec![data.len()]), data).map_err(runtime_err)
+    }
+
+    fn action_array<'py>(
         &self,
         py: Python<'py>,
-        observation: Observation,
+        flat: Vec<f32>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        let flat = self.model.infer_host_f32(&observation).map_err(runtime_err)?;
-        let horizon = self.config.action_horizon;
-        let dim = self.config.action_dim;
+        let [horizon, dim] = self.action_shape();
         if flat.len() != horizon * dim {
             return Err(PyRuntimeError::new_err(format!(
                 "apxinf_py.infer: model returned {} values, expected {} ({}x{})",
@@ -191,23 +514,463 @@ impl Model {
         let array = Array2::from_shape_vec((horizon, dim), flat).map_err(runtime_err)?;
         Ok(array.into_pyarray_bound(py))
     }
+
+    fn next_sampling_rng(&self) -> PyResult<RngKey> {
+        let draw = self.sampling_draw.get();
+        let next = draw
+            .checked_add(1)
+            .ok_or_else(|| PyRuntimeError::new_err("implicit sampling draw counter overflow"))?;
+        self.sampling_draw.set(next);
+        Ok(RngKey::new(self.sampling_seed.get(), 0, draw))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn preprocessed_vla_input<'py>(
+        &self,
+        method: &str,
+        pixel_values: PyReadonlyArray2<'py, f32>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: Option<usize>,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+    ) -> PyResult<PreprocessedVlaInput> {
+        let pixels_shape = pixel_values.shape();
+        if pixels_shape.len() != 2 || pixels_shape[0] == 0 || pixels_shape[1] == 0 {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: pixel_values must be a non-empty rank-2 array, got {pixels_shape:?}"
+            )));
+        }
+        if self.contract.patch_shape[1] != 0 && pixels_shape[1] != self.contract.patch_shape[1] {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: pixel width {} does not match model width {}",
+                pixels_shape[1], self.contract.patch_shape[1]
+            )));
+        }
+        let grid_shape = image_grid_thw.shape();
+        if grid_shape.len() != 2 || grid_shape[0] == 0 || grid_shape[1] != 3 {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: image_grid_thw must have shape [images, 3], got {grid_shape:?}"
+            )));
+        }
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(format!(
+                    "apxinf_py.{method}: token_ids must be C-contiguous uint32"
+                ))
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let mask = attention_mask
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(format!(
+                    "apxinf_py.{method}: attention_mask must be C-contiguous uint8"
+                ))
+            })?
+            .to_vec();
+        if mask.len() != tokens.len() {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: attention mask length {} does not match token length {}",
+                mask.len(),
+                tokens.len()
+            )));
+        }
+        let grids = image_grid_thw
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(format!(
+                    "apxinf_py.{method}: image_grid_thw must be C-contiguous uint32"
+                ))
+            })?
+            .chunks_exact(3)
+            .map(|row| [row[0], row[1], row[2]])
+            .collect::<Vec<_>>();
+        let pixels = Tensor::from_f32(
+            Shape::new(pixels_shape.to_vec()),
+            pixel_values.as_slice().map_err(|_| {
+                PyValueError::new_err(format!(
+                    "apxinf_py.{method}: pixel_values must be C-contiguous float32"
+                ))
+            })?,
+        )
+        .map_err(runtime_err)?;
+        let state = Tensor::from_f32(
+            Shape::new(state.shape().to_vec()),
+            state.as_slice().map_err(|_| {
+                PyValueError::new_err(format!(
+                    "apxinf_py.{method}: state must be C-contiguous float32"
+                ))
+            })?,
+        )
+        .map_err(runtime_err)?;
+        let [horizon, action_dim] = self.action_shape();
+        let noise_shape = noise.shape();
+        if noise_shape != [horizon, action_dim] && noise_shape != [1, horizon, action_dim] {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: noise expected [{horizon}, {action_dim}] or [1, {horizon}, {action_dim}], got {noise_shape:?}"
+            )));
+        }
+        let latent = Tensor::from_f32(
+            Shape::new(noise_shape.to_vec()),
+            noise.as_slice().map_err(|_| {
+                PyValueError::new_err(format!(
+                    "apxinf_py.{method}: noise must be C-contiguous float32"
+                ))
+            })?,
+        )
+        .map_err(runtime_err)?;
+        Ok(PreprocessedVlaInput {
+            observation: Observation {
+                vision: VisionObservation::Patches(pixels),
+                token_ids: tokens,
+                state: Some(state),
+                action_mask: None,
+            },
+            latent,
+            attention_mask: mask,
+            image_grid_thw: grids,
+            embodiment_id,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resized_rgb_vla_input<'py>(
+        &self,
+        rgb: Vec<u8>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: Option<usize>,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+        raw_expected: Option<usize>,
+    ) -> PyResult<PreprocessedVlaInput> {
+        if !self.contract.accepts_rgb_u8
+            || self.contract.num_views != 0
+            || self.contract.image_size != 0
+        {
+            return Err(PyValueError::new_err(
+                "_infer_resized_rgb requires a variable-grid RGB model",
+            ));
+        }
+        let grid_shape = image_grid_thw.shape();
+        if grid_shape.len() != 2 || grid_shape[0] == 0 || grid_shape[1] != 3 {
+            return Err(PyValueError::new_err(
+                "_infer_resized_rgb: grids must be [images,3]",
+            ));
+        }
+        let grids = image_grid_thw
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err("_infer_resized_rgb: grids must be contiguous uint32")
+            })?
+            .chunks_exact(3)
+            .map(|g| [g[0], g[1], g[2]])
+            .collect::<Vec<_>>();
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err("_infer_resized_rgb: token IDs must be contiguous uint32")
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let mask = attention_mask
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err("_infer_resized_rgb: attention mask must be contiguous uint8")
+            })?
+            .to_vec();
+        if mask.len() != tokens.len() {
+            return Err(PyValueError::new_err(
+                "_infer_resized_rgb: attention mask length mismatch",
+            ));
+        }
+        let patch = self.contract.patch_size;
+        let expected = grids
+            .iter()
+            .try_fold(0usize, |total, g| {
+                (g[0] == 1).then_some(())?;
+                total.checked_add(
+                    (g[1] as usize)
+                        .checked_mul(g[2] as usize)?
+                        .checked_mul(patch)?
+                        .checked_mul(patch)?
+                        .checked_mul(3)?,
+                )
+            })
+            .ok_or_else(|| {
+                PyValueError::new_err("_infer_resized_rgb: invalid or overflowing grids")
+            })?;
+        let expected = raw_expected.unwrap_or(expected);
+        if rgb.len() != expected {
+            return Err(PyValueError::new_err(format!(
+                "_infer_resized_rgb: RGB length {} does not match grids ({expected})",
+                rgb.len()
+            )));
+        }
+        let state = Tensor::from_f32(
+            Shape::new(state.shape().to_vec()),
+            state.as_slice().map_err(|_| {
+                PyValueError::new_err("_infer_resized_rgb: state must be contiguous float32")
+            })?,
+        )
+        .map_err(runtime_err)?;
+        let [horizon, dim] = self.action_shape();
+        if noise.shape() != [horizon, dim] && noise.shape() != [1, horizon, dim] {
+            return Err(PyValueError::new_err(
+                "_infer_resized_rgb: noise shape mismatch",
+            ));
+        }
+        let latent = Tensor::from_f32(
+            Shape::new(noise.shape().to_vec()),
+            noise.as_slice().map_err(|_| {
+                PyValueError::new_err("_infer_resized_rgb: noise must be contiguous float32")
+            })?,
+        )
+        .map_err(runtime_err)?;
+        Ok(PreprocessedVlaInput {
+            observation: Observation {
+                vision: VisionObservation::RgbU8 {
+                    bytes: rgb,
+                    layout: ImageLayout::Nhwc,
+                },
+                token_ids: tokens,
+                state: Some(state),
+                action_mask: None,
+            },
+            latent,
+            attention_mask: mask,
+            image_grid_thw: grids,
+            embodiment_id,
+        })
+    }
+
+    // Shared by the NumPy bridge and the one-shot owned RGB bridge.
+    fn infer_resized_rgb_owned<'py>(
+        &self,
+        py: Python<'py>,
+        rgb: Vec<u8>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: Option<usize>,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+        num_steps: Option<usize>,
+        max_new_tokens: Option<usize>,
+        min_new_tokens: usize,
+        terminator_ids: Option<Vec<u32>>,
+        closing_ids: Option<Vec<u32>>,
+        raw_resize_frames: Option<PyReadonlyArray2<'py, u32>>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        use apxinf_model::vla::RawRgbResizeFrame;
+        let raw_frames = if let Some(raw) = raw_resize_frames {
+            if image_grid_thw.shape().len() != 2 || image_grid_thw.shape()[1] != 3 {
+                return Err(PyValueError::new_err("grids must be [images,3]"));
+            }
+            if raw.shape().len() != 2
+                || raw.shape()[0] == 0
+                || raw.shape()[1] != 6
+                || raw.shape()[0] != image_grid_thw.shape()[0]
+            {
+                return Err(PyValueError::new_err(
+                    "raw_resize_frames must be [images,6]",
+                ));
+            }
+            let values = raw.as_slice().map_err(|_| {
+                PyValueError::new_err("raw_resize_frames must be contiguous uint32")
+            })?;
+            let mut frames = Vec::with_capacity(values.len() / 6);
+            let grids = image_grid_thw
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("grids must be contiguous uint32"))?;
+            for (index, row) in values.chunks_exact(6).enumerate() {
+                let [sw, sh, tw, th, fw, fh] = [row[0], row[1], row[2], row[3], row[4], row[5]];
+                let grid = &grids[index * 3..index * 3 + 3];
+                if sw == 0
+                    || sh == 0
+                    || tw == 0
+                    || th == 0
+                    || fw == 0
+                    || fh == 0
+                    || grid[0] != 1
+                    || grid[2].checked_mul(self.contract.patch_size as u32) != Some(fw)
+                    || grid[1].checked_mul(self.contract.patch_size as u32) != Some(fh)
+                {
+                    return Err(PyValueError::new_err(
+                        "raw resize geometry and final grid disagree",
+                    ));
+                }
+                frames.push(RawRgbResizeFrame {
+                    source_width: sw,
+                    source_height: sh,
+                    stage_width: tw,
+                    stage_height: th,
+                    final_width: fw,
+                    final_height: fh,
+                });
+            }
+            Some(frames)
+        } else {
+            None
+        };
+        let raw_expected = if let Some(frames) = &raw_frames {
+            Some(
+                frames
+                    .iter()
+                    .try_fold(0usize, |total, frame| {
+                        total.checked_add(
+                            (frame.source_width as usize)
+                                .checked_mul(frame.source_height as usize)?
+                                .checked_mul(3)?,
+                        )
+                    })
+                    .ok_or_else(|| PyValueError::new_err("raw RGB byte count overflow"))?,
+            )
+        } else {
+            None
+        };
+        let input = self.resized_rgb_vla_input(
+            rgb,
+            image_grid_thw,
+            token_ids,
+            attention_mask,
+            state,
+            embodiment_id,
+            noise,
+            raw_expected,
+        )?;
+        use apxinf_model::vla::{PlanningOptions, ReasoningOptions};
+        let reasoning = match max_new_tokens {
+            Some(max_new_tokens) => Some(ReasoningOptions {
+                max_new_tokens,
+                min_new_tokens,
+                terminator_ids: terminator_ids
+                    .ok_or_else(|| PyValueError::new_err("reasoning requires terminator_ids"))?,
+                closing_ids: closing_ids
+                    .ok_or_else(|| PyValueError::new_err("reasoning requires closing_ids"))?,
+            }),
+            None => {
+                if min_new_tokens != 0 || terminator_ids.is_some() || closing_ids.is_some() {
+                    return Err(PyValueError::new_err(
+                        "reasoning options require max_new_tokens",
+                    ));
+                }
+                None
+            }
+        };
+        let options = PlanningOptions {
+            num_steps,
+            reasoning,
+            raw_rgb_resize: raw_frames,
+        };
+        let metadata = VlaMetadata {
+            attention_mask: Some(&input.attention_mask),
+            image_grid_thw: Some(&input.image_grid_thw),
+            embodiment_id: input.embodiment_id,
+            planning: (options.num_steps.is_some()
+                || options.reasoning.is_some()
+                || options.raw_rgb_resize.is_some())
+            .then_some(&options),
+        };
+        let request =
+            VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
+        let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
+        self.action_array(py, flat)
+    }
+
+    /// Run with an exact caller-provided latent. This is the correctness and
+    /// OpenPI-parity path.
+    fn run_provided<'py>(
+        &self,
+        py: Python<'py>,
+        observation: Observation,
+        latent: Tensor,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let request = VlaRequest::provided(&observation, &latent);
+        let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
+        self.action_array(py, flat)
+    }
+
+    /// Run with a standard-normal latent generated into the prepared device
+    /// buffer, avoiding a host allocation and H2D latent copy.
+    fn run_generated<'py>(
+        &self,
+        py: Python<'py>,
+        observation: Observation,
+        rng: RngKey,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let request = VlaRequest::generated(&observation, rng);
+        let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
+        self.action_array(py, flat)
+    }
+
+    fn run_profiled_provided<'py>(
+        &self,
+        py: Python<'py>,
+        observation: Observation,
+        latent: Tensor,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, BTreeMap<String, f64>)> {
+        let request = VlaRequest::provided(&observation, &latent);
+        let (flat, profile) = self
+            .model
+            .infer_host_f32_profiled(&request)
+            .map_err(runtime_err)?;
+        let actions = self.action_array(py, flat)?;
+        Ok((actions, profile))
+    }
+
+    fn run_profiled_generated<'py>(
+        &self,
+        py: Python<'py>,
+        observation: Observation,
+        rng: RngKey,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, BTreeMap<String, f64>)> {
+        let request = VlaRequest::generated(&observation, rng);
+        let (flat, profile) = self
+            .model
+            .infer_host_f32_profiled(&request)
+            .map_err(runtime_err)?;
+        let actions = self.action_array(py, flat)?;
+        Ok((actions, profile))
+    }
 }
 
 #[pymethods]
-impl Model {
-    /// Load a pi05 checkpoint through the unified `AutoModel` frontend.
+impl ModelRunner {
+    /// Load a VLA checkpoint through the unified `AutoModel` frontend.
     ///
     /// * `model` — model name, e.g. `"pi05"`.
     /// * `path` — checkpoint directory or index file.
-    /// * `device` — `cuda:N` (default) or `cpu`.
-    /// * `precision` — `auto` (default), `fp8`, `bf16`, or `int8`.
-    /// * `calibration` / `tactics` — optional FP8 calibration / tactics json.
-    /// * `action_horizon` — override the checkpoint's chunk length. `None`
+    /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
+    ///   The selected family and compiled features must support that backend.
+    /// * `model_variant` — PI0.5: auto, bf16, fp8_static, int8_dynamic.
+    /// * `precision` — legacy selection for other model families; leave auto for PI0.5.
+    /// * `calibration` — optional FP8 calibration json.
+    /// * `tactics` — optional hardware-wide GEMM tactics json.
+    /// * `autotune` — tune missing exact GEMM keys from the first real request.
+    /// * `sampling_seed` — seed for the implicit device-side noise stream used
+    ///   when inference is called without `noise`.
+    /// * `config_json` - optional `config.json`-shaped architecture JSON.
+    ///   `None` delegates config loading to AutoModel.
+    /// * `action_horizon` - override the checkpoint's chunk length. `None`
     ///   (default) runs the native `config.json` value; an explicit value wins
     ///   over it. The horizon is a sequence length, not a weight dimension, so
     ///   the same weights load and run at the requested chunk length.
+    /// * `num_views` - serve fewer cameras than the checkpoint declares.
+    ///
+    /// `num_views` exists because a deployment often has fewer cameras than the
+    /// checkpoint was trained with. Dropping the trailing views is numerically
+    /// equivalent to openpi zero-padding and masking them - a masked view is
+    /// excluded from attention, consumes no RoPE position, and the vision
+    /// tower has no per-slot parameters - while saving one view's worth of patch
+    /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
+    /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, action_horizon=None))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -215,34 +978,76 @@ impl Model {
         precision: &str,
         calibration: Option<PathBuf>,
         tactics: Option<PathBuf>,
+        autotune: bool,
+        config_json: Option<&str>,
         action_horizon: Option<usize>,
+        num_views: Option<usize>,
+        num_flow_steps: Option<usize>,
+        flow_start_time: Option<f32>,
+        sampling_seed: u64,
+        assets: Option<BTreeMap<String, PathBuf>>,
+        model_variant: Option<String>,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
-        let mut config = load_config(&path)?;
-        // Only hand the loader an explicit config when the caller actually
-        // overrode something; otherwise it reads `config.json` itself, exactly
-        // as before.
-        let overridden = match action_horizon {
-            Some(horizon) => {
+        // Only explicit PI0.5 overrides bypass AutoModel's config loading.
+        let needs_pi05_config = config_json.is_some()
+            || action_horizon.is_some()
+            || num_views.is_some()
+            || num_flow_steps.is_some()
+            || flow_start_time.is_some();
+        let config = if needs_pi05_config {
+            let mut config = match config_json {
+                Some(raw) => Pi05Config::from_json_str(raw).map_err(runtime_err)?,
+                None => load_config(&path)?,
+            };
+            if let Some(horizon) = action_horizon {
                 config.action_horizon = horizon;
-                config.validate().map_err(runtime_err)?;
-                true
             }
-            None => false,
+            if let Some(views) = num_views {
+                if views == 0 || views > config.num_views {
+                    return Err(PyValueError::new_err(format!(
+                        "apxinf_py.load: num_views={views} must be in 1..={} (the \
+                         checkpoint's view count); a checkpoint cannot serve more \
+                         cameras than it was trained on",
+                        config.num_views
+                    )));
+                }
+                config.num_views = views;
+            }
+            if let Some(steps) = num_flow_steps {
+                config.num_flow_steps = steps;
+            }
+            if let Some(start_time) = flow_start_time {
+                config.flow_start_time = start_time;
+            }
+            config.validate().map_err(runtime_err)?;
+            Some(config)
+        } else {
+            None
         };
         let options = LoadOptions {
             model_name: Some(model.to_owned()),
             precision: parse_precision(precision)?,
+            model_variant,
             calibration_path: calibration,
             tuning_path: tactics,
-            config: overridden.then(|| config.clone()),
+            assets: assets.unwrap_or_default(),
+            autotune,
+            num_views,
+            config,
             ..LoadOptions::default()
         };
         let loaded = AutoModel::load_model(device, &path, &options).map_err(runtime_err)?;
+        let vla = loaded.vla().map_err(runtime_err)?;
+        let contract = vla.contract();
+        let action_tokens = vla.action_token_shape();
         Ok(Self {
             model: loaded,
-            config,
+            contract,
+            action_tokens,
             device,
+            sampling_seed: Cell::new(sampling_seed),
+            sampling_draw: Cell::new(0),
         })
     }
 
@@ -254,42 +1059,50 @@ impl Model {
     /// parameters, letting one call sweep 2/3-view, image size, horizon, etc.
     ///
     /// * `model` — model name, e.g. `"pi05"`.
-    /// * `device` — `cuda:N` (default) or `cpu`.
-    /// * `precision` — `bf16` (default), `fp8`, or `int8`.
+    /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
+    ///   The selected family and compiled features must support that backend.
+    /// * `model_variant` — `bf16` (default), `fp8_static`, or `int8_dynamic`.
     /// * `calibration` — for FP8: `"uniform:<scale>"` for a uniform activation
     ///   scale (no calibration file), or a path to a calibration json.
-    /// * `tactics` — optional FP8 tactics json (a synthetic FP8 run falls back to
-    ///   the kernel's default tactic when omitted).
-    /// * `seed` — RNG seed for reproducible weights.
+    /// * `tactics` - optional hardware-wide GEMM tactics json.
+    /// * `autotune` - tune missing exact GEMM keys from the first real request.
+    /// * `seed` - RNG seed for reproducible weights.
+    /// * `sampling_seed` - independent seed for implicit device-side noise.
     #[staticmethod]
     #[pyo3(signature = (
         model,
         device="cuda:0",
-        precision="bf16",
+        model_variant="bf16",
         num_views=2,
         image_size=224,
         action_horizon=10,
         action_dim=32,
         num_flow_steps=10,
+        flow_start_time=1.0,
         max_token_len=200,
         calibration=None,
         tactics=None,
+        autotune=false,
         seed=0,
+        sampling_seed=0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn random(
         model: &str,
         device: &str,
-        precision: &str,
+        model_variant: &str,
         num_views: usize,
         image_size: usize,
         action_horizon: usize,
         action_dim: usize,
         num_flow_steps: usize,
+        flow_start_time: f32,
         max_token_len: usize,
         calibration: Option<String>,
         tactics: Option<PathBuf>,
+        autotune: bool,
         seed: u64,
+        sampling_seed: u64,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         let config = Pi05Config {
@@ -298,6 +1111,7 @@ impl Model {
             action_horizon,
             action_dim,
             num_flow_steps,
+            flow_start_time,
             max_token_len,
             ..Pi05Config::default()
         };
@@ -318,39 +1132,48 @@ impl Model {
 
         let options = LoadOptions {
             model_name: Some(model.to_owned()),
-            precision: parse_precision(precision)?,
+            model_variant: Some(model_variant.to_owned()),
+            text_weight_dtype: None,
             calibration_path,
             tuning_path: tactics,
+            autotune,
             config: Some(config.clone()),
             synthetic: Some(SyntheticWeights { seed }),
             uniform_fp8_scale,
             ..LoadOptions::default()
         };
-        let loaded = AutoModel::load_model(device, Path::new(""), &options)
-            .map_err(runtime_err)?;
+        let loaded = AutoModel::load_model(device, Path::new(""), &options).map_err(runtime_err)?;
+        let vla = loaded.vla().map_err(runtime_err)?;
+        let contract = vla.contract();
+        let action_tokens = vla.action_token_shape();
         Ok(Self {
             model: loaded,
-            config,
+            contract,
+            action_tokens,
             device,
+            sampling_seed: Cell::new(sampling_seed),
+            sampling_draw: Cell::new(0),
         })
     }
 
-    /// **L0** (internal, not public API) — infer from pre-computed patches. No
+    /// **L0** (internal, not public API) - infer from pre-computed patches. No
     /// processor is applied. Exposed to Python as the private `_infer_patches`
     /// for L0/L1 consistency tests only; may change or be removed without notice.
     ///
-    /// * `patches` — `float32` `[num_views * patches_per_view, 3 * patch_size^2]`.
-    /// * `token_ids` — `uint32` `[token_count]` (1..=max_token_len).
-    /// * `noise` — `float32` `[action_horizon, action_dim]`.
+    /// * `patches` - `float32` `[num_views * patches_per_view, 3 * patch_size^2]`.
+    /// * `token_ids` - `uint32` `[token_count]` (1..=max_token_len).
+    /// * `noise` - optional `float32` `[action_horizon, action_dim]`; omission
+    ///   uses the model's internal device-side sampling stream.
     ///
     /// Returns the normalized-domain action, `float32` `[action_horizon, action_dim]`.
-    #[pyo3(name = "_infer_patches")]
+    #[pyo3(name = "_infer_patches", signature = (patches, token_ids, noise=None, action_mask=None))]
     fn infer_patches<'py>(
         &self,
         py: Python<'py>,
         patches: PyReadonlyArray2<'py, f32>,
         token_ids: PyReadonlyArray1<'py, u32>,
-        noise: PyReadonlyArray2<'py, f32>,
+        noise: Option<PyReadonlyArray2<'py, f32>>,
+        action_mask: Option<PyReadonlyArray2<'py, f32>>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let expected = [self.patch_rows(), self.patch_width()];
         let shape = patches.shape();
@@ -366,47 +1189,349 @@ impl Model {
         let tokens = token_ids
             .as_slice()
             .map_err(|_| {
-                PyValueError::new_err("apxinf_py._infer_patches: token_ids must be C-contiguous uint32")
+                PyValueError::new_err(
+                    "apxinf_py._infer_patches: token_ids must be C-contiguous uint32",
+                )
             })?
             .to_vec();
         self.validate_tokens(&tokens)?;
 
-        let noise_tensor = self.noise_tensor(noise)?;
-        let patch_tensor = Tensor::from_f32(
-            Shape::new(vec![expected[0], expected[1]]),
-            patch_data,
-        )
-        .map_err(runtime_err)?;
+        let patch_tensor = Tensor::from_f32(Shape::new(vec![expected[0], expected[1]]), patch_data)
+            .map_err(runtime_err)?;
 
         let observation = Observation {
             vision: VisionObservation::Patches(patch_tensor),
             token_ids: tokens,
-            noise: noise_tensor,
+            state: None,
+            action_mask: action_mask
+                .map(|value| self.action_mask_tensor(value))
+                .transpose()?,
         };
-        self.run(py, observation)
+        match noise {
+            Some(noise) => {
+                let noise_tensor = self.noise_tensor(noise)?;
+                self.run_provided(py, observation, noise_tensor)
+            }
+            None => self.run_generated(py, observation, self.next_sampling_rng()?),
+        }
     }
 
-    /// **L1** — infer from resized RGB `uint8` images; vision→patches runs in the
+    /// Internal model-policy bridge for preprocessors that emit patch-grid,
+    /// attention-mask, state, and embodiment metadata in addition to patches.
+    /// The public policy owns all raw-observation processing and action decode.
+    #[pyo3(name = "_infer_preprocessed", signature = (
+        pixel_values,
+        image_grid_thw,
+        token_ids,
+        attention_mask,
+        state,
+        embodiment_id,
+        noise,
+        *, num_steps=None, max_new_tokens=None, min_new_tokens=0,
+        terminator_ids=None, closing_ids=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn infer_preprocessed<'py>(
+        &self,
+        py: Python<'py>,
+        pixel_values: PyReadonlyArray2<'py, f32>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: Option<usize>,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+        num_steps: Option<usize>,
+        max_new_tokens: Option<usize>,
+        min_new_tokens: usize,
+        terminator_ids: Option<Vec<u32>>,
+        closing_ids: Option<Vec<u32>>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let input = self.preprocessed_vla_input(
+            "_infer_preprocessed",
+            pixel_values,
+            image_grid_thw,
+            token_ids,
+            attention_mask,
+            state,
+            embodiment_id,
+            noise,
+        )?;
+        use apxinf_model::vla::{PlanningOptions, ReasoningOptions};
+        let reasoning = match max_new_tokens {
+            Some(max_new_tokens) => Some(ReasoningOptions {
+                max_new_tokens,
+                min_new_tokens,
+                terminator_ids: terminator_ids
+                    .ok_or_else(|| PyValueError::new_err("reasoning requires terminator_ids"))?,
+                closing_ids: closing_ids
+                    .ok_or_else(|| PyValueError::new_err("reasoning requires closing_ids"))?,
+            }),
+            None => {
+                if min_new_tokens != 0 || terminator_ids.is_some() || closing_ids.is_some() {
+                    return Err(PyValueError::new_err(
+                        "reasoning options require max_new_tokens",
+                    ));
+                }
+                None
+            }
+        };
+        let options = PlanningOptions {
+            num_steps,
+            reasoning,
+            raw_rgb_resize: None,
+        };
+        let metadata = VlaMetadata {
+            attention_mask: Some(&input.attention_mask),
+            image_grid_thw: Some(&input.image_grid_thw),
+            embodiment_id: input.embodiment_id,
+            planning: (options.num_steps.is_some() || options.reasoning.is_some())
+                .then_some(&options),
+        };
+        let request =
+            VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
+        let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
+        self.action_array(py, flat)
+    }
+
+    /// Snapshot contiguous uint8 frames at the old concatenate point. The
+    /// returned request-local holder has no Python array references.
+    #[staticmethod]
+    #[pyo3(name = "_pack_rgb_u8_frames")]
+    fn pack_rgb_u8_frames<'py>(frames: &Bound<'py, PyList>) -> PyResult<PackedRgbU8> {
+        if frames.is_empty() || frames.len() > 65_535 {
+            return Err(PyValueError::new_err(
+                "RGB frame count must be in 1..=65535",
+            ));
+        }
+        let mut arrays = Vec::with_capacity(frames.len());
+        for item in frames.iter() {
+            let frame = item.extract::<PyReadonlyArray1<'py, u8>>().map_err(|_| {
+                PyValueError::new_err("RGB frames must be one-dimensional uint8 arrays")
+            })?;
+            arrays.push(frame);
+        }
+        let mut parts = Vec::with_capacity(arrays.len());
+        for frame in &arrays {
+            parts.push(
+                frame
+                    .as_slice()
+                    .map_err(|_| PyValueError::new_err("RGB frames must be C-contiguous uint8"))?,
+            );
+        }
+        PackedRgbU8::from_slices(&parts)
+    }
+
+    /// Internal variable-grid NHWC RGB bridge. Both entry points share the
+    /// same geometry, planning options, and native request path.
+    #[pyo3(name = "_infer_resized_rgb", signature = (
+        rgb_u8, image_grid_thw, token_ids, attention_mask, state,
+        embodiment_id, noise, *, num_steps=None, max_new_tokens=None,
+        min_new_tokens=0, terminator_ids=None, closing_ids=None,
+        raw_resize_frames=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn infer_resized_rgb<'py>(
+        &self,
+        py: Python<'py>,
+        rgb_u8: PyReadonlyArray1<'py, u8>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: Option<usize>,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+        num_steps: Option<usize>,
+        max_new_tokens: Option<usize>,
+        min_new_tokens: usize,
+        terminator_ids: Option<Vec<u32>>,
+        closing_ids: Option<Vec<u32>>,
+        raw_resize_frames: Option<PyReadonlyArray2<'py, u32>>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let rgb = rgb_u8
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("_infer_resized_rgb: RGB must be contiguous uint8"))?
+            .to_vec();
+        self.infer_resized_rgb_owned(
+            py,
+            rgb,
+            image_grid_thw,
+            token_ids,
+            attention_mask,
+            state,
+            embodiment_id,
+            noise,
+            num_steps,
+            max_new_tokens,
+            min_new_tokens,
+            terminator_ids,
+            closing_ids,
+            raw_resize_frames,
+        )
+    }
+
+    #[pyo3(name = "_infer_resized_rgb_packed", signature = (
+        packed, image_grid_thw, token_ids, attention_mask, state,
+        embodiment_id, noise, *, num_steps=None, max_new_tokens=None,
+        min_new_tokens=0, terminator_ids=None, closing_ids=None,
+        raw_resize_frames=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn infer_resized_rgb_packed<'py>(
+        &self,
+        py: Python<'py>,
+        mut packed: PyRefMut<'py, PackedRgbU8>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: Option<usize>,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+        num_steps: Option<usize>,
+        max_new_tokens: Option<usize>,
+        min_new_tokens: usize,
+        terminator_ids: Option<Vec<u32>>,
+        closing_ids: Option<Vec<u32>>,
+        raw_resize_frames: Option<PyReadonlyArray2<'py, u32>>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let rgb = packed.take_bytes()?;
+        drop(packed);
+        self.infer_resized_rgb_owned(
+            py,
+            rgb,
+            image_grid_thw,
+            token_ids,
+            attention_mask,
+            state,
+            embodiment_id,
+            noise,
+            num_steps,
+            max_new_tokens,
+            min_new_tokens,
+            terminator_ids,
+            closing_ids,
+            raw_resize_frames,
+        )
+    }
+
+    /// Internal bridge used by the public model-neutral calibration runner.
+    /// Preprocessing still belongs to the GR00T policy; the runtime only sees
+    /// the exact typed tensors it executes during normal inference.
+    #[pyo3(name = "_calibrate_preprocessed", signature = (
+        pixel_values,
+        image_grid_thw,
+        token_ids,
+        attention_mask,
+        state,
+        embodiment_id,
+        noise,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn calibrate_preprocessed<'py>(
+        &self,
+        pixel_values: PyReadonlyArray2<'py, f32>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: usize,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+    ) -> PyResult<BTreeMap<String, f32>> {
+        let input = self.preprocessed_vla_input(
+            "_calibrate_preprocessed",
+            pixel_values,
+            image_grid_thw,
+            token_ids,
+            attention_mask,
+            state,
+            Some(embodiment_id),
+            noise,
+        )?;
+        let metadata = VlaMetadata {
+            attention_mask: Some(&input.attention_mask),
+            image_grid_thw: Some(&input.image_grid_thw),
+            embodiment_id: input.embodiment_id,
+            planning: None,
+        };
+        self.model
+            .calibration_amax(&VlaRequest::provided_with_metadata(
+                &input.observation,
+                &input.latent,
+                metadata,
+            ))
+            .map_err(runtime_err)
+    }
+
+    /// **L0** seeded variant for runtime tests. The initial standard-normal
+    /// latent is generated directly in the prepared CUDA input buffer.
+    #[pyo3(name = "_infer_patches_seeded", signature = (patches, token_ids, seed, sequence=0, draw=0))]
+    fn infer_patches_seeded<'py>(
+        &self,
+        py: Python<'py>,
+        patches: PyReadonlyArray2<'py, f32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        seed: u64,
+        sequence: u64,
+        draw: u64,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let expected = [self.patch_rows(), self.patch_width()];
+        let shape = patches.shape();
+        if shape.len() != 2 || shape[0] != expected[0] || shape[1] != expected[1] {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py._infer_patches_seeded: patches expected shape [{}, {}], got {:?}",
+                expected[0], expected[1], shape
+            )));
+        }
+        let patch_data = patches.as_slice().map_err(|_| {
+            PyValueError::new_err(
+                "apxinf_py._infer_patches_seeded: patches must be C-contiguous float32",
+            )
+        })?;
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py._infer_patches_seeded: token_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let patch_tensor = Tensor::from_f32(Shape::new(vec![expected[0], expected[1]]), patch_data)
+            .map_err(runtime_err)?;
+        let observation = Observation {
+            vision: VisionObservation::Patches(patch_tensor),
+            token_ids: tokens,
+            state: None,
+            action_mask: None,
+        };
+        self.run_generated(py, observation, RngKey::new(seed, sequence, draw))
+    }
+
+    /// **L1** - infer from resized RGB `uint8` images; vision->patches runs in the
     /// Rust CUDA graph.
     ///
-    /// * `rgb_u8` — `uint8` images, `num_views * image_size * image_size * 3`
+    /// * `rgb_u8` - `uint8` images, `num_views * image_size * image_size * 3`
     ///   bytes total, in `layout` order.
-    /// * `layout` — `"nhwc"` or `"nchw"`.
-    /// * `token_ids` — `uint32` `[token_count]`.
-    /// * `noise` — `float32` `[action_horizon, action_dim]`.
+    /// * `layout` - `"nhwc"` or `"nchw"`.
+    /// * `token_ids` - `uint32` `[token_count]`.
+    /// * `noise` - optional `float32` `[action_horizon, action_dim]`; omission
+    ///   uses the model's internal device-side sampling stream.
     ///
     /// Returns the normalized-domain action, `float32` `[action_horizon, action_dim]`.
+    #[pyo3(signature = (rgb_u8, layout, token_ids, noise=None, action_mask=None, state=None))]
     fn infer_rgb<'py>(
         &self,
         py: Python<'py>,
         rgb_u8: PyReadonlyArrayDyn<'py, u8>,
         layout: &str,
         token_ids: PyReadonlyArray1<'py, u32>,
-        noise: PyReadonlyArray2<'py, f32>,
+        noise: Option<PyReadonlyArray2<'py, f32>>,
+        action_mask: Option<PyReadonlyArray2<'py, f32>>,
+        state: Option<PyReadonlyArray1<'py, f32>>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let contract = self.require_rgb_contract("infer_rgb")?;
         let layout = parse_layout(layout)?;
-        let expected_bytes =
-            self.config.num_views * self.config.image_size * self.config.image_size * 3;
+        let expected_bytes = contract.num_views * contract.image_size * contract.image_size * 3;
         let bytes = rgb_u8
             .as_slice()
             .map_err(|_| {
@@ -417,9 +1542,9 @@ impl Model {
             return Err(PyValueError::new_err(format!(
                 "apxinf_py.infer_rgb: rgb_u8 expected {} bytes ({} views x {}x{}x3), got {}",
                 expected_bytes,
-                self.config.num_views,
-                self.config.image_size,
-                self.config.image_size,
+                contract.num_views,
+                contract.image_size,
+                contract.image_size,
                 bytes.len()
             )));
         }
@@ -430,76 +1555,436 @@ impl Model {
             })?
             .to_vec();
         self.validate_tokens(&tokens)?;
-        let noise_tensor = self.noise_tensor(noise)?;
+        let mut observation = Observation {
+            vision: VisionObservation::RgbU8 { bytes, layout },
+            token_ids: tokens,
+            state: None,
+            action_mask: action_mask
+                .map(|value| self.action_mask_tensor(value))
+                .transpose()?,
+        };
+        if let Some(state) = state {
+            observation.state = Some(self.state_tensor(state)?);
+        }
+        match noise {
+            Some(noise) => {
+                let noise_tensor = self.noise_tensor(noise)?;
+                self.run_provided(py, observation, noise_tensor)
+            }
+            None => self.run_generated(py, observation, self.next_sampling_rng()?),
+        }
+    }
 
+    /// Diagnostic variant of [`ModelRunner::infer_rgb`] with model-local phase
+    /// timings. Currently only SmolVLA implements the profile.
+    #[pyo3(name = "infer_rgb_profiled", signature = (rgb_u8, layout, token_ids, noise=None, action_mask=None, state=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn infer_rgb_profiled<'py>(
+        &self,
+        py: Python<'py>,
+        rgb_u8: PyReadonlyArrayDyn<'py, u8>,
+        layout: &str,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        noise: Option<PyReadonlyArray2<'py, f32>>,
+        action_mask: Option<PyReadonlyArray2<'py, f32>>,
+        state: Option<PyReadonlyArray1<'py, f32>>,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, BTreeMap<String, f64>)> {
+        let contract = self.require_rgb_contract("infer_rgb_profiled")?;
+        let layout = parse_layout(layout)?;
+        let expected_bytes = contract.num_views * contract.image_size * contract.image_size * 3;
+        let bytes = rgb_u8
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.infer_rgb_profiled: rgb_u8 must be C-contiguous uint8",
+                )
+            })?
+            .to_vec();
+        if bytes.len() != expected_bytes {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.infer_rgb_profiled: rgb_u8 expected {} bytes ({} views x {}x{}x3), got {}",
+                expected_bytes,
+                contract.num_views,
+                contract.image_size,
+                contract.image_size,
+                bytes.len()
+            )));
+        }
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.infer_rgb_profiled: token_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let mut observation = Observation {
+            vision: VisionObservation::RgbU8 { bytes, layout },
+            token_ids: tokens,
+            state: None,
+            action_mask: action_mask
+                .map(|value| self.action_mask_tensor(value))
+                .transpose()?,
+        };
+        if let Some(state) = state {
+            observation.state = Some(self.state_tensor(state)?);
+        }
+        match noise {
+            Some(noise) => {
+                let noise_tensor = self.noise_tensor(noise)?;
+                self.run_profiled_provided(py, observation, noise_tensor)
+            }
+            None => self
+                .run_profiled_generated(py, observation, self.next_sampling_rng()?),
+        }
+    }
+
+    /// **L1** discrete action-token inference for autoregressive token VLAs
+    /// (π0-FAST). Raw observations in, FAST action tokens out.
+    ///
+    /// The engine returns token ids, never continuous actions: π0-FAST decodes
+    /// actions by autoregressing FAST tokens, so detokenization (BPE + DCT) and
+    /// unnormalization belong to the policy layer that knows the tokenizer.
+    ///
+    /// * `rgb_u8` — `uint8` `[num_views, image_size, image_size, 3]` or the
+    ///   channels-first equivalent selected by `layout`.
+    /// * `token_ids` — `uint32` `[token_count]` (1..=max_token_len).
+    ///
+    /// * `stop_token` — optional id that ends the stream: the runtime emits it
+    ///   and stops, returning a shorter array. Pass the FAST `|` terminator to
+    ///   skip the ~90% of `max_action_tokens` that the detokenizer discards.
+    ///
+    /// Returns `uint32` `[1..=max_action_tokens]`, including `stop_token` when
+    /// it was hit.
+    #[pyo3(name = "infer_action_tokens_rgb", signature = (rgb_u8, layout, token_ids, stop_token=None))]
+    fn infer_action_tokens_rgb<'py>(
+        &self,
+        py: Python<'py>,
+        rgb_u8: PyReadonlyArrayDyn<'py, u8>,
+        layout: &str,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        stop_token: Option<u32>,
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        let token_shape = self.action_tokens.ok_or_else(|| {
+            PyValueError::new_err(
+                "apxinf_py.infer_action_tokens_rgb: loaded model does not produce \
+                 discrete action tokens (it is a continuous-action runtime)",
+            )
+        })?;
+        let contract = self.require_rgb_contract("infer_action_tokens_rgb")?;
+        let layout = parse_layout(layout)?;
+        let expected_bytes = contract.num_views * contract.image_size * contract.image_size * 3;
+        let bytes = rgb_u8
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.infer_action_tokens_rgb: rgb_u8 must be C-contiguous uint8",
+                )
+            })?
+            .to_vec();
+        if bytes.len() != expected_bytes {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.infer_action_tokens_rgb: rgb_u8 expected {} bytes ({} views x {}x{}x3), got {}",
+                expected_bytes,
+                contract.num_views,
+                contract.image_size,
+                contract.image_size,
+                bytes.len()
+            )));
+        }
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.infer_action_tokens_rgb: token_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
         let observation = Observation {
             vision: VisionObservation::RgbU8 { bytes, layout },
             token_ids: tokens,
-            noise: noise_tensor,
+            state: None,
+            action_mask: None,
         };
-        self.run(py, observation)
+        // Token VLAs condition on the observation alone; the request still
+        // carries an initial latent, and the runtime ignores it.
+        let unused_latent = Tensor::zeros(Shape::new(vec![1, 1]), DType::F32);
+        let request = VlaRequest::provided(&observation, &unused_latent);
+        let decoded = self
+            .model
+            .infer_action_tokens(&request, stop_token)
+            .map_err(runtime_err)?;
+        let values = decoded.to_f32_vec().map_err(runtime_err)?;
+        if values.is_empty() || values.len() > token_shape[1] {
+            return Err(PyRuntimeError::new_err(format!(
+                "apxinf_py.infer_action_tokens_rgb: runtime produced {} tokens, expected 1..={}",
+                values.len(),
+                token_shape[1]
+            )));
+        }
+        let ids = values
+            .into_iter()
+            .map(|value| value as u32)
+            .collect::<Vec<u32>>();
+        Ok(Array1::from_vec(ids).into_pyarray_bound(py))
+    }
+
+    /// Internal native-BF16 activation probe used by ``scripts/calibrate_pi05.py``.
+    #[pyo3(name = "_calibrate_rgb", signature = (rgb_u8, layout, token_ids, noise))]
+    fn calibrate_rgb(
+        &self,
+        rgb_u8: PyReadonlyArrayDyn<'_, u8>,
+        layout: &str,
+        token_ids: PyReadonlyArray1<'_, u32>,
+        noise: PyReadonlyArray2<'_, f32>,
+    ) -> PyResult<BTreeMap<String, f32>> {
+        let contract = self.require_rgb_contract("_calibrate_rgb")?;
+        let layout = parse_layout(layout)?;
+        let expected_bytes = contract.num_views * contract.image_size * contract.image_size * 3;
+        let bytes = rgb_u8
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err("apxinf_py._calibrate_rgb: rgb_u8 must be C-contiguous uint8")
+            })?
+            .to_vec();
+        if bytes.len() != expected_bytes {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py._calibrate_rgb: expected {expected_bytes} image bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py._calibrate_rgb: token_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let noise = self.noise_tensor(noise)?;
+        let observation = Observation {
+            vision: VisionObservation::RgbU8 { bytes, layout },
+            token_ids: tokens,
+            state: None,
+            action_mask: None,
+        };
+        self.model
+            .calibration_amax(&VlaRequest::provided(&observation, &noise))
+            .map_err(runtime_err)
+    }
+
+    /// Stable logical sites required by this model's static-FP8 execution plan.
+    #[pyo3(name = "_calibration_plan")]
+    fn calibration_plan(&self) -> PyResult<Vec<String>> {
+        self.model.calibration_plan().map_err(runtime_err)
+    }
+
+    /// Internal native-BF16 activation probe used by ``scripts/calibrate_pi0fast.py``.
+    ///
+    /// π0-FAST has no latent to seed: the decode is a deterministic greedy
+    /// argmax, so the same Observation always produces the same activations.
+    /// ``stop_token`` ends the capture where inference would: a profile is only
+    /// valid for the activations deployment quantizes, and free-running past the
+    /// terminator records decode steps no rollout ever reaches.
+    #[pyo3(name = "_calibrate_tokens_rgb", signature = (rgb_u8, layout, token_ids, stop_token=None))]
+    fn calibrate_tokens_rgb(
+        &self,
+        rgb_u8: PyReadonlyArrayDyn<'_, u8>,
+        layout: &str,
+        token_ids: PyReadonlyArray1<'_, u32>,
+        stop_token: Option<u32>,
+    ) -> PyResult<BTreeMap<String, f32>> {
+        self.action_tokens.ok_or_else(|| {
+            PyValueError::new_err(
+                "apxinf_py._calibrate_tokens_rgb: loaded model does not produce \
+                 discrete action tokens (it is a continuous-action runtime)",
+            )
+        })?;
+        let contract = self.require_rgb_contract("_calibrate_tokens_rgb")?;
+        let layout = parse_layout(layout)?;
+        let expected_bytes = contract.num_views * contract.image_size * contract.image_size * 3;
+        let bytes = rgb_u8
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py._calibrate_tokens_rgb: rgb_u8 must be C-contiguous uint8",
+                )
+            })?
+            .to_vec();
+        if bytes.len() != expected_bytes {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py._calibrate_tokens_rgb: rgb_u8 expected {} bytes ({} views x {}x{}x3), got {}",
+                expected_bytes,
+                contract.num_views,
+                contract.image_size,
+                contract.image_size,
+                bytes.len()
+            )));
+        }
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py._calibrate_tokens_rgb: token_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let observation = Observation {
+            vision: VisionObservation::RgbU8 { bytes, layout },
+            token_ids: tokens,
+            state: None,
+            action_mask: None,
+        };
+        let unused_latent = Tensor::zeros(Shape::new(vec![1, 1]), DType::F32);
+        let request = VlaRequest::provided(&observation, &unused_latent);
+        self.model
+            .calibration_amax_stop(&request, stop_token)
+            .map_err(runtime_err)
+    }
+
+    /// Seeded L1 inference. This avoids creating or transferring a host noise
+    /// array and fills the latent on the runtime's CUDA stream.
+    #[pyo3(signature = (rgb_u8, layout, token_ids, seed, sequence=0, draw=0))]
+    fn infer_rgb_seeded<'py>(
+        &self,
+        py: Python<'py>,
+        rgb_u8: PyReadonlyArrayDyn<'py, u8>,
+        layout: &str,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        seed: u64,
+        sequence: u64,
+        draw: u64,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let contract = self.require_rgb_contract("infer_rgb_seeded")?;
+        let layout = parse_layout(layout)?;
+        let expected_bytes = contract.num_views * contract.image_size * contract.image_size * 3;
+        let bytes = rgb_u8
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.infer_rgb_seeded: rgb_u8 must be C-contiguous uint8",
+                )
+            })?
+            .to_vec();
+        if bytes.len() != expected_bytes {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.infer_rgb_seeded: rgb_u8 expected {} bytes ({} views x {}x{}x3), got {}",
+                expected_bytes,
+                contract.num_views,
+                contract.image_size,
+                contract.image_size,
+                bytes.len()
+            )));
+        }
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.infer_rgb_seeded: token_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let observation = Observation {
+            vision: VisionObservation::RgbU8 { bytes, layout },
+            token_ids: tokens,
+            state: None,
+            action_mask: None,
+        };
+        self.run_generated(py, observation, RngKey::new(seed, sequence, draw))
+    }
+
+    /// Reset the implicit device-side sampling stream used when `noise=None`.
+    /// Supplying a seed also replaces the configured seed.
+    #[pyo3(signature = (seed=None))]
+    fn reset_sampling(&self, seed: Option<u64>) {
+        if let Some(seed) = seed {
+            self.sampling_seed.set(seed);
+        }
+        self.sampling_draw.set(0);
     }
 
     /// Device string, e.g. `"cuda:0"`.
     #[getter]
     fn device(&self) -> String {
-        match self.device {
-            Device::Cuda(index) => format!("cuda:{index}"),
-            Device::Cpu => "cpu".to_string(),
-        }
+        self.device.to_string()
+    }
+
+    /// Actual loaded implementation; `auto` is resolved during loading.
+    #[getter]
+    fn model_variant(&self) -> PyResult<Option<&'static str>> {
+        Ok(self.model.vla().map_err(runtime_err)?.model_variant())
     }
 
     #[getter]
     fn action_dim(&self) -> usize {
-        self.config.action_dim
+        self.action_shape()[1]
     }
 
     #[getter]
     fn action_horizon(&self) -> usize {
-        self.config.action_horizon
+        self.action_shape()[0]
     }
 
     #[getter]
     fn num_views(&self) -> usize {
-        self.config.num_views
+        self.contract.num_views
     }
 
     #[getter]
     fn image_size(&self) -> usize {
-        self.config.image_size
+        self.contract.image_size
     }
 
     #[getter]
     fn patch_size(&self) -> usize {
-        self.config.patch_size
+        self.contract.patch_size
     }
 
     #[getter]
     fn patches_per_view(&self) -> usize {
-        self.config.patches_per_view()
+        self.patch_rows() / self.num_views()
     }
 
     #[getter]
     fn max_token_len(&self) -> usize {
-        self.config.max_token_len
+        self.max_token_len_value()
+    }
+
+    #[getter]
+    fn accepts_rgb_u8(&self) -> bool {
+        self.contract.accepts_rgb_u8
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "Model(device={}, action=[{}, {}], views={}, image={}, patch={})",
+            "ModelRunner(device={}, action=[{}, {}], views={}, image={}, patch={})",
             self.device(),
-            self.config.action_horizon,
-            self.config.action_dim,
-            self.config.num_views,
-            self.config.image_size,
-            self.config.patch_size,
+            self.action_horizon(),
+            self.action_dim(),
+            self.num_views(),
+            self.image_size(),
+            self.patch_size(),
         )
     }
 }
 
 #[pymodule]
 fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<Model>()?;
+    #[cfg(feature = "cuda")]
+    module.add(
+        "QWEN_DRIVE_FIXED_SCENE_TOKENS",
+        apxinf_model::qwen_drive::FIXED_SCENE_TOKENS,
+    )?;
+    module.add_class::<ModelRunner>()?;
+    module.add_class::<DecisionRunner>()?;
+    module.add_class::<PackedRgbU8>()?;
+    module.add_class::<HfTokenizer>()?;
+    module.add_class::<PySentencePieceTokenizer>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
@@ -508,11 +1993,241 @@ fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
 
+    mod decision {
+        use super::*;
+        use apxinf_model::{
+            DecisionAnswer, DecisionOutput, DecisionRuntime, DecisionSchema, DecisionScore,
+            LlmCapabilities,
+        };
+
+        const REQUEST: &str = include_str!("../../../tests/fixtures/decision/schema.json");
+
+        struct StubDecisionRuntime {
+            schema: Option<DecisionSchema>,
+            output: Option<apxinf_core::Result<DecisionOutput>>,
+        }
+
+        impl DecisionRuntime for StubDecisionRuntime {
+            fn capabilities(&self) -> LlmCapabilities {
+                LlmCapabilities::TEXT_ONLY
+            }
+
+            fn decide(&mut self, input: DecisionInput<'_>) -> apxinf_core::Result<DecisionOutput> {
+                match (&self.schema, input) {
+                    (Some(expected), DecisionInput::Schema(schema)) => {
+                        assert_eq!(schema, expected);
+                        assert_eq!(
+                            schema
+                                .questions
+                                .iter()
+                                .map(|question| question.id.as_str())
+                                .collect::<Vec<_>>(),
+                            ["zeta", "alpha"]
+                        );
+                    }
+                    (
+                        None,
+                        DecisionInput::Encoded {
+                            token_ids,
+                            image,
+                            candidate_count,
+                        },
+                    ) => {
+                        assert_eq!(token_ids, [17, 42]);
+                        assert!(image.is_none());
+                        assert_eq!(candidate_count, 2);
+                    }
+                    _ => panic!("wrong decision input form"),
+                }
+                self.output.take().expect("unexpected inference call")
+            }
+
+            fn code_names(&self) -> &[String] {
+                &[]
+            }
+
+            fn token_ids(&self) -> &[u32] {
+                &[]
+            }
+        }
+
+        fn runner(schema: bool, output: apxinf_core::Result<DecisionOutput>) -> DecisionRunner {
+            DecisionRunner {
+                model: LoadedModel::Decision(Box::new(StubDecisionRuntime {
+                    schema: schema.then(|| DecisionSchema::from_json(REQUEST).unwrap()),
+                    output: Some(output),
+                })),
+                device: Device::Cpu,
+                model_path: PathBuf::from("/unused-checkpoint"),
+            }
+        }
+
+        fn schema_output() -> DecisionOutput {
+            DecisionOutput {
+                answers: vec![
+                    DecisionAnswer {
+                        question_id: Some("zeta".into()),
+                        selected_index: 1,
+                        scores: vec![
+                            DecisionScore {
+                                code: "go".into(),
+                                token_id: None,
+                                probability: 0.25,
+                            },
+                            DecisionScore {
+                                code: "stay".into(),
+                                token_id: None,
+                                probability: 0.75,
+                            },
+                        ],
+                    },
+                    DecisionAnswer {
+                        question_id: Some("alpha".into()),
+                        selected_index: 1,
+                        scores: vec![
+                            DecisionScore {
+                                code: "low".into(),
+                                token_id: None,
+                                probability: 0.125,
+                            },
+                            DecisionScore {
+                                code: "medium".into(),
+                                token_id: None,
+                                probability: 0.5,
+                            },
+                            DecisionScore {
+                                code: "high".into(),
+                                token_id: None,
+                                probability: 0.375,
+                            },
+                        ],
+                    },
+                ],
+            }
+        }
+
+        #[test]
+        fn schema_dispatch_preserves_question_order_and_scores() {
+            pyo3::prepare_freethreaded_python();
+            Python::with_gil(|py| {
+                let runner = Py::new(py, runner(true, Ok(schema_output()))).unwrap();
+                let kwargs = PyDict::new_bound(py);
+                kwargs.set_item("request_json", REQUEST).unwrap();
+                let result = runner
+                    .bind(py)
+                    .call_method("decide_schema", (), Some(&kwargs))
+                    .unwrap();
+                let locals = PyDict::new_bound(py);
+                locals.set_item("result", result).unwrap();
+                py.run_bound(
+                    "assert result == {'answers': [\n\
+                        {'question_id': 'zeta', 'selected_index': 1, 'scores': [\n\
+                            {'code': 'go', 'token_id': None, 'probability': 0.25},\n\
+                            {'code': 'stay', 'token_id': None, 'probability': 0.75}]},\n\
+                        {'question_id': 'alpha', 'selected_index': 1, 'scores': [\n\
+                            {'code': 'low', 'token_id': None, 'probability': 0.125},\n\
+                            {'code': 'medium', 'token_id': None, 'probability': 0.5},\n\
+                            {'code': 'high', 'token_id': None, 'probability': 0.375}]}]}",
+                    None,
+                    Some(&locals),
+                )
+                .unwrap();
+            });
+        }
+
+        #[test]
+        fn encoded_decision_keeps_existing_output() {
+            pyo3::prepare_freethreaded_python();
+            Python::with_gil(|py| {
+                let output = DecisionOutput {
+                    answers: vec![DecisionAnswer {
+                        question_id: None,
+                        selected_index: 1,
+                        scores: vec![
+                            DecisionScore {
+                                code: "A".into(),
+                                token_id: Some(101),
+                                probability: 0.25,
+                            },
+                            DecisionScore {
+                                code: "B".into(),
+                                token_id: Some(102),
+                                probability: 0.75,
+                            },
+                        ],
+                    }],
+                };
+                let runner = Py::new(py, runner(false, Ok(output))).unwrap();
+                let token_ids = vec![17u32, 42].into_pyarray_bound(py);
+                let result = runner
+                    .bind(py)
+                    .call_method1("decide", (token_ids, 2))
+                    .unwrap();
+                let locals = PyDict::new_bound(py);
+                locals.set_item("result", result).unwrap();
+                py.run_bound(
+                    "assert result == {'selected_index': 1, 'scores': [\n\
+                        {'code': 'A', 'token_id': 101, 'probability': 0.25},\n\
+                        {'code': 'B', 'token_id': 102, 'probability': 0.75}]}",
+                    None,
+                    Some(&locals),
+                )
+                .unwrap();
+            });
+        }
+
+        #[test]
+        fn schema_errors_reach_python() {
+            pyo3::prepare_freethreaded_python();
+            Python::with_gil(|py| {
+                let runner = Py::new(
+                    py,
+                    runner(
+                        true,
+                        Err(apxinf_core::Error::Other(
+                            "schema rejected by runtime".into(),
+                        )),
+                    ),
+                )
+                .unwrap();
+                for invalid in [
+                    "not JSON",
+                    r#"{"state": {}, "questions": {}}"#,
+                    r#"{"state": {}, "questions": {"q": {"type": "choice"}, "q": {"type": "score"}}}"#,
+                    r#"{"state": {}, "questions": {"q": {"type": "choice", "unknown": true}}}"#,
+                ] {
+                    let error = runner
+                        .bind(py)
+                        .call_method1("decide_schema", (invalid,))
+                        .unwrap_err();
+                    assert!(error.is_instance_of::<PyValueError>(py), "{error}");
+                    assert!(error.to_string().contains("decision request:"), "{error}");
+                }
+                let error = runner
+                    .bind(py)
+                    .call_method1("decide_schema", (REQUEST,))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyRuntimeError>(py), "{error}");
+                assert!(
+                    error.to_string().contains("schema rejected by runtime"),
+                    "{error}"
+                );
+            });
+        }
+    }
+
     #[test]
     fn parses_device_forms() {
         assert!(matches!(parse_device("cuda").unwrap(), Device::Cuda(0)));
+        assert!(matches!(parse_device("hip").unwrap(), Device::Hip(0)));
+        assert!(matches!(parse_device("hip:2").unwrap(), Device::Hip(2)));
         assert!(matches!(parse_device("cuda:1").unwrap(), Device::Cuda(1)));
         assert!(matches!(parse_device("cpu").unwrap(), Device::Cpu));
+        assert_eq!(parse_device("metal").unwrap(), Device::Metal(0));
+        assert_eq!(parse_device("metal:1").unwrap(), Device::Metal(1));
+        assert_eq!(parse_device("mlx:0").unwrap(), Device::Metal(0));
+        assert!(parse_device("metal:").is_err());
+        assert!(parse_device("mlx:-1").is_err());
         assert!(parse_device("tpu").is_err());
         assert!(parse_device("cuda:x").is_err());
     }
@@ -538,5 +2253,23 @@ mod tests {
     fn missing_config_falls_back_to_default() {
         let config = load_config(Path::new("/nonexistent/checkpoint")).unwrap();
         assert_eq!(config, Pi05Config::default());
+    }
+
+    #[test]
+    fn packed_rgb_snapshots_and_consumes_once() {
+        let mut first = vec![1u8, 2, 3];
+        let second = vec![4u8, 5];
+        let mut holder = PackedRgbU8::from_slices(&[&first, &second]).unwrap();
+        first[0] = 99;
+        assert_eq!(holder.take_bytes().unwrap(), vec![1, 2, 3, 4, 5]);
+        assert!(holder.take_bytes().is_err());
+    }
+
+    #[test]
+    fn packed_rgb_rejects_empty_and_excess_frames() {
+        assert!(PackedRgbU8::from_slices(&[]).is_err());
+        assert!(PackedRgbU8::from_slices(&[&[]]).is_err());
+        let part = &[1u8][..];
+        assert!(PackedRgbU8::from_slices(&vec![part; 65_536]).is_err());
     }
 }

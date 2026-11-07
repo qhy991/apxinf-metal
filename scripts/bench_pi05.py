@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Unified layered latency benchmark for the pi05 serving stack — L0 / L1 / L2 / L3.
 
-One entry point, driven by ``--layer × --precision × weights-source × input``,
+One entry point, driven by ``--layer × --model-variant × weights-source × input``,
 that folds the former ``bench_pi05_layers.py`` (L0/L1/L2 in-process) and
 ``bench_pi05_openpi_latency.py`` (L3 websocket). The serving call peels into four
 concentric shells, each the cost of the layer around the one inside it:
 
-* **L0 model** — ``Model._infer_patches``: pure engine forward, inputs already
+* **L0 model** — ``ModelRunner._infer_patches``: pure engine forward, inputs already
   patch-embedded (vision→patches skipped). The floor.
-* **L1 rust** — ``Model.infer_rgb``: the ``apxinf_py`` binding from resized RGB;
+* **L1 rust** — ``ModelRunner.infer_rgb``: the ``apxinf_py`` binding from resized RGB;
   adds Rust-side vision→patches (in the CUDA graph) + PyO3 marshalling over L0.
 * **L2 python api** — ``Pi05Policy.infer``: adds the numpy pre chain
-  (parse/resize/tokenize/sample-noise) + post chain (trim/unnormalize) around L1.
+  (parse/resize/tokenize) + post chain (trim/unnormalize) around L1. Its default
+  latent is generated in the runtime's device buffer.
 * **L3 websocket** — one ``client.infer`` round trip: adds transport (websocket +
   msgpack) + the server processor pipeline around the bare model. Measured against
   a *running* server (``--host/--port``); this script attaches, it does not spawn.
@@ -30,18 +31,18 @@ server (``--host/--port``) and needs no local weights — serve with
 ``--random-weights`` for a fully checkpoint-free L3.
 
     # checkpoint-free engine floor — the zero-config default (no download)
-    python scripts/bench_pi05.py --precision bf16 --views 2 --token-count 10
+    python scripts/bench_pi05.py --model-variant bf16 --views 2 --token-count 10
 
     # full in-process breakdown against a checkpoint
     python scripts/bench_pi05.py --model-dir /path/to/pi05 --layer l0,l1,l2 \
-        --precision bf16 --prompt "put both moka pots on the stove"
+        --model-variant bf16 --prompt "put both moka pots on the stove"
 
     # same checkpoint, forced to a 10-step chunk instead of its native H=50
     python scripts/bench_pi05.py --model-dir /path/to/pi05 --layer l0,l1,l2 \
-        --precision bf16 --action-horizon 10
+        --model-variant bf16 --action-horizon 10
 
     # L3 against a running websocket server
-    python scripts/bench_pi05.py --layer l3 --precision bf16 \
+    python scripts/bench_pi05.py --layer l3 --model-variant bf16 \
         --host 127.0.0.1 --port 8000 --prompt "put both moka pots on the stove"
 """
 
@@ -62,6 +63,8 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _APXINF_PKG = _REPO_ROOT / "python" / "apxinf"
 if _APXINF_PKG.is_dir() and str(_APXINF_PKG) not in sys.path:
     sys.path.insert(0, str(_APXINF_PKG))
+
+from apxinf._tactics import resolve_pi05_tactics
 
 # doc/pi05-cuda-regression.md primary/worst-case LIBERO prompts
 # (T = PaliGemma token count).
@@ -133,8 +136,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="comma list of l0,l1,l2,l3 or `all` (default: all with --model-dir, else l0,l1)",
     )
-    p.add_argument("--precision", choices=("bf16", "fp8", "int8"), default="bf16")
+    p.add_argument("--model-variant", choices=("bf16", "fp8_static", "int8_dynamic"), default="bf16")
     p.add_argument("--model", default="pi05", help="model name for the random-weights engine")
+    p.add_argument(
+        "--model-type",
+        help="override config.json model type when loading a checkpoint through AutoPolicy",
+    )
     p.add_argument("--device", default="cuda:0")
 
     # Not unconditionally required: L3 is attach-only (connects to a running
@@ -145,11 +152,23 @@ def parse_args() -> argparse.Namespace:
     source.add_argument(
         "--random-weights", action="store_true", help="checkpoint-free engine (L0/L1/L2)"
     )
+    p.add_argument(
+        "--tokenizer",
+        type=pathlib.Path,
+        help="local SentencePiece model for checkpoint L2 (otherwise resolve beside the checkpoint)",
+    )
 
-    # FP8 knobs. In random mode these feed `Model.random`; in checkpoint mode the
-    # loader reads calibration.json / tactics.json from the model dir.
+    # Calibration is public for synthetic FP8 latency runs. Tactics are routed
+    # internally by CUDA SM + model_variant below.
     p.add_argument("--calibration", help="FP8 calibration json or `uniform:SCALE` (random mode)")
-    p.add_argument("--tactics", type=pathlib.Path, help="FP8 tactics json (random mode)")
+    # Internal escape hatch for tactic generation/debugging. Normal benchmark
+    # runs select the repository's validated JSON from CUDA SM + model_variant.
+    p.add_argument("--tactics", type=pathlib.Path, help=argparse.SUPPRESS)
+    p.add_argument(
+        "--autotune",
+        action="store_true",
+        help="tune missing exact GEMM tactics from the benchmark workload and persist them",
+    )
 
     # Architecture overrides — synthetic shapes. `--action-horizon` is the one
     # knob that also applies to a checkpoint (see below).
@@ -197,7 +216,7 @@ def _run_in_process(handle, policy, layers, observation, rgb, token_ids, noise, 
     return raw
 
 
-def _run_l3(host, port, precision, prompt, warmup, samples):
+def _run_l3(host, port, model_variant, prompt, warmup, samples):
     """Attach to a running websocket server and time one round trip per call."""
     from openpi_client import websocket_client_policy
 
@@ -209,9 +228,9 @@ def _run_l3(host, port, precision, prompt, warmup, samples):
 
     client = websocket_client_policy.WebsocketClientPolicy(host, port)
     metadata = client.get_server_metadata()
-    actual_precision = metadata.get("precision")
-    if actual_precision != precision:
-        raise RuntimeError(f"server precision is {actual_precision!r}, expected {precision!r}")
+    actual_model_variant = metadata.get("model_variant")
+    if actual_model_variant != model_variant:
+        raise RuntimeError(f"server model_variant is {actual_model_variant!r}, expected {model_variant!r}")
     action_horizon = int(metadata.get("action_horizon", 10))
 
     rng = np.random.default_rng(0)
@@ -286,38 +305,46 @@ def main() -> None:
                 "--model-dir (they reshape synthetic weights; a checkpoint runs its "
                 "native config apart from --action-horizon)"
             )
-    # FP8 tuning knobs: synthetic + fp8 only (a checkpoint reads calibration/tactics
-    # from its own dir; bf16/int8 have no per-tensor FP8 scales).
-    fp8_knobs = [
-        name for name, value in (("--tactics", args.tactics), ("--calibration", args.calibration))
-        if value is not None
-    ]
-    if fp8_knobs:
-        if checkpoint:
-            raise SystemExit(
-                f"{', '.join(fp8_knobs)} only apply to synthetic weights (drop --model-dir); "
-                "a checkpoint loads calibration/tactics from its own directory"
-            )
-        if args.precision != "fp8":
-            raise SystemExit(f"{', '.join(fp8_knobs)} only apply to --precision fp8")
-
+    # Calibration remains a synthetic FP8 knob here. Tactics are selected below
+    # from CUDA SM + model_variant for both synthetic and checkpoint benchmarks.
+    if checkpoint and args.calibration is not None:
+        raise SystemExit(
+            "--calibration only applies to synthetic weights (drop --model-dir); "
+            "a checkpoint loads calibration.json from its model directory"
+        )
+    if args.calibration is not None and args.model_variant != "fp8_static":
+        raise SystemExit("--calibration only applies to --model-variant fp8_static")
     handle = None
     policy = None
+    tactics = args.tactics
     observation = rgb = token_ids = noise = patches = None
 
     if in_process:
         if random:
-            from apxinf import Model
+            from apxinf import ModelRunner
 
+            # Random engines bypass Pi05Policy.from_pretrained, so this synthetic
+            # benchmark is the sole caller that must resolve the package default.
+            tactics = resolve_pi05_tactics(
+                args.device,
+                args.model_variant,
+                override=args.tactics,
+                allow_missing=args.autotune,
+            )
+            if tactics is not None:
+                print(
+                    f"using {args.model_variant} tactics for {args.device}: {tactics}",
+                    file=sys.stderr,
+                )
             calibration = args.calibration
-            if args.precision == "fp8" and calibration is None:
+            if args.model_variant == "fp8_static" and calibration is None:
                 # Synthetic FP8 has no calibration file; a uniform scale keeps the
                 # FP8 path on (the kernel falls back to a default tactic).
                 calibration = "uniform:1.0"
-            handle = Model.random(
+            handle = ModelRunner.random(
                 model=args.model,
                 device=args.device,
-                precision=args.precision,
+                model_variant=args.model_variant,
                 num_views=args.views if args.views is not None else 2,
                 image_size=args.image_size if args.image_size is not None else 224,
                 action_horizon=args.action_horizon if args.action_horizon is not None else 10,
@@ -325,7 +352,8 @@ def main() -> None:
                 num_flow_steps=args.num_flow_steps if args.num_flow_steps is not None else 10,
                 max_token_len=args.max_token_len if args.max_token_len is not None else 200,
                 calibration=calibration,
-                tactics=str(args.tactics) if args.tactics is not None else None,
+                tactics=str(tactics) if tactics is not None else None,
+                autotune=args.autotune,
                 seed=args.seed,
             )
             if "l2" in layers:
@@ -334,7 +362,6 @@ def main() -> None:
                 # from the same pipeline so all layers see one consistent input.
                 from apxinf import Pi05Policy
                 from apxinf.processors.transforms import (
-                    NOISE,
                     OBSERVATION,
                     PROMPT,
                     RGB,
@@ -357,7 +384,9 @@ def main() -> None:
                 data = policy.input_pipeline({OBSERVATION: observation, PROMPT: args.prompt})
                 rgb = data[RGB]
                 token_ids = np.asarray(data[TOKEN_IDS], dtype=np.uint32)
-                noise = np.asarray(data[NOISE], dtype=np.float32)
+                noise = np.random.default_rng(args.seed).standard_normal(
+                    (handle.action_horizon, handle.action_dim), dtype=np.float32
+                )
                 token_count = int(token_ids.size)
             else:
                 views, size = handle.num_views, handle.image_size
@@ -369,40 +398,69 @@ def main() -> None:
             patch_width = 3 * handle.patch_size * handle.patch_size
             patches = np.zeros((patch_rows, patch_width), dtype=np.float32)
         else:
-            from apxinf import Pi05Policy
+            from apxinf import AutoPolicy
 
-            policy = Pi05Policy.from_pretrained(
-                args.model_dir,
-                device=args.device,
-                precision=args.precision,
-                action_dim=(args.action_dim or None),
-                action_horizon=args.action_horizon,
-            )
-            handle = policy.model
-            from apxinf.processors.transforms import (
-                NOISE,
-                OBSERVATION,
-                PROMPT,
-                RGB,
-                TOKEN_IDS,
-            )
-
-            size = handle.image_size
-            rng = np.random.default_rng(0)
-            observation = {
-                "observation/image": rng.integers(0, 256, (size, size, 3), dtype=np.uint8),
-                "observation/wrist_image": rng.integers(0, 256, (size, size, 3), dtype=np.uint8),
-                "prompt": args.prompt,
+            options = {
+                "tactics": args.tactics,
+                "tokenizer_path": args.tokenizer,
+                "action_dim": (args.action_dim or None),
+                "action_horizon": args.action_horizon,
             }
-            # Run the pre chain once so L0/L1 are driven by the real serving inputs.
-            data = policy.input_pipeline({OBSERVATION: observation, PROMPT: args.prompt})
-            rgb = data[RGB]
-            token_ids = np.asarray(data[TOKEN_IDS], dtype=np.uint32)
-            noise = np.asarray(data[NOISE], dtype=np.float32)
-            patch_rows = handle.num_views * handle.patches_per_view
-            patch_width = 3 * handle.patch_size * handle.patch_size
-            patches = np.zeros((patch_rows, patch_width), dtype=np.float32)
-            token_count = int(token_ids.size)
+            if args.autotune:
+                options["autotune"] = True
+            policy = AutoPolicy.from_pretrained(
+                args.model_dir,
+                model_type=args.model_type,
+                device=args.device,
+                model_variant=args.model_variant,
+                **{name: value for name, value in options.items() if value is not None},
+            )
+            handle = policy.model_runner
+            rng = np.random.default_rng(0)
+            model_type = str(policy.metadata.get("model_type", "pi05"))
+            image_keys = tuple(
+                policy.metadata.get(
+                    "image_keys", ("observation/image", "observation/wrist_image")
+                )
+            )
+            # WallOSS owns its Qwen2.5-VL smart resize and consumes raw LIBERO
+            # frames. PI0.5's policy pipeline accepts its configured image size.
+            size = 256 if model_type == "walloss" else handle.image_size
+            observation = {
+                key: rng.integers(0, 256, (size, size, 3), dtype=np.uint8)
+                for key in image_keys
+            }
+            observation.update({
+                "observation/state": np.zeros(policy.action_dim, dtype=np.float32),
+                "prompt": args.prompt,
+            })
+            if model_type != "pi05" and any(layer in layers for layer in ("l0", "l1")):
+                raise SystemExit(
+                    f"checkpoint model {model_type!r} supports --layer l2 in this "
+                    "PI0.5-layered benchmark; its model-specific lower-level input "
+                    "contract is intentionally not guessed"
+                )
+            if model_type == "pi05":
+                from apxinf.processors.transforms import (
+                    OBSERVATION,
+                    PROMPT,
+                    RGB,
+                    TOKEN_IDS,
+                )
+
+                # Run the pre chain once so L0/L1 are driven by real serving inputs.
+                data = policy.input_pipeline({OBSERVATION: observation, PROMPT: args.prompt})
+                rgb = data[RGB]
+                token_ids = np.asarray(data[TOKEN_IDS], dtype=np.uint32)
+                noise = np.random.default_rng(args.seed).standard_normal(
+                    (handle.action_horizon, handle.action_dim), dtype=np.float32
+                )
+                patch_rows = handle.num_views * handle.patches_per_view
+                patch_width = 3 * handle.patch_size * handle.patch_size
+                patches = np.zeros((patch_rows, patch_width), dtype=np.float32)
+                token_count = int(token_ids.size)
+            else:
+                token_count = None
 
     in_process_raw = {}
     if in_process:
@@ -415,7 +473,7 @@ def main() -> None:
     l3_segments = None
     if "l3" in layers:
         l3_metadata, l3_segments = _run_l3(
-            args.host, args.port, args.precision, args.prompt, args.warmup, args.samples
+            args.host, args.port, args.model_variant, args.prompt, args.warmup, args.samples
         )
 
     # Assemble report.
@@ -424,12 +482,13 @@ def main() -> None:
     result = {
         "schema": "apxinf.pi05.latency.v2",
         "git_commit": _git_commit(),
-        "precision": args.precision,
+        "model_variant": args.model_variant,
         "device": args.device,
         "weights": "synthetic" if random else "checkpoint",
         "layers": layers,
         "warmup": args.warmup,
         "samples": args.samples,
+        "autotune": args.autotune,
     }
     if handle is not None:
         result["workload"] = {
@@ -443,6 +502,8 @@ def main() -> None:
             result["model_dir"] = str(args.model_dir)
             result["workload"]["prompt"] = args.prompt
             result["workload"]["deploy_action_dim"] = policy.action_dim
+        if tactics is not None:
+            result["tactics"] = str(tactics)
     if in_process_report:
         result["layers_ms"] = in_process_report
         result["raw_ms"] = {layer_names[layer]: ms for layer, ms in in_process_raw.items()}
@@ -454,7 +515,7 @@ def main() -> None:
     # Console table.
     if in_process_report:
         hdr = (
-            f"pi05 in-process latency  |  {args.precision}  "
+            f"in-process latency  |  {args.model_variant}  "
             f"{'synthetic' if random else 'checkpoint'}  "
             f"H={handle.action_horizon} Dmodel={handle.action_dim} "
             f"views={handle.num_views} T={token_count}"
@@ -479,7 +540,7 @@ def main() -> None:
     if l3_segments is not None:
         stats = result["l3_segments_ms"]
         print(
-            f"\nL3 websocket  views={l3_metadata.get('num_views')} precision={args.precision} "
+            f"\nL3 websocket  views={l3_metadata.get('num_views')} model_variant={args.model_variant} "
             f"prompt={args.prompt!r} ({args.warmup} warmup + {args.samples} samples)"
         )
         header = f"{'segment':<18}{'p50':>9}{'p95':>9}{'min':>9}{'max':>9}{'mean':>9}{'std':>8}"

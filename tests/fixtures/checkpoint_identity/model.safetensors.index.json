@@ -1,0 +1,6 @@
+{
+  "weight_map": {
+    "layer.a": "a-b/x.safetensors",
+    "layer.b": "a/b.safetensors"
+  }
+}

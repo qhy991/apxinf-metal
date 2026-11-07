@@ -1,3 +1,10 @@
+//! CUDA-independent PI0.5 helpers and reference semantics.
+//!
+//! Model loading uses [`sinusoidal_time_embedding`] to prepare fixed timestep
+//! embeddings. The state/prompt helpers are CPU utilities, not the implementation
+//! called by Python preprocessing. [`euler_flow_step`] documents and tests the
+//! reverse-time update; inference performs that update in device kernels.
+
 use std::f64::consts::TAU;
 
 /// OpenPI's float64-generated sinusoidal flow timestep embedding.
@@ -26,12 +33,28 @@ pub fn sinusoidal_time_embedding(
     sin
 }
 
-/// Match NumPy `digitize(state, linspace(-1, 1, 257)[:-1]) - 1`, with
-/// saturation for out-of-range sensor values.
-pub fn discretize_state(state: &[f32]) -> Vec<u8> {
+/// Match NumPy `digitize(state, linspace(-1, 1, 257)[:-1]) - 1`.
+///
+/// The signed result preserves NumPy's `-1` bin below `-1`; values at or above
+/// `1` saturate to `255`. Searching exact f32 edges avoids arithmetic rounding
+/// onto the next bin. Non-finite state is rejected by the caller.
+pub fn discretize_state(state: &[f32]) -> Vec<i16> {
     state
         .iter()
-        .map(|&value| (((value + 1.0) * 128.0).floor() as i32).clamp(0, 255) as u8)
+        .map(|&value| {
+            // Binary search for the number of edges <= value, i.e.
+            // `searchsorted(edges, value, side="right")`; the bin is that minus one.
+            let (mut lo, mut hi) = (0i32, 256i32);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if -1.0 + mid as f32 / 128.0 <= value {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            (lo - 1) as i16
+        })
         .collect()
 }
 
@@ -42,7 +65,7 @@ pub fn pi05_prompt(task: &str, normalized_state: &[f32], discrete_state_input: b
     }
     let state = discretize_state(normalized_state)
         .iter()
-        .map(u8::to_string)
+        .map(i16::to_string)
         .collect::<Vec<_>>()
         .join(" ");
     format!("Task: {task}, State: {state};\nAction: ")
@@ -73,14 +96,62 @@ mod tests {
     #[test]
     fn state_discretization_and_prompt_match_pi05() {
         assert_eq!(
-            discretize_state(&[-2.0, -1.0, 0.0, 0.999, 1.0, 2.0]),
-            vec![0, 0, 128, 255, 255, 255]
+            discretize_state(&[-2.0, -1.000_001, -1.0, 0.0, 0.999, 1.0, 2.0]),
+            vec![-1, -1, 0, 128, 255, 255, 255]
         );
         assert_eq!(
-            pi05_prompt(" pick_up\ncup ", &[-1.0, 0.0, 1.0], true),
-            "Task: pick up cup, State: 0 128 255;\nAction: "
+            pi05_prompt(" pick_up\ncup ", &[-2.0, -1.0, 0.0, 1.0], true),
+            "Task: pick up cup, State: -1 0 128 255;\nAction: "
         );
         assert_eq!(pi05_prompt("pick_up", &[], false), "pick up\n");
+    }
+
+    /// The next representable f32 below `x`. `0.0` steps to the smallest
+    /// negative subnormal, which is what makes edge 128 (exactly `0.0`) testable.
+    fn next_below(x: f32) -> f32 {
+        if x > 0.0 {
+            f32::from_bits(x.to_bits() - 1)
+        } else if x < 0.0 {
+            f32::from_bits(x.to_bits() + 1)
+        } else {
+            -f32::from_bits(1)
+        }
+    }
+
+    fn next_above(x: f32) -> f32 {
+        -next_below(-x)
+    }
+
+    #[test]
+    fn discretization_matches_digitize_at_every_bin_edge() {
+        // The edge opens its bin; one ulp below remains in the preceding bin.
+        for i in 0..256i32 {
+            let edge = -1.0 + i as f32 / 128.0;
+            assert_eq!(discretize_state(&[edge]), vec![i as i16], "edge {i}");
+            assert_eq!(
+                discretize_state(&[next_below(edge)]),
+                vec![(i - 1) as i16],
+                "one ulp below edge {i}"
+            );
+            assert_eq!(
+                discretize_state(&[next_above(edge)]),
+                vec![i as i16],
+                "one ulp above edge {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn discretization_does_not_round_up_onto_an_edge() {
+        // Arithmetic indexing rounds this value onto edge 65; NumPy keeps bin 64.
+        let v = f32::from_bits((-0.4921875f32).to_bits() + 1);
+        assert!(v < -0.4921875, "one ulp below the edge");
+        assert_eq!(
+            ((v + 1.0) * 128.0).floor() as i32,
+            65,
+            "the trap this guards"
+        );
+        assert_eq!(discretize_state(&[v]), vec![64]);
     }
 
     #[test]
