@@ -607,7 +607,7 @@ pub const MAX_PREFETCH_WINDOW: usize = 8;
 /// Memory-gate floors: prefetch admits only when the host has this much
 /// free+inactive memory and at most this much swap in use (round-18 owner
 /// criteria), so the cache warming can never push the host into paging.
-pub const DEFAULT_PREFETCH_MIN_FREE_MB: u64 = 4096;
+pub const DEFAULT_PREFETCH_MIN_AVAIL_MB: u64 = 4096;
 pub const DEFAULT_PREFETCH_MAX_SWAP_MB: u64 = 3072;
 
 fn parse_window(value: Option<&str>) -> usize {
@@ -640,11 +640,11 @@ fn prefetch_window() -> usize {
     parse_window(env_cached("APXINF_QWEN_IMAGE_PREFETCH_WINDOW", &WINDOW).as_deref())
 }
 
-fn prefetch_min_free_bytes() -> u64 {
+fn prefetch_min_avail_bytes() -> u64 {
     static FLOOR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     parse_mb(
-        env_cached("APXINF_QWEN_IMAGE_PREFETCH_MIN_FREE_MB", &FLOOR).as_deref(),
-        DEFAULT_PREFETCH_MIN_FREE_MB,
+        env_cached("APXINF_QWEN_IMAGE_PREFETCH_MIN_AVAIL_MB", &FLOOR).as_deref(),
+        DEFAULT_PREFETCH_MIN_AVAIL_MB,
     )
 }
 
@@ -656,11 +656,12 @@ fn prefetch_max_swap_bytes() -> u64 {
     )
 }
 
-/// Host memory at the encode start: pages instantly reusable without
-/// paging (free + inactive) and swap bytes in use.
+/// Host memory at the encode start: pages the kernel can reuse immediately
+/// without paging (free + inactive + purgeable + speculative) and swap
+/// bytes in use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemSnapshot {
-    pub free_inactive_bytes: u64,
+    pub available_bytes: u64,
     pub swap_used_bytes: u64,
 }
 
@@ -696,7 +697,10 @@ fn memory_snapshot() -> Option<MemSnapshot> {
             return None;
         }
         Some(MemSnapshot {
-            free_inactive_bytes: (u64::from(stats.free_count) + u64::from(stats.inactive_count))
+            available_bytes: (u64::from(stats.free_count)
+                + u64::from(stats.inactive_count)
+                + u64::from(stats.purgeable_count)
+                + u64::from(stats.speculative_count))
                 * page as u64,
             swap_used_bytes: usage.xsu_used,
         })
@@ -724,7 +728,7 @@ fn decide_gate(
     forced: Option<bool>,
     image_tokens: usize,
     mem: Option<MemSnapshot>,
-    min_free: u64,
+    min_avail: u64,
     max_swap: u64,
 ) -> PrefetchGate {
     if let Some(forced) = forced {
@@ -738,61 +742,93 @@ fn decide_gate(
         return PrefetchGate::TierCap;
     }
     match mem {
-        Some(mem)
-            if mem.swap_used_bytes > max_swap || mem.free_inactive_bytes < min_free =>
-        {
+        Some(mem) if mem.swap_used_bytes > max_swap || mem.available_bytes < min_avail => {
             PrefetchGate::Memory(mem)
         }
         mem => PrefetchGate::Admit(mem),
     }
 }
 
-/// The admitted prefetch for one encode: the background worker and the
-/// configured window.
-pub struct TextPrefetchPlan {
-    pub worker: TextPrefetch,
-    pub window: usize,
+/// What one encode does about the shard page cache.
+pub enum PrefetchPlan {
+    /// Legacy path (forced off or an unmeasured tier): no worker, no purge.
+    Disabled(PrefetchGate),
+    /// The worker runs: `warm` prefetches ahead, `purge` drops each consumed
+    /// layer's pages. A memory-pressured host degrades to warm=false with
+    /// purge still on — under pressure the encode must not grow the cache.
+    Active(Box<TextPrefetchPlan>),
 }
 
-/// Decide whether this encode prefetches, and start the worker when it does.
+pub struct TextPrefetchPlan {
+    pub worker: TextPrefetch,
+    pub warm: bool,
+    pub purge: bool,
+    pub window: usize,
+    pub gate: PrefetchGate,
+}
+
+/// Decide what this encode does with the shard cache, and start the worker
+/// when it does anything at all.
 ///
-/// Unset `APXINF_QWEN_IMAGE_TEXT_PREFETCH` admits tiers up to
+/// `APXINF_QWEN_IMAGE_TEXT_PREFETCH` forces warming on/off for measurement
+/// and rollback. Unset, warming admits tiers up to
 /// `PREFETCH_MAX_IMAGE_TOKENS` subject to the memory gate
-/// (`APXINF_QWEN_IMAGE_PREFETCH_MIN_FREE_MB`, default 4096;
+/// (`APXINF_QWEN_IMAGE_PREFETCH_MIN_AVAIL_MB`, default 4096;
 /// `APXINF_QWEN_IMAGE_PREFETCH_MAX_SWAP_MB`, default 3072): a host already
-/// under memory pressure degrades to the legacy on-demand reads, with a log
-/// line, rather than warming cache it cannot afford.
-pub fn prefetch_plan(image_tokens: usize) -> Option<TextPrefetchPlan> {
-    let min_free = prefetch_min_free_bytes();
+/// under memory pressure skips the warming — with a log line — but still
+/// purges consumed layers, so the encode never grows the cache it cannot
+/// afford. `APXINF_QWEN_IMAGE_PREFETCH_PURGE` (default on) disables the
+/// purge alone for isolation measurements.
+pub fn prefetch_plan(image_tokens: usize) -> PrefetchPlan {
+    let min_avail = prefetch_min_avail_bytes();
     let max_swap = prefetch_max_swap_bytes();
     let gate = decide_gate(
         forced_prefetch(),
         image_tokens,
         memory_snapshot(),
-        min_free,
+        min_avail,
         max_swap,
     );
+    let purge = purge_enabled();
     match gate {
-        PrefetchGate::ForcedOff | PrefetchGate::TierCap => None,
+        PrefetchGate::ForcedOff | PrefetchGate::TierCap => PrefetchPlan::Disabled(gate),
         PrefetchGate::Memory(mem) => {
             // Always logged: degrading silently would hide the lever's
             // absence from the operator exactly when the host is pressured.
             eprintln!(
                 "qwen-image: text prefetch disabled by the memory gate \
-                 (free+inactive {:.2} GB < {} MB or swap used {:.2} GB > {} MB); \
-                 reading weights on demand",
-                mem.free_inactive_bytes as f64 / (1u64 << 30) as f64,
-                min_free >> 20,
+                 (available {:.2} GB < {} MB or swap used {:.2} GB > {} MB); \
+                 reading weights on demand, still purging consumed layers",
+                mem.available_bytes as f64 / (1u64 << 30) as f64,
+                min_avail >> 20,
                 mem.swap_used_bytes as f64 / (1u64 << 30) as f64,
                 max_swap >> 20,
             );
-            None
+            PrefetchPlan::Active(Box::new(TextPrefetchPlan {
+                worker: TextPrefetch::new(),
+                warm: false,
+                purge,
+                window: prefetch_window(),
+                gate,
+            }))
         }
-        PrefetchGate::ForcedOn | PrefetchGate::Admit(_) => Some(TextPrefetchPlan {
-            worker: TextPrefetch::new(),
-            window: prefetch_window(),
-        }),
+        PrefetchGate::ForcedOn | PrefetchGate::Admit(_) => {
+            PrefetchPlan::Active(Box::new(TextPrefetchPlan {
+                worker: TextPrefetch::new(),
+                warm: true,
+                purge,
+                window: prefetch_window(),
+                gate,
+            }))
+        }
     }
+}
+
+fn purge_enabled() -> bool {
+    static PURGE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    env_cached("APXINF_QWEN_IMAGE_PREFETCH_PURGE", &PURGE)
+        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+        .unwrap_or(true)
 }
 
 /// Whole `page`-sized pages fully inside `[start, end)`: layer boundaries
@@ -803,14 +839,17 @@ fn contained_pages(start: u64, end: u64, page: u64) -> Option<(u64, u64)> {
     (hi > lo).then_some((lo, hi - lo))
 }
 
-/// Drop warmed pages of these absolute file ranges from the OS page cache.
-/// The pages are clean and file-backed, so `MADV_DONTNEED` on a throwaway
-/// private mapping releases them without I/O; the bytes on disk are
-/// untouched and a later reader re-faults from the file. Used after a layer
-/// is consumed so the encode keeps only its small window resident instead
-/// of all 15.1 GB. Failures are ignored: eviction is a cache hint, never
-/// part of the read path.
-pub fn evict_cached_ranges(ranges: &[(PathBuf, u64, u64)]) {
+/// Drop already-consumed shard bytes from the OS page cache. On this host
+/// (measured, EngineTailor #222 round 19) the effective userspace primitive
+/// is `mmap(MAP_SHARED)` + `msync(MS_INVALIDATE)`: it returns the clean
+/// file pages to the free pool deterministically (~2 ms per 386 MB layer),
+/// while `madvise(MADV_DONTNEED)`/`MADV_FREE` leave them resident. The
+/// shards are read-only model weights, so invalidation cannot discard
+/// anybody's dirty data; a concurrent reader of a page simply re-faults it
+/// from disk. Only whole pages fully inside a range are touched, so a page
+/// shared with a kept neighbor layer is never dropped. Failures are
+/// ignored: a missed purge only means the cache keeps the pages longer.
+pub fn purge_cached_ranges(ranges: &[(PathBuf, u64, u64)]) {
     use std::os::unix::io::AsRawFd;
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page <= 0 {
@@ -836,17 +875,25 @@ pub fn evict_cached_ranges(ranges: &[(PathBuf, u64, u64)]) {
                 std::ptr::null_mut(),
                 len as usize,
                 libc::PROT_READ,
-                libc::MAP_PRIVATE,
+                libc::MAP_SHARED,
                 input.as_raw_fd(),
                 offset as libc::off_t,
             );
             if addr == libc::MAP_FAILED {
                 continue;
             }
-            libc::madvise(addr, len as usize, libc::MADV_DONTNEED);
+            libc::msync(addr, len as usize, libc::MS_INVALIDATE);
             libc::munmap(addr, len as usize);
         }
     }
+}
+
+/// Work item for the prefetch thread: warm these bytes into the cache, or
+/// purge these already-consumed bytes out of it.
+enum Msg {
+    Warm(Vec<(PathBuf, u64, u64)>),
+    Purge(Vec<(PathBuf, u64, u64)>),
+    Quit,
 }
 
 /// Background disk prefetcher for the text encoder's per-layer loads.
@@ -854,11 +901,13 @@ pub fn evict_cached_ranges(ranges: &[(PathBuf, u64, u64)]) {
 /// The encoder reads its weights one layer at a time; while a layer computes
 /// on the device, this worker reads the *next* layers' exact shard bytes so
 /// the OS page cache already holds them when the graph mmaps and evaluates
-/// them. The bytes the loader sees are unchanged — prefetching moves the
-/// disk wait, not the computation — so outputs are bit-exact. Read failures
+/// them (`warm`), and drops each consumed layer's pages again (`purge`), so
+/// the cache holds a ~0.8 GB window instead of the full 15.1 GB. The bytes
+/// the loader sees are unchanged — this moves the disk wait and the cache
+/// footprint, not the computation — so outputs are bit-exact. Read failures
 /// are ignored: every tensor is still read synchronously by the real load.
 pub struct TextPrefetch {
-    sender: Option<std::sync::mpsc::Sender<Option<Vec<(PathBuf, u64, u64)>>>>,
+    sender: Option<std::sync::mpsc::Sender<Msg>>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -881,31 +930,44 @@ impl TextPrefetch {
     }
 
     /// Queue these absolute file ranges for a cache-warming read.
-    pub fn submit(&self, ranges: Vec<(PathBuf, u64, u64)>) {
+    pub fn warm(&self, ranges: Vec<(PathBuf, u64, u64)>) {
         if let Some(sender) = &self.sender {
-            let _ = sender.send(Some(ranges));
+            let _ = sender.send(Msg::Warm(ranges));
         }
     }
 
-    fn run(receiver: std::sync::mpsc::Receiver<Option<Vec<(PathBuf, u64, u64)>>>) {
+    /// Queue these absolute file ranges for page-cache eviction.
+    pub fn purge(&self, ranges: Vec<(PathBuf, u64, u64)>) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(Msg::Purge(ranges));
+        }
+    }
+
+    fn run(receiver: std::sync::mpsc::Receiver<Msg>) {
         use std::io::{Read, Seek, SeekFrom};
         const CHUNK: usize = 8 << 20;
         let mut buf = vec![0_u8; CHUNK];
-        while let Ok(Some(ranges)) = receiver.recv() {
-            for (file, start, end) in ranges {
-                let Ok(mut input) = std::fs::File::open(&file) else {
-                    continue;
-                };
-                if input.seek(SeekFrom::Start(start)).is_err() {
-                    continue;
-                }
-                let mut left = end - start;
-                while left > 0 {
-                    let want = left.min(CHUNK as u64) as usize;
-                    match input.read(&mut buf[..want]) {
-                        Ok(0) => break,
-                        Ok(read) => left -= read as u64,
-                        Err(_) => break,
+        while let Ok(msg) = receiver.recv() {
+            match msg {
+                Msg::Quit => break,
+                Msg::Purge(ranges) => purge_cached_ranges(&ranges),
+                Msg::Warm(ranges) => {
+                    for (file, start, end) in ranges {
+                        let Ok(mut input) = std::fs::File::open(&file) else {
+                            continue;
+                        };
+                        if input.seek(SeekFrom::Start(start)).is_err() {
+                            continue;
+                        }
+                        let mut left = end - start;
+                        while left > 0 {
+                            let want = left.min(CHUNK as u64) as usize;
+                            match input.read(&mut buf[..want]) {
+                                Ok(0) => break,
+                                Ok(read) => left -= read as u64,
+                                Err(_) => break,
+                            }
+                        }
                     }
                 }
             }
@@ -916,11 +978,11 @@ impl TextPrefetch {
 impl Drop for TextPrefetch {
     fn drop(&mut self) {
         if let Some(sender) = self.sender.take() {
-            let _ = sender.send(None);
+            let _ = sender.send(Msg::Quit);
         }
         if let Some(worker) = self.worker.take() {
-            // Wait out the queued reads; prefetch is on the encode critical
-            // path's shadow, never on a later phase's.
+            // Wait out the queued reads and purges; prefetch is on the
+            // encode critical path's shadow, never on a later phase's.
             let _ = worker.join();
         }
     }
@@ -1015,7 +1077,7 @@ mod tests {
     #[test]
     fn prefetch_gate_admits_measured_tiers_and_forced_directions() {
         let roomy = Some(MemSnapshot {
-            free_inactive_bytes: 8 << 30,
+            available_bytes: 8 << 30,
             swap_used_bytes: 0,
         });
         let (floor, ceil) = (4 << 30, 3 << 30);
@@ -1046,11 +1108,11 @@ mod tests {
     fn prefetch_gate_degrades_under_memory_pressure() {
         let (floor, ceil) = (4u64 << 30, 3u64 << 30);
         let low_free = MemSnapshot {
-            free_inactive_bytes: (2u64 << 30),
+            available_bytes: (2u64 << 30),
             swap_used_bytes: 0,
         };
         let swapping = MemSnapshot {
-            free_inactive_bytes: 12 << 30,
+            available_bytes: 12 << 30,
             swap_used_bytes: 4 << 30,
         };
         for pressured in [low_free, swapping] {
@@ -1062,7 +1124,7 @@ mod tests {
         // Exactly at the floors still admits; a failed stat query keeps the
         // legacy admit rather than disabling the lever blindly.
         let at_floor = MemSnapshot {
-            free_inactive_bytes: floor,
+            available_bytes: floor,
             swap_used_bytes: ceil,
         };
         assert_eq!(
