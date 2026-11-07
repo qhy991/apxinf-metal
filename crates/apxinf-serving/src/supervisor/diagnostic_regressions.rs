@@ -9,12 +9,72 @@ const PROBE_MODE: &str = "APXINF_SERVING_DIAGNOSTIC_PROBE";
 const PROBE_MODEL: &str = "APXINF_SERVING_DIAGNOSTIC_MODEL";
 const COMPLETED_MARKER: &str = "APXINF_DIAGNOSTIC_PROBE_COMPLETED";
 const PROGRESS_MARKER: &str = "APXINF_DIAGNOSTIC_PROBE_PROGRESS";
+/// A transcript is only used to explain a failure; keep it bounded so a probe
+/// that floods stdout cannot grow the parent's memory without limit.
+const MAX_TRANSCRIPT_BYTES: usize = 64 * 1024;
 /// A probe step waits for a Python fixture, a re-executed test binary, or both.
 /// The parent therefore watches for stalled progress instead of enforcing a
 /// fixed wall-clock deadline that a loaded host can exceed without a bug.
+/// The bound assumes a host at up to roughly four times oversubscription; a CI
+/// host that cannot schedule the probe at all for this long should raise it and
+/// record the observation instead of treating the stall as a probe bug.
 const PROBE_STALL_GRACE: Duration = Duration::from_secs(30);
-/// Absolute upper bound so a pathological probe still cannot hang the suite.
-const PROBE_HARD_LIMIT: Duration = Duration::from_secs(180);
+/// The absolute upper bound only catches a probe that keeps making progress
+/// without ever finishing; it must stay well above a loaded full-suite run.
+const PROBE_HARD_LIMIT: Duration = Duration::from_secs(120);
+/// Probe wait limits, parameterized so both branches are unit-tested.
+#[derive(Debug, Clone, Copy)]
+struct ProbeLimits {
+    stall: Duration,
+    hard: Duration,
+}
+
+const PROBE_LIMITS: ProbeLimits = ProbeLimits {
+    stall: PROBE_STALL_GRACE,
+    hard: PROBE_HARD_LIMIT,
+};
+
+/// The terminal observation of the probe wait loop.
+#[derive(Debug)]
+enum ProbeWait {
+    Exited(std::process::ExitStatus),
+    Stalled(Duration),
+    ExceededHardLimit(Duration),
+}
+
+fn wait_for_probe(
+    child: &mut ProbeChild,
+    last_progress: &std::sync::Mutex<Instant>,
+    started: Instant,
+    limits: ProbeLimits,
+) -> ProbeWait {
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return ProbeWait::Exited(status);
+        }
+        let idle = last_progress.lock().unwrap().elapsed();
+        if idle >= limits.stall {
+            return ProbeWait::Stalled(idle);
+        }
+        if started.elapsed() >= limits.hard {
+            return ProbeWait::ExceededHardLimit(limits.hard);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Keep the diagnostic transcript bounded without splitting a UTF-8 character.
+fn append_transcript(transcript: &mut String, chunk: &str) {
+    let remaining = MAX_TRANSCRIPT_BYTES.saturating_sub(transcript.len());
+    if remaining == 0 {
+        return;
+    }
+    let end = (0..=chunk.len().min(remaining))
+        .rev()
+        .find(|&index| chunk.is_char_boundary(index))
+        .unwrap_or(0);
+    transcript.push_str(&chunk[..end]);
+}
 /// The flood scenario proves that stderr backpressure cannot block stdout, so
 /// its waits only need to catch a real deadlock and can tolerate a loaded host.
 const FLOOD_LIVENESS_GRACE: Duration = Duration::from_secs(30);
@@ -106,10 +166,10 @@ fn run_isolated(output_mode: &str, scenario: &str) {
                 match output.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(count) => {
-                        transcript
-                            .lock()
-                            .unwrap()
-                            .push_str(&String::from_utf8_lossy(&buffer[..count]));
+                        append_transcript(
+                            &mut transcript.lock().unwrap(),
+                            &String::from_utf8_lossy(&buffer[..count]),
+                        );
                         *last_progress.lock().unwrap() = Instant::now();
                     }
                 }
@@ -118,19 +178,16 @@ fn run_isolated(output_mode: &str, scenario: &str) {
     };
     let started = Instant::now();
     let mut blocked = String::new();
-    let status = loop {
-        if let Some(status) = probe.child.try_wait().unwrap() {
-            break Some(status);
+    let status = match wait_for_probe(&mut probe.child, &last_progress, started, PROBE_LIMITS) {
+        ProbeWait::Exited(status) => Some(status),
+        ProbeWait::Stalled(idle) => {
+            blocked = format!("made no progress for {idle:?}");
+            None
         }
-        if last_progress.lock().unwrap().elapsed() >= PROBE_STALL_GRACE {
-            blocked = format!("made no progress for {PROBE_STALL_GRACE:?}");
-            break None;
+        ProbeWait::ExceededHardLimit(limit) => {
+            blocked = format!("exceeded the {limit:?} hard limit");
+            None
         }
-        if started.elapsed() >= PROBE_HARD_LIMIT {
-            blocked = format!("exceeded the {PROBE_HARD_LIMIT:?} hard limit");
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(10));
     };
     // A failing or blocked probe cannot leave its worker alive.
     probe.reap_group();
@@ -370,4 +427,113 @@ fn diagnostic_closed_stderr_drains_unterminated_invalid_utf8_worker_output() {
 #[test]
 fn diagnostic_full_stderr_drains_unterminated_invalid_utf8_worker_output() {
     run_isolated("full", "flood");
+}
+
+#[test]
+fn a_probe_that_stops_making_progress_is_detected() {
+    let mut child = ProbeCommand::new("/bin/sh")
+        .args(["-c", "sleep 30"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let last_progress = std::sync::Mutex::new(Instant::now());
+    let outcome = wait_for_probe(
+        &mut child,
+        &last_progress,
+        Instant::now(),
+        ProbeLimits {
+            stall: Duration::from_millis(50),
+            hard: Duration::from_secs(5),
+        },
+    );
+    assert!(
+        matches!(outcome, ProbeWait::Stalled(idle) if idle >= Duration::from_millis(50)),
+        "{outcome:?}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn a_probe_that_keeps_progressing_hits_the_hard_limit() {
+    let mut child = ProbeCommand::new("/bin/sh")
+        .args(["-c", "sleep 30"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let last_progress = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let running = Arc::new(AtomicBool::new(true));
+    let keeper = {
+        let last_progress = last_progress.clone();
+        let running = running.clone();
+        std::thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                *last_progress.lock().unwrap() = Instant::now();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    let outcome = wait_for_probe(
+        &mut child,
+        &last_progress,
+        Instant::now(),
+        ProbeLimits {
+            stall: Duration::from_secs(5),
+            hard: Duration::from_millis(100),
+        },
+    );
+    running.store(false, Ordering::Relaxed);
+    keeper.join().unwrap();
+    assert!(
+        matches!(outcome, ProbeWait::ExceededHardLimit(limit) if limit == Duration::from_millis(100)),
+        "{outcome:?}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn an_exited_probe_reports_its_exit_status() {
+    let mut child = ProbeCommand::new("/bin/sh")
+        .args(["-c", "exit 3"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let last_progress = std::sync::Mutex::new(Instant::now());
+    let outcome = wait_for_probe(
+        &mut child,
+        &last_progress,
+        Instant::now(),
+        ProbeLimits {
+            stall: Duration::from_secs(5),
+            hard: Duration::from_secs(5),
+        },
+    );
+    match outcome {
+        ProbeWait::Exited(status) => assert_eq!(status.code(), Some(3), "{status:?}"),
+        other => panic!("An exited probe must report its status: {other:?}"),
+    }
+}
+
+#[test]
+fn a_probe_transcript_stays_bounded_without_splitting_utf8() {
+    let mut transcript = String::new();
+    append_transcript(&mut transcript, &"a".repeat(MAX_TRANSCRIPT_BYTES + 4096));
+    assert_eq!(transcript.len(), MAX_TRANSCRIPT_BYTES);
+    append_transcript(&mut transcript, "the failure marker must not append");
+    assert_eq!(transcript.len(), MAX_TRANSCRIPT_BYTES);
+    // One byte short of the cap, a two-byte character cannot be appended.
+    let mut near_cap = "b".repeat(MAX_TRANSCRIPT_BYTES - 1);
+    append_transcript(&mut near_cap, "é");
+    assert_eq!(near_cap.len(), MAX_TRANSCRIPT_BYTES - 1);
+    assert!(near_cap.is_char_boundary(near_cap.len()));
+    let mut small = String::new();
+    append_transcript(&mut small, "APXINF_MARKER");
+    assert_eq!(small, "APXINF_MARKER");
 }
