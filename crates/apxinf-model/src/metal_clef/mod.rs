@@ -44,6 +44,8 @@ fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
         Some("reference") => Some(Composition::Reference),
         #[cfg(feature = "coreml")]
         Some("gpu-ane-columns") => Some(Composition::GpuAneColumns),
+        #[cfg(feature = "coreml")]
+        Some("gpu-ane-neurons") => Some(Composition::GpuAneNeurons),
         Some(_) => {
             return Err(Error::Contract(
                 "Clef MLX supports the auto and reference variants",
@@ -233,13 +235,25 @@ mod tests {
         }
         #[cfg(not(feature = "coreml"))]
         assert!(admit(&options).is_err());
+        let options = LoadOptions {
+            model_variant: Some("gpu-ane-neurons".into()),
+            ..LoadOptions::default()
+        };
+        #[cfg(feature = "coreml")]
+        {
+            assert_eq!(admit(&options).unwrap(), Some(Composition::GpuAneNeurons));
+            assert_eq!(select(admit(&options).unwrap(), ""), Composition::GpuAneNeurons);
+        }
+        #[cfg(not(feature = "coreml"))]
+        assert!(admit(&options).is_err());
     }
 
 
     #[test]
     fn auto_runs_the_gpu_composition_only_on_qualified_architectures() {
         assert_eq!(select(None, "applegpu_g13s"), Composition::Gpu);
-        for other in ["applegpu_g16g", "applegpu_g14g", "applegpu_g13g", ""] {
+        assert_eq!(select(None, "applegpu_g16g"), Composition::Reference);
+        for other in ["applegpu_g14g", "applegpu_g13g", ""] {
             assert_eq!(select(None, other), Composition::Reference, "{other}");
         }
         for architecture in ["applegpu_g13s", "applegpu_g16g"] {

@@ -223,14 +223,10 @@ cargo run --features mlx -- speak --model /path/to/Qwen3-TTS-12Hz-1.7B-CustomVoi
 ```
 ## Clef decision preparation
 
-`auto` selects only GPU execution. Core ML column splitting requires the explicit
-`gpu-ane-columns` model variant and the `coreml` feature. An architecture name
-does not qualify a new OS, checkpoint, or execution profile. The declared
-placement and complete-request qualification requirements still apply.
-
-The decision CLI sets its process allocator cache limit before loading.
-Library callers retain ownership of their process policy through
-`apxinf_mlx::set_cache_limit`; loading Clef does not change that limit.
+`auto` selects only GPU execution. Core ML splitting requires an explicit
+`gpu-ane-columns` or `gpu-ane-neurons` model variant and the `coreml` feature.
+An architecture name does not qualify a new OS, checkpoint, or execution profile.
+The declared placement and complete-request qualification requirements still apply.
 
 With `coreml`, Clef checks its selected fixed input/output profile before
 compilation and matches the inspected expected plan to the generated source
@@ -248,7 +244,7 @@ qualification in [the Core ML contract](coreml-ane.md).
 
 The `metal_clef` decision family prepares its existing shapeless decay/beta
 callable during loading, before returning the runner. Its disposable BF16
-operands match the admitted 32 value heads and token lengths 1, 2 and 16384;
+operands match the admitted 32 value heads and token lengths 1, 2 and 4096;
 `Compiled::prepare` evaluates both outputs and verifies Rust trace reuse for
 each warm profile. Preparation errors fail loading. Real requests retain the
 original single lazy invocation with their actual layer weights and values.

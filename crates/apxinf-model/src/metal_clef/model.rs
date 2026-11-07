@@ -20,6 +20,8 @@ use apxinf_mlx::fusions::{
     GatedDeltaRecurrence, HalfSplitRope, PadRowsF16, Q4DecodeArithmetic, Q4RowDecodeF16,
     Q4TransposeDecode, SplitF16Gemm,
 };
+#[cfg(feature = "coreml")]
+use apxinf_mlx::fusions::{AneTileHandoff, AneTileMerge, MppF16Gemm, SplitMppF16Gemm};
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 
 const EPS: f32 = 1e-6;
@@ -67,6 +69,20 @@ pub enum Composition {
     /// the Neural Engine as one INT8 Core ML program per layer.
     #[cfg(feature = "coreml")]
     GpuAneColumns,
+    /// The GPU composition's gated-delta and MLP kernels, the projections as
+    /// Metal 4 MPP GEMMs, and each MLP split by neuron: 5632 INT8 and 1248
+    /// FP16 neurons as one Neural Engine program per layer (128-token tiles,
+    /// one batch prediction), the other 5408 on the GPU.
+    #[cfg(feature = "coreml")]
+    GpuAneNeurons,
+}
+
+/// The neuron split's projection GEMMs, in place of the Steel `split` and
+/// `single`.
+#[cfg(feature = "coreml")]
+struct MppProjections {
+    split: SplitMppF16Gemm,
+    single: MppF16Gemm,
 }
 
 /// Kernels only the GPU composition uses.
@@ -88,6 +104,9 @@ struct GpuKernels {
     conv: CausalDepthwiseConv,
     /// Eight value rows per SIMD group.
     recurrence: GatedDeltaRecurrence,
+    /// Neuron split: the projections run as MPP GEMMs instead of `split`/`single`.
+    #[cfg(feature = "coreml")]
+    mpp: Option<MppProjections>,
 }
 
 impl GpuKernels {
@@ -102,6 +121,8 @@ impl GpuKernels {
             single: F16Gemm::new(stream)?,
             conv: CausalDepthwiseConv::new(stream)?,
             recurrence: GatedDeltaRecurrence::with_layout(stream, GatedDeltaLayout::EightLanes)?,
+            #[cfg(feature = "coreml")]
+            mpp: None,
         })
     }
 
@@ -111,6 +132,15 @@ impl GpuKernels {
         let tokens = x.shape()[1];
         let half = q.rows() / 2;
         let h = self.pad.call(x)?;
+        #[cfg(feature = "coreml")]
+        if let Some(mpp) = &self.mpp {
+            let decode = |row0| {
+                self.project_decode
+                    .call(&q.weight, &q.scales, &q.biases, row0, half)
+            };
+            let low = mpp.split.low(&h, tokens, &decode(0)?)?;
+            return mpp.split.high(&decode(half)?, &low, &h, tokens);
+        }
         let low = self.split.low(
             &h,
             tokens,
@@ -130,6 +160,10 @@ impl GpuKernels {
         let weight = self
             .project_decode
             .call(&q.weight, &q.scales, &q.biases, 0, q.rows())?;
+        #[cfg(feature = "coreml")]
+        if let Some(mpp) = &self.mpp {
+            return mpp.single.call(&self.pad.call(x)?, x.shape()[1], &weight);
+        }
         self.single.call(&self.pad.call(x)?, x.shape()[1], &weight)
     }
 
@@ -157,6 +191,77 @@ impl GpuKernels {
             .slice_axis(1, 0, tokens)?
             .cast(MlxDType::BF16)
     }
+}
+
+/// The neuron split's per-layer MLP: the GPU neurons' gate rows (decoded per
+/// call), their up and down
+/// weights decoded once at load (FP16 `[5408, 4096]` each), and the Neural
+/// Engine program for the other neurons.
+#[cfg(feature = "coreml")]
+struct NeuronMlp {
+    gate: Q4,
+    up: Array,
+    down: Array,
+    ane: super::ane::AneMlp,
+}
+
+#[cfg(feature = "coreml")]
+impl NeuronMlp {
+    fn new(c: &GpuKernels, cache: &apxinf_coreml::ProgramCache, mlp: &Mlp) -> Result<Self> {
+        let dense = super::ane::DenseMlp::new(mlp)?;
+        let split = dense.split();
+        let ane = super::ane::AneMlp::load_package(cache, &dense.program(&split)?)?;
+        drop(dense);
+        let stream = mlp.gate.weight.stream();
+        let neurons: Vec<i32> = split.gpu.iter().map(|&n| n as i32).collect();
+        let index = Array::from_i32(stream, &[neurons.len()], &neurons)?;
+        let rows = |q: &Q4| -> Result<Q4> {
+            Ok(Q4 {
+                weight: q.weight.take(&index, 0)?,
+                scales: q.scales.take(&index, 0)?,
+                biases: q.biases.take(&index, 0)?,
+            })
+        };
+        let gate = rows(&mlp.gate)?;
+        let up = rows(&mlp.up)?;
+        let up = c.row_decode.call(&up.weight, &up.scales, &up.biases)?;
+        let d = &mlp.down;
+        let down = c
+            .down_decode
+            .call(&d.weight, &d.scales, &d.biases, 0, d.rows())?
+            .take(&index, 0)?;
+        stream.eval(&[
+            gate.weight.clone(),
+            gate.scales.clone(),
+            gate.biases.clone(),
+            up.clone(),
+            down.clone(),
+        ])?;
+        Ok(Self {
+            gate,
+            up,
+            down,
+            ane,
+        })
+    }
+}
+
+/// A layer MLP slot whose weights moved elsewhere (neuron split): empty arrays, so
+/// the checkpoint's full Q4 weights are released.
+#[cfg(feature = "coreml")]
+fn moved_mlp(stream: &Stream) -> Result<Mlp> {
+    let empty = || -> Result<Q4> {
+        Ok(Q4 {
+            weight: Array::zeros(stream, &[0, 0], MlxDType::U32)?,
+            scales: Array::zeros(stream, &[0, 0], MlxDType::BF16)?,
+            biases: Array::zeros(stream, &[0, 0], MlxDType::BF16)?,
+        })
+    };
+    Ok(Mlp {
+        gate: empty()?,
+        up: empty()?,
+        down: empty()?,
+    })
 }
 
 /// `compute_g`: `exp(-exp(A_log) * softplus(a + dt_bias))`; beta: `sigmoid(b)`.
@@ -199,6 +304,11 @@ pub struct Network {
     /// The column split's per-layer Neural Engine programs, in layer order.
     #[cfg(feature = "coreml")]
     ane: Vec<super::ane::AneMlp>,
+    /// The neuron split's per-layer MLPs and its GPU/Neural Engine boundary kernels.
+    #[cfg(feature = "coreml")]
+    neurons: Vec<NeuronMlp>,
+    #[cfg(feature = "coreml")]
+    tiles: Option<(AneTileHandoff, AneTileMerge)>,
     /// MRoPE inverse frequencies, computed on the device as MLX-VLM does.
     inv_freq: Array,
 }
@@ -276,10 +386,13 @@ impl Network {
             rope: HalfSplitRope::new(&stream, config.rotary_dim())?,
             g_beta: prepared_g_beta(&stream, config.text.linear_num_value_heads)?,
         };
-        let gpu = match composition {
+        #[cfg_attr(not(feature = "coreml"), allow(unused_mut))]
+        let mut gpu = match composition {
             Composition::Gpu => Some(GpuKernels::new(&stream)?),
             #[cfg(feature = "coreml")]
             Composition::GpuAneColumns => Some(GpuKernels::new(&stream)?),
+            #[cfg(feature = "coreml")]
+            Composition::GpuAneNeurons => Some(GpuKernels::new(&stream)?),
             Composition::Reference => None,
         };
         // Column split: build each layer's program from the full MLP, then
@@ -296,6 +409,26 @@ impl Network {
         } else {
             Vec::new()
         };
+        // Neuron split: split each MLP and build its program from the full
+        // weights, keep the GPU share's weights, release the rest.
+        #[cfg(feature = "coreml")]
+        let (neurons, tiles) = match (composition, gpu.as_mut()) {
+            (Composition::GpuAneNeurons, Some(c)) => {
+                c.mpp = Some(MppProjections {
+                    split: SplitMppF16Gemm::new(&stream)?,
+                    single: MppF16Gemm::new(&stream)?,
+                });
+                let cache = apxinf_coreml::ProgramCache::new(super::ane::cache_dir());
+                let mut neurons = Vec::with_capacity(backbone.layers.len());
+                for layer in &mut backbone.layers {
+                    neurons.push(NeuronMlp::new(c, &cache, &layer.mlp)?);
+                    layer.mlp = moved_mlp(&stream)?;
+                }
+                let tiles = (AneTileHandoff::new(&stream)?, AneTileMerge::new(&stream)?);
+                (neurons, Some(tiles))
+            }
+            _ => (Vec::new(), None),
+        };
         // compute_inv_freq: 1 / (base ** (arange(0, dim, 2) / dim)) in FP32.
         let dim = config.rotary_dim();
         let exponents = Array::arange(&stream, 0.0, dim as f32, 2.0, MlxDType::F32)?
@@ -309,7 +442,7 @@ impl Network {
         stream.eval(&[inv_freq.clone()])?;
         #[cfg(feature = "coreml")]
         for _ in 0..2 {
-            for model in &ane {
+            for model in ane.iter().chain(neurons.iter().map(|layer| &layer.ane)) {
                 model.warm()?;
             }
         }
@@ -322,6 +455,10 @@ impl Network {
             gpu,
             #[cfg(feature = "coreml")]
             ane,
+            #[cfg(feature = "coreml")]
+            neurons,
+            #[cfg(feature = "coreml")]
+            tiles,
             inv_freq,
         })
     }
@@ -372,6 +509,31 @@ impl Network {
     /// GPU share is enqueued, and the Neural Engine predicts while the GPU runs.
     #[cfg_attr(not(feature = "coreml"), allow(unused_variables))]
     fn mlp(&self, h: &Array, m: &Mlp, index: usize) -> Result<Array> {
+        // Neuron split: one kernel writes the GPU share's padded rows and the
+        // Neural Engine tiles; the GPU share is queued behind it, the host
+        // waits for the tiles only, the Neural Engine predicts every tile in
+        // one batch, and one kernel adds its share to the GPU's.
+        #[cfg(feature = "coreml")]
+        if let (Some(c), Some((handoff, merge)), Some(layer_mlp)) =
+            (&self.gpu, &self.tiles, self.neurons.get(index))
+        {
+            let tokens = h.shape()[1];
+            let (x, packed) = handoff.call(h, super::ane::NEURON_TILE)?;
+            let up = x.matmul(&layer_mlp.up.transpose(&[1, 0])?)?;
+            let gate = c.row_decode.call(
+                &layer_mlp.gate.weight,
+                &layer_mlp.gate.scales,
+                &layer_mlp.gate.biases,
+            )?;
+            let activation = c.gate_swiglu.call(&x, &gate, &up)?;
+            let gpu = activation
+                .matmul(&layer_mlp.down)?
+                .slice_axis(1, 0, tokens)?;
+            self.stream.async_eval(std::slice::from_ref(&packed))?;
+            self.stream.async_eval(std::slice::from_ref(&gpu))?;
+            let [y, gate_scale, up_scale] = layer_mlp.ane.predict_tiles(&self.stream, &packed)?;
+            return merge.call(&gpu, &y, &gate_scale, &up_scale);
+        }
         #[cfg(feature = "coreml")]
         if let (Some(c), Some(ane)) = (&self.gpu, self.ane.get(index)) {
             let gpu = c.mlp(h, m)?;
