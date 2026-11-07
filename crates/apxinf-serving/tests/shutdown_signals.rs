@@ -237,6 +237,47 @@ fn loading_listener_reports_the_loading_phase() {
 }
 
 #[test]
+fn loading_surface_switches_to_ready_on_the_same_listener() {
+    let mut cli = Cli::start("delayed");
+    let address = cli.bound_address();
+    // The worker is still loading, so this listener reports the loading phase.
+    let response = http_request(&address, "GET", "/readyz", None);
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    assert!(response.contains("\"phase\":\"loading\""), "{response}");
+    // The same address must switch to ready without refusing a connection.
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = http_request(&address, "GET", "/readyz", None);
+        assert!(
+            response.starts_with("HTTP/1.1 "),
+            "The listener dropped during the switch: {response}"
+        );
+        if response.starts_with("HTTP/1.1 200") {
+            assert!(response.contains("\"ready\":true"), "{response}");
+            break;
+        }
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(
+            Instant::now() < until,
+            "The listener never became ready: {}",
+            cli.log()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let response = http_request(&address, "GET", "/v1/models", None);
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let response = http_request(&address, "GET", "/metrics", None);
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    cli.signal("-TERM");
+    assert!(
+        cli.wait().success(),
+        "Shutdown failed after the switch: {}",
+        cli.log()
+    );
+    cli.fixture.assert_reaped();
+}
+
+#[test]
 fn sigterm_after_ready_stops_and_reaps_the_worker() {
     let mut cli = Cli::start("ready");
     let _ = cli.address();

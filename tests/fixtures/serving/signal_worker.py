@@ -25,6 +25,10 @@ mode = (root / "mode").read_text()
 if mode == "loading":
     time.sleep(60)
     sys.exit(3)
+if mode == "delayed":
+    # Report readiness after a short delay so a test can observe the switch
+    # from the loading surface to the declared routes on one listener.
+    time.sleep(2)
 
 
 def digest(path):
