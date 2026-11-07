@@ -769,17 +769,34 @@ fn normalize(
                             ))
                         }
                     }
-                    if let Some(s) = call["function"]["arguments"].as_str() {
-                        call["function"]["arguments"] =
-                            crate::contracts::parse_document(s.as_bytes()).map_err(|_| {
+                    // A JSON string must encode an object. Any other parsed
+                    // value would reach the prepared-input contract and report
+                    // its internal wording instead of this request error.
+                    if let Some(arguments) = call["function"]["arguments"].as_str() {
+                        let parsed = crate::contracts::parse_document(arguments.as_bytes())
+                            .map_err(|_| {
                                 ApiError::invalid(
-                                "Tool arguments must contain valid JSON without duplicate keys.",
-                            )
+                                    "Tool arguments must contain valid JSON without duplicate keys.",
+                                )
                             })?;
+                        if !parsed.is_object() {
+                            return Err(ApiError::invalid(
+                                "Tool call arguments must encode a JSON object.",
+                            ));
+                        }
+                        call["function"]["arguments"] = parsed;
                     }
                 }
-            } else if role == "tool" && message.get("tool_call_id").is_none() {
-                return Err(ApiError::invalid("Tool messages require a tool_call_id."));
+            } else if role == "tool" {
+                match message["tool_call_id"].as_str() {
+                    Some(id) if !id.is_empty() => {}
+                    Some(_) => {
+                        return Err(ApiError::invalid(
+                            "Tool message tool_call_id must be a non-empty string.",
+                        ))
+                    }
+                    None => return Err(ApiError::invalid("Tool messages require a tool_call_id.")),
+                }
             }
             messages.push(message);
             continue;
@@ -1762,6 +1779,30 @@ mod tests {
                 )),
                 "Tool calls accept only id, type, and function fields.",
             ),
+            (
+                history(call(
+                    json!({"id":"call-a","type":"function","function":{"name":"read","arguments":"[]"}}),
+                )),
+                "Tool call arguments must encode a JSON object.",
+            ),
+            (
+                history(call(
+                    json!({"id":"call-a","type":"function","function":{"name":"read","arguments":"null"}}),
+                )),
+                "Tool call arguments must encode a JSON object.",
+            ),
+            (
+                history(call(
+                    json!({"id":"call-a","type":"function","function":{"name":"read","arguments":"5"}}),
+                )),
+                "Tool call arguments must encode a JSON object.",
+            ),
+            (
+                history(call(
+                    json!({"id":"call-a","type":"function","function":{"name":"read","arguments":"\"text\""}}),
+                )),
+                "Tool call arguments must encode a JSON object.",
+            ),
         ] {
             let error = request_error(service.clone(), openai_request(messages), Api::OpenAi).await;
             assert_eq!(
@@ -1780,6 +1821,10 @@ mod tests {
             (
                 json!([{"role":"tool","content":"x"}]),
                 "Tool messages require a tool_call_id.",
+            ),
+            (
+                json!([{"role":"tool","tool_call_id":"","content":"x"}]),
+                "Tool message tool_call_id must be a non-empty string.",
             ),
         ] {
             let error = request_error(service.clone(), openai_request(messages), Api::OpenAi).await;
@@ -1814,6 +1859,25 @@ mod tests {
         assert_eq!(
             admitted.messages[0]["tool_calls"][0]["function"]["arguments"],
             json!({"path":"a"})
+        );
+
+        // An object arguments value stays accepted as well.
+        let value = json!({
+            "model":"test-model","max_tokens":4,
+            "messages":[
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call-b","type":"function","function":{"name":"read","arguments":{"path":"b"}}} ]},
+                {"role":"tool","tool_call_id":"call-b","content":"file"}
+            ]
+        });
+        let error = request_error(service.clone(), value, Api::OpenAi).await;
+        assert_eq!(error.message, "Test coordinator observed admission.");
+        let admitted = observed
+            .try_recv()
+            .expect("An object arguments value must reach admission.");
+        assert_eq!(
+            admitted.messages[0]["tool_calls"][0]["function"]["arguments"],
+            json!({"path":"b"})
         );
     }
 

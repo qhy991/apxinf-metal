@@ -360,7 +360,7 @@ An OpenAI text part accepts only the `type` and `text` keys; the Anthropic route
 An image part receives HTTP 400 `unsupported_feature` on this text profile.
 A message with an unsupported role, a missing role, or a content value that is neither a string nor an array receives HTTP 400 `invalid_request` with an actionable message.
 The optional `name` and `tool_call_id` fields must be strings.
-A `tool` message requires a `tool_call_id`, and only an `assistant` message can carry `tool_calls`.
+A `tool` message requires a non-empty `tool_call_id`, and only an `assistant` message can carry `tool_calls`.
 The same roles and shapes apply to the vision profile, where user content arrays keep their text and image order.
 
 Anthropic messages support text, `tool_use`, and `tool_result` blocks.
@@ -378,7 +378,7 @@ It checks object arguments, required properties, basic types, enums, and additio
 It does not claim complete JSON Schema enforcement or constrained decoding.
 The gateway rejects `strict: true` on OpenAI function tools.
 An OpenAI tool declaration uses `type: function` with a non-empty function name and optional object parameters.
-An OpenAI assistant tool call uses `type: function` with a non-empty id, a non-empty function name, and object or JSON-string arguments.
+An OpenAI assistant tool call uses `type: function` with a non-empty id, a non-empty function name, and an object `arguments` value or a JSON string that encodes an object.
 A malformed tool declaration or tool history receives HTTP 400 `invalid_request` with an actionable message before admission.
 The service never executes a tool.
 The client applies its own tool permissions and executes permitted calls.

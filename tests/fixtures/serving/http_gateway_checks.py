@@ -343,6 +343,11 @@ class HttpGatewayTests(GatewayChecks, unittest.TestCase):
             ({"messages": [{"role": "assistant", "content": None, "tool_calls": [
                 {"id": 5, "type": "function", "function": {"name": "read", "arguments": {}}}]}]},
              "Tool call id must be a non-empty string."),
+            ({"messages": [{"role": "assistant", "content": None, "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "read", "arguments": "[]"}}]}]},
+             "Tool call arguments must encode a JSON object."),
+            ({"messages": [{"role": "tool", "tool_call_id": "", "content": "x"}]},
+             "Tool message tool_call_id must be a non-empty string."),
         ):
             request = body("text")
             request.update(document)
