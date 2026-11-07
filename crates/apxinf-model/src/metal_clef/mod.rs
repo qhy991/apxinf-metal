@@ -105,9 +105,56 @@ fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
     Ok(requested)
 }
 
+/// A composition name from the diagnostic gate. `reference` and `gpu` are
+/// always available; the two Core ML compositions only with that feature.
+fn parse_composition(value: &str) -> Result<Composition> {
+    match value {
+        "reference" => Ok(Composition::Reference),
+        "gpu" => Ok(Composition::Gpu),
+        #[cfg(feature = "coreml")]
+        "gpu-ane-columns" => Ok(Composition::GpuAneColumns),
+        #[cfg(feature = "coreml")]
+        "gpu-ane-neurons" => Ok(Composition::GpuAneNeurons),
+        other => Err(Error::Other(format!(
+            "APXINF_CLEF_COMPOSITION must be {}, not {other:?}",
+            if cfg!(feature = "coreml") {
+                "reference, gpu, gpu-ane-columns or gpu-ane-neurons"
+            } else {
+                "reference or gpu"
+            }
+        ))),
+    }
+}
+
+/// `APXINF_CLEF_COMPOSITION` forces a composition for a measured campaign or a
+/// diagnostic run. Unset (or empty) leaves `auto`, which runs an optimized
+/// composition only on an architecture where it qualified. A forced
+/// composition bypasses that qualification gate, so it is a scan gate and
+/// never a default; the column depth stays `APXINF_CLEF_ANE_COLUMNS`.
+fn forced_composition() -> Result<Option<Composition>> {
+    match std::env::var("APXINF_CLEF_COMPOSITION") {
+        Ok(value) if !value.is_empty() => parse_composition(&value).map(Some),
+        Ok(_) => Ok(None),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::Contract(
+            "APXINF_CLEF_COMPOSITION is not valid UTF-8",
+        )),
+    }
+}
+
 /// `auto` runs an optimized composition only on an architecture where it
-/// qualified.
-fn select(requested: Option<Composition>, architecture: &str) -> Composition {
+/// qualified. A forced composition applies in place of `auto`; an explicit
+/// [`LoadOptions::model_variant`] request wins over the environment.
+fn select(
+    requested: Option<Composition>,
+    architecture: &str,
+    forced: Option<Composition>,
+) -> Composition {
+    if requested.is_none() {
+        if let Some(composition) = forced {
+            return composition;
+        }
+    }
     #[cfg(feature = "coreml")]
     if requested.is_none() {
         if GPU_ANE_NEURONS_QUALIFIED_ARCHITECTURES.contains(&architecture) {
@@ -158,8 +205,9 @@ pub fn load(
     let architecture = stream
         .metal_caps()
         .map_or("", |caps| caps.architecture.as_str());
-    let composition = select(requested, architecture);
-    if requested.is_none() && composition == Composition::Reference {
+    let forced = forced_composition()?;
+    let composition = select(requested, architecture, forced);
+    if requested.is_none() && forced.is_none() && composition == Composition::Reference {
         eprintln!(
             "Clef: no optimized composition is qualified on {architecture:?}; using the reference composition"
         );
@@ -412,21 +460,86 @@ mod tests {
     #[test]
     fn auto_runs_each_composition_only_on_its_qualified_architectures() {
         #[cfg(feature = "coreml")]
-        assert_eq!(select(None, "applegpu_g13s"), Composition::GpuAneColumns);
+        assert_eq!(
+            select(None, "applegpu_g13s", None),
+            Composition::GpuAneColumns
+        );
         #[cfg(not(feature = "coreml"))]
-        assert_eq!(select(None, "applegpu_g13s"), Composition::Gpu);
+        assert_eq!(select(None, "applegpu_g13s", None), Composition::Gpu);
         #[cfg(feature = "coreml")]
-        assert_eq!(select(None, "applegpu_g16g"), Composition::GpuAneNeurons);
+        assert_eq!(
+            select(None, "applegpu_g16g", None),
+            Composition::GpuAneNeurons
+        );
         #[cfg(not(feature = "coreml"))]
-        assert_eq!(select(None, "applegpu_g16g"), Composition::Reference);
+        assert_eq!(select(None, "applegpu_g16g", None), Composition::Reference);
         for other in ["applegpu_g14g", "applegpu_g13g", ""] {
-            assert_eq!(select(None, other), Composition::Reference, "{other}");
+            assert_eq!(
+                select(None, other, None),
+                Composition::Reference,
+                "{other}"
+            );
         }
         for architecture in ["applegpu_g13s", "applegpu_g16g"] {
             assert_eq!(
-                select(Some(Composition::Reference), architecture),
+                select(Some(Composition::Reference), architecture, None),
                 Composition::Reference
             );
+        }
+        // The gate replaces auto, while an explicit variant request wins.
+        assert_eq!(
+            select(None, "applegpu_g16g", Some(Composition::GpuAneColumns)),
+            Composition::GpuAneColumns
+        );
+        assert_eq!(
+            select(None, "applegpu_g13s", Some(Composition::Gpu)),
+            Composition::Gpu
+        );
+        assert_eq!(
+            select(
+                Some(Composition::Reference),
+                "applegpu_g16g",
+                Some(Composition::Gpu)
+            ),
+            Composition::Reference
+        );
+    }
+
+    #[test]
+    fn composition_gate_parses_only_named_compositions() {
+        let mut cases = vec![
+            ("reference", Composition::Reference),
+            ("gpu", Composition::Gpu),
+        ];
+        #[cfg(feature = "coreml")]
+        cases.extend([
+            ("gpu-ane-columns", Composition::GpuAneColumns),
+            ("gpu-ane-neurons", Composition::GpuAneNeurons),
+        ]);
+        for (value, composition) in cases {
+            assert_eq!(parse_composition(value).unwrap(), composition, "{value}");
+        }
+        for value in ["", "auto", "columns", "GPU", "gpu-ane", "1", "gpu-ane-column"] {
+            assert!(parse_composition(value).is_err(), "accepted {value:?}");
+        }
+    }
+
+    #[test]
+    fn forced_composition_reads_the_gate_and_absent_means_auto() {
+        // `APXINF_CLEF_COMPOSITION` is process-global: this is the only test
+        // that sets it, and it restores the prior value.
+        let prior = std::env::var_os("APXINF_CLEF_COMPOSITION");
+        std::env::remove_var("APXINF_CLEF_COMPOSITION");
+        assert_eq!(forced_composition().unwrap(), None);
+        std::env::set_var("APXINF_CLEF_COMPOSITION", "");
+        assert_eq!(forced_composition().unwrap(), None);
+        std::env::set_var("APXINF_CLEF_COMPOSITION", "gpu");
+        assert_eq!(forced_composition().unwrap(), Some(Composition::Gpu));
+        std::env::set_var("APXINF_CLEF_COMPOSITION", "auto");
+        assert!(forced_composition().is_err());
+        match prior {
+            Some(value) => std::env::set_var("APXINF_CLEF_COMPOSITION", value),
+            None => std::env::remove_var("APXINF_CLEF_COMPOSITION"),
         }
     }
 }

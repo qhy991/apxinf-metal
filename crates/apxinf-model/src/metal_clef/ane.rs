@@ -21,50 +21,50 @@ const INTERMEDIATE: usize = 12288;
 /// `12288 - round(12288 * 5632 / 12288 / 256) * 256`: the GPU keeps the first
 /// 6656 columns, the Neural Engine runs the other 5632.
 pub const GPU_COLUMNS: usize = 6656;
-/// Column depths the campaign may run on the Neural Engine: the GPU keeps the
-/// first `C` of 12288 intermediate columns, the Neural Engine runs the rest.
-/// Each is a multiple of 64 so the packed Q4 down columns
-/// (`weight` axis 1 length `C / 8`, scales/biases `C / 64`) stay whole.
-const ANE_DEEPER_COLUMNS: &[usize] = &[6656, 5632, 4608];
+/// Column depths measured on the Neural Engine: the GPU keeps the first `C` of
+/// 12288 intermediate columns, the Neural Engine runs the rest. Each is a
+/// multiple of 64 so the packed Q4 down columns (`weight` axis 1 length
+/// `C / 8`, scales/biases `C / 64`) stay whole. 6656 is the qualified default;
+/// the other depths are the M4 column-split scan points and stay unqualified
+/// until a KEEP decision.
+const ANE_COLUMN_DEPTHS: &[usize] = &[6656, 6144, 5632, 5120, 4608, 4096, 3584, 3072];
 
-/// The Neural Engine deeper-column split: `APXINF_CLEF_ANE_COLUMNS` overrides
-/// the GPU's column share for the GPU+ANE column composition. Unset (or empty)
-/// keeps [`GPU_COLUMNS`], the qualified default. Only a whole campaign-qualified
-/// depth is accepted, so an arbitrary value cannot reach an unverified program.
-/// Applies only to the GPU+ANE column composition; other compositions ignore it.
+/// The Neural Engine column split: `APXINF_CLEF_ANE_COLUMNS` overrides the
+/// GPU's column share for the GPU+ANE column composition. Unset (or empty)
+/// keeps [`GPU_COLUMNS`], the qualified default. Only a measured depth is
+/// accepted, so an arbitrary value cannot reach an unverified program. Applies
+/// only to the GPU+ANE column composition; other compositions ignore it.
 pub fn gpu_columns() -> Result<usize> {
     match std::env::var("APXINF_CLEF_ANE_COLUMNS").ok().as_deref() {
         None | Some("") => Ok(GPU_COLUMNS),
         Some(value) => value
             .parse::<usize>()
             .ok()
-            .filter(|columns| ANE_DEEPER_COLUMNS.contains(columns))
+            .filter(|columns| ANE_COLUMN_DEPTHS.contains(columns))
             .ok_or_else(|| {
                 Error::Contract(
-                    "APXINF_CLEF_ANE_COLUMNS must be one of 6656, 5632 or 4608",
+                    "APXINF_CLEF_ANE_COLUMNS must be one of 6656, 6144, 5632, 5120, 4608, 4096, 3584 or 3072",
                 )
             }),
     }
 }
 
-/// `(ane columns, down parts, down part width)` for a GPU column share. The
-/// Neural Engine runs `[gpu, 12288)`; the down weight is K-split into at most
-/// [`DOWN_PART`]-wide parts that are convolved and summed. All campaign depths
-/// give two parts of a 128-multiple width, which the quantized layout needs.
+/// `(ane columns, down parts, part width)` for a GPU column share. The Neural
+/// Engine runs `[gpu, 12288)`; the down weight is K-split into parts that are
+/// at most [`DOWN_PART`]-wide and convolved separately, then summed. `parts *
+/// width` can exceed `columns`: the program zero-pads the trailing columns so
+/// every part width stays a 64-multiple the quantized layout needs (8704
+/// columns, for one, need three 2944-wide parts).
 pub fn ane_split_geometry(gpu: usize) -> Result<(usize, usize, usize)> {
     if gpu >= INTERMEDIATE || gpu % 64 != 0 {
         return Err(Error::Contract(
             "Clef GPU+ANE columns need a 64-multiple below 12288",
         ));
     }
-    let n = INTERMEDIATE - gpu;
-    let parts = n.div_ceil(DOWN_PART);
-    if n % parts != 0 {
-        return Err(Error::Contract(
-            "Clef GPU+ANE down parts must divide the Neural Engine columns",
-        ));
-    }
-    Ok((n, parts, n / parts))
+    let columns = INTERMEDIATE - gpu;
+    let parts = columns.div_ceil(DOWN_PART);
+    let width = columns.div_ceil(parts).div_ceil(64) * 64;
+    Ok((columns, parts, width))
 }
 
 const TILE: usize = 512;
@@ -120,23 +120,30 @@ fn columns(w: &[f16], cols: usize, start: usize, width: usize) -> Vec<f16> {
 /// One layer's Core ML program for the Neural Engine share of `mlp`, the
 /// intermediate columns `[gpu_columns, 12288)`.
 pub fn program_with_columns(mlp: &Mlp, gpu_columns: usize) -> Result<Package> {
-    let (n, parts, width) = ane_split_geometry(gpu_columns)?;
+    let (ane_columns, parts, width) = ane_split_geometry(gpu_columns)?;
+    let padded = parts * width;
     if mlp.gate.rows() != INTERMEDIATE || mlp.down.rows() != HIDDEN {
         return Err(Error::Contract(
             "Clef GPU+ANE needs the 4096 x 12288 MLP geometry",
         ));
     }
-    let (qg, sg) = int8_per_row(
-        &dense(&mlp.gate, (gpu_columns, INTERMEDIATE), (0, HIDDEN))?,
-        HIDDEN,
-    );
-    let (qu, su) = int8_per_row(
-        &dense(&mlp.up, (gpu_columns, INTERMEDIATE), (0, HIDDEN))?,
-        HIDDEN,
-    );
+    // The down split's parts must be 64-multiples, so a share that does not
+    // divide evenly is zero-padded at the tail: the padded gate/up rows and
+    // down columns stay zero and contribute nothing to the sum.
+    let mut gate = dense(&mlp.gate, (gpu_columns, INTERMEDIATE), (0, HIDDEN))?;
+    gate.resize(padded * HIDDEN, f16::ZERO);
+    let (qg, sg) = int8_per_row(&gate, HIDDEN);
+    let mut up = dense(&mlp.up, (gpu_columns, INTERMEDIATE), (0, HIDDEN))?;
+    up.resize(padded * HIDDEN, f16::ZERO);
+    let (qu, su) = int8_per_row(&up, HIDDEN);
     let wd = dense(&mlp.down, (0, HIDDEN), (gpu_columns, INTERMEDIATE))?;
+    let mut down_weights = Vec::with_capacity(HIDDEN * padded);
+    for row in wd.chunks_exact(ane_columns) {
+        down_weights.extend_from_slice(row);
+        down_weights.resize(down_weights.len() + (padded - ane_columns), f16::ZERO);
+    }
     let down: Vec<(Vec<i8>, Vec<f16>)> = (0..parts)
-        .map(|p| int8_per_row(&columns(&wd, n, p * width, width), width))
+        .map(|p| int8_per_row(&columns(&down_weights, padded, p * width, width), width))
         .collect();
     // Bound the dot products of the INT8 weights the Neural Engine uses.
     let mut row_sums = vec![0f64; HIDDEN];
@@ -164,9 +171,11 @@ pub fn program_with_columns(mlp: &Mlp, gpu_columns: usize) -> Result<Package> {
 
     let mut b = ProgramBuilder::new();
     let x = b.input("x", &[1, HIDDEN, 1, TILE]);
-    let wg = b.constexpr_blockwise_shift_scale(&qg, &[n, HIDDEN, 1, 1], &sg, &[n, 1, 1, 1])?;
+    let wg =
+        b.constexpr_blockwise_shift_scale(&qg, &[padded, HIDDEN, 1, 1], &sg, &[padded, 1, 1, 1])?;
     let g = b.conv(&x, &wg)?;
-    let wu = b.constexpr_blockwise_shift_scale(&qu, &[n, HIDDEN, 1, 1], &su, &[n, 1, 1, 1])?;
+    let wu =
+        b.constexpr_blockwise_shift_scale(&qu, &[padded, HIDDEN, 1, 1], &su, &[padded, 1, 1, 1])?;
     let u = b.conv(&x, &wu)?;
     let half = b.mul(&g, Operand::Scalar(f16::from_f32(0.5)), None)?;
     let t = b.tanh(&half);
@@ -1006,8 +1015,15 @@ mod tests {
     #[test]
     fn ane_split_geometry_matches_the_campaign_depths() -> Result<()> {
         assert_eq!(ane_split_geometry(6656)?, (5632, 2, 2816));
+        assert_eq!(ane_split_geometry(6144)?, (6144, 2, 3072));
         assert_eq!(ane_split_geometry(5632)?, (6656, 2, 3328));
+        assert_eq!(ane_split_geometry(5120)?, (7168, 2, 3584));
         assert_eq!(ane_split_geometry(4608)?, (7680, 2, 3840));
+        assert_eq!(ane_split_geometry(4096)?, (8192, 2, 4096));
+        // 8704 columns need three parts; 2944 is the smallest 64-multiple
+        // width that covers them, so the program pads 128 zero columns.
+        assert_eq!(ane_split_geometry(3584)?, (8704, 3, 2944));
+        assert_eq!(ane_split_geometry(3072)?, (9216, 3, 3072));
         // Non-64-multiple columns would leave a packed down column partial.
         assert!(ane_split_geometry(6657).is_err());
         // GPU takes nothing: the Neural Engine runs all 12288 columns (three parts).
@@ -1015,6 +1031,16 @@ mod tests {
         // The Neural Engine must keep at least one column.
         assert!(ane_split_geometry(INTERMEDIATE).is_err());
         assert!(ane_split_geometry(INTERMEDIATE + 64).is_err());
+        // Every accepted depth yields whole, 64-multiple down parts that cover
+        // the Neural Engine share, padding at most one 64-wide column per part.
+        for &gpu in ANE_COLUMN_DEPTHS {
+            let (columns, parts, width) = ane_split_geometry(gpu)?;
+            assert_eq!(columns, INTERMEDIATE - gpu);
+            assert_eq!(width % 64, 0, "{gpu}");
+            assert!(width <= DOWN_PART, "{gpu}");
+            assert!(parts * width >= columns, "{gpu}");
+            assert!(parts * width - columns < 64 * parts, "{gpu}");
+        }
         Ok(())
     }
 
@@ -1028,9 +1054,9 @@ mod tests {
         let prior = std::env::var_os("APXINF_CLEF_ANE_COLUMNS");
         std::env::remove_var("APXINF_CLEF_ANE_COLUMNS");
         assert_eq!(gpu_columns()?, GPU_COLUMNS, "unset must default to 6656");
-        for (value, expected) in [("6656", 6656), ("5632", 5632), ("4608", 4608)] {
-            std::env::set_var("APXINF_CLEF_ANE_COLUMNS", value);
-            assert_eq!(gpu_columns()?, expected, "value {value}");
+        for &columns in ANE_COLUMN_DEPTHS {
+            std::env::set_var("APXINF_CLEF_ANE_COLUMNS", columns.to_string());
+            assert_eq!(gpu_columns()?, columns, "value {columns}");
         }
         match prior {
             Some(value) => std::env::set_var("APXINF_CLEF_ANE_COLUMNS", value),
@@ -1043,7 +1069,9 @@ mod tests {
     fn gpu_columns_rejects_unqualified_values() -> Result<()> {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var_os("APXINF_CLEF_ANE_COLUMNS");
-        for value in ["0", "1", "64", "6657", "12288", "12352", "-1", "abc", "6656.0"] {
+        for value in [
+            "0", "1", "64", "6657", "7680", "12288", "12352", "-1", "abc", "6656.0",
+        ] {
             std::env::set_var("APXINF_CLEF_ANE_COLUMNS", value);
             assert!(gpu_columns().is_err(), "accepted unqualified columns {value}");
         }
