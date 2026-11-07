@@ -333,7 +333,7 @@ These routes implement the declared subset only.
 They do not establish compatibility with the OpenAI Responses API or every Anthropic extension.
 
 The request body limit is 1000000 bytes.
-The decoder rejects duplicate JSON keys and excessive nesting.
+The decoder rejects duplicate JSON keys, excessive nesting, and integers outside the safe-integer range.
 The gateway checks the complete normalized input before queue admission.
 Malformed client input must not stop a healthy worker.
 

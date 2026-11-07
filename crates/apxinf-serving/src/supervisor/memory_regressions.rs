@@ -222,6 +222,12 @@ fn context_limit_must_fit_the_default_output_budget() {
     config.max_context = 1;
     config.max_output = 0;
     assert!(config.validate_memory().is_ok());
+    // The minimum reads as a single position for a zero-sized deployment.
+    config.max_context = 0;
+    assert_eq!(
+        config.validate_memory().unwrap_err(),
+        "The context limit must fit the default output budget and one input token; it must be at least 1 position."
+    );
 }
 
 #[tokio::test]

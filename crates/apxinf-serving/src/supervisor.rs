@@ -259,8 +259,13 @@ impl Config {
         let default_output = crate::gateway::DEFAULT_MAX_TOKENS.min(self.max_output as u64);
         let minimum_context = default_output + 1;
         if minimum_context > self.max_context as u64 {
+            let unit = if minimum_context == 1 {
+                "position"
+            } else {
+                "positions"
+            };
             return Err(format!(
-                "The context limit must fit the default output budget and one input token; it must be at least {minimum_context} positions."
+                "The context limit must fit the default output budget and one input token; it must be at least {minimum_context} {unit}."
             ));
         }
         Ok(())

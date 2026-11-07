@@ -348,7 +348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vision_profile_rejects_public_top_k_and_seed() {
+    async fn vision_profile_rejects_public_top_k() {
         let (service, _) = gateway_test_service_with_protocol(contracts::VISION_PROTOCOL);
         let mut value = request(json!([{"role":"user","content":"hello"}]));
         value["top_k"] = json!(5);
@@ -359,7 +359,12 @@ mod tests {
             (error.status, error.code.as_str()),
             (400, "unsupported_feature")
         );
-        assert!(error.message.contains("top_k"), "{}", error.message);
+        assert_eq!(error.message, "This profile does not support top_k.");
+    }
+
+    #[tokio::test]
+    async fn vision_profile_rejects_public_seed() {
+        let (service, _) = gateway_test_service_with_protocol(contracts::VISION_PROTOCOL);
         let mut value = request(json!([{"role":"user","content":"hello"}]));
         value["seed"] = json!(42);
         let error = normalize(&value, Api::OpenAi, false, &service)
@@ -369,7 +374,10 @@ mod tests {
             (error.status, error.code.as_str()),
             (400, "unsupported_feature")
         );
-        assert!(error.message.contains("request ID"), "{}", error.message);
+        assert_eq!(
+            error.message,
+            "This profile derives the sampling seed from the request ID."
+        );
     }
 
     #[tokio::test]
