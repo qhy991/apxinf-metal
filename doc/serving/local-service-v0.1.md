@@ -351,12 +351,16 @@ A deployment with an output limit of zero still reports readiness and counts tok
 
 OpenAI messages accept the `system`, `developer`, `user`, `assistant`, and `tool` roles.
 A `developer` message is normalized to a `system` message, because both carry the same instructions.
+The gateway preserves multiple system and developer messages in order; the selected model template decides how it renders them.
 Message content must be a string or an array of content parts.
+An assistant message may send null content when it carries tool calls, and the gateway normalizes that value to an empty string.
 OpenAI messages may send content as an array of text parts in any role.
 The gateway joins those text parts into the serial text form without changing tool identity.
 An OpenAI text part accepts only the `type` and `text` keys; the Anthropic route also accepts `cache_control` on its text blocks.
 An image part receives HTTP 400 `unsupported_feature` on this text profile.
 A message with an unsupported role, a missing role, or a content value that is neither a string nor an array receives HTTP 400 `invalid_request` with an actionable message.
+The optional `name` and `tool_call_id` fields must be strings.
+A `tool` message requires a `tool_call_id`, and only an `assistant` message can carry `tool_calls`.
 The same roles and shapes apply to the vision profile, where user content arrays keep their text and image order.
 
 Anthropic messages support text, `tool_use`, and `tool_result` blocks.
@@ -373,6 +377,9 @@ The parser rejects undeclared tools and incomplete tool blocks.
 It checks object arguments, required properties, basic types, enums, and additional properties.
 It does not claim complete JSON Schema enforcement or constrained decoding.
 The gateway rejects `strict: true` on OpenAI function tools.
+An OpenAI tool declaration uses `type: function` with a non-empty function name and optional object parameters.
+An OpenAI assistant tool call uses `type: function` with a non-empty id, a non-empty function name, and object or JSON-string arguments.
+A malformed tool declaration or tool history receives HTTP 400 `invalid_request` with an actionable message before admission.
 The service never executes a tool.
 The client applies its own tool permissions and executes permitted calls.
 
@@ -386,7 +393,7 @@ Readiness explicitly reports no prompt-cache capability.
 
 A request that the gateway or its worker rejects with a contract error code returns a JSON document with `type` set to `error`.
 Its `error` object contains `type`, `code`, and `message`.
-The `code` is a contract error code, and its HTTP status follows the
+A request that fails with an error record from request validation or the model worker uses a contract error code, and its HTTP status follows the
 [error-code table](contracts-v0.1.md#faults-and-recovery).
 Transport-level rejections keep the HTTP framework response instead of this envelope: an unknown route or unsupported method returns an empty body, and an oversized body returns `text/plain`.
 A cancellation uses HTTP 499 `cancelled`, which is outside that table.

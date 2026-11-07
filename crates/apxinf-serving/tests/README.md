@@ -30,7 +30,7 @@ They do not establish real inference, model quality, performance, or Claude Code
 | OpenAI SSE | The stream ends with `[DONE]`. Only the requested final usage chunk contains usage counts. |
 | OpenAI content parts | Text part arrays are normalized into the serial text form in every role on the text profile, and an image part stays an explicit request error there. |
 | OpenAI message roles | A `developer` message reaches the worker as a `system` message, and an unsupported role or content shape is an actionable 400 `invalid_request` before admission. |
-| Invalid input | Malformed JSON, duplicate keys, unsupported sampling, and conflicting limits never reach the worker. |
+| Invalid input | Malformed JSON, duplicate keys, unsupported sampling, conflicting limits, and malformed tool or message shapes never reach the worker. |
 | HTTP routing | Unknown paths return 404. Unsupported methods return 405. Oversized bodies return 413. |
 | Tools and stop sequences | Checked arguments become tool blocks. A stop match suppresses the matched text and following text. |
 | Recoverable failure | Preparation errors and failed attempts retain readiness after resource settlement. |
