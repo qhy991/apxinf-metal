@@ -59,6 +59,7 @@ target/release/apxinf-serve \
   --diagnostics-file /var/tmp/apxinf-diagnostics.jsonl
 ```
 
+The example uses the local MLX-LM environment from [Python MLX-LM](#python-mlx-lm).
 The process uses one dedicated diagnostic writer thread and one queue with 256 records.
 Each record contains at most 4096 bytes, including its final newline.
 The writer can hold one additional record while its destination blocks.

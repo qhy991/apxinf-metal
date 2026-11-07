@@ -526,8 +526,9 @@ async fn decision_deadline_and_cancel_kill_before_capacity_release() {
     // The cancel cases must wait for a worker stage through a file poll before
     // they request cancellation. A timer close to that setup races the poll and
     // turns a requested cancellation into a deadline; their timer must not
-    // participate. Every wait in this test is bounded by 5 seconds, so this
-    // bound cannot be reached before the test itself fails.
+    // participate. The stage-synchronization waits below use explicit 5-second
+    // bounds, and the service timeout bounds the terminal result, so this
+    // 30-second timer cannot decide a cancel case first.
     let uncontended = Duration::from_secs(30);
     for (mode, cancel, timeout) in [
         ("prepare_hold", false, deadline),
@@ -600,6 +601,8 @@ async fn decision_queue_expires_during_replacement_loading() {
     })
     .await
     .unwrap();
+    // Force the queue deadline instead of waiting for the sweeper. The elapsed
+    // threshold itself is covered by the pending-queue unit tests.
     service.queue.sweep(&service.metrics, Duration::ZERO);
     let error = queued.begin.await.unwrap().err().unwrap();
     assert_eq!(error.code, "deadline_exceeded");
