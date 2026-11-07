@@ -377,6 +377,7 @@ Serve browser clients from the same origin, or place a reverse proxy in front of
 | `POST /v1/messages` | Generate an Anthropic Messages response, with optional SSE output. |
 | `POST /v1/messages/count_tokens` | Apply the same template and count its tokens. |
 | `POST /v1/chat/completions` | Generate an OpenAI Chat Completions response, with optional SSE output. |
+| `POST /v1/systemone` | Run a Clef decision request. Other providers reject it with HTTP 400 `unsupported_feature`. |
 | `GET /metrics` | Read counters in Prometheus text format. |
 
 These routes implement the declared subset only.
