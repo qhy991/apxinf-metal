@@ -365,10 +365,9 @@ async fn drive(
 
 fn failure_error(frame: &Value) -> ApiError {
     let code = frame["code"].as_str().unwrap();
-    let status = match code {
-        "invalid_request" | "context_limit" => 400,
-        "model_unavailable" | "worker_lost" => 503,
-        _ => 500,
-    };
-    ApiError::new(status, code, frame["message"].as_str().unwrap())
+    ApiError::new(
+        crate::contracts::status_for_code(code),
+        code,
+        frame["message"].as_str().unwrap(),
+    )
 }

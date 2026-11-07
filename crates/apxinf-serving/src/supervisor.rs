@@ -2547,18 +2547,8 @@ fn record_public_status(metrics: &Metrics, status: &str) {
 
 fn error_from_frame(frame: &Value) -> ApiError {
     let code = frame["error"]["code"].as_str().unwrap_or("internal_error");
-    // Keep the documented default status for every worker error code.
-    let status = match code {
-        "invalid_request" | "unsupported_feature" | "context_limit" => 400,
-        "model_not_found" | "session_not_found" => 404,
-        "session_conflict" | "prefix_mismatch" => 409,
-        "queue_full" | "quota_exceeded" => 429,
-        "capacity_unavailable" | "model_unavailable" | "worker_lost" => 503,
-        "deadline_exceeded" => 504,
-        _ => 500,
-    };
     ApiError::new(
-        status,
+        crate::contracts::status_for_code(code),
         code,
         frame["error"]["message"]
             .as_str()

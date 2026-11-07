@@ -1,11 +1,12 @@
 //! Worker-declared failure codes keep the documented HTTP status.
 //!
-//! `doc/serving/contracts-v0.1.md` ("Faults and recovery") fixes the default
-//! public status for every error code. The supervisor is the only place that
-//! turns a worker error record into a public result, so this table is the
-//! contract lock for that mapping.
+//! `doc/serving/contracts-v0.1.md` ("Faults and recovery") is the authoritative
+//! table. `contracts::status_for_code` is the only implementation of it, so the
+//! worker and decision routes cannot drift apart. The copy below stays explicit
+//! on purpose: it is the independent oracle the implementation is checked
+//! against, not a second implementation.
 use super::*;
-use crate::contracts::ERRORS;
+use crate::contracts::{status_for_code, ERRORS};
 
 /// The documented default status before stream headers.
 fn contract_status(code: &str) -> u16 {
@@ -24,6 +25,7 @@ fn contract_status(code: &str) -> u16 {
 #[test]
 fn every_worker_failure_code_keeps_its_contract_status() {
     for code in ERRORS {
+        assert_eq!(status_for_code(code), contract_status(code), "{code}");
         let frame = json!({"error": {
             "code": code,
             "message": "The worker declared this failure.",
@@ -38,4 +40,6 @@ fn every_worker_failure_code_keeps_its_contract_status() {
         );
         assert_eq!(error.message, "The worker declared this failure.", "{code}");
     }
+    // A code outside the contract table keeps the generic server-error default.
+    assert_eq!(status_for_code("not_a_contract_code"), 500);
 }

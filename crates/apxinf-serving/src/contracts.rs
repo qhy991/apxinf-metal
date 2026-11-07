@@ -59,6 +59,23 @@ pub(crate) const ERRORS: &[&str] = &[
     "state_invalid",
 ];
 
+/// The documented default HTTP status for a contract error code.
+///
+/// `doc/serving/contracts-v0.1.md` ("Faults and recovery") owns this table, so
+/// every route that turns a contract code into a public result uses this helper
+/// instead of keeping its own copy.
+pub(crate) fn status_for_code(code: &str) -> u16 {
+    match code {
+        "invalid_request" | "unsupported_feature" | "context_limit" => 400,
+        "model_not_found" | "session_not_found" => 404,
+        "session_conflict" | "prefix_mismatch" => 409,
+        "queue_full" | "quota_exceeded" => 429,
+        "capacity_unavailable" | "model_unavailable" | "worker_lost" => 503,
+        "deadline_exceeded" => 504,
+        _ => 500,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractError(pub String);
 
