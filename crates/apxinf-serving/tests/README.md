@@ -71,6 +71,35 @@ Set `APXINF_HTTP_TEST_OUTPUT` to select another output directory.
 The runner retains gateway diagnostics and worker events when a check fails.
 The CI workflow uploads this directory after success or failure.
 
+## Probe scratch directories
+
+The CPU protocol probes in the library tests create one directory per run under
+`${TMPDIR:-/tmp}/apxinf-serving-tests/<pid>-<uuid>/`.
+The directory holds the probe trace and its release marker.
+A completed run removes its own directory.
+A test process killed while a probe is active cannot run its cleanup, so it
+leaves one recognisable directory under that root instead of files scattered
+through the system temp root.
+Concurrent runs never share a probe directory.
+
+When no serving test is running, remove stale probe state with:
+
+```sh
+rm -rf "${TMPDIR:-/tmp}/apxinf-serving-tests"
+```
+
+Revisions before this layout wrote `apxinf-generation-deadline-*.jsonl` files
+and `apxinf-clef-cpu-*` directories directly into the temp root.
+The same one-time cleanup, only while no serving test is running, is:
+
+```sh
+rm -f "${TMPDIR:-/tmp}"/apxinf-generation-deadline-*.jsonl "${TMPDIR:-/tmp}"/apxinf-generation-deadline-*.jsonl.release
+rm -rf "${TMPDIR:-/tmp}"/apxinf-clef-cpu-*
+```
+
+Do not run these commands while a serving test is active, and do not widen the
+patterns beyond the listed names.
+
 The CPU workflow runs Rust checks and Python unit tests on Linux and macOS.
 It fixes the Rust and Python versions and uses `Cargo.lock`.
 It leaves `APXINF_SERVING_URL` empty, so the six external model tests remain skipped.
