@@ -361,6 +361,12 @@ fn diagnostics_file_records_the_startup_evidence() {
         "stderr keeps the same records: {}",
         cli.log()
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "The file must be created owner-only.");
+    }
 }
 
 #[test]
@@ -377,6 +383,27 @@ fn unopenable_diagnostics_file_fails_before_startup() {
     assert!(!output.status.success());
     let log = String::from_utf8_lossy(&output.stderr);
     assert!(log.contains("Cannot open the diagnostics file:"), "{log}");
+    assert!(
+        !log.contains("listener bound"),
+        "Startup must fail before binding: {log}"
+    );
+}
+
+#[test]
+fn a_special_diagnostics_path_fails_before_startup() {
+    let fixture = Fixture::new("ready");
+    let path = fixture.root.join("diagnostics-directory");
+    fs::create_dir(&path).unwrap();
+    let output = cli_command(&fixture, &["--diagnostics-file", path.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert!(!output.status.success());
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(log.contains("must be a regular file"), "{log}");
     assert!(
         !log.contains("listener bound"),
         "Startup must fail before binding: {log}"

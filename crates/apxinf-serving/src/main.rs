@@ -93,6 +93,9 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    // Register signal handling before the optional file open, so a blocked
+    // filesystem cannot leave an interactive interrupt on the default action.
+    let shutdown = Box::pin(termination_signal()?);
     match &args.diagnostics_file {
         Some(path) => diagnostics::initialize_with_file(path)?,
         None => diagnostics::initialize()?,
@@ -103,7 +106,6 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             path.display()
         ));
     }
-    let shutdown = Box::pin(termination_signal()?);
     if !args.host.is_loopback() {
         return Err("This local profile requires a loopback address.".into());
     }

@@ -47,6 +47,14 @@ This HTTP profile does not expose sessions, images, embeddings, batch execution,
 
 ## Diagnostic output
 
+Add `--diagnostics-file PATH` to mirror the same records into a file, for example:
+
+```sh
+apxinf-serve \
+  --model /absolute/path/to/local/model \
+  --diagnostics-file /var/tmp/apxinf-diagnostics.jsonl
+```
+
 The process uses one dedicated diagnostic writer thread and one queue with 256 records.
 Each record contains at most 4096 bytes, including its final newline.
 The writer can hold one additional record while its destination blocks.
@@ -56,7 +64,10 @@ A write failure disables the writer and discards its remaining records.
 Thread creation failure prevents worker startup.
 `--diagnostics-file PATH` adds an append-only file destination.
 The process opens the file before it binds or loads a model, and writes the same records to stderr and the file.
+The process creates the file with owner-only permissions on Unix; an existing file keeps its mode.
+The path must be a regular file: a directory, FIFO, or device path fails before startup.
 A failed file write is counted and does not stop the stderr destination or change the service lifecycle.
+A blocked file destination also delays the stderr destination, because one writer thread serves both; a full queue then discards records for either destination.
 The file has no rotation or retention policy.
 Two processes should not share one diagnostics file; their records are not locked or interleaved safely.
 

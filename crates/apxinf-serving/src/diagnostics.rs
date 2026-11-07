@@ -227,9 +227,21 @@ pub fn initialize() -> Result<(), &'static str> {
 /// The file is opened before the worker starts. A later file write failure is
 /// counted and leaves the stderr records and the service lifecycle unchanged.
 pub fn initialize_with_file(path: &std::path::Path) -> Result<(), String> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    // Reject special files: opening a FIFO without a reader blocks, and a
+    // device or directory cannot hold an append-only record stream.
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if !metadata.is_file() {
+            return Err("The diagnostics file must be a regular file.".to_owned());
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
         .open(path)
         .map_err(|error| format!("Cannot open the diagnostics file: {error}"))?;
     let file_errors = Arc::new(AtomicU64::new(0));
