@@ -1895,24 +1895,21 @@ mod tests {
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
-        // Every declared route must answer through the published gate. A route
-        // that only one router declares would answer 404 from the other.
-        for (method, path, payload) in [
-            ("GET", "/healthz", ""),
-            ("GET", "/readyz", ""),
-            ("GET", "/v1/models", ""),
-            ("GET", "/metrics", ""),
-            ("POST", "/v1/messages", "{"),
-            ("POST", "/v1/messages/count_tokens", "{"),
-            ("POST", "/v1/chat/completions", "{"),
-            ("POST", "/v1/systemone", "{"),
+        // Every declared route must answer through the published gate with its
+        // published status. This also fails if the gate answers its loading
+        // surface (503): a missing route answers 404 and a missing method 405.
+        for (method, path, payload, expected) in [
+            ("GET", "/healthz", "", 200),
+            ("GET", "/readyz", "", 200),
+            ("GET", "/v1/models", "", 200),
+            ("GET", "/metrics", "", 200),
+            ("POST", "/v1/messages", "{", 400),
+            ("POST", "/v1/messages/count_tokens", "{", 400),
+            ("POST", "/v1/chat/completions", "{", 400),
+            ("POST", "/v1/systemone", "{", 400),
         ] {
             let (status, response) = route_request(address, method, path, payload).await;
-            assert_ne!(status, 404, "{method} {path} is not declared: {response}");
-            assert_ne!(
-                status, 405,
-                "{method} {path} has no method binding: {response}"
-            );
+            assert_eq!(status, expected, "{method} {path}: {response}");
         }
         // Framework responses stay outside the declared set.
         let (status, response) = route_request(address, "GET", "/not-a-route", "").await;
@@ -1920,6 +1917,7 @@ mod tests {
         let (status, response) = route_request(address, "GET", "/v1/messages", "").await;
         assert_eq!(status, 405, "{response}");
         server.abort();
+        let _ = server.await;
     }
 
     async fn route_request(

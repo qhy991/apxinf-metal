@@ -268,6 +268,14 @@ fn loading_surface_switches_to_ready_on_the_same_listener() {
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let response = http_request(&address, "GET", "/metrics", None);
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert_eq!(
+        cli.log()
+            .matches("ApxInf listener bound at http://")
+            .count(),
+        1,
+        "The switch must not rebind the listener: {}",
+        cli.log()
+    );
     cli.signal("-TERM");
     assert!(
         cli.wait().success(),
