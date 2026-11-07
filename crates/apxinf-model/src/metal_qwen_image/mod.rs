@@ -179,6 +179,19 @@ fn probed_gemm(stream: &Stream) -> Option<MppBf16GemmNt> {
     }
 }
 
+/// Env-gated (`APXINF_QWEN_IMAGE_TIMING=1`) stderr phase and per-step timing
+/// for the long-prompt attention probe (EngineTailor #205): text encode,
+/// text-prefix K/V build, compiled-step preparation, each denoise step, VAE
+/// decode and the allocator peak. Off by default; when off, each probe point
+/// costs one `Instant::now` pair whose delta is discarded.
+fn timing_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("APXINF_QWEN_IMAGE_TIMING").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 /// Request admission, before any device work.
 fn admit_request(request: &ImageRequest<'_>) -> Result<()> {
     if request.prompt.trim().is_empty() {
@@ -271,12 +284,21 @@ fn rope(
 impl ImageRuntime for QwenImage {
     fn generate(&mut self, request: &ImageRequest<'_>) -> Result<GeneratedImage> {
         admit_request(request)?;
+        let timing = timing_enabled();
         let ops = &self.ops;
         let stream = ops.stream();
         let (width, height) = (request.width, request.height);
         let (lh, lw) = (height / SCALE, width / SCALE);
+        let phase = std::time::Instant::now();
         let tokens = text::tokenize(&self.tokenizer, request.prompt)?;
         let prompt = text::encode(&self.text, &tokens, ops)?;
+        if timing {
+            eprintln!(
+                "qimage-timing: text_encode {:.3}s raw_tokens={}",
+                phase.elapsed().as_secs_f64(),
+                prompt.shape()[1] + tokens.drop
+            );
+        }
         // The text encoder layers are freed; release their cached buffers as
         // mflux --low-ram does after deleting the encoder.
         apxinf_mlx::clear_cache()?;
@@ -293,11 +315,20 @@ impl ImageRuntime for QwenImage {
             None => Transformer::load(stream, &self.dir.join("transformer"))?,
         };
         let dit = dit::Dit::new(transformer, ops, self.gemm.clone())?;
+        let phase = std::time::Instant::now();
         let cache = dit.text_cache(
             &prompt,
             &table(&cos[..split], text_len)?,
             &table(&sin[..split], text_len)?,
         )?;
+        if timing {
+            eprintln!(
+                "qimage-timing: text_cache {:.3}s text_len={} calls={}",
+                phase.elapsed().as_secs_f64(),
+                text_len,
+                dit::text_cache_call_count()
+            );
+        }
         drop(prompt);
         let (cos, sin) = (
             table(&cos[split..], lh * lw)?,
@@ -317,13 +348,23 @@ impl ImageRuntime for QwenImage {
         } else {
             vec![false; request.steps]
         };
+        let phase = std::time::Instant::now();
         let (step, first) = dit::Step::prepare(
             dit,
             &dit::Step::inputs(&latents, &sigma(0)?, &cos, &sin, &cache),
         )?;
+        if timing {
+            eprintln!(
+                "qimage-timing: step_prepare {:.3}s (compile + first forward)",
+                phase.elapsed().as_secs_f64()
+            );
+        }
         let mut first = Some(first);
         let mut previous_velocity: Option<Array> = None;
+        let loop_start = std::time::Instant::now();
         for t in 0..request.steps {
+            let step_start = std::time::Instant::now();
+            let skipped = previous_velocity.is_some() && skip_steps[t];
             let velocity = match previous_velocity.clone() {
                 Some(velocity) if skip_steps[t] => velocity,
                 _ => {
@@ -342,12 +383,38 @@ impl ImageRuntime for QwenImage {
                 .cast(MlxDType::BF16)?;
             latents = latents.add(&velocity.cast(MlxDType::BF16)?.mul(&dt)?)?;
             latents.eval()?;
+            if timing {
+                eprintln!(
+                    "qimage-timing: step {t} {:.1}ms {}",
+                    step_start.elapsed().as_secs_f64() * 1e3,
+                    if skipped { "skip" } else { "compute" },
+                );
+            }
+        }
+        if timing {
+            eprintln!(
+                "qimage-timing: denoise_loop {:.3}s text_cache_calls={}",
+                loop_start.elapsed().as_secs_f64(),
+                dit::text_cache_call_count()
+            );
         }
         // Release the DiT and its cached buffers before decoding, as mflux
         // --low-ram does.
         drop((cache, step));
         apxinf_mlx::clear_cache()?;
+        let phase = std::time::Instant::now();
         let rgb = vae::decode(&self.decoder, ops, &latents, width, height)?;
+        if timing {
+            let stats = apxinf_mlx::memory_stats()?;
+            eprintln!(
+                "qimage-timing: vae_decode {:.3}s",
+                phase.elapsed().as_secs_f64()
+            );
+            eprintln!(
+                "qimage-timing: memory active={} cache={} peak={} bytes",
+                stats.active_bytes, stats.cache_bytes, stats.peak_bytes
+            );
+        }
         Ok(GeneratedImage { width, height, rgb })
     }
 }
@@ -378,6 +445,7 @@ mod tests {
             height: 1024,
             seed: 7,
             steps: STEPS,
+            step_cache_ratio: None,
         };
         for (width, height) in [
             (16, 16),
@@ -472,6 +540,7 @@ mod tests {
             height: 576,
             seed: 7,
             steps: STEPS,
+            step_cache_ratio: None,
         };
         assert!(admit_request(&request).is_ok());
         for bad in [
