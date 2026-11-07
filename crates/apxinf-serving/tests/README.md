@@ -11,6 +11,7 @@ Its `--select` and `--exclude` options map cases onto the Rust test targets;
 `http_output_budget.rs` selects the output-budget cases and `http_gateway.rs` runs the rest.
 Each target passes `--expect-cases`, so a renamed selected case fails instead of silently matching nothing.
 Every target passes `--expect-total`, so a case added without a target fails instead of never running under `cargo test`.
+The output-budget target also runs `--count-only` over the class, so a new output-budget case must gain its own target instead of silently dropping out of the run.
 
 These checks use the existing [local HTTP profile](../../../doc/serving/local-service-v0.1.md)
 and [serial worker profile](../../../doc/serving/serial-profile-v0.1.md).

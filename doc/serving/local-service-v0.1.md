@@ -378,15 +378,18 @@ Readiness explicitly reports no prompt-cache capability.
 
 ## Streaming and failures
 
-A failed request returns a JSON document with `type` set to `error`.
+A request that the gateway or its worker rejects with a contract error code returns a JSON document with `type` set to `error`.
 Its `error` object contains `type`, `code`, and `message`.
 The `code` is a contract error code, and its HTTP status follows the
 [error-code table](contracts-v0.1.md#faults-and-recovery).
+Transport-level rejections keep the HTTP framework response instead of this envelope: an unknown route or unsupported method returns an empty body, and an oversized body returns `text/plain`.
+A cancellation observed after the response starts can use HTTP 499 `cancelled`, which is outside that table.
 The `error.type` value derives from that status: `invalid_request_error` for 400,
 `not_found_error` for 404, `rate_limit_error` for 429, `overloaded_error` for 503,
 and `api_error` for every other status.
 A stream error event carries the same derived `error.type`.
-Clients can use the status and `error.type` to decide whether a retry is useful.
+Clients can use the status and `error.type` to classify a failure.
+This document does not define a retry policy.
 
 Anthropic SSE output uses matching event names and payload types.
 Each content block has a stable, contiguous index.

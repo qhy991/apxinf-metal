@@ -22,6 +22,19 @@ fn omitted_limit_is_admitted_with_the_deployment_budget() {
 }
 
 #[test]
+fn every_output_budget_case_has_a_target() {
+    // The two targets select methods individually, so a new class case would
+    // otherwise never run under `cargo test`.
+    python_fixture::run(&[
+        "--select",
+        "OutputBudgetTests",
+        "--expect-cases",
+        "2",
+        "--count-only",
+    ]);
+}
+
+#[test]
 fn exhausted_output_budget_rejects_generation_but_counts_tokens() {
     python_fixture::run(&[
         "--select",

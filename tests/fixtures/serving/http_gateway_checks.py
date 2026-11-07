@@ -421,6 +421,7 @@ class HttpGatewayTests(GatewayChecks, unittest.TestCase):
         _, events = self.stream_all("/v1/messages", body("slow", stream=True, max_tokens=64))
         self.assertEqual(events[-1][0], "error")
         self.assertEqual(events[-1][1]["error"]["code"], "deadline_exceeded")
+        self.assertEqual(events[-1][1]["error"]["type"], "api_error")
         self.assertFalse(any(name == "message_stop" for name, _ in events))
         self.gateway.idle()
         self.assertEqual(self.gateway.metrics()['apxinf_requests_total{status="expired"}'], 1)
@@ -540,6 +541,8 @@ if __name__ == "__main__":
                         help="Fail unless exactly this many cases are selected.")
     parser.add_argument("--expect-total", type=int,
                         help="Fail unless the module defines exactly this many cases.")
+    parser.add_argument("--count-only", action="store_true",
+                        help="Validate the case mapping and exit without running a gateway.")
     args = parser.parse_args()
     BINARY = str(Path(args.binary).resolve(strict=True))
     cases = list(flatten(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])))
@@ -556,6 +559,9 @@ if __name__ == "__main__":
     # re-running other cases or an empty suite.
     if args.expect_cases is not None and count != args.expect_cases:
         raise AssertionError(f"Expected {args.expect_cases} selected cases, got {count}.")
+    if args.count_only:
+        print(f"Selected {count} cases.", file=sys.stderr)
+        sys.exit(0)
     base = Path(os.environ.get("APXINF_HTTP_TEST_OUTPUT", str(ROOT / "devlocal/serving-http-integration"))).resolve()
     base.mkdir(parents=True, exist_ok=True)
     RUN_ROOT = Path(tempfile.mkdtemp(prefix="http-gateway-", dir=base))
