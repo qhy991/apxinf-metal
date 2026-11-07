@@ -55,12 +55,20 @@ struct Options {
     model: PathBuf,
     variant: Option<String>,
     model_name: Option<String>,
+    /// `--warm-shapes <file>` (env `APXINF_CLEF_WARM_SHAPES`). `None` keeps
+    /// the cold-start behaviour: no load-time warm, lazy per-shape compile.
+    warm_shapes: Option<PathBuf>,
 }
 
 fn parse_options() -> Fallible<Options> {
     let mut model = None;
     let mut variant = None;
     let mut model_name = None;
+    // The hypothesis gate is opt-in; the flag wins over the environment.
+    let mut warm_shapes = std::env::var_os("APXINF_CLEF_WARM_SHAPES")
+        .or_else(|| std::env::var_os("APXINF_DECIDE_WARM_SHAPES"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty());
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -69,6 +77,13 @@ fn parse_options() -> Fallible<Options> {
             }
             "--model-variant" => variant = Some(args.next().ok_or("--model-variant needs a value")?),
             "--model-name" => model_name = Some(args.next().ok_or("--model-name needs a value")?),
+            "--warm-shapes" => {
+                let value = args.next().ok_or("--warm-shapes needs a file")?;
+                if value.is_empty() {
+                    return Err("--warm-shapes needs a non-empty file".into());
+                }
+                warm_shapes = Some(PathBuf::from(value));
+            }
             "--help" | "-h" => {
                 return Err(
                     "usage: apxinf-decide-server --model <checkpoint> [--model-variant reference|auto]"
@@ -85,21 +100,35 @@ fn parse_options() -> Fallible<Options> {
         model: model.ok_or("--model <checkpoint> is required")?,
         variant,
         model_name,
+        warm_shapes,
     })
 }
 
 /// Load the resident model and print the one `ready` line the client waits for.
 fn load() -> Fallible<LoadedModel> {
     let options = parse_options()?;
+    // Parse the warm manifest before the checkpoint load so a broken explicit
+    // warm request fails in milliseconds, not after a multi-second load.
+    let warm_manifest = match &options.warm_shapes {
+        Some(path) => Some(load_warm_manifest(path)?),
+        None => None,
+    };
     let started = Instant::now();
     let load_options = LoadOptions {
         model_name: options.model_name.clone(),
         model_variant: options.variant.clone(),
         ..LoadOptions::default()
     };
-    let model = AutoModel::load_model(Device::Metal(0), &options.model, &load_options)
+    let mut model = AutoModel::load_model(Device::Metal(0), &options.model, &load_options)
         .map_err(|e| format!("load: {e}"))?;
     let load_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let mut warm_ms = 0.0;
+    let mut warm_rows = Vec::new();
+    if let Some(manifest) = &warm_manifest {
+        let (wall_ms, rows) = warm_shapes(&mut model, manifest)?;
+        warm_ms = wall_ms;
+        warm_rows = rows;
+    }
     let model_name = options
         .model_name
         .or_else(|| AutoModel::detect_model_name(&options.model).ok())
@@ -113,6 +142,8 @@ fn load() -> Fallible<LoadedModel> {
             "model": model_name,
             "variant": variant,
             "load_ms": load_ms,
+            "warm_ms": warm_ms,
+            "warm_shapes": warm_rows,
         })
     )
     .map_err(|e| format!("write ready: {e}"))?;
@@ -120,6 +151,219 @@ fn load() -> Fallible<LoadedModel> {
         .flush()
         .map_err(|e| format!("flush ready: {e}"))?;
     Ok(model)
+}
+
+/// One warm manifest shape: the question id the demo uses, the exact crop
+/// size the server receives, an optional crop image and the question body.
+#[derive(Clone, Debug)]
+struct WarmShape {
+    id: String,
+    width: usize,
+    height: usize,
+    image: Option<PathBuf>,
+    question: Value,
+}
+
+#[derive(Clone, Debug)]
+struct WarmManifest {
+    state: String,
+    shapes: Vec<WarmShape>,
+}
+
+/// Read and validate `--warm-shapes <file>`. A present but broken manifest is
+/// a start-up error, never a silent cold start.
+fn load_warm_manifest(path: &std::path::Path) -> Fallible<WarmManifest> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("warm shapes {path:?}: {error}"))?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("warm shapes {path:?}: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("warm shapes {path:?}: expected a JSON object"))?;
+    if let Some(schema) = object.get("schema").and_then(Value::as_str) {
+        if schema != "clef-warm-shapes/1" {
+            return Err(format!(
+                "warm shapes {path:?}: unsupported schema {schema:?}, want \"clef-warm-shapes/1\""
+            ));
+        }
+    }
+    let state = object
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("warm shapes {path:?}: state must be a string"))?
+        .to_string();
+    let shapes = object
+        .get("shapes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("warm shapes {path:?}: shapes must be an array"))?;
+    if shapes.is_empty() {
+        return Err(format!("warm shapes {path:?}: shapes is empty"));
+    }
+    let mut parsed = Vec::with_capacity(shapes.len());
+    for shape in shapes {
+        let shape = shape
+            .as_object()
+            .ok_or_else(|| format!("warm shapes {path:?}: each shape must be an object"))?;
+        let id = shape
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| format!("warm shapes {path:?}: shape id must be a non-empty string"))?
+            .to_string();
+        let dimension = |key: &str| -> Fallible<usize> {
+            let value = shape
+                .get(key)
+                .and_then(Value::as_u64)
+                .ok_or_else(|| format!("warm shapes {path:?}: shape {id} needs integer {key}"))?;
+            usize::try_from(value)
+                .ok()
+                .filter(|value| (1..=8192).contains(value))
+                .ok_or_else(|| format!("warm shapes {path:?}: shape {id} {key} out of range"))
+        };
+        let width = dimension("width")?;
+        let height = dimension("height")?;
+        let question = shape
+            .get("question")
+            .cloned()
+            .ok_or_else(|| format!("warm shapes {path:?}: shape {id} needs a question"))?;
+        if !question.is_object() {
+            return Err(format!("warm shapes {path:?}: shape {id} question must be an object"));
+        }
+        let image = shape
+            .get("image")
+            .and_then(Value::as_str)
+            .filter(|image| !image.is_empty())
+            .map(PathBuf::from);
+        parsed.push(WarmShape {
+            id,
+            width,
+            height,
+            image,
+            question,
+        });
+    }
+    Ok(WarmManifest {
+        state,
+        shapes: parsed,
+    })
+}
+
+/// One synthetic full decide per listed shape, discarding the answers: this
+/// builds the per-shape `Compiled` profile and its Metal JIT before `ready`.
+fn warm_shapes(model: &mut LoadedModel, manifest: &WarmManifest) -> Fallible<(f64, Vec<Value>)> {
+    let started = Instant::now();
+    let mut rows = Vec::with_capacity(manifest.shapes.len());
+    for shape in &manifest.shapes {
+        let png = match &shape.image {
+            Some(path) => std::fs::read(path)
+                .map_err(|error| format!("warm image {path:?}: {error}"))?,
+            None => solid_png(shape.width, shape.height)?,
+        };
+        let mut questions = Map::new();
+        questions.insert(shape.id.clone(), shape.question.clone());
+        let request = json!({
+            "state": manifest.state,
+            "questions": Value::Object(questions),
+            "images": [encode_base64(&png)],
+        });
+        let shape_started = Instant::now();
+        answer(model, &request).map_err(|error| format!("warm shape {}: {error}", shape.id))?;
+        let ms = shape_started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "clef warm: {} {}x{} {ms:.1} ms",
+            shape.id, shape.width, shape.height
+        );
+        rows.push(json!({
+            "id": shape.id,
+            "width": shape.width,
+            "height": shape.height,
+            "ms": ms,
+        }));
+    }
+    Ok((started.elapsed().as_secs_f64() * 1000.0, rows))
+}
+
+/// A valid 8-bit grayscale PNG of the exact crop size: raw rows with filter 0,
+/// a stored-block zlib stream and manual CRCs (no image crate).
+fn solid_png(width: usize, height: usize) -> Fallible<Vec<u8>> {
+    if width == 0 || height == 0 {
+        return Err("solid PNG needs a positive size".into());
+    }
+    let stride = width + 1;
+    let mut raw = vec![0u8; stride * height];
+    for row in raw.chunks_exact_mut(stride) {
+        row[0] = 0;
+        row[1..].fill(0x80);
+    }
+    let compressed = zlib_stored(&raw);
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&(width as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(height as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 0, 0, 0, 0]);
+    png_chunk(&mut png, b"IHDR", &ihdr);
+    png_chunk(&mut png, b"IDAT", &compressed);
+    png_chunk(&mut png, b"IEND", &[]);
+    Ok(png)
+}
+
+fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    let mut crc = 0xFFFF_FFFFu32;
+    for byte in kind.iter().chain(data) {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                0xEDB8_8320 ^ (crc >> 1)
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    out.extend_from_slice(&(!crc).to_be_bytes());
+}
+
+/// zlib stream of stored (uncompressed) deflate blocks, which the server's
+/// system-zlib `uncompress` accepts.
+fn zlib_stored(raw: &[u8]) -> Vec<u8> {
+    let blocks: Vec<&[u8]> = raw.chunks(0xFFFF).collect();
+    let mut out = Vec::with_capacity(raw.len() + blocks.len() * 5 + 6);
+    out.extend_from_slice(&[0x78, 0x01]);
+    for (index, block) in blocks.iter().enumerate() {
+        out.push(if index + 1 == blocks.len() { 0x01 } else { 0x00 });
+        out.extend_from_slice(&(block.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
+        out.extend_from_slice(block);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in raw {
+        a = (a + byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    out.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    out
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let mut packed = 0u32;
+        for (index, &byte) in chunk.iter().enumerate() {
+            packed |= (byte as u32) << (16 - 8 * index);
+        }
+        for index in 0..4 {
+            if index <= chunk.len() {
+                out.push(ALPHABET[((packed >> (18 - 6 * index)) & 0x3F) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 fn serve(model: &mut LoadedModel) {
@@ -350,6 +594,53 @@ mod tests {
         assert_eq!(decode_base64("aGVsbG8").unwrap(), b"hello");
         assert_eq!(decode_base64("aGVsbA==").unwrap(), b"hell");
         assert!(decode_base64("a").is_err());
+    }
+
+    #[test]
+    fn warm_manifest_parses_the_demo_shapes_and_rejects_broken_ones() {
+        let dir = std::env::temp_dir().join(format!("clef-warm-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("warm.json");
+        std::fs::write(
+            &path,
+            r#"{"schema":"clef-warm-shapes/1","state":"Answer each question using only the picture it refers to.",
+                "shapes":[{"id":"enemy","width":320,"height":400,
+                           "question":{"type":"noul","instructions":"Close-up:\nIs there an enemy?"}}]}"#,
+        )
+        .unwrap();
+        let manifest = load_warm_manifest(&path).unwrap();
+        assert_eq!(manifest.shapes.len(), 1);
+        assert_eq!(manifest.shapes[0].id, "enemy");
+        assert_eq!((manifest.shapes[0].width, manifest.shapes[0].height), (320, 400));
+        assert!(manifest.shapes[0].image.is_none());
+
+        for broken in [
+            r#"{"state":"s","shapes":[]}"#,
+            r#"{"state":"s","shapes":[{"id":"x","width":0,"height":10,"question":{}}]}"#,
+            r#"{"state":"s","shapes":[{"id":"x","width":10,"height":10}]}"#,
+            r#"{"schema":"other","state":"s","shapes":[{"id":"x","width":10,"height":10,"question":{}}]}"#,
+        ] {
+            std::fs::write(&path, broken).unwrap();
+            assert!(load_warm_manifest(&path).is_err(), "accepted {broken}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn solid_png_is_a_well_formed_gray_png_and_round_trips_through_base64() {
+        let png = solid_png(320, 400).unwrap();
+        assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!(&png[16..24], &[0, 0, 1, 64, 0, 0, 1, 144]);
+        assert_eq!(&png[24..29], &[8, 0, 0, 0, 0]);
+        // The IDAT inflates to (width + 1) * height raw bytes; the server's
+        // decoder accepts exactly this shape.
+        assert!(png.len() > 320 * 400);
+        let encoded = encode_base64(&png);
+        assert_eq!(decode_base64(&encoded).unwrap(), png);
+        assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
+        assert_eq!(encode_base64(b"hell"), "aGVsbA==");
+        assert!(solid_png(0, 4).is_err());
     }
 
     #[test]
