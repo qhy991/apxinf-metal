@@ -519,15 +519,28 @@ async fn decision_inference_failure_reaps_and_records_worker_cleanup() {
 
 #[tokio::test]
 async fn decision_deadline_and_cancel_kill_before_capacity_release() {
-    for (mode, cancel) in [
-        ("prepare_hold", false),
-        ("accepted_hold", true),
-        ("result_hold", true),
+    // The held preparation cannot complete, so its only terminal result is the
+    // request deadline. Keep that timer tight to exercise the real elapsed-time
+    // comparison, and synchronize on the held preparation first.
+    let deadline = Duration::from_millis(300);
+    // The cancel cases must wait for a worker stage through a file poll before
+    // they request cancellation. A timer close to that setup races the poll and
+    // turns a requested cancellation into a deadline; their timer must not
+    // participate. Every wait in this test is bounded by 5 seconds, so this
+    // bound cannot be reached before the test itself fails.
+    let uncontended = Duration::from_secs(30);
+    for (mode, cancel, timeout) in [
+        ("prepare_hold", false, deadline),
+        ("accepted_hold", true, uncontended),
+        ("result_hold", true, uncontended),
     ] {
         let probe = Probe::new();
-        let (service, task) = start(&probe, mode, Duration::from_millis(300), Duration::ZERO).await;
+        let (service, task) = start(&probe, mode, timeout, Duration::ZERO).await;
         let mut ticket = service.enqueue_decision(request()).unwrap();
         if mode == "prepare_hold" {
+            // The worker holds inside preparation; only the deadline can settle
+            // the request after this point.
+            probe.event("preparing").await;
             assert_eq!(
                 ticket.begin.await.unwrap().err().unwrap().code,
                 "deadline_exceeded"
@@ -558,11 +571,14 @@ async fn decision_deadline_and_cancel_kill_before_capacity_release() {
 #[tokio::test]
 async fn decision_queue_expires_during_replacement_loading() {
     let probe = Probe::new();
+    // Neither request may race a wall-clock deadline in this scenario. The
+    // replacement delay keeps the worker unavailable while the queued request
+    // is expired explicitly below.
     let (service, task) = start(
         &probe,
         "result_hold",
-        Duration::from_millis(300),
-        Duration::from_millis(600),
+        Duration::from_secs(30),
+        Duration::from_secs(1),
     )
     .await;
     let mut first = service.enqueue_decision(request()).unwrap();
@@ -574,6 +590,17 @@ async fn decision_queue_expires_during_replacement_loading() {
         first.output.recv().await,
         Some(Event::Decision(_))
     ));
+    // Synchronize on the retired worker's replacement loading before expiring
+    // the queued request, instead of waiting for a timer and hoping the
+    // replacement load still lasts.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while service.available.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    service.queue.sweep(&service.metrics, Duration::ZERO);
     let error = queued.begin.await.unwrap().err().unwrap();
     assert_eq!(error.code, "deadline_exceeded");
     assert!(!service.available.load(Ordering::Acquire));
