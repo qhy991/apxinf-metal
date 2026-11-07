@@ -114,6 +114,15 @@ the reference-tier whole-backbone `mx.compile` candidate: feasibility is in the 
 (shape-specialized, ~335 production lines in this file, 3 profiles for the 42-case suite,
 ~6–7 % ceiling, 0.0022 parity headroom, unknown-profile eager fallback required).
 
+### Joint protocol, 2026-11-07
+
+Full record: [JOINT-PROTOCOL.md](JOINT-PROTOCOL.md). One 3-image request per decision
+instead of three 1-image requests: reference tier **+11.6 %** (CI95 lower bound +11.2 %, 3/3
+clean rounds), but **NOT-WORTH as the default** — parity fails (38/42 decisions agree with
+separate; MLX reproduces the 3 obstacle flips, 2 of them missed real obstacles; 0.274 > 0.035 vs
+MLX joint from multi-image vision drift). The timeline shows the saving is per-pass GPU fixed cost
+plus 36 fewer tokens, not chunk0 (Tier-1 already removes it).
+
 ## Measurement discipline
 
 - Shared Metal locks: take `~/.cache/enginetailor/metal-measure.lock` first, then
