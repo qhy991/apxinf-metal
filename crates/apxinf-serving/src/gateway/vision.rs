@@ -317,6 +317,19 @@ mod tests {
             normalized.messages[0]["content"].as_array().unwrap().len(),
             4
         );
+
+        // A fifth image exceeds the same media limit on this route.
+        let value = request(json!([{"role":"user","content":[
+            openai_image("rgb"),openai_image("rgba"),openai_image("rgb"),
+            openai_image("rgba"),openai_image("rgb")
+        ]}]));
+        let error = normalize(&value, Api::OpenAi, false, &service)
+            .err()
+            .expect("The fifth image must exceed the media limit.");
+        assert_eq!(
+            (error.status, error.code.as_str()),
+            (400, "unsupported_feature")
+        );
     }
 
     #[tokio::test]
