@@ -165,8 +165,14 @@ async fn faulted_worker_restarts_after_backoff_and_serves_new_requests() {
     )
     .await;
     assert!(!service.available.load(Ordering::Acquire));
-    assert!(service.enqueue(request(true)).is_err(), "Backoff must reject admission.");
-    assert!(service.metrics_text().contains("apxinf_worker_restarts_total 0"));
+    let error = service
+        .enqueue(request(true))
+        .err()
+        .expect("Backoff must reject admission.");
+    assert_eq!((error.status, error.code.as_str()), (503, "worker_lost"));
+    assert!(service
+        .metrics_text()
+        .contains("apxinf_worker_restarts_total 0"));
     wait_until(
         || service.metrics.worker_restarts.load(Ordering::Relaxed) == 1,
         Duration::from_secs(5),
@@ -179,14 +185,20 @@ async fn faulted_worker_restarts_after_backoff_and_serves_new_requests() {
     assert!(service.available.load(Ordering::Acquire));
     assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 1);
     assert_eq!(
-        service.metrics.worker_restart_failures.load(Ordering::Relaxed),
+        service
+            .metrics
+            .worker_restart_failures
+            .load(Ordering::Relaxed),
         0
     );
     assert_ne!(service.ready_snapshot()["worker_epoch"], faulted_epoch);
 
     let mut ticket = service.enqueue(request(false)).unwrap();
     assert!(ticket.begin.await.unwrap().is_ok());
-    assert!(matches!(ticket.output.recv().await, Some(Event::Done { .. })));
+    assert!(matches!(
+        ticket.output.recv().await,
+        Some(Event::Done { .. })
+    ));
     assert_eq!(service.metrics.completed.load(Ordering::Relaxed), 1);
     stop(&service, task).await;
     assert_eq!(service.metrics.worker_restarts.load(Ordering::Relaxed), 1);
@@ -256,6 +268,97 @@ async fn in_flight_fault_reports_worker_lost_once_and_the_service_recovers() {
 }
 
 #[tokio::test]
+async fn unconfirmed_reaping_blocks_settlement_and_restart() {
+    let model = CpuModel::new(json!({}));
+    let ready = fixture_ready(&model).await;
+    let (mut service, completion) = service_with_restart(
+        ready,
+        Duration::from_secs(10),
+        4,
+        RestartPolicy {
+            max_attempts: Some(3),
+            initial_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_millis(50),
+        },
+    );
+    Arc::get_mut(&mut service)
+        .unwrap()
+        .unconfirmed_reaping
+        .store(true, Ordering::Release);
+    let path = model.model();
+    let launches = Arc::new(AtomicU64::new(0));
+    let counted = launches.clone();
+    let task = tokio::spawn(coordinate_and_report(
+        faulting_worker(),
+        service.clone(),
+        1024,
+        move || {
+            let path = path.clone();
+            counted.fetch_add(1, Ordering::Relaxed);
+            cpu_worker(path)
+        },
+        completion,
+    ));
+    let ticket = service.enqueue(request(false)).unwrap();
+    let error = match ticket.begin.await.unwrap() {
+        Err(error) => error,
+        Ok(_) => panic!("An in-flight worker fault must not admit the request."),
+    };
+    assert_eq!((error.status, error.code.as_str()), (503, "worker_lost"));
+    let error = tokio::time::timeout(Duration::from_secs(5), service.wait_stopped())
+        .await
+        .expect("An unconfirmed worker exit must end the coordinator.")
+        .expect_err("An unconfirmed worker exit must stay a failure.");
+    assert!(error.contains("could not be reaped"), "{error}");
+    task.await.unwrap();
+    // No replacement may load while the old process may still own memory.
+    assert_eq!(launches.load(Ordering::Relaxed), 0);
+    assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 1);
+    assert_eq!(service.metrics.worker_restarts.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        service
+            .metrics
+            .worker_restart_failures
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert!(service.queue.is_closed());
+    assert!(!service.available.load(Ordering::Acquire));
+    // The unresolved request keeps its reservation and stays in the gauge.
+    assert_eq!(service.metrics.active.load(Ordering::Relaxed), 1);
+    assert_eq!(service.metrics.reserved_bytes.load(Ordering::Relaxed), 1024);
+    assert_eq!(
+        observed(
+            &service,
+            "apxinf_request_outcomes_total",
+            "operation=\"generate\",status=\"failed\""
+        ),
+        1.0
+    );
+    assert_eq!(
+        observed(&service, "apxinf_cleanup_pending", "operation=\"generate\""),
+        1.0
+    );
+    assert_eq!(
+        observed(
+            &service,
+            "apxinf_public_terminal_to_settlement_seconds_count",
+            "operation=\"generate\""
+        ),
+        0.0
+    );
+    // The fixture trace keeps its single identity start: no model was loaded.
+    assert_eq!(
+        model
+            .events()
+            .iter()
+            .filter(|event| event["event"] == "started")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn consecutive_launch_failures_back_off_then_recover() {
     let model = CpuModel::new(json!({}));
     let ready = fixture_ready(&model).await;
@@ -292,7 +395,10 @@ async fn consecutive_launch_failures_back_off_then_recover() {
     .await;
     assert_eq!(attempts.load(Ordering::Relaxed), 2);
     assert_eq!(
-        service.metrics.worker_restart_failures.load(Ordering::Relaxed),
+        service
+            .metrics
+            .worker_restart_failures
+            .load(Ordering::Relaxed),
         1
     );
     assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 1);
@@ -301,8 +407,12 @@ async fn consecutive_launch_failures_back_off_then_recover() {
         "A failed attempt must not skip the doubled backoff: {:?}",
         started.elapsed()
     );
-    assert!(service.metrics_text().contains("apxinf_worker_restarts_total 1"));
-    assert!(service.metrics_text().contains("apxinf_worker_restart_failures_total 1"));
+    assert!(service
+        .metrics_text()
+        .contains("apxinf_worker_restarts_total 1"));
+    assert!(service
+        .metrics_text()
+        .contains("apxinf_worker_restart_failures_total 1"));
     assert!(service.available.load(Ordering::Acquire));
     stop_reported(&service, task).await;
 }
@@ -360,13 +470,19 @@ async fn consecutive_worker_faults_restart_after_every_fault() {
     .await;
     assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 2);
     assert_eq!(
-        service.metrics.worker_restart_failures.load(Ordering::Relaxed),
+        service
+            .metrics
+            .worker_restart_failures
+            .load(Ordering::Relaxed),
         0
     );
     assert!(service.available.load(Ordering::Acquire));
     let mut ticket = service.enqueue(request(false)).unwrap();
     assert!(ticket.begin.await.unwrap().is_ok());
-    assert!(matches!(ticket.output.recv().await, Some(Event::Done { .. })));
+    assert!(matches!(
+        ticket.output.recv().await,
+        Some(Event::Done { .. })
+    ));
     stop_reported(&service, task).await;
 }
 
@@ -419,6 +535,15 @@ async fn shutdown_during_backoff_skips_the_restart() {
     assert_eq!(service.metrics.worker_restarts.load(Ordering::Relaxed), 0);
     assert!(service.queue.is_closed());
     assert!(service.enqueue(request(true)).is_err());
+    // The fixture traced the identity probe only; no replacement was started.
+    assert_eq!(
+        model
+            .events()
+            .iter()
+            .filter(|event| event["event"] == "started")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -452,7 +577,10 @@ async fn exhausted_restart_budget_fences_the_service() {
     );
     task.await.unwrap();
     assert_eq!(
-        service.metrics.worker_restart_failures.load(Ordering::Relaxed),
+        service
+            .metrics
+            .worker_restart_failures
+            .load(Ordering::Relaxed),
         2
     );
     assert_eq!(service.metrics.worker_restarts.load(Ordering::Relaxed), 0);
@@ -460,6 +588,15 @@ async fn exhausted_restart_budget_fences_the_service() {
     assert!(service.queue.is_closed());
     let error = service.enqueue(request(true)).err().unwrap();
     assert_eq!((error.status, error.code.as_str()), (503, "worker_lost"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = crate::gateway::router(service.clone());
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let (status, body) = http_request(address, http_get("/readyz")).await;
+    assert_eq!(status, 503, "A fenced service must report unready: {body}");
+    server.abort();
 }
 
 async fn http_request(addr: SocketAddr, request: String) -> (u16, String) {
@@ -522,7 +659,10 @@ async fn readyz_reports_backoff_then_serves_a_recovered_request() {
     )
     .await;
     let (status, body) = http_request(address, http_get("/readyz")).await;
-    assert_eq!(status, 503, "Backoff must report an unready service: {body}");
+    assert_eq!(
+        status, 503,
+        "Backoff must report an unready service: {body}"
+    );
     assert!(body.contains("\"ready\":false"));
 
     let recovered = tokio::time::timeout(Duration::from_secs(8), async {
@@ -541,7 +681,10 @@ async fn readyz_reports_backoff_then_serves_a_recovered_request() {
     let body = r#"{"model":"cpu-fixture","messages":[{"role":"user","content":"count this"}]}"#;
     let (status, response) =
         http_request(address, http_post("/v1/messages/count_tokens", body)).await;
-    assert_eq!(status, 200, "A recovered service must serve requests: {response}");
+    assert_eq!(
+        status, 200,
+        "A recovered service must serve requests: {response}"
+    );
     assert!(response.contains("\"input_tokens\":2"), "{response}");
 
     stop_reported(&service, task).await;

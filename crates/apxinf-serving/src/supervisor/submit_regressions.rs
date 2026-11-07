@@ -136,6 +136,8 @@ sys.stdin.buffer.readline()
         timeout,
         memory_budget: 4096,
         restart: RestartPolicy::immediate(3),
+        #[cfg(test)]
+        unconfirmed_reaping: AtomicBool::new(false),
     });
     let task = tokio::spawn(coordinate_and_report(
         worker,

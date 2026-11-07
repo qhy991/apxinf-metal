@@ -74,6 +74,12 @@ pub(super) async fn cpu_worker(model: PathBuf) -> Result<(Worker, Value), String
     Ok((worker, ready))
 }
 
+/// CPU fixture service.
+///
+/// CPU fixtures inject a bounded, immediate restart policy so tests that expect
+/// a fault to end the coordinator still terminate through the exhausted-budget
+/// path. Production `start_inner` keeps `RestartPolicy::default()`: no attempt
+/// limit, 250ms doubling to a 30-second cap, so a real service keeps retrying.
 pub(super) fn cpu_service(ready: Value, timeout: Duration, capacity: usize) -> Arc<Service> {
     cpu_service_with_completion(ready, timeout, capacity).0
 }
@@ -97,6 +103,8 @@ fn cpu_service_with_completion(
         timeout,
         memory_budget: 4096,
         restart: RestartPolicy::immediate(3),
+        #[cfg(test)]
+        unconfirmed_reaping: AtomicBool::new(false),
     });
     (service, sender)
 }
@@ -679,6 +687,8 @@ sys.stdin.readline()
             timeout: Duration::from_millis(150),
             memory_budget: 1024,
             restart: RestartPolicy::immediate(3),
+            #[cfg(test)]
+            unconfirmed_reaping: AtomicBool::new(false),
         });
         let content = if blocked_write {
             "x".repeat(700_000)

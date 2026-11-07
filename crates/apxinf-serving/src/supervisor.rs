@@ -18,9 +18,9 @@ mod lifecycle_regressions;
 #[cfg(test)]
 mod memory_regressions;
 #[cfg(test)]
-mod rotation_pressure_regressions;
-#[cfg(test)]
 mod restart_regressions;
+#[cfg(test)]
+mod rotation_pressure_regressions;
 #[cfg(test)]
 mod shutdown_regressions;
 #[cfg(test)]
@@ -95,10 +95,10 @@ impl ApiError {
 /// the service. Production keeps no attempt limit and relies on the capped
 /// backoff; tests inject bounded budgets so fixture coordinators terminate.
 #[derive(Clone, Copy, Debug)]
-pub struct RestartPolicy {
-    pub max_attempts: Option<u32>,
-    pub initial_backoff: Duration,
-    pub max_backoff: Duration,
+pub(crate) struct RestartPolicy {
+    pub(crate) max_attempts: Option<u32>,
+    pub(crate) initial_backoff: Duration,
+    pub(crate) max_backoff: Duration,
 }
 
 impl Default for RestartPolicy {
@@ -113,7 +113,8 @@ impl Default for RestartPolicy {
 
 impl RestartPolicy {
     /// A bounded policy without backoff delays for CPU fixtures.
-    pub const fn immediate(max_attempts: u32) -> Self {
+    #[cfg(test)]
+    pub(crate) const fn immediate(max_attempts: u32) -> Self {
         Self {
             max_attempts: Some(max_attempts),
             initial_backoff: Duration::ZERO,
@@ -374,6 +375,9 @@ pub struct Service {
     pub timeout: Duration,
     pub memory_budget: u64,
     restart: RestartPolicy,
+    /// Test hook that forces the unconfirmed-reaping branch of `fence_worker`.
+    #[cfg(test)]
+    unconfirmed_reaping: AtomicBool,
 }
 
 impl Service {
@@ -1019,6 +1023,8 @@ async fn start_inner(
         timeout: config.timeout,
         memory_budget: config.memory_budget,
         restart: RestartPolicy::default(),
+        #[cfg(test)]
+        unconfirmed_reaping: AtomicBool::new(false),
     });
     service.metrics.peak_bytes.store(peak, Ordering::Relaxed);
     start_queue_sweeper(&service);
@@ -1073,20 +1079,91 @@ fn withdraw_worker(service: &Service) {
     service.queue.pause(&service.metrics, service.timeout);
 }
 
-async fn fence_worker(worker: &mut Worker, service: &Service, error: ApiError) {
+/// Fences the worker and waits for its process to exit.
+/// The reaping result is returned: an unconfirmed exit stays a failure and must
+/// not release the reserved capacity or the unresolved request.
+async fn fence_worker(worker: &mut Worker, service: &Service, error: ApiError) -> StopResult {
     withdraw_worker(service);
     service
         .metrics
         .worker_faults
         .fetch_add(1, Ordering::Relaxed);
     diagnostics::emit(format_args!("Worker fenced: {}", error.message));
-    if stop_child(&mut worker.child).await.is_ok() {
-        service.metrics.active.store(0, Ordering::Relaxed);
-        service.metrics.reserved_bytes.store(0, Ordering::Relaxed);
-    } else {
+    #[cfg(test)]
+    if service.unconfirmed_reaping.load(Ordering::Acquire) {
+        // The branch cannot be reached with a real child because SIGKILL cannot
+        // be blocked; tests force it to exercise the unconfirmed-reaping path.
         diagnostics::emit(format_args!(
-            "Worker exit is unconfirmed. Capacity remains reserved."
+            "Worker exit is unconfirmed. Capacity remains reserved. (injected)"
         ));
+        return Err("The worker exit is unconfirmed (injected).".to_owned());
+    }
+    match stop_child(&mut worker.child).await {
+        Ok(()) => {
+            service.metrics.active.store(0, Ordering::Relaxed);
+            service.metrics.reserved_bytes.store(0, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(cleanup) => {
+            diagnostics::emit(format_args!(
+                "Worker exit is unconfirmed. Capacity remains reserved. {cleanup}"
+            ));
+            Err(cleanup)
+        }
+    }
+}
+
+/// Ends the coordinator when a faulted worker process could not be reaped.
+/// The unresolved request stays in the settlement gauge, reserved capacity stays
+/// reserved, and no replacement may load while the old process can still own
+/// device memory.
+fn abandon_unreaped_worker(shared: &Service, cleanup: String) -> String {
+    shared.queue.close(&shared.metrics, shared.timeout);
+    shared.available.store(false, Ordering::Release);
+    shared.rotating.store(false, Ordering::Release);
+    diagnostics::emit(format_args!(
+        "{}",
+        json!({"event":"worker_fault_unreaped","error":cleanup})
+    ));
+    format!("The faulted worker could not be reaped: {cleanup}")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FaultFollowUp {
+    Continue,
+    Stop,
+    Unreaped,
+}
+
+/// Fences the faulted worker, then either recovers admission or ends the loop.
+/// An unconfirmed process exit skips both the request settlement and the
+/// replacement load.
+async fn fence_and_recover<F, Fut, E>(
+    worker: &mut Worker,
+    shared: &Arc<Service>,
+    error: ApiError,
+    launch: &mut F,
+    backoff: &mut RestartBackoff,
+    pending: &mut Option<Arc<RequestObservation>>,
+    fault: &mut Option<String>,
+) -> FaultFollowUp
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(Worker, Value), E>>,
+    E: Into<LaunchError>,
+{
+    if let Err(cleanup) = fence_worker(worker, shared, error).await {
+        *fault = Some(abandon_unreaped_worker(shared, cleanup));
+        return FaultFollowUp::Unreaped;
+    }
+    settle_pending_recovery(shared, pending);
+    match recover_worker(worker, shared, launch, backoff).await {
+        Recovery::Ready => FaultFollowUp::Continue,
+        Recovery::Stopped => FaultFollowUp::Stop,
+        Recovery::Exhausted => {
+            *fault = Some(exhaust_restart_budget(shared));
+            FaultFollowUp::Stop
+        }
     }
 }
 
@@ -1122,7 +1199,7 @@ impl RestartBackoff {
 
     fn next_delay(&mut self) -> Duration {
         let delay = self.next.min(self.policy.max_backoff);
-        self.next = (delay * 2).min(self.policy.max_backoff);
+        self.next = delay.saturating_mul(2).min(self.policy.max_backoff);
         delay
     }
 
@@ -1210,11 +1287,11 @@ where
         }
         match adopt_replacement(worker, shared, replacement, ready).await {
             Ok(()) => {
-                shared.metrics.worker_restarts.fetch_add(1, Ordering::Relaxed);
                 shared.rotating.store(false, Ordering::Release);
                 if !shared.queue.resume(&shared.available) {
                     return Recovery::Stopped;
                 }
+                shared.metrics.worker_restarts.fetch_add(1, Ordering::Relaxed);
                 backoff.reset();
                 diagnostics::emit(format_args!(
                     "{}",
@@ -1282,6 +1359,7 @@ where
     let mut backoff = RestartBackoff::new(shared.restart);
     let mut pending_recovery: Option<Arc<RequestObservation>> = None;
     let mut fault: Option<String> = None;
+    let mut abandoned = false;
     loop {
         if shared.queue.is_closed() {
             break;
@@ -1291,13 +1369,21 @@ where
                 Ok(Rotation::Ready) => backoff.reset(),
                 Ok(Rotation::Stopped) => break,
                 Err(error) => {
-                    fence_worker(&mut worker, &shared, error).await;
-                    settle_pending_recovery(&shared, &mut pending_recovery);
-                    match recover_worker(&mut worker, &shared, &mut launch, &mut backoff).await {
-                        Recovery::Ready => continue,
-                        Recovery::Stopped => break,
-                        Recovery::Exhausted => {
-                            fault = Some(exhaust_restart_budget(&shared));
+                    let follow_up = fence_and_recover(
+                        &mut worker,
+                        &shared,
+                        error,
+                        &mut launch,
+                        &mut backoff,
+                        &mut pending_recovery,
+                        &mut fault,
+                    )
+                    .await;
+                    match follow_up {
+                        FaultFollowUp::Continue => continue,
+                        FaultFollowUp::Stop => break,
+                        FaultFollowUp::Unreaped => {
+                            abandoned = true;
                             break;
                         }
                     }
@@ -1313,12 +1399,21 @@ where
                     None => Err(ApiError::worker("The idle worker output pipe closed.")),
                 };
                 if let Err(error) = result {
-                    fence_worker(&mut worker, &shared, error).await;
-                    match recover_worker(&mut worker, &shared, &mut launch, &mut backoff).await {
-                        Recovery::Ready => continue,
-                        Recovery::Stopped => break,
-                        Recovery::Exhausted => {
-                            fault = Some(exhaust_restart_budget(&shared));
+                    let follow_up = fence_and_recover(
+                        &mut worker,
+                        &shared,
+                        error,
+                        &mut launch,
+                        &mut backoff,
+                        &mut pending_recovery,
+                        &mut fault,
+                    )
+                    .await;
+                    match follow_up {
+                        FaultFollowUp::Continue => continue,
+                        FaultFollowUp::Stop => break,
+                        FaultFollowUp::Unreaped => {
+                            abandoned = true;
                             break;
                         }
                     }
@@ -1377,13 +1472,21 @@ where
                 );
             }
             pending_recovery = Some(observation);
-            fence_worker(&mut worker, &shared, failure.error).await;
-            settle_pending_recovery(&shared, &mut pending_recovery);
-            match recover_worker(&mut worker, &shared, &mut launch, &mut backoff).await {
-                Recovery::Ready => continue,
-                Recovery::Stopped => break,
-                Recovery::Exhausted => {
-                    fault = Some(exhaust_restart_budget(&shared));
+            let follow_up = fence_and_recover(
+                &mut worker,
+                &shared,
+                failure.error,
+                &mut launch,
+                &mut backoff,
+                &mut pending_recovery,
+                &mut fault,
+            )
+            .await;
+            match follow_up {
+                FaultFollowUp::Continue => continue,
+                FaultFollowUp::Stop => break,
+                FaultFollowUp::Unreaped => {
+                    abandoned = true;
                     break;
                 }
             }
@@ -1391,6 +1494,11 @@ where
         shared.metrics.active.store(0, Ordering::Relaxed);
         shared.metrics.reserved_bytes.store(0, Ordering::Relaxed);
         observation.settled(&shared.metrics.observations, Instant::now());
+    }
+    if abandoned {
+        // The faulted process was never confirmed dead: keep its unresolved
+        // request in the settlement gauge and its reservation in place.
+        return Err(fault.unwrap_or_else(|| "The faulted worker could not be reaped.".into()));
     }
     // A closed coordinator must not leave its owned child running.
     stop_child(&mut worker.child).await?;
@@ -2506,6 +2614,8 @@ fn gateway_test_service_config(
         timeout: Duration::from_secs(1),
         memory_budget: 1024,
         restart: RestartPolicy::immediate(3),
+        #[cfg(test)]
+        unconfirmed_reaping: AtomicBool::new(false),
     });
     let coordinator = service.clone();
     tokio::spawn(async move {
@@ -2543,6 +2653,8 @@ mod lifecycle_tests {
             timeout: Duration::from_secs(1),
             memory_budget: 1024,
             restart: RestartPolicy::immediate(3),
+            #[cfg(test)]
+            unconfirmed_reaping: AtomicBool::new(false),
         })
     }
 
@@ -2833,7 +2945,9 @@ mod lifecycle_tests {
             "protocol_fault"
         );
         let service = idle_service();
-        fence_worker(&mut worker, &service, ApiError::worker("Test finished.")).await;
+        assert!(fence_worker(&mut worker, &service, ApiError::worker("Test finished."))
+            .await
+            .is_ok());
         assert!(worker.child.try_wait().unwrap().is_some());
     }
 
@@ -2843,15 +2957,39 @@ mod lifecycle_tests {
         let service = idle_service();
         service.metrics.active.store(1, Ordering::Relaxed);
         service.metrics.reserved_bytes.store(64, Ordering::Relaxed);
-        fence_worker(
+        assert!(fence_worker(
+            &mut worker,
+            &service,
+            ApiError::worker("Injected execution fault."),
+        )
+        .await
+        .is_ok());
+        assert!(worker.child.try_wait().unwrap().is_some());
+        assert!(!service.available.load(Ordering::Acquire));
+        assert_eq!(service.metrics.active.load(Ordering::Relaxed), 0);
+        assert_eq!(service.metrics.reserved_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_reaping_keeps_the_reservation_and_reports_failure() {
+        let mut worker = shell_worker("read signal");
+        let service = idle_service();
+        service.unconfirmed_reaping.store(true, Ordering::Release);
+        service.metrics.active.store(1, Ordering::Relaxed);
+        service.metrics.reserved_bytes.store(64, Ordering::Relaxed);
+        let reaping = fence_worker(
             &mut worker,
             &service,
             ApiError::worker("Injected execution fault."),
         )
         .await;
-        assert!(worker.child.try_wait().unwrap().is_some());
+        assert!(reaping.is_err());
+        assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 1);
+        // An unconfirmed exit neither releases capacity nor reopens admission.
+        assert_eq!(service.metrics.active.load(Ordering::Relaxed), 1);
+        assert_eq!(service.metrics.reserved_bytes.load(Ordering::Relaxed), 64);
         assert!(!service.available.load(Ordering::Acquire));
-        assert_eq!(service.metrics.active.load(Ordering::Relaxed), 0);
-        assert_eq!(service.metrics.reserved_bytes.load(Ordering::Relaxed), 0);
+        // The injected branch skips the real wait; reap the shell explicitly.
+        let _ = stop_child(&mut worker.child).await;
     }
 }

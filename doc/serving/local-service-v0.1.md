@@ -405,11 +405,14 @@ It rejects context overflow before generation.
 A worker protocol fault fences the worker epoch.
 The supervisor stops the failed worker before releasing uncertain reservations.
 It then restarts that worker through the approved launch and identity checks.
+The restart waits for confirmed process exit.
+An unconfirmed exit within 20 seconds ends the service as a failure instead of loading a replacement.
+That failure keeps the unresolved request in the settlement gauge and keeps its capacity reserved.
 The restart uses a bounded exponential backoff.
 The first retry waits 250 milliseconds and each later retry doubles up to a 30-second cap.
 The default restart policy has no attempt limit, so a persistently failing worker keeps retrying at the cap instead of ending the service.
 `apxinf_worker_restarts_total`, `apxinf_worker_restart_failures_total`, and the `worker_restart_scheduled` diagnostics expose that loop.
-A configured attempt budget ends in a fenced service whose `/readyz` stays unavailable until an operator restarts the process.
+An internal attempt budget (used by crate tests) ends in a fenced service whose `/readyz` stays unavailable until an operator restarts the process.
 An in-flight request still fails with HTTP 503 `worker_lost`.
 The service does not replay that request or its partial output.
 Requests waiting in the queue are rejected with HTTP 503 `worker_lost` when the fault fences the worker.
@@ -581,7 +584,8 @@ Its `host_pressure` object reports `policy`, `state`, `admission_allowed`, `reco
 The `state` is `disabled`, `normal`, `warning`, `critical`, `unknown`, or `stale`.
 The top-level `worker_available` field reports the separate worker lifecycle state.
 `GET /healthz` remains independent of pressure.
-Pressure recovery cannot reopen a closed service or fix a worker fault.
+Pressure recovery cannot reopen a closed service.
+A worker fault is recovered only by the bounded restart policy.
 
 The pressure metrics use fixed labels only:
 
