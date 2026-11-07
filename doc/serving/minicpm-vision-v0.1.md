@@ -190,7 +190,14 @@ OpenAI text content-part arrays are accepted in any role.
 On user content, their text parts stay ordered with any supported image parts.
 On other roles, the gateway joins the text parts into the serial string form.
 For tool-result errors, the gateway inserts an ordinary text part before the original content.
-Public readiness states both image input restrictions.
+Public readiness states both image input restrictions:
+
+| Readiness field | Value |
+| --- | --- |
+| `public_capabilities.image_input_restriction` | `anthropic_base64_png_user_and_tool_result` |
+| `public_capabilities.openai_image_input_restriction` | `openai_base64_png_user_only` |
+
+Both fields appear only when the profile enables image input.
 
 Message and tool field names retain their serial meanings and bounds.
 System and assistant content remain strings.

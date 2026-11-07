@@ -354,6 +354,7 @@ A `developer` message is normalized to a `system` message, because both carry th
 Message content must be a string or an array of content parts.
 OpenAI messages may send content as an array of text parts in any role.
 The gateway joins those text parts into the serial text form without changing tool identity.
+An OpenAI text part accepts only the `type` and `text` keys; the Anthropic route also accepts `cache_control` on its text blocks.
 An image part receives HTTP 400 `unsupported_feature` on this text profile.
 A message with an unsupported role, a missing role, or a content value that is neither a string nor an array receives HTTP 400 `invalid_request` with an actionable message.
 The same roles and shapes apply to the vision profile, where user content arrays keep their text and image order.
@@ -388,7 +389,9 @@ Its `error` object contains `type`, `code`, and `message`.
 The `code` is a contract error code, and its HTTP status follows the
 [error-code table](contracts-v0.1.md#faults-and-recovery).
 Transport-level rejections keep the HTTP framework response instead of this envelope: an unknown route or unsupported method returns an empty body, and an oversized body returns `text/plain`.
-A cancellation observed after the response starts can use HTTP 499 `cancelled`, which is outside that table.
+A cancellation uses HTTP 499 `cancelled`, which is outside that table.
+The cancellation usually comes from the client disconnecting, so that client cannot observe the status.
+A cancellation after the stream headers appears as a stream error event instead.
 The `error.type` value derives from that status: `invalid_request_error` for 400,
 `not_found_error` for 404, `rate_limit_error` for 429, `overloaded_error` for 503,
 and `api_error` for every other status.

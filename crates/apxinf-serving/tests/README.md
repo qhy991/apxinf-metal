@@ -45,6 +45,11 @@ They do not establish real inference, model quality, performance, or Claude Code
 | Rejected output limit | An explicit zero returns 400 `invalid_request` before admission on both generation APIs. |
 | Exhausted output budget | Readiness and token counting stay available; both text-generation routes return 400 `invalid_request`. |
 
+The coverage above is the text profile's HTTP surface.
+The vision profile's OpenAI `image_url` acceptance has unit and prepared-frame evidence only:
+the CPU fixture worker declares `image:false`, and a synthetic vision worker would need the full
+vision runtime identity digests. The HTTP cases therefore cover the text-profile rejection of image parts.
+
 ## Run the checks
 
 Run this command from the repository root:
