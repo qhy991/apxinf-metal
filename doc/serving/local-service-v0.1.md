@@ -345,6 +345,19 @@ The default output budget is 512 tokens or the output limit, whichever is smalle
 A deployment with a zero output limit is exempt because it never emits tokens.
 The default request timeout is 300 seconds, including queue time.
 
+The selected provider fixes its own context and output limits, and startup rejects values outside them:
+
+| Provider | Context limit | Output limit |
+| --- | --- | --- |
+| `python-mlx-lm` | 1 through 131072 | 0 through 65536, at most the context limit |
+| `python-clef` | 1 through 4096 | exactly 0 |
+| `mlx-vlm-minicpmv47` | 1 through 16384 | 0 through 8192 |
+| native MiniCPM5 profiles | 1 through 16384 | 0 through 65536, at most the context limit |
+
+The generic Python provider cannot check the loaded model capacity before the worker starts, so the operator owns that bound.
+The native profiles keep 16384 positions for launch compatibility even though the model layer can address more.
+Raising that limit needs device memory and quality measurements, so the service does not claim it.
+
 ## HTTP interface
 
 | Route | Operation |
