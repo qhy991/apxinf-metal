@@ -111,17 +111,24 @@ pub fn encode(
     let timing = super::timing_enabled();
     // Overlap the per-layer disk reads with the previous layer's device
     // compute: the worker warms the page cache for the next layers while
-    // this thread evaluates the current one. Scheduling only; the bytes and
+    // this thread evaluates the current one, and every consumed range is
+    // evicted again so the cache holds only the small prefetch window
+    // (~0.8 GB) instead of all 15.1 GB. Scheduling only; the bytes and
     // kernels are unchanged, so the encoded states stay bit-exact.
-    let prefetch = weights::prefetch_enabled(image_tokens).then(|| {
-        let prefetch = weights::TextPrefetch::new();
-        prefetch.submit(files.layer_ranges(0));
-        if TEXT_LAYERS > 1 {
-            prefetch.submit(files.layer_ranges(1));
+    let prefetch = weights::prefetch_plan(image_tokens);
+    if let Some(plan) = &prefetch {
+        for k in 0..=plan.window.min(TEXT_LAYERS - 1) {
+            plan.worker.submit(files.layer_ranges(k));
         }
-        prefetch
-    });
-    let mut next = 2;
+    }
+    if timing {
+        eprintln!(
+            "qimage-timing: text_prefetch enabled={} window={}",
+            usize::from(prefetch.is_some()),
+            prefetch.as_ref().map_or(0, |plan| plan.window),
+        );
+    }
+    let mut next = prefetch.as_ref().map_or(usize::MAX, |plan| plan.window + 1);
     let length = tokens.ids.len();
     let ids: Vec<i32> = tokens.ids.iter().map(|&id| id as i32).collect();
     let embed_start = std::time::Instant::now();
@@ -131,6 +138,11 @@ pub fn encode(
         h.eval()?;
         h
     };
+    if prefetch.is_some() {
+        // The ~0.8 GB embedding table is read once; do not keep it cached
+        // for the rest of the run.
+        weights::evict_cached_ranges(&files.tensor_ranges("embed_tokens.weight"));
+    }
     let embed_elapsed = embed_start.elapsed();
     // Text positions repeat on all three MRoPE axes, so the interleave is the identity.
     let inv_freq = files.tensor(stream, "rotary_emb.inv_freq")?;
@@ -148,9 +160,9 @@ pub fn encode(
         let load_start = std::time::Instant::now();
         let weights = files.layer(stream, i)?;
         let load = load_start.elapsed();
-        if let Some(prefetch) = &prefetch {
+        if let Some(plan) = &prefetch {
             if next < TEXT_LAYERS {
-                prefetch.submit(files.layer_ranges(next));
+                plan.worker.submit(files.layer_ranges(next));
                 next += 1;
             }
         }
@@ -159,6 +171,12 @@ pub fn encode(
         // Release this layer's weights before reading the next one.
         h.eval()?;
         let compute = compute_start.elapsed();
+        drop(weights);
+        if prefetch.is_some() {
+            // This layer's pages are clean, unmapped and never read again;
+            // drop them from the cache so the window stays small.
+            weights::evict_cached_ranges(&files.layer_ranges(i));
+        }
         load_total += load;
         compute_total += compute;
         if timing {
