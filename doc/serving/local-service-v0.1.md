@@ -349,6 +349,10 @@ A client-supplied `max_tokens` of zero is invalid, and a value above the deploym
 Counting tokens ignores the output limit.
 A deployment with an output limit of zero still reports readiness and counts tokens, but requests on the two text-generation routes receive HTTP 400 `invalid_request`.
 
+OpenAI messages may send content as an array of text parts in any role.
+The gateway joins those text parts into the serial text form without changing tool identity.
+An image part receives HTTP 400 `unsupported_feature` on this text profile.
+
 Anthropic messages support text, `tool_use`, and `tool_result` blocks.
 Tool results must precede text within their user message.
 An error result adds `[tool_result is_error=true]` before its text during normalization.

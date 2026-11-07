@@ -627,15 +627,12 @@ fn normalize(
                 "Message",
             )?;
             let mut message = message.clone();
-            if service.image_enabled() && message["content"].is_array() {
-                return Err(ApiError::new(
-                    400,
-                    "unsupported_feature",
-                    "OpenAI image inputs are unsupported.",
-                ));
-            }
             if message["content"].is_null() && message.get("tool_calls").is_some() {
                 message["content"] = json!("");
+            }
+            if message["content"].is_array() {
+                let role = message["role"].as_str().unwrap_or("");
+                message["content"] = openai_content(&message["content"], role, service)?;
             }
             if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
                 for call in calls {
@@ -762,6 +759,48 @@ fn normalize(
         },
         stream,
     ))
+}
+
+/// Normalize the OpenAI content-part array into the serial profile shape.
+///
+/// Text parts join into one string unless the vision profile must preserve
+/// order, in which case they stay ordered with the image parts.
+fn openai_content(content: &Value, role: &str, service: &Service) -> Result<Value, ApiError> {
+    let ordered = service.image_enabled() && role == "user";
+    let mut joined = String::new();
+    let mut parts = Vec::new();
+    for part in array(content, "Message content")? {
+        match part["type"].as_str() {
+            Some("text") => {
+                unknown(part, &["type", "text"], "Text block")?;
+                let value = text(&part["text"], "Text block text")?;
+                if ordered {
+                    parts.push(json!({"type":"text","text":value}));
+                } else {
+                    joined.push_str(&value);
+                }
+            }
+            Some("image_url") => {
+                return Err(ApiError::new(
+                    400,
+                    "unsupported_feature",
+                    "OpenAI image inputs are unsupported.",
+                ))
+            }
+            _ => {
+                return Err(ApiError::new(
+                    400,
+                    "unsupported_feature",
+                    "OpenAI messages support text content parts.",
+                ))
+            }
+        }
+    }
+    Ok(if parts.is_empty() {
+        json!(joined)
+    } else {
+        json!(parts)
+    })
 }
 
 fn content_text(content: &Value) -> Result<String, ApiError> {
@@ -1468,6 +1507,57 @@ mod tests {
             ));
         }
         assert!(service.available.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn openai_content_part_arrays_reach_admission_as_text() {
+        let (service, mut observed) = gateway_test_service();
+        let value = json!({"model":"test-model","max_tokens":4,"messages":[
+            {"role":"user","content":[{"type":"text","text":"hello "},{"type":"text","text":"world"}]}
+        ]});
+        let error = request_error(service.clone(), value, Api::OpenAi).await;
+        assert_eq!(error.message, "Test coordinator observed admission.");
+        let admitted = observed
+            .try_recv()
+            .expect("Content parts must reach admission.");
+        assert_eq!(
+            admitted.messages,
+            vec![json!({"role":"user","content":"hello world"})]
+        );
+
+        // Tool and assistant content arrays keep their tool identity.
+        let value = json!({"model":"test-model","max_tokens":4,"messages":[
+            {"role":"assistant","content":[{"type":"text","text":"calling"}],"tool_calls":[
+                {"id":"call-a","type":"function","function":{"name":"read","arguments":{}}}]},
+            {"role":"tool","tool_call_id":"call-a","content":[{"type":"text","text":"file "},{"type":"text","text":"text"}]}
+        ]});
+        let error = request_error(service.clone(), value, Api::OpenAi).await;
+        assert_eq!(error.message, "Test coordinator observed admission.");
+        let admitted = observed
+            .try_recv()
+            .expect("Tool content parts must reach admission.");
+        assert_eq!(admitted.messages[0]["content"], "calling");
+        assert_eq!(
+            admitted.messages[1],
+            json!({"role":"tool","tool_call_id":"call-a","content":"file text"})
+        );
+
+        // Unknown part types and images stay explicit request errors.
+        for content in [
+            json!([{"type":"input_audio","input_audio":{"data":"x","format":"wav"}}]),
+            json!([{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]),
+        ] {
+            let value = json!({"model":"test-model","max_tokens":4,"messages":[{"role":"user","content":content}]});
+            let error = request_error(service.clone(), value, Api::OpenAi).await;
+            assert_eq!(
+                (error.status, error.code.as_str()),
+                (400, "unsupported_feature")
+            );
+        }
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

@@ -200,6 +200,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_text_content_parts_keep_the_vision_order() {
+        let (service, _) = gateway_test_service_with_protocol(contracts::VISION_PROTOCOL);
+        let value = request(json!([
+            {"role":"user","content":[{"type":"text","text":"before"},{"type":"text","text":"after"}]},
+            {"role":"assistant","content":[{"type":"text","text":"reply "},{"type":"text","text":"text"}]}
+        ]));
+        let (normalized, _) = normalize(&value, Api::OpenAi, false, &service).unwrap();
+        assert_eq!(
+            normalized.messages[0]["content"],
+            json!([{"type":"text","text":"before"},{"type":"text","text":"after"}])
+        );
+        assert_eq!(normalized.messages[1]["content"], "reply text");
+    }
+
+    #[tokio::test]
     async fn image_limits_count_occurrences_across_history() {
         let (service, _) = gateway_test_service_with_protocol(contracts::VISION_PROTOCOL);
         let mut messages = vec![

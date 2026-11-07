@@ -13,8 +13,8 @@ fn real_gateway_with_cpu_worker() {
         "--exclude",
         "OutputBudgetTests",
         "--expect-cases",
-        "14",
+        "15",
         "--expect-total",
-        "16",
+        "17",
     ]);
 }

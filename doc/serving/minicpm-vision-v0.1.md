@@ -184,6 +184,9 @@ User content and tool-result content can contain these blocks.
 The gateway preserves text and image order and each `tool_call_id`.
 It rejects URL sources, other media types, and images in system or assistant content.
 OpenAI image inputs remain unsupported. OpenAI text inputs retain their existing behavior.
+OpenAI text content-part arrays are accepted in any role.
+On user content, their text parts stay ordered with any supported image parts.
+On other roles, the gateway joins the text parts into the serial string form.
 For tool-result errors, the gateway inserts an ordinary text part before the original content.
 Public readiness must state this image input restriction.
 

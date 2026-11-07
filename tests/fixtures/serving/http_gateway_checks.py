@@ -300,6 +300,24 @@ class HttpGatewayTests(GatewayChecks, unittest.TestCase):
                     self.assertTrue(all("usage" not in chunk for chunk in chunks))
                     self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
 
+    def test_openai_content_part_arrays_are_normalized(self):
+        gateway = self.gateway
+        content = [{"type": "text", "text": "fixture:"}, {"type": "text", "text": "text"}]
+        status, _, reply = gateway.request("/v1/chat/completions", {
+            "model": MODEL, "max_tokens": 8,
+            "messages": [{"role": "user", "content": content}]})
+        self.assertEqual(status, 200, reply)
+        self.assertEqual(reply["choices"][0]["message"]["content"], "Original reply.")
+        prepared = [item for item in gateway.trace() if item["event"] == "prepared"]
+        self.assertEqual(prepared[-1]["messages"], [{"role": "user", "content": "fixture:text"}])
+
+        # OpenAI image parts remain unsupported on the text profile.
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        response = gateway.request("/v1/chat/completions", {
+            "model": MODEL, "max_tokens": 8, "messages": [{"role": "user", "content": [image]}]})
+        self.assert_error(response, 400, "unsupported_feature")
+        gateway.idle()
+
     def test_invalid_input_never_reaches_worker(self):
         gateway = self.gateway
         for path in ("/v1/messages", "/v1/chat/completions", "/v1/messages/count_tokens"):
