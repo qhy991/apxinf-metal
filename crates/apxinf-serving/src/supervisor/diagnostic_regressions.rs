@@ -63,6 +63,40 @@ fn wait_for_probe(
     }
 }
 
+/// Detects the completion marker across chunk boundaries.
+///
+/// The transcript is bounded, so the completion signal cannot be read back from
+/// it: a probe that writes more than `MAX_TRANSCRIPT_BYTES` before finishing
+/// would otherwise look incomplete. Scan every chunk instead and keep only the
+/// tail that can still complete a split marker.
+#[derive(Default)]
+struct MarkerScan {
+    tail: String,
+    seen: bool,
+}
+
+impl MarkerScan {
+    fn feed(&mut self, chunk: &str) {
+        if self.seen {
+            return;
+        }
+        let mut window = String::with_capacity(self.tail.len() + chunk.len());
+        window.push_str(&self.tail);
+        window.push_str(chunk);
+        if window.contains(COMPLETED_MARKER) {
+            self.seen = true;
+            self.tail.clear();
+            return;
+        }
+        let keep = COMPLETED_MARKER.len().saturating_sub(1);
+        let mut cut = window.len().saturating_sub(keep);
+        while cut < window.len() && !window.is_char_boundary(cut) {
+            cut += 1;
+        }
+        self.tail = window[cut..].to_owned();
+    }
+}
+
 /// Keep the diagnostic transcript bounded without splitting a UTF-8 character.
 fn append_transcript(transcript: &mut String, chunk: &str) {
     let remaining = MAX_TRANSCRIPT_BYTES.saturating_sub(transcript.len());
@@ -156,20 +190,25 @@ fn run_isolated(output_mode: &str, scenario: &str) {
     // Read the probe's progress while it runs. Every step prints a marker, so
     // the parent can distinguish a loaded host from a blocked probe.
     let transcript = Arc::new(std::sync::Mutex::new(String::new()));
+    let completed = Arc::new(AtomicBool::new(false));
     let last_progress = Arc::new(std::sync::Mutex::new(Instant::now()));
     let reader = {
         let transcript = transcript.clone();
+        let completed = completed.clone();
         let last_progress = last_progress.clone();
         std::thread::spawn(move || {
             let mut buffer = [0_u8; 4096];
+            let mut scan = MarkerScan::default();
             loop {
                 match output.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(count) => {
-                        append_transcript(
-                            &mut transcript.lock().unwrap(),
-                            &String::from_utf8_lossy(&buffer[..count]),
-                        );
+                        let text = String::from_utf8_lossy(&buffer[..count]);
+                        scan.feed(&text);
+                        if scan.seen {
+                            completed.store(true, Ordering::Release);
+                        }
+                        append_transcript(&mut transcript.lock().unwrap(), &text);
                         *last_progress.lock().unwrap() = Instant::now();
                     }
                 }
@@ -208,7 +247,7 @@ fn run_isolated(output_mode: &str, scenario: &str) {
         "The {output_mode}/{scenario} probe failed: {status}. {transcript}"
     );
     assert!(
-        transcript.contains(COMPLETED_MARKER),
+        completed.load(Ordering::Acquire),
         "The probe did not confirm lifecycle completion. {transcript}"
     );
 }
@@ -536,4 +575,36 @@ fn a_probe_transcript_stays_bounded_without_splitting_utf8() {
     let mut small = String::new();
     append_transcript(&mut small, "APXINF_MARKER");
     assert_eq!(small, "APXINF_MARKER");
+}
+
+#[test]
+fn the_completion_marker_is_found_across_chunk_boundaries() {
+    let mut scan = MarkerScan::default();
+    let mut typed = COMPLETED_MARKER.to_owned();
+    // Split the marker at every byte and feed one character per chunk.
+    for _ in 0..typed.len() {
+        let (head, rest) = typed.split_at(1);
+        scan.feed(head);
+        typed = rest.to_owned();
+    }
+    assert!(scan.seen, "A split marker must still be detected.");
+}
+
+#[test]
+fn the_completion_marker_survives_a_truncated_transcript() {
+    let mut transcript = String::new();
+    append_transcript(&mut transcript, &"noise".repeat(MAX_TRANSCRIPT_BYTES));
+    let mut scan = MarkerScan::default();
+    scan.feed(&transcript);
+    // The transcript is full, so the marker never reaches it.
+    append_transcript(&mut transcript, COMPLETED_MARKER);
+    scan.feed(COMPLETED_MARKER);
+    assert!(
+        scan.seen,
+        "The completion signal must not depend on the bounded transcript."
+    );
+    assert!(
+        !transcript.contains(COMPLETED_MARKER),
+        "The bounded transcript is full, so the marker is not appended."
+    );
 }
