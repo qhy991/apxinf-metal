@@ -191,6 +191,20 @@ async fn clef_compatibility_arguments_fail_before_the_worker_can_start() {
 }
 
 #[test]
+fn output_limit_above_the_context_limit_fails_before_startup() {
+    let mut config = configuration(4096, 1024);
+    config.max_output = 2048;
+    assert_eq!(
+        config.validate_memory().unwrap_err(),
+        "The output limit must not exceed the context limit."
+    );
+    config.max_context = 2048;
+    assert!(config.validate_memory().is_ok());
+    config.max_context = 128;
+    assert!(config.validate_memory().is_err());
+}
+
+#[test]
 fn clef_execution_limits_preserve_the_supported_boundaries() {
     let mut config = configuration(4096, 1024);
     config.runtime = WorkerRuntime::PythonClef {

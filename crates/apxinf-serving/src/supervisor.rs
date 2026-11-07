@@ -249,6 +249,11 @@ impl Config {
         if self.sequence_reservation > self.memory_budget {
             return Err("The sequence reservation exceeds the memory budget.".into());
         }
+        // A request reserves at least its own output budget, so a deployment
+        // whose output limit exceeds its context cannot serve normal requests.
+        if self.max_output > self.max_context {
+            return Err("The output limit must not exceed the context limit.".into());
+        }
         Ok(())
     }
 

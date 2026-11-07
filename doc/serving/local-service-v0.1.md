@@ -310,6 +310,7 @@ The process requires a loopback address.
 The process exposes its listener only after model loading and identity checks.
 The default context limit is 16384 tokens.
 The default output limit is 2048 tokens.
+Startup rejects a configuration whose output limit exceeds its context limit, because a request reserves its output budget inside that context.
 The default request timeout is 300 seconds, including queue time.
 
 ## HTTP interface
