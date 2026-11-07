@@ -456,6 +456,36 @@ class HttpGatewayTests(GatewayChecks, unittest.TestCase):
             self.assertEqual(self.gateway.request("/readyz")[0], 503)
             self.gateway.idle()
 
+    def test_openai_developer_messages_and_message_shape_errors(self):
+        gateway = self.gateway
+        # A developer message carries the system instructions; the worker sees
+        # the normalized system role, not the OpenAI-only role name.
+        request = {"model": MODEL, "max_tokens": 4, "messages": [
+            {"role": "developer", "content": "fixture:text"},
+            {"role": "user", "content": "fixture:text"},
+        ]}
+        self.assertEqual(gateway.request("/v1/chat/completions", request)[0], 200)
+        prepared = [item for item in gateway.trace() if item["event"] == "prepared"]
+        self.assertEqual(prepared[-1]["messages"], [
+            {"role": "system", "content": "fixture:text"},
+            {"role": "user", "content": "fixture:text"},
+        ])
+        # An unsupported role or content shape is an actionable request error.
+        for message, expected in (
+            ({"role": "function", "content": "hello"},
+             "system, developer, user, assistant, or tool"),
+            ({"role": "user", "content": {"text": "hello"}},
+             "a string or a content-part array"),
+        ):
+            response = gateway.request("/v1/chat/completions",
+                                       {"model": MODEL, "max_tokens": 4, "messages": [message]})
+            self.assert_error(response, 400, "invalid_request", "invalid_request_error")
+            self.assertIn(expected, response[2]["error"]["message"])
+        # Only the successful request reached the worker, which stays usable.
+        self.assertEqual(len([item for item in gateway.trace() if item["event"] == "accepted"]), 1)
+        self.assertEqual(gateway.request("/v1/messages", body())[0], 200)
+        gateway.idle()
+
     def test_cli_shutdown_reaps_worker(self):
         gateway = self.gateway
         gateway.close()

@@ -632,9 +632,33 @@ fn normalize(
             if message["content"].is_null() && message.get("tool_calls").is_some() {
                 message["content"] = json!("");
             }
+            // Accept the OpenAI role vocabulary and report message shape
+            // problems here instead of leaving them to the prepared-input
+            // contract, which can only report a generic contract failure.
+            let role = text(&message["role"], "Message role")?;
+            if role == "developer" {
+                // OpenAI developer messages carry the same instructions as a
+                // system message, so both use the worker's system role.
+                message["role"] = json!("system");
+            } else if !matches!(role.as_str(), "system" | "user" | "assistant" | "tool") {
+                return Err(ApiError::invalid(
+                    "OpenAI messages require system, developer, user, assistant, or tool roles.",
+                ));
+            }
+            for key in ["name", "tool_call_id"] {
+                if message.get(key).is_some_and(|value| !value.is_string()) {
+                    return Err(ApiError::invalid(format!(
+                        "Message {key} must be a string."
+                    )));
+                }
+            }
+            if !message["content"].is_string() && !message["content"].is_array() {
+                return Err(ApiError::invalid(
+                    "Message content must be a string or a content-part array.",
+                ));
+            }
             if message["content"].is_array() {
-                let role = message["role"].as_str().unwrap_or("");
-                message["content"] = openai_content(&message["content"], role, service)?;
+                message["content"] = openai_content(&message["content"], &role, service)?;
             }
             if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
                 for call in calls {
@@ -1296,6 +1320,74 @@ mod tests {
             vec![json!({"role": "user", "content": "hello"})]
         );
         assert!(service.available.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn openai_developer_messages_use_the_system_role() {
+        let (service, mut observed) = gateway_test_service();
+        let value = openai_request(json!([
+            {"role":"developer","content":"Be brief."},
+            {"role":"user","content":"hello"}
+        ]));
+        let (request, _) = normalize(&value, Api::OpenAi, false, &service).unwrap();
+        assert_eq!(
+            request.messages,
+            vec![
+                json!({"role":"system","content":"Be brief."}),
+                json!({"role":"user","content":"hello"}),
+            ]
+        );
+        // Content parts on a developer message collapse into the serial form,
+        // because the worker contract only accepts text for a system message.
+        let value = openai_request(json!([{"role":"developer","content":[
+            {"type":"text","text":"Be "},{"type":"text","text":"brief."}
+        ]}]));
+        let (request, _) = normalize(&value, Api::OpenAi, false, &service).unwrap();
+        assert_eq!(
+            request.messages,
+            vec![json!({"role":"system","content":"Be brief."})]
+        );
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn openai_message_shape_errors_are_actionable() {
+        let (service, mut observed) = gateway_test_service();
+        for (message, expected) in [
+            (
+                json!({"role":"function","content":"hello"}),
+                "system, developer, user, assistant, or tool",
+            ),
+            (json!({"role":17,"content":"hello"}), "Message role"),
+            (json!({"content":"hello"}), "Message role"),
+            (
+                json!({"role":"user","content":{"text":"hello"}}),
+                "a string or a content-part array",
+            ),
+            (
+                json!({"role":"user","tool_call_id":17,"content":"hello"}),
+                "tool_call_id must be a string",
+            ),
+        ] {
+            let value = openai_request(json!([message]));
+            let error = request_error(service.clone(), value, Api::OpenAi).await;
+            assert_eq!(
+                (error.status, error.code.as_str()),
+                (400, "invalid_request"),
+                "{}",
+                error.message
+            );
+            assert!(error.message.contains(expected), "{}", error.message);
+            assert!(matches!(
+                observed.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+        assert!(service.available.load(Ordering::Acquire));
+        assert_eq!(service.metrics.failed.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

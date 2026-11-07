@@ -349,9 +349,14 @@ A client-supplied `max_tokens` of zero is invalid, and a value above the deploym
 Counting tokens ignores the output limit.
 A deployment with an output limit of zero still reports readiness and counts tokens, but requests on the two text-generation routes receive HTTP 400 `invalid_request`.
 
+OpenAI messages accept the `system`, `developer`, `user`, `assistant`, and `tool` roles.
+A `developer` message is normalized to a `system` message, because both carry the same instructions.
+Message content must be a string or an array of content parts.
 OpenAI messages may send content as an array of text parts in any role.
 The gateway joins those text parts into the serial text form without changing tool identity.
 An image part receives HTTP 400 `unsupported_feature` on this text profile.
+A message with an unsupported role, a missing role, or a content value that is neither a string nor an array receives HTTP 400 `invalid_request` with an actionable message.
+The same roles and shapes apply to the vision profile, where user content arrays keep their text and image order.
 
 Anthropic messages support text, `tool_use`, and `tool_result` blocks.
 Tool results must precede text within their user message.
