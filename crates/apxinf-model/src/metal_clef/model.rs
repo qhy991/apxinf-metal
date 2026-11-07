@@ -256,7 +256,8 @@ struct NeuronMlp {
 impl NeuronMlp {
     fn new(c: &GpuKernels, cache: &apxinf_coreml::ProgramCache, mlp: &Mlp) -> Result<Self> {
         let dense = super::ane::DenseMlp::new(mlp)?;
-        let split = dense.split();
+        let (int8, fp16) = super::ane::neuron_counts()?;
+        let split = dense.split(int8, fp16)?;
         let ane = super::ane::AneMlp::load_package(cache, &dense.program(&split)?)?;
         drop(dense);
         let stream = mlp.gate.weight.stream();
