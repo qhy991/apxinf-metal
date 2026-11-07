@@ -311,6 +311,9 @@ The process exposes its listener only after model loading and identity checks.
 The default context limit is 16384 tokens.
 The default output limit is 2048 tokens.
 Startup rejects a configuration whose output limit exceeds its context limit, because a request reserves its output budget inside that context.
+It also rejects a configuration whose context cannot fit the default output budget and one input token, because a request that omits `max_tokens` reserves that budget inside the context.
+The default output budget is 512 tokens or the output limit, whichever is smaller.
+A deployment with a zero output limit is exempt because it never emits tokens.
 The default request timeout is 300 seconds, including queue time.
 
 ## HTTP interface
@@ -380,7 +383,10 @@ It does not claim complete JSON Schema enforcement or constrained decoding.
 The gateway rejects `strict: true` on OpenAI function tools.
 An OpenAI tool declaration uses `type: function` with a non-empty function name and optional object parameters.
 An OpenAI assistant tool call uses `type: function` with a non-empty id, a non-empty function name, and an object `arguments` value or a JSON string that encodes an object.
-A tool declaration, a tool call, and its function accept only the documented fields, and an extra field receives HTTP 400 `invalid_request`.
+Numbers inside such a JSON string must remain within the safe-integer range.
+An OpenAI tool declaration accepts only `type` and `function`, and its function accepts only `name`, `description`, `parameters`, and `strict`.
+An OpenAI assistant tool call accepts only `id`, `type`, and `function`, and its function accepts only `name` and `arguments`.
+An extra field at any of those levels receives HTTP 400 `invalid_request`.
 A malformed tool declaration or tool history receives HTTP 400 `invalid_request` with an actionable message before admission.
 The service never executes a tool.
 The client applies its own tool permissions and executes permitted calls.

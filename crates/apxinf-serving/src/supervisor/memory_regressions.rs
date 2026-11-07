@@ -205,6 +205,47 @@ fn output_limit_above_the_context_limit_fails_before_startup() {
 }
 
 #[test]
+fn context_limit_must_fit_the_default_output_budget() {
+    let mut config = configuration(4096, 1024);
+    assert!(config.validate_memory().is_ok());
+    // An omitted max_tokens reserves the default budget, so the context must
+    // also fit that budget plus one input token.
+    config.max_context = 16;
+    config.max_output = 16;
+    assert_eq!(
+        config.validate_memory().unwrap_err(),
+        "The context limit must fit the default output budget and one input token."
+    );
+    config.max_context = 17;
+    assert!(config.validate_memory().is_ok());
+    // A count-only deployment keeps its zero output limit.
+    config.max_context = 1;
+    config.max_output = 0;
+    assert!(config.validate_memory().is_ok());
+}
+
+#[tokio::test]
+async fn unserviceable_context_limit_fails_before_the_worker_can_start() {
+    for with_shutdown in [false, true] {
+        let mut config = configuration(4096, 1024);
+        config.max_context = 128;
+        config.max_output = 128;
+        let result = if with_shutdown {
+            start_with_shutdown(config, std::future::pending())
+                .await
+                .map(|_| ())
+        } else {
+            start(config).await.map(|_| ())
+        };
+        let error = result.expect_err("An unserviceable context limit must fail before startup.");
+        assert_eq!(
+            error, "The context limit must fit the default output budget and one input token.",
+            "shutdown={with_shutdown}"
+        );
+    }
+}
+
+#[test]
 fn clef_execution_limits_preserve_the_supported_boundaries() {
     let mut config = configuration(4096, 1024);
     config.runtime = WorkerRuntime::PythonClef {

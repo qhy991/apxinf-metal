@@ -26,6 +26,7 @@ The manifest declares `adapter_revision=apxinf-native-minicpm5-v1`.
 Its execution object declares `provider=metal_minicpm5`, `precision=bf16`, and `variant=bf16-compiled`.
 It declares `parser=minicpm5_xml` and `enable_thinking=false`.
 Its `memory_limit_bytes`, `max_context`, and `max_output_tokens` match the launch configuration.
+The launcher also requires the context bound to fit the default output budget and one input token.
 
 ## Capabilities and preparation
 

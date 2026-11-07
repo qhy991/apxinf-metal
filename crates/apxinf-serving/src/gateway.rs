@@ -36,7 +36,7 @@ enum Api {
 }
 
 /// Output tokens used when a request omits an explicit limit.
-const DEFAULT_MAX_TOKENS: u64 = 512;
+pub(crate) const DEFAULT_MAX_TOKENS: u64 = 512;
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {

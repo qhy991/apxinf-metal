@@ -117,6 +117,7 @@ No release event follows uncertain cleanup. Process exit remains the recovery bo
 | `enable_thinking`, `kv_reuse` | `false`, `false` |
 | `max_context` | Integer from 1 through 16384. |
 | `max_output_tokens` | Integer from 0 through 8192. |
+| Startup bound | The context bound must also fit the default output budget and one input token. |
 | `prefill_step_size`, `output_batch_tokens` | `256`, `1` |
 | `memory_limit_bytes` | Positive safe integer. |
 | `selection` | The fixed selection identity below. |
