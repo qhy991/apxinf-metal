@@ -47,11 +47,15 @@ This HTTP profile does not expose sessions, images, embeddings, batch execution,
 
 ## Diagnostic output
 
-Add `--diagnostics-file PATH` to mirror the same records into a file, for example:
+Add `--diagnostics-file PATH` to the start command to mirror the same records into a file.
+For example, the local text deployment below becomes:
 
 ```sh
-apxinf-serve \
+target/release/apxinf-serve \
   --model /absolute/path/to/local/model \
+  --model-id apxinf-local \
+  --python .apxinf/toolchains/mlx-lm-0.31.3-copies/bin/python \
+  --port 8080 \
   --diagnostics-file /var/tmp/apxinf-diagnostics.jsonl
 ```
 
@@ -64,6 +68,8 @@ A write failure disables the writer and discards its remaining records.
 Thread creation failure prevents worker startup.
 `--diagnostics-file PATH` adds an append-only file destination.
 The process opens the file before it binds or loads a model, and writes the same records to stderr and the file.
+The Unix signal handlers are installed before that open.
+A signal that arrives while a blocking file open is pending is buffered until startup observes it, so only SIGKILL interrupts such an open.
 The process creates the file with owner-only permissions on Unix; an existing file keeps its mode.
 The path must be a regular file: a directory, FIFO, or device path fails before startup.
 A failed file write is counted and does not stop the stderr destination or change the service lifecycle.

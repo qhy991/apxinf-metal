@@ -244,6 +244,15 @@ pub fn initialize_with_file(path: &std::path::Path) -> Result<(), String> {
     let file = options
         .open(path)
         .map_err(|error| format!("Cannot open the diagnostics file: {error}"))?;
+    // Re-check the opened handle so a path replaced after the pre-open check
+    // cannot install a directory or device as the record destination.
+    if !file
+        .metadata()
+        .map_err(|error| format!("Cannot inspect the diagnostics file: {error}"))?
+        .is_file()
+    {
+        return Err("The diagnostics file must be a regular file.".to_owned());
+    }
     let file_errors = Arc::new(AtomicU64::new(0));
     let writer = TeeWriter {
         primary: io::stderr(),
