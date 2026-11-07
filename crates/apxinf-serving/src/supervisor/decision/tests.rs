@@ -113,9 +113,10 @@ async fn start(
             worker(root, "success").await
         }
     }));
-    // A request deadline starts at enqueue. Wait until the Python fixture is
-    // reading stdin before the caller can enqueue, so a deadline measured by a
-    // test covers the scenario instead of interpreter startup.
+    // A request deadline starts at enqueue. Wait until the Python fixture has
+    // finished startup and is about to read stdin before the caller can enqueue,
+    // so a deadline measured by a test covers the scenario instead of
+    // interpreter startup.
     probe.wait_for("started", WORKER_GRACE).await;
     (service, task)
 }
