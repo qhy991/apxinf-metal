@@ -106,9 +106,7 @@ execute a Metal request on CPU.
 
 Metal admission requires a registered `metal_` factory and is resolved before
 device construction or checkpoint loading. It does not fall back to a legacy
-generic model factory; CPU/CUDA registry fallback remains unchanged. Only the
-selected family parses `model_variant`, so adding a Metal family does not edit
-a central variant list. Explicit
+generic model factory; CPU/CUDA registry fallback remains unchanged. Explicit
 `--model-name metal_qwen3` and `--model-name metal_minicpm5` select these
 implementations, as does `--model-name metal_d3_lite` for the d3-lite port (the
 detected `d3` name already resolves to `metal_d3`). The original
@@ -317,6 +315,15 @@ reference's `get_rope_index` positions from the placeholder runs. See the
 [P1a port report](d3-lite-metal.md) plus the reusable
 [`d3_lite_bench`](../crates/apxinf-model/examples/d3_lite_bench.rs) entry
 (`--set image` / `--images SUITE`).
+
+## Native serving preparation lifetime
+
+The opt-in [prepared-code profile](serving/native-prepared-v0.1.md) separates model-owned code from request KV.
+It retains one complete MiniCPM5 preparation key and reports memory after cleanup.
+The existing native profiles retain release-all settlement.
+This lifetime policy does not add a model arithmetic variant.
+Only the worker owner sets process-wide allocator cache limits.
+The ordinary public forward output contract remains unchanged.
 
 ## Native dependency and ABI
 

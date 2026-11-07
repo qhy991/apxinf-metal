@@ -3,9 +3,11 @@ use apxinf_core::{Error, Result};
 use serde::Deserialize;
 
 pub const CONTEXT_CAPACITY: usize = 65792;
+pub const PREFILL_CHUNK_TOKENS: usize = 256;
 pub const DSPARK_CONTEXT_CAPACITY: usize = 4096;
 #[derive(Clone, Copy)]
 pub(super) enum PrefillChunk {
+    Tokens256 = 256,
     Tokens512 = 512,
     Tokens1024 = 1024,
     Tokens2048 = 2048,
@@ -16,6 +18,7 @@ impl PrefillChunk {
         match std::env::var("APXINF_MINICPM5_PREFILL_CHUNK") {
             Err(std::env::VarError::NotPresent) => Ok(None),
             Ok(value) => match value.as_str() {
+                "256" => Ok(Some(Self::Tokens256)),
                 "512" => Ok(Some(Self::Tokens512)),
                 "1024" => Ok(Some(Self::Tokens1024)),
                 "2048" => Ok(Some(Self::Tokens2048)),

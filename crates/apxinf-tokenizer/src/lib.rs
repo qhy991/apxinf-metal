@@ -537,9 +537,18 @@ impl Tokenizer {
         self.render_chat_template(messages, options, true)
     }
 
-    fn render_chat_template(
+    /// Render checked structured messages without flattening tool arguments.
+    pub fn apply_rich_chat_template(
         &self,
-        messages: &[ChatMessage],
+        messages: &[serde_json::Value],
+        options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<String> {
+        self.render_chat_template(messages, options, true)
+    }
+
+    fn render_chat_template<M: serde::Serialize>(
+        &self,
+        messages: &[M],
         options: &serde_json::Map<String, serde_json::Value>,
         hf_whitespace: bool,
     ) -> Result<String> {

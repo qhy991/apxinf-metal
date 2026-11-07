@@ -102,19 +102,6 @@ releases old state handles before evaluation so native buffer reuse is possible.
 The qualification runs enforce a 12 GiB physical process limit, leaving room
 for macOS and the other jobs; the context limit is not a reservation of that RAM.
 
-Long generation prepares the 512-token chunks and final row. It does not prepare
-a full prompt-sized `forward` above 2048 rows; that call fails explicitly.
-This avoids allocating a large `[prompt,vocabulary]` result during generation.
-
-On a 16 GiB host, the BF16 KV budget is
-`2 * 28 layers * 8 KV heads * 128 channels * 2 bytes = 112 KiB/token`.
-At 40960 tokens the live cache is 4.375 GiB, both RoPE tables total 20 MiB,
-and one shared immutable reset buffer is 80 MiB. These are tensor sizes,
-excluding weights, allocator cache and temporary arrays. Request execution
-releases old state handles before evaluation so native buffer reuse is possible.
-The qualification runs enforce a 12 GiB physical process limit, leaving room
-for macOS and the other jobs; the context limit is not a reservation of that RAM.
-
 Load through `AutoModel` with `model_name=metal_qwen3` (or checkpoint detection),
 `Device::Metal(0)`, BF16, and the desired `model_variant`. The native CLI uses:
 

@@ -6,7 +6,7 @@ use super::{
     weights::Weights,
 };
 use crate::{
-    LlmInput, LlmTrait, TextCompilationScope, TextPreparationState, TextPreparationStatus,
+    GenerationBoundary, LlmInput, LlmTrait, TextCompilationScope, TextPreparationState, TextPreparationStatus,
 };
 use apxinf_core::{Backend, Device, Error, Result, Tensor};
 use apxinf_loader::ModelConfig;
@@ -17,6 +17,28 @@ use std::{collections::HashMap, rc::Rc};
 struct LocalMath {
     norm: Compiled,
     rope: Compiled,
+}
+
+impl LocalMath {
+    fn new(variant: Variant, epsilon: &Array, rms_norm_eps: f32) -> Result<Option<Self>> {
+        if variant == Variant::Public {
+            return Ok(None);
+        }
+        let stream = epsilon.stream();
+        let eps = epsilon.clone();
+        let native_norm = variant == Variant::Compiled;
+        Ok(Some(Self {
+            norm: Compiled::with_shapeless(stream, 1, true, move |a| {
+                let normalized = if native_norm {
+                    a[0].fast_rms_norm(&a[1], rms_norm_eps)?
+                } else {
+                    math::norm(&a[0], &a[1], &eps)?
+                };
+                Ok(vec![normalized])
+            })?,
+            rope: Compiled::new(stream, 1, |a| Ok(vec![math::rotate(&a[0], &a[1], &a[2])?]))?,
+        }))
+    }
 }
 
 enum RequiredOutput {
@@ -119,6 +141,7 @@ pub struct MiniCpm5 {
     step: Option<Compiled>,
     attention_policy: DecodeAttentionPolicy,
     prepared: Option<PreparedRequest>,
+    retained_preparation: bool,
     states: Vec<Array>,
     capacity: usize,
     pub(crate) offset: usize,
@@ -142,24 +165,7 @@ impl MiniCpm5 {
         let stream = backend.stream();
         let epsilon = Array::scalar(stream, config.rms_norm_eps, MlxDType::F32)?;
         let (cos, sin) = math::tables(stream, 256)?;
-        let local = if variant == Variant::Public {
-            None
-        } else {
-            let eps = epsilon.clone();
-            let native_norm = variant == Variant::Compiled;
-            let rms_norm_eps = config.rms_norm_eps;
-            Some(LocalMath {
-                norm: Compiled::with_shapeless(stream, 1, true, move |a| {
-                    let normalized = if native_norm {
-                        a[0].fast_rms_norm(&a[1], rms_norm_eps)?
-                    } else {
-                        math::norm(&a[0], &a[1], &eps)?
-                    };
-                    Ok(vec![normalized])
-                })?,
-                rope: Compiled::new(stream, 1, |a| Ok(vec![math::rotate(&a[0], &a[1], &a[2])?]))?,
-            })
-        };
+        let local = LocalMath::new(variant, &epsilon, config.rms_norm_eps)?;
         let swiglu =
             Compiled::with_shapeless(stream, 1, true, |a| Ok(vec![math::swiglu(&a[0], &a[1])?]))?;
         let attention_policy = DecodeAttentionPolicy::from_override(
@@ -179,6 +185,7 @@ impl MiniCpm5 {
             step: None,
             attention_policy,
             prepared: None,
+            retained_preparation: false,
             states: Vec::new(),
             capacity: 0,
             offset: 0,
@@ -208,47 +215,39 @@ impl MiniCpm5 {
     fn prepare_inner(&mut self, prompt: usize, output: usize) -> Result<()> {
         let capacity = self.config.request_capacity(self.variant, prompt, output)?;
         let attention = self.attention_policy.resolve(self.variant);
-        if self.capacity == capacity
-            && self
-                .prepared
-                .as_ref()
-                .is_some_and(|p| p.prefill.prompt == prompt && p.output == output)
-            && self.failure.is_none()
-            && !self.states.is_empty()
-        {
-            return Ok(());
-        }
-        if self.offset != 0 {
-            return Err(Error::Contract(
-                "reset before changing MiniCPM request preparation",
-            ));
-        }
-        let reuse_bucket = attention == DecodeAttention::Bucketed
-            && self.capacity == capacity
-            && !self.states.is_empty()
-            && self
-                .prepared
-                .as_ref()
-                .is_some_and(|p| p.attention == DecodeAttention::Bucketed);
-        if !reuse_bucket {
+        let same_profile = self.capacity == capacity
+            && self.prepared.as_ref().is_some_and(|p| p.prefill.prompt == prompt && p.output == output && p.attention == attention)
+            && self.failure.is_none();
+        if same_profile && !self.states.is_empty() { return Ok(()); }
+        if self.offset != 0 { return Err(Error::Contract("reset before changing MiniCPM request preparation")); }
+        let reuse_bucket = attention == DecodeAttention::Bucketed && self.capacity == capacity
+            && !self.states.is_empty() && self.prepared.as_ref().is_some_and(|p| p.attention == DecodeAttention::Bucketed);
+        if self.retained_preparation && !same_profile {
+            self.release_request_state()?;
+        } else if !same_profile && !reuse_bucket {
             self.step = None;
             self.prepared = None;
         }
         if self.capacity != capacity || self.states.is_empty() {
             self.states.clear();
-            self.step = None;
-            self.prepared = None;
-            self.capacity = 0;
+            if !same_profile {
+                self.step = None;
+                self.prepared = None;
+                self.capacity = 0;
+            }
             let stream = self.backend.stream();
-            let (cos, sin) = math::tables(stream, capacity)?;
-            self.cos = cos;
-            self.sin = sin;
+            if self.capacity != capacity {
+                let (cos, sin) = math::tables(stream, capacity)?;
+                self.cos = cos;
+                self.sin = sin;
+            }
             let zero = Array::zeros(stream, &[1, 2, capacity, 128], MlxDType::BF16)?;
             let states = vec![zero; 84];
             stream.eval(&states)?;
             self.states = states;
             self.capacity = capacity;
         }
+        if same_profile { return Ok(()); }
         if self.step.is_none() && self.variant != Variant::Public {
             self.step = Some(self.compile_step(attention)?);
         }
@@ -845,6 +844,34 @@ impl LlmTrait for MiniCpm5 {
             .err()
             .map(|e| e.to_string());
     }
+    fn release_request_state_retaining_preparation(&mut self) -> Result<()> {
+        if self.variant != Variant::Compiled {
+            return Err(Error::Contract("prepared-code retention requires ordinary compiled MiniCPM5"));
+        }
+        if self.failure.is_some() { return self.release_request_state(); }
+        self.backend.stream().synchronize()?;
+        self.states.clear();
+        self.last_taps = None;
+        self.offset = 0;
+        self.retained_preparation = true;
+        Ok(())
+    }
+    fn release_request_state(&mut self) -> Result<()> {
+        self.backend.stream().synchronize()?;
+        self.states.clear();
+        self.step = None;
+        self.prepared = None;
+        self.retained_preparation = false;
+        self.last_taps = None;
+        self.local = None;
+        let stream = self.backend.stream();
+        self.swiglu = Compiled::with_shapeless(stream, 1, true, |a| Ok(vec![math::swiglu(&a[0], &a[1])?]))?;
+        self.local = LocalMath::new(self.variant, &self.epsilon, self.config.rms_norm_eps)?;
+        self.capacity = 0;
+        self.offset = 0;
+        self.failure = None;
+        stream.synchronize()
+    }
     fn prewarm_decode(&mut self, prompt: usize, output: usize) {
         if let Err(e) = self.prepare(prompt, output) {
             self.failure = Some(e.to_string());
@@ -854,33 +881,38 @@ impl LlmTrait for MiniCpm5 {
         self.config.vocab_size
     }
     fn prefill(&mut self, input: LlmInput<'_>) -> Result<Tensor> {
+        self.prefill_controlled(input, &mut |_| Ok(true))?
+            .ok_or(Error::Contract("uncontrolled MiniCPM prefill stopped"))
+    }
+    fn prefill_controlled(
+        &mut self,
+        input: LlmInput<'_>,
+        boundary: &mut dyn FnMut(GenerationBoundary) -> Result<bool>,
+    ) -> Result<Option<Tensor>> {
         if input.image.is_some() {
             return Err(Error::Contract("MiniCPM5 is text-only"));
         }
         if self.offset != 0
             || self.prepared.as_ref().map(|p| p.prefill.prompt) != Some(input.token_ids.len())
             || input.token_ids.is_empty()
-            || input
-                .token_ids
-                .iter()
-                .any(|&id| id as usize >= self.config.vocab_size)
+            || input.token_ids.iter().any(|&id| id as usize >= self.config.vocab_size)
         {
-            return Err(Error::Contract(
-                "MiniCPM prefill requires the complete prepared prompt and valid token IDs",
-            ));
+            return Err(Error::Contract("MiniCPM prefill requires its prepared prompt and valid tokens"));
         }
+        if !boundary(GenerationBoundary::PrefillStart)? { return Ok(None); }
         let plan = self.prepared.as_ref().unwrap().prefill;
         let mut logits = None;
         for range in plan.chunks() {
-            let required = if self.variant == Variant::Compiled && range.end < plan.prompt {
+            let end = range.end;
+            let required = if self.variant == Variant::Compiled && end < plan.prompt {
                 RequiredOutput::CacheOnly
-            } else {
-                RequiredOutput::Logits { last_only: true }
-            };
+            } else { RequiredOutput::Logits { last_only: true } };
             logits = self.execute_tokens(&input.token_ids[range], self.offset, required)?;
+            if !boundary(GenerationBoundary::PrefillProgress { consumed_tokens: end })? {
+                return Ok(None);
+            }
         }
-        let logits = logits.expect("the final prefill chunk requires logits");
-        self.backend
-            .from_array(logits.reshape(&[1, self.vocab_size()])?)
+        let logits = logits.expect("final chunk produces logits");
+        self.backend.from_array(logits.reshape(&[1, self.vocab_size()])?).map(Some)
     }
 }

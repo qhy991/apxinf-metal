@@ -25,6 +25,7 @@ sha2 = { version = "0.10", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Decodes recorded Core ML packages in the Clef GPU+ANE device test.
 prost = "0.14"
+apxinf-tokenizer = { path = "../apxinf-tokenizer" }
 
 # The d3-lite os_signpost shim (native/d3_signpost_shim.c), compiled only
 # when the `mlx` feature is on for Apple Silicon.
@@ -115,4 +116,9 @@ required-features = ["mlx"]
 
 [[example]]
 name = "d3_lite_bench"
+
+required-features = ["mlx"]
+
+[[example]]
+name = "metal_text_probe"
 required-features = ["mlx"]
