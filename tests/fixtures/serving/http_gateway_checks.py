@@ -202,12 +202,14 @@ class Gateway:
 class GatewayChecks:
     """Assertions shared by every case that drives a gateway."""
 
-    def assert_error(self, response, status, code):
+    def assert_error(self, response, status, code, error_type=None):
         actual, headers, content = response
         self.assertEqual(actual, status, content)
         self.assertIn("application/json", headers["content-type"])
         self.assertEqual(content["type"], "error")
         self.assertEqual(content["error"]["code"], code)
+        if error_type is not None:
+            self.assertEqual(content["error"]["type"], error_type, code)
 
     def assert_reaped(self, gateway):
         gateway.close()
@@ -347,19 +349,34 @@ class HttpGatewayTests(GatewayChecks, unittest.TestCase):
         # The public status comes from the documented error-code table, not from
         # a generic backend-failure default.
         cases = (
-            ("unavailable", 503, "model_unavailable"),
-            ("capacity", 503, "capacity_unavailable"),
-            ("prefix-mismatch", 409, "prefix_mismatch"),
-            ("session-missing", 404, "session_not_found"),
-            ("fail", 500, "internal_error"),
+            ("unavailable", 503, "model_unavailable", "overloaded_error"),
+            ("capacity", 503, "capacity_unavailable", "overloaded_error"),
+            ("prefix-mismatch", 409, "prefix_mismatch", "api_error"),
+            ("session-missing", 404, "session_not_found", "not_found_error"),
+            ("fail", 500, "internal_error", "api_error"),
         )
-        for scenario, status, code in cases:
+        for scenario, status, code, error_type in cases:
             with self.subTest(scenario=scenario):
                 for path in ("/v1/messages", "/v1/chat/completions"):
-                    self.assert_error(self.gateway.request(path, body(scenario)), status, code)
+                    response = self.gateway.request(path, body(scenario))
+                    self.assert_error(response, status, code, error_type)
         # A worker-declared request failure does not fence a healthy worker.
         self.assertEqual(self.gateway.request("/readyz")[0], 200)
         self.assertEqual(self.gateway.request("/v1/messages", body())[0], 200)
+        self.gateway.idle()
+
+    def test_worker_declared_failure_stream_error_type_follows_the_status(self):
+        # A stream error event reports the same status-derived error type as the
+        # non-streamed body, and it never reports a successful finish.
+        for path in ("/v1/messages", "/v1/chat/completions"):
+            _, events = self.stream_all(path, body("unavailable", stream=True))
+            errors = [value for name, value in events if name == "error"]
+            self.assertEqual(len(errors), 1, path)
+            self.assertEqual(errors[0]["error"]["code"], "model_unavailable", path)
+            self.assertEqual(errors[0]["error"]["type"], "overloaded_error", path)
+            self.assertFalse(any(name == "message_stop" for name, _ in events), path)
+            self.assertNotIn(("message", "[DONE]"), events, path)
+        self.assertEqual(self.gateway.request("/readyz")[0], 200)
         self.gateway.idle()
 
     def test_disconnects_reclaim_waiting_queue_and_active_reservation(self):
@@ -369,7 +386,8 @@ class HttpGatewayTests(GatewayChecks, unittest.TestCase):
         until(lambda: next(events)[0] == "content_block_delta", "first active output")
         queued = gateway.send("/v1/messages", body())
         until(lambda: gateway.metrics()["apxinf_queued_requests"] == 1, "queued request")
-        self.assert_error(gateway.request("/v1/messages", body()), 429, "queue_full")
+        self.assert_error(gateway.request("/v1/messages", body()), 429, "queue_full",
+                         "rate_limit_error")
         queued.close()
         until(lambda: gateway.metrics()["apxinf_queued_requests"] == 0, "queued disconnect")
         self.assertEqual(len([item for item in gateway.trace() if item["event"] == "prepared"]), 1)
@@ -447,7 +465,7 @@ class OutputBudgetTests(GatewayChecks, unittest.TestCase):
             request = body("text")
             request["max_tokens"] = 0
             response = gateway.request(path, request)
-            self.assert_error(response, 400, "invalid_request")
+            self.assert_error(response, 400, "invalid_request", "invalid_request_error")
             self.assertIn("at least 1", response[2]["error"]["message"], path)
         self.assertFalse(any(item["event"] == "accepted" for item in gateway.trace()))
         self.assertEqual(gateway.metrics()['apxinf_requests_total{status="failed"}'], 0)
@@ -502,11 +520,16 @@ if __name__ == "__main__":
                         help="Skip these case names or classes.")
     parser.add_argument("--expect-cases", type=int,
                         help="Fail unless exactly this many cases are selected.")
+    parser.add_argument("--expect-total", type=int,
+                        help="Fail unless the module defines exactly this many cases.")
     args = parser.parse_args()
     BINARY = str(Path(args.binary).resolve(strict=True))
-    cases = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    cases = list(flatten(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])))
+    # A new case that no target selects would otherwise never run in cargo test.
+    if args.expect_total is not None and len(cases) != args.expect_total:
+        raise AssertionError(f"Expected {args.expect_total} cases in the module, got {len(cases)}.")
     selected = unittest.TestSuite(
-        test for test in flatten(cases)
+        test for test in cases
         if (not args.select or matches(test, args.select)) and not matches(test, args.exclude))
     count = selected.countTestCases()
     if args.select and not count:

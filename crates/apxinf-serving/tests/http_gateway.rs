@@ -9,5 +9,12 @@ mod python_fixture;
 
 #[test]
 fn real_gateway_with_cpu_worker() {
-    python_fixture::run(&["--exclude", "OutputBudgetTests", "--expect-cases", "13"]);
+    python_fixture::run(&[
+        "--exclude",
+        "OutputBudgetTests",
+        "--expect-cases",
+        "14",
+        "--expect-total",
+        "16",
+    ]);
 }

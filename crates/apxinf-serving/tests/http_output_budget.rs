@@ -16,6 +16,8 @@ fn omitted_limit_is_admitted_with_the_deployment_budget() {
         "OutputBudgetTests.test_omitted_limit_is_admitted_with_the_deployment_budget",
         "--expect-cases",
         "1",
+        "--expect-total",
+        "16",
     ]);
 }
 
@@ -26,5 +28,7 @@ fn exhausted_output_budget_rejects_generation_but_counts_tokens() {
         "OutputBudgetTests.test_exhausted_output_budget_rejects_generation_but_counts_tokens",
         "--expect-cases",
         "1",
+        "--expect-total",
+        "16",
     ]);
 }

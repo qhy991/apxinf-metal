@@ -9,7 +9,8 @@ Startup checks the fixture manifest against local files and the actual interpret
 The runner owns fixture layout, gateway lifecycle, process groups, and diagnostics.
 Its `--select` and `--exclude` options map cases onto the Rust test targets;
 `http_output_budget.rs` selects the output-budget cases and `http_gateway.rs` runs the rest.
-Each target also passes `--expect-cases`, so a renamed case fails the selection instead of silently moving cases between targets.
+Each target passes `--expect-cases`, so a renamed selected case fails instead of silently matching nothing.
+Every target passes `--expect-total`, so a case added without a target fails instead of never running under `cargo test`.
 
 These checks use the existing [local HTTP profile](../../../doc/serving/local-service-v0.1.md)
 and [serial worker profile](../../../doc/serving/serial-profile-v0.1.md).
@@ -32,6 +33,7 @@ They do not establish real inference, model quality, performance, or Claude Code
 | Recoverable failure | Preparation errors and failed attempts retain readiness after resource settlement. |
 | Protocol failure | Token counting preserves `protocol_fault`. Streaming emits one error without a success terminal. |
 | Worker-declared failure | A failed worker terminal keeps the documented HTTP status for its error code on both generation APIs and leaves the worker ready. |
+| Error envelope | `error.type` derives from the contract status (`invalid_request_error`, `not_found_error`, `rate_limit_error`, `overloaded_error`, `api_error`), and a stream error reports it without a success terminal. |
 | Queue and disconnect | Overflow returns 429. Waiting and active disconnects release queue capacity and reservations. |
 | Deadline | Expiry emits an error, records one expired outcome, and releases resources after worker settlement. |
 | Worker exit | Readiness returns 503. Health remains available. New generation requests fail. |
