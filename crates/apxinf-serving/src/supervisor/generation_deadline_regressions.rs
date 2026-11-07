@@ -22,15 +22,29 @@ impl GenerationProbe {
 }
 
 impl GenerationProbe {
+    fn trace_path(&self) -> &PathBuf {
+        &self.0
+    }
+
+    fn release_path(&self) -> PathBuf {
+        PathBuf::from(format!("{}.release", self.0.display()))
+    }
+
     fn release(&self) {
-        std::fs::write(format!("{}.release", self.0.display()), b"release").unwrap();
+        std::fs::write(self.release_path(), b"release").unwrap();
+    }
+
+    /// Remove the trace and release files. The worker recreates the trace on
+    /// every command, so callers must clean up after process reaping.
+    fn cleanup(&self) {
+        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(self.release_path());
     }
 }
 
 impl Drop for GenerationProbe {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-        let _ = std::fs::remove_file(format!("{}.release", self.0.display()));
+        self.cleanup();
     }
 }
 
@@ -185,7 +199,7 @@ where
     let probe = Arc::new(GenerationProbe::new());
     let (service, task) = service_for(&probe, mode).await;
     // A red assertion must still close admission and wait for the owned process.
-    let result = std::panic::AssertUnwindSafe(check(service.clone(), probe))
+    let result = std::panic::AssertUnwindSafe(check(service.clone(), probe.clone()))
         .catch_unwind()
         .await;
     service.shutdown();
@@ -198,6 +212,19 @@ where
         .await
         .expect("The CPU coordinator must stop.")
         .unwrap();
+    // The worker opens the trace for every command, so the files are removed
+    // only after reaping; otherwise the shutdown command recreates them.
+    probe.cleanup();
+    assert!(
+        !probe.trace_path().exists(),
+        "The probe trace file must be removed: {}",
+        probe.trace_path().display()
+    );
+    assert!(
+        !probe.release_path().exists(),
+        "The probe release marker must be removed: {}",
+        probe.release_path().display()
+    );
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
