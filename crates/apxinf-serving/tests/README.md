@@ -31,12 +31,24 @@ They do not establish real inference, model quality, performance, or Claude Code
 | Worker exit | Readiness returns 503. Health remains available. New generation requests fail. |
 | CLI shutdown | The binary exits successfully and reaps its worker process. |
 
+## Output budget checks
+
+`http_output_budget.rs` starts the same real binary and CPU worker fixture.
+It covers the public output-budget contract on the HTTP boundary:
+
+| Boundary | Required observation |
+| --- | --- |
+| Omitted limit | The deployment budget reaches the worker and bounds generation, so a small deployment stays usable. |
+| Explicit zero | HTTP 400 `invalid_request` before queue admission on both generation APIs. |
+| Exhausted deployment | Readiness and token counting stay available; generation receives HTTP 400 `invalid_request`. |
+
 ## Run the checks
 
 Run this command from the repository root:
 
 ```sh
 cargo test --locked -p apxinf-serving --test http_gateway -- --nocapture
+cargo test --locked -p apxinf-serving --test http_output_budget -- --nocapture
 ```
 
 Python 3 must be available as `python3`.
