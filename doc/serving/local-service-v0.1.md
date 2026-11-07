@@ -308,7 +308,9 @@ target/release/apxinf-serve \
 
 The process requires a loopback address.
 The process binds its listener before model loading.
-While the worker loads, `/healthz` answers that the process is alive, `/readyz` returns HTTP 503 with `"phase":"loading"`, and the other routes return HTTP 503 `model_unavailable`.
+While the worker loads, `/healthz` answers that the process is alive, `/readyz` returns HTTP 503 with `"phase":"loading"`, and the six other declared routes, including `/metrics`, return HTTP 503 `model_unavailable`.
+Unknown paths and unsupported methods keep the framework responses (HTTP 404 and 405), because loading only gates the declared routes.
+A Prometheus scrape that starts before the worker is ready therefore fails with 503 and succeeds after readiness.
 After loading and identity checks the same listener serves the declared routes.
 The default context limit is 16384 tokens.
 The default output limit is 2048 tokens.
