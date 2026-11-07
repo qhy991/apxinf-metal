@@ -113,6 +113,10 @@ async fn start(
             worker(root, "success").await
         }
     }));
+    // A request deadline starts at enqueue. Wait until the Python fixture is
+    // reading stdin before the caller can enqueue, so a deadline measured by a
+    // test covers the scenario instead of interpreter startup.
+    probe.wait_for("started", WORKER_GRACE).await;
     (service, task)
 }
 fn request() -> crate::decision::DecisionRequest {
@@ -569,11 +573,9 @@ async fn decision_deadline_and_cancel_kill_before_capacity_release() {
         ("result_hold", true, uncontended),
     ] {
         let probe = Probe::new();
+        // `start` waits for fixture readiness before it returns, so the request
+        // below starts the 300ms deadline against a reading fixture.
         let (service, task) = start(&probe, mode, timeout, Duration::ZERO).await;
-        // The fixture is a Python process. Wait until it is reading stdin before
-        // the request starts the 300ms preparation deadline, so that deadline
-        // measures the held preparation instead of interpreter startup.
-        probe.wait_for("started", WORKER_GRACE).await;
         let mut ticket = service.enqueue_decision(request()).unwrap();
         if mode == "prepare_hold" {
             // The worker holds inside preparation; only the deadline can settle
