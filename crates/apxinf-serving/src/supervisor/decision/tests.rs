@@ -1,16 +1,20 @@
+use super::super::probe_paths::ProbeDir;
 use super::*;
 use crate::decision::parse_decision_request;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-struct Probe(PathBuf);
+/// One CPU decision probe run. All fixture files live in a per-run directory
+/// under the shared probe root, so a clean run removes everything it created.
+struct Probe(ProbeDir);
 impl Probe {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("apxinf-clef-cpu-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        Self(root)
+        Self(ProbeDir::new())
+    }
+    fn root(&self) -> &std::path::Path {
+        self.0.path()
     }
     fn events(&self) -> Vec<Value> {
-        std::fs::read_to_string(self.0.join("trace.jsonl"))
+        std::fs::read_to_string(self.root().join("trace.jsonl"))
             .unwrap_or_default()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
@@ -29,12 +33,7 @@ impl Probe {
         .unwrap();
     }
     fn release(&self) {
-        std::fs::write(self.0.join("release"), b"release").unwrap();
-    }
-}
-impl Drop for Probe {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        std::fs::write(self.root().join("release"), b"release").unwrap();
     }
 }
 
@@ -82,10 +81,10 @@ async fn start(
     timeout: Duration,
     replacement_delay: Duration,
 ) -> (Arc<Service>, tokio::task::JoinHandle<StopResult>) {
-    let (initial_worker, ready) = worker(probe.0.clone(), mode).await.unwrap();
+    let (initial_worker, ready) = worker(probe.root().to_path_buf(), mode).await.unwrap();
     let service = super::super::lifecycle_regressions::cpu_service(ready, timeout, 4);
     start_queue_sweeper(&service);
-    let root = probe.0.clone();
+    let root = probe.root().to_path_buf();
     let task = tokio::spawn(coordinate(initial_worker, service.clone(), 64, move || {
         let root = root.clone();
         async move {
@@ -131,7 +130,7 @@ async fn stopped_attempt(
     probe: &Probe,
     mode: &str,
 ) -> (Worker, Arc<Service>, DecisionTracker, Value, Vec<Value>) {
-    let (mut worker, ready) = worker(probe.0.clone(), mode).await.unwrap();
+    let (mut worker, ready) = worker(probe.root().to_path_buf(), mode).await.unwrap();
     let service =
         super::super::lifecycle_regressions::cpu_service(ready, Duration::from_secs(10), 4);
     let mut prepare = worker.command("prepare_decision");

@@ -1,50 +1,46 @@
 //! CPU protocol probes for public deadlines after submission finishes.
+use super::probe_paths::ProbeDir;
 use super::*;
 use futures_util::FutureExt;
 
-struct GenerationProbe(PathBuf);
+/// One CPU probe run. The trace and release marker live in a per-run
+/// directory, so a clean run removes the whole directory and an interrupted
+/// run leaves one recognisable directory instead of scattered files.
+struct GenerationProbe {
+    dir: ProbeDir,
+}
 
 impl GenerationProbe {
     fn new() -> Self {
-        Self(std::env::temp_dir().join(format!(
-            "apxinf-generation-deadline-{}.jsonl",
-            uuid::Uuid::new_v4()
-        )))
+        Self {
+            dir: ProbeDir::new(),
+        }
     }
 
     fn commands(&self) -> Vec<String> {
-        std::fs::read_to_string(&self.0)
+        std::fs::read_to_string(self.trace_path())
             .unwrap_or_default()
             .lines()
             .map(str::to_owned)
             .collect()
     }
-}
 
-impl GenerationProbe {
-    fn trace_path(&self) -> &PathBuf {
-        &self.0
+    fn trace_path(&self) -> PathBuf {
+        self.dir.file("trace.jsonl")
     }
 
     fn release_path(&self) -> PathBuf {
-        PathBuf::from(format!("{}.release", self.0.display()))
+        self.dir.file("release")
     }
 
     fn release(&self) {
         std::fs::write(self.release_path(), b"release").unwrap();
     }
 
-    /// Remove the trace and release files. The worker recreates the trace on
-    /// every command, so callers must clean up after process reaping.
+    /// Remove the run directory. The worker opens the trace for every command,
+    /// so callers must clean up after process reaping.
     fn cleanup(&self) {
-        let _ = std::fs::remove_file(&self.0);
-        let _ = std::fs::remove_file(self.release_path());
-    }
-}
-
-impl Drop for GenerationProbe {
-    fn drop(&mut self) {
-        self.cleanup();
+        self.dir.cleanup();
     }
 }
 
@@ -55,8 +51,7 @@ async fn service_for(
     // Model execution is absent. Real pipes carry the complete checked protocol.
     let script = r#"
 import hashlib, json, os, queue, struct, sys, threading, time
-mode, trace_path = sys.argv[1:]
-release_path = trace_path + ".release"
+mode, trace_path, release_path = sys.argv[1:]
 generation = 0
 def hold():
     until = time.monotonic() + 30
@@ -123,7 +118,8 @@ while True:
     let epoch = uuid::Uuid::new_v4().to_string();
     let mut child = Command::new("python3")
         .args(["-u", "-c", script, mode])
-        .arg(&probe.0)
+        .arg(probe.trace_path())
+        .arg(probe.release_path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -212,18 +208,13 @@ where
         .await
         .expect("The CPU coordinator must stop.")
         .unwrap();
-    // The worker opens the trace for every command, so the files are removed
-    // only after reaping; otherwise the shutdown command recreates them.
+    // The worker opens the trace for every command, so the run directory is
+    // removed only after reaping; otherwise the shutdown command recreates it.
     probe.cleanup();
     assert!(
-        !probe.trace_path().exists(),
-        "The probe trace file must be removed: {}",
-        probe.trace_path().display()
-    );
-    assert!(
-        !probe.release_path().exists(),
-        "The probe release marker must be removed: {}",
-        probe.release_path().display()
+        !probe.dir.path().exists(),
+        "The probe run directory must be removed: {}",
+        probe.dir.path().display()
     );
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
