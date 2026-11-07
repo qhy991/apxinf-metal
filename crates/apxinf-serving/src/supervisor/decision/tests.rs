@@ -3,6 +3,15 @@ use super::*;
 use crate::decision::parse_decision_request;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Grace for a stage the fixture writes right after it reads the command.
+const STAGE_GRACE: Duration = Duration::from_secs(10);
+/// Worker startup, identity handshake, and process reaping run a Python
+/// fixture, so these lifecycle waits tolerate a loaded host instead of relying
+/// on a wall-clock guess.
+const WORKER_GRACE: Duration = Duration::from_secs(30);
+/// A service-state transition only needs the coordinator to settle.
+const SETTLE_GRACE: Duration = Duration::from_secs(15);
+
 /// One CPU decision probe run. All fixture files live in a per-run directory
 /// under the shared probe root, so a clean run removes everything it created.
 struct Probe(ProbeDir);
@@ -21,7 +30,15 @@ impl Probe {
             .collect()
     }
     async fn event(&self, name: &str) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // Wait for the fixture process first: interpreter startup and imports
+        // are the load-sensitive part. The requested stage follows a command
+        // the fixture already read, so it needs a much smaller grace.
+        self.wait_for("started", WORKER_GRACE).await;
+        self.wait_for(name, STAGE_GRACE).await;
+    }
+
+    async fn wait_for(&self, name: &str, grace: Duration) {
+        let observed = tokio::time::timeout(grace, async {
             loop {
                 if self.events().iter().any(|event| event["event"] == name) {
                     return;
@@ -29,8 +46,12 @@ impl Probe {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
-        .await
-        .unwrap();
+        .await;
+        assert!(
+            observed.is_ok(),
+            "The decision probe did not reach the {name} stage within {grace:?}. Events: {:?}",
+            self.events()
+        );
     }
     fn release(&self) {
         std::fs::write(self.root().join("release"), b"release").unwrap();
@@ -99,11 +120,12 @@ fn request() -> crate::decision::DecisionRequest {
 }
 async fn stop(service: &Service, task: tokio::task::JoinHandle<StopResult>, probe: &Probe) {
     service.shutdown();
-    tokio::time::timeout(Duration::from_secs(5), task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let stopped = tokio::time::timeout(WORKER_GRACE, task).await;
+    assert!(
+        stopped.is_ok(),
+        "The decision coordinator did not stop and reap within {WORKER_GRACE:?}."
+    );
+    stopped.unwrap().unwrap().unwrap();
     // Reaping is confirmed, so the worker can no longer recreate the fixture
     // files: remove the run directory and require the whole directory to be
     // gone instead of relying only on Drop.
@@ -115,13 +137,16 @@ async fn stop(service: &Service, task: tokio::task::JoinHandle<StopResult>, prob
     );
 }
 async fn available(service: &Service) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let ready = tokio::time::timeout(WORKER_GRACE, async {
         while !service.available.load(Ordering::Acquire) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    assert!(
+        ready.is_ok(),
+        "The decision worker did not become available within {WORKER_GRACE:?}."
+    );
 }
 
 fn decision_metric(service: &Service, name: &str) -> f64 {
@@ -545,6 +570,10 @@ async fn decision_deadline_and_cancel_kill_before_capacity_release() {
     ] {
         let probe = Probe::new();
         let (service, task) = start(&probe, mode, timeout, Duration::ZERO).await;
+        // The fixture is a Python process. Wait until it is reading stdin before
+        // the request starts the 300ms preparation deadline, so that deadline
+        // measures the held preparation instead of interpreter startup.
+        probe.wait_for("started", WORKER_GRACE).await;
         let mut ticket = service.enqueue_decision(request()).unwrap();
         if mode == "prepare_hold" {
             // The worker holds inside preparation; only the deadline can settle
@@ -602,13 +631,16 @@ async fn decision_queue_expires_during_replacement_loading() {
     // Synchronize on the retired worker's replacement loading before expiring
     // the queued request, instead of waiting for a timer and hoping the
     // replacement load still lasts.
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let retired = tokio::time::timeout(SETTLE_GRACE, async {
         while service.available.load(Ordering::Acquire) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    assert!(
+        retired.is_ok(),
+        "The retiring decision worker stayed available for {SETTLE_GRACE:?}."
+    );
     // Force the queue deadline instead of waiting for the sweeper. The elapsed
     // threshold itself is covered by the pending-queue unit tests.
     service.queue.sweep(&service.metrics, Duration::ZERO);
@@ -667,13 +699,16 @@ async fn decision_disconnect_and_service_shutdown_reap_owned_processes() {
             task.await.unwrap().unwrap();
         } else {
             ticket.output.close();
-            tokio::time::timeout(Duration::from_secs(3), async {
+            let cancelled = tokio::time::timeout(SETTLE_GRACE, async {
                 while service.metrics.cancelled.load(Ordering::Relaxed) == 0 {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
-            .await
-            .unwrap();
+            .await;
+            assert!(
+                cancelled.is_ok(),
+                "The cancelled decision attempt did not settle within {SETTLE_GRACE:?}."
+            );
             available(&service).await;
             stop(&service, task, &probe).await;
         }
