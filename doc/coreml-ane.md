@@ -164,7 +164,7 @@ The family must define a placement ledger for every admitted fixed profile:
 | --- | --- |
 | GPU share and remainder of the model | MLX GPU computation, including the merge of the two MLP shares. No new CPU layer mathematics. |
 | Core ML share | The declared fixed-profile column or neuron share above in each of 32 layers. All runtime tensor arithmetic, including projections, activation, reductions and arithmetic quantization operations inside the program, requires ANE placement evidence. |
-| Host boundary | Only the declared tile copies, stride-aware packing/unpacking and per-row symmetric int8 quantization with FP16 scales and round-half-even. Record exact formulas, extents and frequency. The fork operator accepted this limited scope on 2026-10-19, not arbitrary CPU operators. |
+| Host boundary | Only the declared tile copies, stride-aware packing/unpacking and per-row symmetric int8 quantization with FP16 scales and round-half-even. Record exact formulas, extents and frequency. The requesting Metal maintainer accepted this limited scope on 2026-10-19, not arbitrary CPU operators. |
 | Preparation and orchestration | CPU weight conversion, constant materialization before readiness, static metadata, validation, scheduling and error handling are permitted. They do not authorize moving runtime layer mathematics to the CPU. |
 
 The ledger must map source operations to the compute-plan structure, including
@@ -190,8 +190,15 @@ preference. A missing plan, unknown usage, unavailable API or unacceptable
 CPU assignment leaves the path unqualified. `MLComputePlan` is available
 from macOS 14.4; the program format may require a newer deployment target.
 
+The fixed-profile Clef loader now checks the generated source against owned
+plan facts. Static classification requires typed source values, valid weight
+blob extents and exact operation/input/output correspondence. Missing values,
+unexplained rewrites or non-ANE runtime preference fail preparation. Source
+independence does not prove opaque compiled numeric equality or materialization
+timing; the artifact and execution evidence below is still required.
+
 A compute plan describes anticipated placement, not an execution certificate.
-On 2026-10-19 the fork operator accepted the following combined,
+On 2026-10-19 the requesting Metal maintainer accepted the following combined,
 finite evidence for the fixed Clef compositions, instead of requiring a
 per-source-operation execution span:
 
@@ -222,8 +229,9 @@ unqualified with the blocking reason. An explicit GPU+ANE request must fail, not
 silently select CPU-only Core ML or the GPU-only composition, which remains a separate
 selection. Recheck the plan during preparation and invalidate qualification
 when any bound identity, profile or configuration changes, or when contrary
-placement evidence appears. These are proposed acceptance rules, not an
-implemented status API or a claim that loading enforces placement.
+placement evidence appears. These rules do not introduce a generic status API.
+Loading rejects unacceptable anticipated plans but does not enforce physical
+placement for every prediction.
 
 ## Scoped host-handoff decision
 
@@ -233,7 +241,7 @@ The [MLX prepared execution contract](mlx-backend.md#prepared-compiled-execution
 also requires device-resident handoff. The GPU+ANE composition's native Core ML programs and host
 tile exchange do not satisfy those rules as written.
 
-The fork operator accepted only the fixed-profile
+The requesting Metal maintainer accepted only the fixed-profile
 `metal_clef` GPU+ANE compositions described here on 2026-10-19, in the
 EngineTailor-to-APXinf review session. The accepted boundary permits the
 native Core ML stage and the bounded host work in the placement
@@ -301,7 +309,7 @@ bit-equal to the GPU and can differ between ANE generations.
 
 ## Questions for maintainers
 
-- The fork operator accepted the narrowly scoped host-handoff
+- The requesting Metal maintainer accepted the narrowly scoped host-handoff
   boundary above. Upstream review must still assess the evidence and design;
   no unenforceable ANE-only promise is made.
 - Is the crate name `apxinf-coreml` and the feature name `coreml` acceptable?
