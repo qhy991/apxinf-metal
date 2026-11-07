@@ -356,7 +356,7 @@ The selected provider fixes its own context and output limits, and startup rejec
 
 The context bounds above are provider bounds.
 A nonzero output limit additionally requires the context to fit the default output budget plus one input token (see above).
-With the default 2048-token output limit that minimum is 513 positions; with a smaller nonzero output limit it is that limit plus one.
+The exact minimum is `min(512, --max-output-tokens) + 1`: with the default 2048-token output limit that is 513 positions, and only an output limit below 512 lowers it (for example, an output limit of 64 requires at least 65 positions).
 Only a zero output limit permits a context limit of 1.
 
 The generic Python provider cannot check the loaded model capacity before the worker starts, so the operator owns that bound.
