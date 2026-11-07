@@ -347,7 +347,7 @@ The gateway rejects requests that set both fields.
 A request that omits both fields uses 512 output tokens or the deployment output limit, whichever is smaller.
 A client-supplied `max_tokens` of zero is invalid, and a value above the deployment output limit receives HTTP 400 `invalid_request`.
 Counting tokens ignores the output limit.
-A deployment with an output limit of zero still reports readiness and counts tokens, but every generation request receives HTTP 400 `invalid_request`.
+A deployment with an output limit of zero still reports readiness and counts tokens, but requests on the two text-generation routes receive HTTP 400 `invalid_request`.
 
 Anthropic messages support text, `tool_use`, and `tool_result` blocks.
 Tool results must precede text within their user message.
