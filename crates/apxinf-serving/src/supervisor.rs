@@ -257,10 +257,11 @@ impl Config {
         // A request that omits `max_tokens` reserves the default output budget,
         // so the context must also fit that budget plus one input token.
         let default_output = crate::gateway::DEFAULT_MAX_TOKENS.min(self.max_output as u64);
-        if default_output + 1 > self.max_context as u64 {
-            return Err(
-                "The context limit must fit the default output budget and one input token.".into(),
-            );
+        let minimum_context = default_output + 1;
+        if minimum_context > self.max_context as u64 {
+            return Err(format!(
+                "The context limit must fit the default output budget and one input token; it must be at least {minimum_context} positions."
+            ));
         }
         Ok(())
     }

@@ -214,7 +214,7 @@ fn context_limit_must_fit_the_default_output_budget() {
     config.max_output = 16;
     assert_eq!(
         config.validate_memory().unwrap_err(),
-        "The context limit must fit the default output budget and one input token."
+        "The context limit must fit the default output budget and one input token; it must be at least 17 positions."
     );
     config.max_context = 17;
     assert!(config.validate_memory().is_ok());
@@ -239,7 +239,8 @@ async fn unserviceable_context_limit_fails_before_the_worker_can_start() {
         };
         let error = result.expect_err("An unserviceable context limit must fail before startup.");
         assert_eq!(
-            error, "The context limit must fit the default output budget and one input token.",
+            error,
+            "The context limit must fit the default output budget and one input token; it must be at least 129 positions.",
             "shutdown={with_shutdown}"
         );
     }

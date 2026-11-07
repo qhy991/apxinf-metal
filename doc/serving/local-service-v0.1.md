@@ -312,6 +312,7 @@ The default context limit is 16384 tokens.
 The default output limit is 2048 tokens.
 Startup rejects a configuration whose output limit exceeds its context limit, because a request reserves its output budget inside that context.
 It also rejects a configuration whose context cannot fit the default output budget and one input token, because a request that omits `max_tokens` reserves that budget inside the context.
+The startup error names the smallest context limit that satisfies this rule.
 The default output budget is 512 tokens or the output limit, whichever is smaller.
 A deployment with a zero output limit is exempt because it never emits tokens.
 The default request timeout is 300 seconds, including queue time.
