@@ -35,6 +35,9 @@ enum Api {
     OpenAi,
 }
 
+/// Output tokens used when a request omits an explicit limit.
+const DEFAULT_MAX_TOKENS: u64 = 512;
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -400,23 +403,35 @@ fn normalize(
     let max_value = value
         .get("max_tokens")
         .or_else(|| value.get("max_completion_tokens"));
+    let output_limit = service.ready["capabilities"]["max_output_tokens"]
+        .as_u64()
+        .unwrap_or(0);
     let max_tokens = if count_only {
         0
-    } else {
-        max_value
-            .map_or(Some(512), Value::as_u64)
-            .ok_or_else(|| ApiError::invalid("max_tokens must be a non-negative integer."))?
-            as usize
-    };
-    if max_tokens as u64
-        > service.ready["capabilities"]["max_output_tokens"]
+    } else if let Some(value) = max_value {
+        let tokens = value
             .as_u64()
-            .unwrap_or(0)
-    {
-        return Err(ApiError::invalid(
-            "max_tokens exceeds the deployment output limit.",
-        ));
-    }
+            .ok_or_else(|| ApiError::invalid("max_tokens must be a non-negative integer."))?;
+        if tokens == 0 {
+            return Err(ApiError::invalid("max_tokens must be at least 1."));
+        }
+        if tokens > output_limit {
+            return Err(ApiError::invalid(
+                "max_tokens exceeds the deployment output limit.",
+            ));
+        }
+        tokens as usize
+    } else {
+        // The default must never exceed what this deployment can emit, so an
+        // omitted limit stays usable on a deployment with a small output budget.
+        let tokens = DEFAULT_MAX_TOKENS.min(output_limit);
+        if tokens == 0 {
+            return Err(ApiError::invalid(
+                "This deployment allows no output tokens.",
+            ));
+        }
+        tokens as usize
+    };
     let stops = value.get(if api == Api::Anthropic {
         "stop_sequences"
     } else {
@@ -881,7 +896,7 @@ impl Stream for PublicStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervisor::gateway_test_service;
+    use crate::supervisor::{gateway_test_service, gateway_test_service_with_max_output};
 
     #[tokio::test]
     async fn prepared_readiness_advertises_the_selected_native_tool_parser() {
@@ -1163,6 +1178,68 @@ mod tests {
             observed.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn omitted_output_limit_stays_within_the_deployment_budget() {
+        let (service, _) = gateway_test_service();
+        let value = json!({"model":"test-model","messages":[{"role":"user","content":"hello"}]});
+        let (request, _) = normalize(&value, Api::OpenAi, false, &service).unwrap();
+        assert_eq!(request.max_tokens, 512);
+
+        let (small, _) = gateway_test_service_with_max_output(64);
+        let (request, _) = normalize(&value, Api::OpenAi, false, &small).unwrap();
+        assert_eq!(request.max_tokens, 64);
+        let explicit = json!({"model":"test-model","max_tokens":8,"messages":[{"role":"user","content":"hello"}]});
+        let (request, _) = normalize(&explicit, Api::OpenAi, false, &small).unwrap();
+        assert_eq!(request.max_tokens, 8);
+
+        // Counting tokens never reserves output capacity and ignores the limit.
+        let (request, _) = normalize(&value, Api::Anthropic, true, &small).unwrap();
+        assert_eq!(request.max_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn output_limits_reject_zero_and_an_exhausted_deployment() {
+        let (service, mut observed) = gateway_test_service();
+        for api in [Api::OpenAi, Api::Anthropic] {
+            let value = json!({"model":"test-model","max_tokens":0,"messages":[{"role":"user","content":"hello"}]});
+            let error = request_error(service.clone(), value, api).await;
+            assert_eq!((error.status, error.code.as_str()), (400, "invalid_request"));
+            assert!(
+                error.message.contains("at least 1"),
+                "{}",
+                error.message
+            );
+        }
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let (small, mut observed) = gateway_test_service_with_max_output(64);
+        let over = json!({"model":"test-model","max_tokens":65,"messages":[{"role":"user","content":"hello"}]});
+        let error = request_error(small.clone(), over, Api::OpenAi).await;
+        assert_eq!((error.status, error.code.as_str()), (400, "invalid_request"));
+        assert_eq!(error.message, "max_tokens exceeds the deployment output limit.");
+
+        let (exhausted, mut observed_exhausted) = gateway_test_service_with_max_output(0);
+        let omitted = json!({"model":"test-model","messages":[{"role":"user","content":"hello"}]});
+        let error = request_error(exhausted.clone(), omitted.clone(), Api::OpenAi).await;
+        assert_eq!((error.status, error.code.as_str()), (400, "invalid_request"));
+        // Counting tokens still works without an output budget.
+        let (request, _) = normalize(&omitted, Api::Anthropic, true, &exhausted).unwrap();
+        assert_eq!(request.max_tokens, 0);
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            observed_exhausted.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(small.metrics.failed.load(Ordering::Relaxed), 0);
+        assert_eq!(exhausted.metrics.failed.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

@@ -2589,8 +2589,31 @@ fn gateway_test_service_config(
     pressure: Arc<HostPressure>,
     protocol: &str,
 ) -> (Arc<Service>, mpsc::UnboundedReceiver<Request>) {
+    gateway_test_service_capabilities(
+        pressure,
+        protocol,
+        json!({"max_context":4096,"max_output_tokens":1024}),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn gateway_test_service_with_max_output(
+    max_output: u64,
+) -> (Arc<Service>, mpsc::UnboundedReceiver<Request>) {
+    gateway_test_service_capabilities(
+        Arc::new(HostPressure::new(HostPressurePolicy::Disabled)),
+        PROTOCOL,
+        json!({"max_context":4096,"max_output_tokens":max_output}),
+    )
+}
+
+#[cfg(test)]
+fn gateway_test_service_capabilities(
+    pressure: Arc<HostPressure>,
+    protocol: &str,
+    mut capabilities: Value,
+) -> (Arc<Service>, mpsc::UnboundedReceiver<Request>) {
     let (observed, requests) = mpsc::unbounded_channel();
-    let mut capabilities = json!({"max_context":4096,"max_output_tokens":1024});
     if protocol == contracts::VISION_PROTOCOL {
         capabilities["media_limits"] = json!({"max_images":4,"max_image_bytes":131072,"max_total_bytes":262144,"max_dimension":1024,"max_host_array_bytes":67108864});
     }
