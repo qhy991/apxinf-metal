@@ -55,21 +55,12 @@ fn public_error_type(status: u16) -> &'static str {
     }
 }
 
+/// Serve the declared routes with an already loaded service.
+///
+/// The load gate owns the only route table, so the library and CLI surfaces
+/// cannot declare different routes.
 pub fn router(service: Arc<Service>) -> Router {
-    Router::new()
-        .route(
-            "/healthz",
-            get(|| async { Json(json!({"status":"alive"})) }),
-        )
-        .route("/readyz", get(ready))
-        .route("/v1/models", get(models))
-        .route("/v1/messages", post(messages))
-        .route("/v1/messages/count_tokens", post(count_tokens))
-        .route("/v1/chat/completions", post(chat))
-        .route("/v1/systemone", post(decision::systemone))
-        .route("/metrics", get(metrics))
-        .layer(DefaultBodyLimit::max(1_000_000))
-        .with_state(service)
+    router_with_gate(Gate::published(service))
 }
 /// The HTTP surface before model loading publishes a ready service.
 pub struct Gate {
@@ -81,6 +72,13 @@ impl Gate {
         Arc::new(Self {
             service: std::sync::RwLock::new(None),
         })
+    }
+
+    /// A gate that already publishes a loaded service.
+    pub fn published(service: Arc<Service>) -> Arc<Self> {
+        let gate = Self::new();
+        gate.publish(service);
+        gate
     }
 
     /// Publish the loaded service. Requests before this point see the loading
@@ -1886,6 +1884,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["ready"], true);
+    }
+
+    #[tokio::test]
+    async fn published_gate_serves_every_declared_route() {
+        let (service, _) = gateway_test_service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = router(service);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        // Every declared route must answer through the published gate. A route
+        // that only one router declares would answer 404 from the other.
+        for (method, path, payload) in [
+            ("GET", "/healthz", ""),
+            ("GET", "/readyz", ""),
+            ("GET", "/v1/models", ""),
+            ("GET", "/metrics", ""),
+            ("POST", "/v1/messages", "{"),
+            ("POST", "/v1/messages/count_tokens", "{"),
+            ("POST", "/v1/chat/completions", "{"),
+            ("POST", "/v1/systemone", "{"),
+        ] {
+            let (status, response) = route_request(address, method, path, payload).await;
+            assert_ne!(status, 404, "{method} {path} is not declared: {response}");
+            assert_ne!(
+                status, 405,
+                "{method} {path} has no method binding: {response}"
+            );
+        }
+        // Framework responses stay outside the declared set.
+        let (status, response) = route_request(address, "GET", "/not-a-route", "").await;
+        assert_eq!(status, 404, "{response}");
+        let (status, response) = route_request(address, "GET", "/v1/messages", "").await;
+        assert_eq!(status, 405, "{response}");
+        server.abort();
+    }
+
+    async fn route_request(
+        address: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        payload: &str,
+    ) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response).into_owned();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        (status, text)
     }
 
     #[tokio::test]

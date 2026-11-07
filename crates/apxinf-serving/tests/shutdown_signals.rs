@@ -209,6 +209,7 @@ fn loading_listener_reports_the_loading_phase() {
         ("POST", "/v1/messages", Some(body)),
         ("POST", "/v1/messages/count_tokens", Some(body)),
         ("POST", "/v1/chat/completions", Some(body)),
+        ("POST", "/v1/systemone", Some(body)),
         ("GET", "/metrics", None),
     ] {
         let response = http_request(&address, method, path, payload);
@@ -221,6 +222,11 @@ fn loading_listener_reports_the_loading_phase() {
             "{method} {path}: {response}"
         );
     }
+    // The declared-route set does not change the framework responses.
+    let response = http_request(&address, "GET", "/not-a-route", None);
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    let response = http_request(&address, "GET", "/v1/messages", None);
+    assert!(response.starts_with("HTTP/1.1 405"), "{response}");
     cli.signal("-TERM");
     assert!(
         cli.wait().success(),
