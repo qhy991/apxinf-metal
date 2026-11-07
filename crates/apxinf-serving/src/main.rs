@@ -62,6 +62,9 @@ struct Args {
     allocator_cache_limit_bytes: Option<u64>,
     #[arg(long, value_enum, default_value = "macos")]
     host_pressure_policy: HostPressurePolicy,
+    /// Append the diagnostic records to this file in addition to stderr.
+    #[arg(long)]
+    diagnostics_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -90,7 +93,16 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    diagnostics::initialize()?;
+    match &args.diagnostics_file {
+        Some(path) => diagnostics::initialize_with_file(path)?,
+        None => diagnostics::initialize()?,
+    }
+    if let Some(path) = &args.diagnostics_file {
+        diagnostics::emit(format_args!(
+            "ApxInf diagnostics file at {}",
+            path.display()
+        ));
+    }
     let shutdown = Box::pin(termination_signal()?);
     if !args.host.is_loopback() {
         return Err("This local profile requires a loopback address.".into());

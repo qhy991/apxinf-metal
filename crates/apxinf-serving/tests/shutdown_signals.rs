@@ -15,40 +15,73 @@ use signal_fixture::Fixture;
 struct Cli {
     child: Child,
     fixture: Fixture,
+    diagnostics_file: Option<std::path::PathBuf>,
+}
+
+fn cli_command(fixture: &Fixture, extra: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_apxinf-serve"));
+    command
+        .arg("--python")
+        .arg(&fixture.config.python)
+        .arg("--worker")
+        .arg(&fixture.config.worker)
+        .arg("--model")
+        .arg(&fixture.config.model)
+        .args([
+            "--host-pressure-policy",
+            "disabled",
+            "--port",
+            "0",
+            "--max-context",
+            "64",
+            "--max-output-tokens",
+            "16",
+            "--memory-budget-bytes",
+            "4096",
+            "--sequence-reservation-bytes",
+            "1024",
+            "--timeout-seconds",
+            "5",
+        ])
+        .args(extra);
+    command
 }
 
 impl Cli {
     fn start(mode: &str) -> Self {
+        Self::start_extra(mode, &[])
+    }
+
+    fn start_extra(mode: &str, extra: &[&str]) -> Self {
         let fixture = Fixture::new(mode);
         let log = fs::File::create(fixture.root.join("cli.log")).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_apxinf-serve"))
-            .arg("--python")
-            .arg(&fixture.config.python)
-            .arg("--worker")
-            .arg(&fixture.config.worker)
-            .arg("--model")
-            .arg(&fixture.config.model)
-            .args([
-                "--host-pressure-policy",
-                "disabled",
-                "--port",
-                "0",
-                "--max-context",
-                "64",
-                "--max-output-tokens",
-                "16",
-                "--memory-budget-bytes",
-                "4096",
-                "--sequence-reservation-bytes",
-                "1024",
-                "--timeout-seconds",
-                "5",
-            ])
+        let child = cli_command(&fixture, extra)
             .stdout(Stdio::null())
             .stderr(log)
             .spawn()
             .unwrap();
-        Self { child, fixture }
+        Self {
+            child,
+            fixture,
+            diagnostics_file: None,
+        }
+    }
+
+    fn start_with_diagnostics(mode: &str) -> Self {
+        let fixture = Fixture::new(mode);
+        let path = fixture.root.join("diagnostics.jsonl");
+        let file = path.to_str().unwrap().to_owned();
+        let log = fs::File::create(fixture.root.join("cli.log")).unwrap();
+        let child = cli_command(&fixture, &["--diagnostics-file", &file])
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        Self {
+            child,
+            fixture,
+            diagnostics_file: Some(path),
+        }
     }
 
     fn until(&mut self, mut ready: impl FnMut(&Fixture) -> bool) {
@@ -296,6 +329,58 @@ fn sigterm_after_ready_stops_and_reaps_the_worker() {
         cli.log()
     );
     cli.fixture.assert_reaped();
+}
+
+#[test]
+fn diagnostics_file_records_the_startup_evidence() {
+    let mut cli = Cli::start_with_diagnostics("ready");
+    let address = cli.address();
+    let response = http_request(&address, "GET", "/healthz", None);
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    cli.signal("-TERM");
+    assert!(cli.wait().success(), "{}", cli.log());
+    let path = cli
+        .diagnostics_file
+        .clone()
+        .expect("The file destination is configured.");
+    let contents = fs::read_to_string(&path).unwrap();
+    assert!(
+        contents.contains("ApxInf diagnostics file at"),
+        "{contents}"
+    );
+    assert_eq!(
+        contents.matches("ApxInf listener bound at http://").count(),
+        1,
+        "{contents}"
+    );
+    assert_eq!(
+        cli.log()
+            .matches("ApxInf listener bound at http://")
+            .count(),
+        1,
+        "stderr keeps the same records: {}",
+        cli.log()
+    );
+}
+
+#[test]
+fn unopenable_diagnostics_file_fails_before_startup() {
+    let fixture = Fixture::new("ready");
+    let path = fixture.root.join("missing-directory/diagnostics.jsonl");
+    let output = cli_command(&fixture, &["--diagnostics-file", path.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert!(!output.status.success());
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(log.contains("Cannot open the diagnostics file:"), "{log}");
+    assert!(
+        !log.contains("listener bound"),
+        "Startup must fail before binding: {log}"
+    );
 }
 
 #[test]

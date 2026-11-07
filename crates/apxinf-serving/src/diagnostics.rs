@@ -74,10 +74,44 @@ impl Drop for WriterState {
 struct Diagnostics {
     sender: Option<SyncSender<Record>>,
     counters: Arc<Counters>,
+    file_errors: Option<Arc<AtomicU64>>,
+}
+
+/// Write to the primary destination and mirror the record to a file.
+///
+/// A failing file write never stops the primary writer: it is counted instead,
+/// so an optional file destination cannot change the service lifecycle.
+struct TeeWriter<A: Write, B: Write> {
+    primary: A,
+    secondary: B,
+    file_errors: Arc<AtomicU64>,
+}
+
+impl<A: Write, B: Write> Write for TeeWriter<A, B> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.primary.write(bytes)?;
+        if self.secondary.write_all(bytes).is_err() {
+            self.file_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let _ = self.secondary.flush();
+        self.primary.flush()
+    }
 }
 
 impl Diagnostics {
     fn with_writer<W: Write + Send + 'static>(writer: W, capacity: usize) -> Self {
+        Self::with_extras(writer, capacity, None)
+    }
+
+    fn with_extras<W: Write + Send + 'static>(
+        writer: W,
+        capacity: usize,
+        file_errors: Option<Arc<AtomicU64>>,
+    ) -> Self {
         let (sender, receiver) = mpsc::sync_channel::<Record>(capacity);
         let counters = Arc::new(Counters::default());
         counters.available.store(true, Ordering::Release);
@@ -102,6 +136,7 @@ impl Diagnostics {
         Self {
             sender: started.ok().map(|_| sender),
             counters,
+            file_errors,
         }
     }
 
@@ -161,6 +196,13 @@ impl Diagnostics {
             "apxinf_diagnostic_writer_available {}",
             u8::from(c.available.load(Ordering::Acquire))
         );
+        if let Some(file_errors) = &self.file_errors {
+            let _ = writeln!(
+                output,
+                "apxinf_diagnostic_file_errors_total {}",
+                get(file_errors)
+            );
+        }
     }
 }
 
@@ -175,6 +217,28 @@ pub fn initialize() -> Result<(), &'static str> {
     } else {
         Err("Cannot start the diagnostic writer thread.")
     }
+}
+
+/// Create the diagnostic thread with an additional append-only file destination.
+///
+/// The file is opened before the worker starts. A later file write failure is
+/// counted and leaves the stderr records and the service lifecycle unchanged.
+pub fn initialize_with_file(path: &std::path::Path) -> Result<(), String> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("Cannot open the diagnostics file: {error}"))?;
+    let file_errors = Arc::new(AtomicU64::new(0));
+    let writer = TeeWriter {
+        primary: io::stderr(),
+        secondary: file,
+        file_errors: file_errors.clone(),
+    };
+    let diagnostics = Diagnostics::with_extras(writer, QUEUE_CAPACITY, Some(file_errors));
+    DIAGNOSTICS
+        .set(diagnostics)
+        .map_err(|_| "Cannot reconfigure the diagnostic writer.".to_owned())
 }
 
 /// Discard the record if its size or queue capacity exceeds the fixed limit.
@@ -336,6 +400,61 @@ mod tests {
         wait_empty(&logger);
         assert_eq!(logger.counters.written.load(Ordering::Relaxed), 3);
         assert_eq!(&*gate.0.bytes.lock().unwrap(), b"first\nsecond\nthird\n");
+    }
+
+    struct RejectingWriter;
+
+    impl Write for RejectingWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("The destination is full."))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failing_file_destination_keeps_the_primary_records() {
+        let gate = Arc::new(Gate {
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+            bytes: Mutex::new(Vec::new()),
+        });
+        let (entered, receiver) = mpsc::channel();
+        let file_errors = Arc::new(AtomicU64::new(0));
+        let logger = Diagnostics::with_extras(
+            TeeWriter {
+                primary: GatedWriter {
+                    gate: gate.clone(),
+                    entered: Some(entered),
+                    fail: false,
+                },
+                secondary: RejectingWriter,
+                file_errors: file_errors.clone(),
+            },
+            2,
+            Some(file_errors.clone()),
+        );
+        logger.emit(format_args!("first"));
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("The primary writer must block.");
+        logger.emit(format_args!("second"));
+        gate.release();
+        wait_empty(&logger);
+        assert_eq!(logger.counters.written.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            &*gate.bytes.lock().unwrap(),
+            b"first\nsecond\n",
+            "The primary destination keeps every record."
+        );
+        assert_eq!(file_errors.load(Ordering::Relaxed), 2);
+        let mut metrics = String::new();
+        logger.append_metrics(&mut metrics);
+        assert!(
+            metrics.contains("apxinf_diagnostic_file_errors_total 2\n"),
+            "{metrics}"
+        );
     }
 
     #[test]

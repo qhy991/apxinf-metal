@@ -54,6 +54,11 @@ Full queues discard new records without waiting.
 Oversized records disappear completely, without partial JSON output.
 A write failure disables the writer and discards its remaining records.
 Thread creation failure prevents worker startup.
+`--diagnostics-file PATH` adds an append-only file destination.
+The process opens the file before it binds or loads a model, and writes the same records to stderr and the file.
+A failed file write is counted and does not stop the stderr destination or change the service lifecycle.
+The file has no rotation or retention policy.
+Two processes should not share one diagnostics file; their records are not locked or interleaved safely.
 
 Worker stderr uses a separate pipe and an asynchronous reader with 512-byte chunks.
 Each chunk becomes a diagnostic record with its worker epoch.
@@ -65,7 +70,7 @@ Unread bytes can disappear during worker recovery or rotation.
 The service never requires diagnostic delivery for a request, recovery, or shutdown result.
 At process exit, the binary allows up to 100 milliseconds for remaining diagnostics.
 It does not join a blocked diagnostic writer.
-This output is unsuitable for a durable audit trail.
+This output, including the optional file destination, is unsuitable for a durable audit trail.
 
 Diagnostic metrics describe the complete process, including worker rotations:
 
@@ -76,6 +81,7 @@ Diagnostic metrics describe the complete process, including worker rotations:
 | `apxinf_diagnostic_write_errors_total` | Failed destination writes. |
 | `apxinf_diagnostic_worker_read_errors_total` | Failed reads from worker stderr. |
 | `apxinf_diagnostic_writer_available` | Whether the writer thread remains available. |
+| `apxinf_diagnostic_file_errors_total` | Failed writes to the optional file destination; present only with `--diagnostics-file`. |
 
 These counters do not measure delivery beyond the destination write.
 A failed write can leave partial bytes at that destination.
