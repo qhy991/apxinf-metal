@@ -90,7 +90,10 @@ struct TeeWriter<A: Write, B: Write> {
 impl<A: Write, B: Write> Write for TeeWriter<A, B> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let written = self.primary.write(bytes)?;
-        if self.secondary.write_all(bytes).is_err() {
+        // Mirror only the accepted prefix. The caller retries the remaining
+        // bytes after a short write, so mirroring the whole slice would
+        // duplicate the tail in the file destination.
+        if self.secondary.write_all(&bytes[..written]).is_err() {
             self.file_errors.fetch_add(1, Ordering::Relaxed);
         }
         Ok(written)
@@ -455,6 +458,62 @@ mod tests {
             metrics.contains("apxinf_diagnostic_file_errors_total 2\n"),
             "{metrics}"
         );
+    }
+
+    struct ShortWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        limit: usize,
+    }
+
+    impl Write for ShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let accepted = bytes.len().min(self.limit);
+            self.bytes
+                .lock()
+                .unwrap()
+                .extend_from_slice(&bytes[..accepted]);
+            Ok(accepted)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_short_primary_write_mirrors_only_the_accepted_bytes() {
+        let primary = Arc::new(Mutex::new(Vec::new()));
+        let file = Arc::new(Mutex::new(Vec::new()));
+        let file_errors = Arc::new(AtomicU64::new(0));
+        let mut tee = TeeWriter {
+            primary: ShortWriter {
+                bytes: primary.clone(),
+                limit: 3,
+            },
+            secondary: RecordingWriter(file.clone()),
+            file_errors: file_errors.clone(),
+        };
+        // The writer thread uses write_all, so a short primary write retries the
+        // remaining bytes.
+        tee.write_all(b"abcdefghij").unwrap();
+        assert_eq!(&*primary.lock().unwrap(), b"abcdefghij");
+        assert_eq!(
+            &*file.lock().unwrap(),
+            b"abcdefghij",
+            "The file destination must not duplicate a short write tail."
+        );
+        assert_eq!(file_errors.load(Ordering::Relaxed), 0);
     }
 
     #[test]
