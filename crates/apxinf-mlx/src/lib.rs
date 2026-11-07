@@ -21,6 +21,8 @@ pub use device_caps::MetalDeviceCaps;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub mod fusions;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod gate_swiglu;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod gated_delta;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod half_split_rope;
