@@ -91,7 +91,7 @@ async fn main() -> ExitCode {
 
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     diagnostics::initialize()?;
-    let mut shutdown = Box::pin(termination_signal()?);
+    let shutdown = Box::pin(termination_signal()?);
     if !args.host.is_loopback() {
         return Err("This local profile requires a loopback address.".into());
     }
@@ -177,47 +177,60 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let (python, worker) = worker_paths(&runtime, args.python, args.worker)?;
-    let service = supervisor::start_with_shutdown(
-        Config {
-            runtime,
-            python,
-            worker,
-            model: std::fs::canonicalize(args.model)?,
-            model_id: args.model_id,
-            max_context: args.max_context,
-            max_output: args.max_output_tokens,
-            prefill_step_size: args.prefill_step_size,
-            output_batch_tokens: args.output_batch_tokens,
-            queue_capacity: args.queue_capacity,
-            timeout: Duration::from_secs(args.timeout_seconds),
-            memory_budget: args.memory_budget_bytes,
-            sequence_reservation: args.sequence_reservation_bytes,
-            host_pressure_policy: args.host_pressure_policy,
-        },
-        shutdown.as_mut(),
-    )
-    .await?;
-    let Some(service) = service else {
-        return Ok(());
+    let config = Config {
+        runtime,
+        python,
+        worker,
+        model: std::fs::canonicalize(args.model)?,
+        model_id: args.model_id,
+        max_context: args.max_context,
+        max_output: args.max_output_tokens,
+        prefill_step_size: args.prefill_step_size,
+        output_batch_tokens: args.output_batch_tokens,
+        queue_capacity: args.queue_capacity,
+        timeout: Duration::from_secs(args.timeout_seconds),
+        memory_budget: args.memory_budget_bytes,
+        sequence_reservation: args.sequence_reservation_bytes,
+        host_pressure_policy: args.host_pressure_policy,
     };
     let shutdown = shutdown.shared();
-    let http_shutdown = shutdown.clone();
-    let serving = async {
-        let listener = tokio::net::TcpListener::bind(SocketAddr::new(args.host, args.port)).await?;
-        diagnostics::emit(format_args!(
-            "ApxInf listener bound at http://{}",
-            listener.local_addr()?
-        ));
-        let shutdown_service = service.clone();
-        axum::serve(listener, gateway::router(service.clone()))
-            .with_graceful_shutdown(async move {
-                http_shutdown.await;
-                shutdown_service.shutdown();
-            })
-            .await?;
-        Ok::<(), Box<dyn std::error::Error>>(())
+    // Bind and serve before loading so a client can observe the loading phase
+    // instead of a refused connection. The gate installs the ready service.
+    let gate = gateway::Gate::new();
+    let listener = tokio::net::TcpListener::bind(SocketAddr::new(args.host, args.port)).await?;
+    diagnostics::emit(format_args!(
+        "ApxInf listener bound at http://{}",
+        listener.local_addr()?
+    ));
+    let serving_gate = gate.clone();
+    let serving_shutdown = shutdown.clone();
+    let mut serving = tokio::spawn(async move {
+        axum::serve(listener, gateway::router_with_gate(serving_gate))
+            .with_graceful_shutdown(serving_shutdown)
+            .await
+            .map_err(|error| error.to_string())
+    });
+    let service = match supervisor::start_with_shutdown(config, shutdown.clone()).await {
+        Ok(Some(service)) => service,
+        Ok(None) => {
+            // Startup stopped through the shutdown signal; the listener drains too.
+            if tokio::time::timeout(HTTP_DRAIN_TIMEOUT, &mut serving)
+                .await
+                .is_err()
+            {
+                diagnostics::emit(format_args!(
+                    "HTTP connections did not drain within 20 seconds after startup cancellation."
+                ));
+            }
+            return Ok(());
+        }
+        Err(error) => {
+            serving.abort();
+            let _ = serving.await;
+            return Err(error.into());
+        }
     };
-    tokio::pin!(serving);
+    gate.publish(service.clone());
     let stopping = async {
         shutdown.await;
         service.shutdown();
@@ -227,13 +240,19 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         result = &mut serving => {
             service.shutdown();
             let stopped = service.wait_stopped().await;
-            result?;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => return Err(message.into()),
+                Err(error) => return Err(format!("The HTTP server stopped: {error}").into()),
+            }
             stopped?;
         }
         stopped = stopping => {
             stopped?;
             match tokio::time::timeout(HTTP_DRAIN_TIMEOUT, &mut serving).await {
-                Ok(result) => result?,
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(message))) => return Err(message.into()),
+                Ok(Err(error)) => return Err(format!("The HTTP server stopped: {error}").into()),
                 Err(_) => diagnostics::emit(format_args!(
                     "HTTP connections did not drain within 20 seconds after worker reaping."
                 )),

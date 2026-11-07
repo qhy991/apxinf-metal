@@ -307,7 +307,9 @@ target/release/apxinf-serve \
 ```
 
 The process requires a loopback address.
-The process exposes its listener only after model loading and identity checks.
+The process binds its listener before model loading.
+While the worker loads, `/healthz` answers that the process is alive, `/readyz` returns HTTP 503 with `"phase":"loading"`, and the other routes return HTTP 503 `model_unavailable`.
+After loading and identity checks the same listener serves the declared routes.
 The default context limit is 16384 tokens.
 The default output limit is 2048 tokens.
 Startup rejects a configuration whose output limit exceeds its context limit, because a request reserves its output budget inside that context.

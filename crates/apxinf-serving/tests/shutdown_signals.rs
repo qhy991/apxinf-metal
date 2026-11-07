@@ -99,7 +99,7 @@ impl Cli {
         }
     }
 
-    fn address(&mut self) -> String {
+    fn bound_address(&mut self) -> String {
         self.until(|fixture| {
             fs::read_to_string(fixture.root.join("cli.log"))
                 .unwrap()
@@ -111,6 +111,53 @@ impl Cli {
             .unwrap()
             .to_owned()
     }
+
+    /// The listener now binds before loading, so wait for readiness before a
+    /// test sends request traffic.
+    fn address(&mut self) -> String {
+        let address = self.bound_address();
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if http_status(&address, "/readyz") == Some(200) {
+                return address;
+            }
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "CLI exited early: {}",
+                self.log()
+            );
+            assert!(
+                Instant::now() < until,
+                "CLI did not become ready: {}",
+                self.log()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+fn http_request(address: &str, method: &str, path: &str, body: Option<&str>) -> String {
+    let payload = body.unwrap_or("");
+    let mut connection = TcpStream::connect(address).unwrap();
+    connection
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(connection,
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+        payload.len()).unwrap();
+    let mut response = String::new();
+    connection.read_to_string(&mut response).unwrap();
+    response
+}
+
+fn http_status(address: &str, path: &str) -> Option<u16> {
+    http_request(address, "GET", path, None)
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 impl Drop for Cli {
@@ -134,7 +181,14 @@ fn sigterm_during_loading_reaps_before_cli_exit() {
 
 fn loading_signal(signal: &str) {
     let mut cli = Cli::start("loading");
+    let address = cli.bound_address();
     cli.until(|fixture| fixture.worker_pid().is_some());
+    // The listener now serves the loading surface before readiness.
+    let response = http_request(&address, "GET", "/healthz", None);
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let response = http_request(&address, "GET", "/readyz", None);
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    assert!(response.contains("\"phase\":\"loading\""), "{response}");
     cli.signal(signal);
     assert!(
         cli.wait().success(),
@@ -142,7 +196,38 @@ fn loading_signal(signal: &str) {
         cli.log()
     );
     cli.fixture.assert_reaped();
-    assert!(!cli.log().contains("listener bound"));
+}
+
+#[test]
+fn loading_listener_reports_the_loading_phase() {
+    let mut cli = Cli::start("loading");
+    let address = cli.bound_address();
+    cli.until(|fixture| fixture.worker_pid().is_some());
+    let body = r#"{"model":"cpu-signals","messages":[{"role":"user","content":"count this"}]}"#;
+    for (method, path, payload) in [
+        ("GET", "/v1/models", None),
+        ("POST", "/v1/messages", Some(body)),
+        ("POST", "/v1/messages/count_tokens", Some(body)),
+        ("POST", "/v1/chat/completions", Some(body)),
+        ("GET", "/metrics", None),
+    ] {
+        let response = http_request(&address, method, path, payload);
+        assert!(
+            response.starts_with("HTTP/1.1 503"),
+            "{method} {path}: {response}"
+        );
+        assert!(
+            response.contains("\"code\":\"model_unavailable\""),
+            "{method} {path}: {response}"
+        );
+    }
+    cli.signal("-TERM");
+    assert!(
+        cli.wait().success(),
+        "Loading shutdown failed: {}",
+        cli.log()
+    );
+    cli.fixture.assert_reaped();
 }
 
 #[test]

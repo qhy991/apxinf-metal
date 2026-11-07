@@ -71,6 +71,130 @@ pub fn router(service: Arc<Service>) -> Router {
         .layer(DefaultBodyLimit::max(1_000_000))
         .with_state(service)
 }
+/// The HTTP surface before model loading publishes a ready service.
+pub struct Gate {
+    service: std::sync::RwLock<Option<Arc<Service>>>,
+}
+
+impl Gate {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            service: std::sync::RwLock::new(None),
+        })
+    }
+
+    /// Publish the loaded service. Requests before this point see the loading
+    /// surface; requests after it use the declared routes.
+    pub fn publish(&self, service: Arc<Service>) {
+        *self
+            .service
+            .write()
+            .expect("The load gate lock is poisoned.") = Some(service);
+    }
+
+    fn service(&self) -> Option<Arc<Service>> {
+        self.service
+            .read()
+            .expect("The load gate lock is poisoned.")
+            .clone()
+    }
+}
+
+fn loading_error() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"type":"error","error":{"type":"overloaded_error","code":"model_unavailable","message":"The model is still loading."}})),
+    )
+        .into_response()
+}
+
+fn loading_readiness() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"ready":false,"phase":"loading"})),
+    )
+        .into_response()
+}
+
+/// Serve the declared routes while the worker is still loading.
+///
+/// Health reports that the process is alive, readiness reports the loading
+/// phase, and every other route answers HTTP 503 `model_unavailable` until
+/// `Gate::publish` installs the ready service.
+pub fn router_with_gate(gate: Arc<Gate>) -> Router {
+    Router::new()
+        .route(
+            "/healthz",
+            get(|| async { Json(json!({"status":"alive"})) }),
+        )
+        .route("/readyz", get(gated_ready))
+        .route("/v1/models", get(gated_models))
+        .route("/v1/messages", post(gated_messages))
+        .route("/v1/messages/count_tokens", post(gated_count_tokens))
+        .route("/v1/chat/completions", post(gated_chat))
+        .route("/v1/systemone", post(gated_systemone))
+        .route("/metrics", get(gated_metrics))
+        .layer(DefaultBodyLimit::max(1_000_000))
+        .with_state(gate)
+}
+
+async fn gated_ready(State(gate): State<Arc<Gate>>) -> Response {
+    match gate.service() {
+        Some(service) => ready(State(service)).await,
+        None => loading_readiness(),
+    }
+}
+
+async fn gated_models(State(gate): State<Arc<Gate>>) -> Response {
+    match gate.service() {
+        Some(service) => models(State(service)).await.into_response(),
+        None => loading_error(),
+    }
+}
+
+async fn gated_messages(
+    State(gate): State<Arc<Gate>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match gate.service() {
+        Some(service) => messages(State(service), headers, body).await,
+        None => loading_error(),
+    }
+}
+
+async fn gated_chat(State(gate): State<Arc<Gate>>, headers: HeaderMap, body: Bytes) -> Response {
+    match gate.service() {
+        Some(service) => chat(State(service), headers, body).await,
+        None => loading_error(),
+    }
+}
+
+async fn gated_count_tokens(
+    State(gate): State<Arc<Gate>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match gate.service() {
+        Some(service) => count_tokens(State(service), headers, body).await,
+        None => loading_error(),
+    }
+}
+
+async fn gated_systemone(State(gate): State<Arc<Gate>>, body: Bytes) -> Response {
+    match gate.service() {
+        Some(service) => decision::systemone(State(service), body).await,
+        None => loading_error(),
+    }
+}
+
+async fn gated_metrics(State(gate): State<Arc<Gate>>) -> Response {
+    match gate.service() {
+        Some(service) => metrics(State(service)).await.into_response(),
+        None => loading_error(),
+    }
+}
+
 async fn ready(State(service): State<Arc<Service>>) -> Response {
     let (admission_allowed, host_pressure) = service.admission_snapshot();
     let worker_available = service.available.load(Ordering::Acquire);
@@ -1716,6 +1840,52 @@ mod tests {
                 Err(mpsc::error::TryRecvError::Empty)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn loading_surface_answers_before_a_service_is_published() {
+        let gate = Gate::new();
+        let response = gated_ready(State(gate.clone())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 10000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["phase"], "loading");
+
+        let body = Bytes::from_static(b"{}");
+        for response in [
+            gated_models(State(gate.clone())).await,
+            gated_metrics(State(gate.clone())).await,
+            gated_messages(State(gate.clone()), HeaderMap::new(), body.clone()).await,
+            gated_chat(State(gate.clone()), HeaderMap::new(), body.clone()).await,
+            gated_count_tokens(State(gate.clone()), HeaderMap::new(), body.clone()).await,
+            gated_systemone(State(gate.clone()), body.clone()).await,
+        ] {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 10000)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["error"]["code"], "model_unavailable");
+        }
+
+        let (service, _) = gateway_test_service();
+        gate.publish(service);
+        let response = gated_ready(State(gate)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 100000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["ready"], true);
     }
 
     #[tokio::test]
