@@ -1886,6 +1886,21 @@ mod tests {
         assert_eq!(body["ready"], true);
     }
 
+    /// Every declared route with the method and payload that reach its handler,
+    /// plus the status a published service returns for it. Both the route-set
+    /// test and the no-CORS test use this table, so a new route must satisfy
+    /// both instead of drifting out of one of them.
+    const DECLARED_ROUTES: [(&str, &str, &str, u16); 8] = [
+        ("GET", "/healthz", "", 200),
+        ("GET", "/readyz", "", 200),
+        ("GET", "/v1/models", "", 200),
+        ("GET", "/metrics", "", 200),
+        ("POST", "/v1/messages", "{", 400),
+        ("POST", "/v1/messages/count_tokens", "{", 400),
+        ("POST", "/v1/chat/completions", "{", 400),
+        ("POST", "/v1/systemone", "{", 400),
+    ];
+
     #[tokio::test]
     async fn cors_is_not_enabled_by_default() {
         let (service, _) = gateway_test_service();
@@ -1896,35 +1911,36 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
         // A cross-origin browser request must not receive CORS permissions
-        // unless the operator adds them explicitly outside this router.
-        for (method, path) in [
-            ("GET", "/healthz"),
-            ("GET", "/readyz"),
-            ("GET", "/v1/models"),
-            ("POST", "/v1/messages"),
-        ] {
-            let response =
-                request_with_origin(address, method, path, "http://example.invalid").await;
-            assert!(
-                response.starts_with("HTTP/1.1 "),
-                "{method} {path}: {response}"
+        // unless the operator adds them explicitly outside this router. Walk
+        // every declared route so a new route cannot silently add CORS.
+        for (method, path, payload, expected) in DECLARED_ROUTES {
+            let (status, response) = cross_origin_request(address, method, path, payload).await;
+            assert_eq!(status, expected, "{method} {path}: {response}");
+            assert_no_cors_headers(&format!("{method} {path}"), &response);
+            // A browser sends a preflight before a cross-origin non-simple
+            // request; it must stay a framework response without CORS.
+            let (status, response) = preflight_request(address, path, method).await;
+            assert_eq!(
+                status, 405,
+                "{method} {path} preflight must stay a framework response: {response}"
             );
-            assert!(
-                !response.to_ascii_lowercase().contains("access-control-"),
-                "{method} {path} must not advertise CORS: {response}"
-            );
+            assert_no_cors_headers(&format!("{method} {path} preflight"), &response);
         }
-        let (status, response) = route_request(address, "OPTIONS", "/v1/messages", "").await;
-        assert_eq!(
-            status, 405,
-            "A preflight must stay a framework response: {response}"
-        );
-        assert!(
-            !response.to_ascii_lowercase().contains("access-control-"),
-            "A preflight must not advertise CORS: {response}"
-        );
         server.abort();
         let _ = server.await;
+    }
+
+    /// Assert that a response advertises no CORS permission.
+    fn assert_no_cors_headers(context: &str, response: &str) {
+        let headers = response
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or(response)
+            .to_ascii_lowercase();
+        assert!(
+            !headers.contains("access-control-"),
+            "{context} must not advertise CORS: {response}"
+        );
     }
 
     #[tokio::test]
@@ -1939,16 +1955,7 @@ mod tests {
         // Every declared route must answer through the published gate with its
         // published status. This also fails if the gate answers its loading
         // surface (503): a missing route answers 404 and a missing method 405.
-        for (method, path, payload, expected) in [
-            ("GET", "/healthz", "", 200),
-            ("GET", "/readyz", "", 200),
-            ("GET", "/v1/models", "", 200),
-            ("GET", "/metrics", "", 200),
-            ("POST", "/v1/messages", "{", 400),
-            ("POST", "/v1/messages/count_tokens", "{", 400),
-            ("POST", "/v1/chat/completions", "{", 400),
-            ("POST", "/v1/systemone", "{", 400),
-        ] {
+        for (method, path, payload, expected) in DECLARED_ROUTES {
             let (status, response) = route_request(address, method, path, payload).await;
             assert_eq!(status, expected, "{method} {path}: {response}");
         }
@@ -1961,21 +1968,40 @@ mod tests {
         let _ = server.await;
     }
 
-    async fn request_with_origin(
+    /// A cross-origin request: the shape a browser sends with `Origin`.
+    async fn cross_origin_request(
         address: std::net::SocketAddr,
         method: &str,
         path: &str,
-        origin: &str,
-    ) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
-        let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        stream.write_all(request.as_bytes()).await.unwrap();
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).await.unwrap();
-        String::from_utf8_lossy(&response).into_owned()
+        payload: &str,
+    ) -> (u16, String) {
+        raw_probe_request(
+            address,
+            method,
+            path,
+            payload,
+            &[("Origin", "http://example.invalid")],
+        )
+        .await
+    }
+
+    /// A browser preflight: `OPTIONS` plus the requested method.
+    async fn preflight_request(
+        address: std::net::SocketAddr,
+        path: &str,
+        requested_method: &str,
+    ) -> (u16, String) {
+        raw_probe_request(
+            address,
+            "OPTIONS",
+            path,
+            "",
+            &[
+                ("Origin", "http://example.invalid"),
+                ("Access-Control-Request-Method", requested_method),
+            ],
+        )
+        .await
     }
 
     async fn route_request(
@@ -1984,12 +2010,27 @@ mod tests {
         path: &str,
         payload: &str,
     ) -> (u16, String) {
+        raw_probe_request(address, method, path, payload, &[]).await
+    }
+
+    async fn raw_probe_request(
+        address: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        payload: &str,
+        headers: &[(&str, &str)],
+    ) -> (u16, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
-        let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
             payload.len()
         );
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        request.push_str(payload);
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.unwrap();
