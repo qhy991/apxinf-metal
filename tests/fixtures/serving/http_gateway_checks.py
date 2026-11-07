@@ -2,6 +2,8 @@
 
 No model, MLX package, GPU, or external service is required.
 Each test starts its own process group and retains diagnostics under devlocal.
+This runner owns fixture launch, process groups, and cleanup for every Rust
+HTTP test target; `--select` and `--exclude` map its cases onto those targets.
 """
 
 import argparse
@@ -31,6 +33,13 @@ def body(scenario="text", **fields):
             "messages": [{"role": "user", "content": "fixture:" + scenario}], **fields}
 
 
+def without_limit(scenario="text"):
+    """Omit max_tokens so the gateway applies the deployment output budget."""
+    request = body(scenario)
+    del request["max_tokens"]
+    return request
+
+
 def until(probe, description, seconds=4):
     end = time.monotonic() + seconds
     while time.monotonic() < end:
@@ -58,9 +67,23 @@ def frames(response):
         raise AssertionError("The SSE response ended inside a frame.")
 
 
+def flatten(suite):
+    for test in suite:
+        if isinstance(test, unittest.TestSuite):
+            yield from flatten(test)
+        else:
+            yield test
+
+
+def matches(test, entries):
+    owner = type(test).__name__
+    return any(entry == owner or entry == owner + "." + test._testMethodName for entry in entries)
+
+
 class Gateway:
-    def __init__(self, name, timeout=5):
+    def __init__(self, name, timeout=5, max_output_tokens=64, request_timeout=4):
         self.root = Path(tempfile.mkdtemp(prefix=name + "-", dir=RUN_ROOT))
+        self.request_timeout = request_timeout
         adapter = self.root / "python/apxinf/apxinf/serving/text_worker.py"
         adapter.parent.mkdir(parents=True)
         shutil.copyfile(ROOT / "tests/fixtures/serving/http_worker.py", adapter)
@@ -79,7 +102,7 @@ class Gateway:
             BINARY, "--model", str(model), "--model-id", MODEL,
             "--python", str(Path(sys.executable).resolve()), "--worker", str(adapter),
             "--port", "0", "--host-pressure-policy", "disabled",
-            "--max-context", "128", "--max-output-tokens", "64",
+            "--max-context", "128", "--max-output-tokens", str(max_output_tokens),
             "--queue-capacity", "1", "--timeout-seconds", str(timeout),
             "--memory-budget-bytes", "8192", "--sequence-reservation-bytes", "1024",
         ], stdout=self.log, stderr=self.log, start_new_session=True, cwd=ROOT)
@@ -108,7 +131,7 @@ class Gateway:
         return result
 
     def send(self, path, document=None, raw=None, method=None):
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=4)
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=self.request_timeout)
         self.connections.append(connection)
         payload = raw if raw is not None else json.dumps(document) if document is not None else None
         connection.request(method or ("GET" if payload is None else "POST"), path, payload,
@@ -176,10 +199,8 @@ class Gateway:
                 self.log.close()
 
 
-class HttpGatewayTests(unittest.TestCase):
-    def setUp(self):
-        self.gateway = Gateway(self._testMethodName, timeout=1 if "deadline" in self._testMethodName else 5)
-        self.addCleanup(self.gateway.close)
+class GatewayChecks:
+    """Assertions shared by every case that drives a gateway."""
 
     def assert_error(self, response, status, code):
         actual, headers, content = response
@@ -187,6 +208,20 @@ class HttpGatewayTests(unittest.TestCase):
         self.assertIn("application/json", headers["content-type"])
         self.assertEqual(content["type"], "error")
         self.assertEqual(content["error"]["code"], code)
+
+    def assert_reaped(self, gateway):
+        gateway.close()
+        self.assertEqual(gateway.process.returncode, 0, "Graceful shutdown failed.")
+        self.assertFalse(gateway.forced_cleanup, "The CLI must reap its worker.")
+        worker_pid = next(item["pid"] for item in gateway.trace() if item["event"] == "started")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(worker_pid, 0)
+
+
+class HttpGatewayTests(GatewayChecks, unittest.TestCase):
+    def setUp(self):
+        self.gateway = Gateway(self._testMethodName, timeout=1 if "deadline" in self._testMethodName else 5)
+        self.addCleanup(self.gateway.close)
 
     def stream_all(self, path, document):
         connection, response = self.gateway.stream(path, document)
@@ -373,13 +408,88 @@ class HttpGatewayTests(unittest.TestCase):
             os.kill(worker_pid, 0)
 
 
+class OutputBudgetTests(GatewayChecks, unittest.TestCase):
+    """The public output budget keeps ordinary requests usable."""
+
+    def open_gateway(self, max_output_tokens):
+        # The slow fixture emits one token per 0.15s, so both deadlines keep
+        # room above a small deployment budget instead of racing the budget.
+        gateway = Gateway(self._testMethodName, timeout=15,
+                          max_output_tokens=max_output_tokens, request_timeout=15)
+        self.addCleanup(gateway.close)
+        return gateway
+
+    def test_omitted_limit_is_admitted_with_the_deployment_budget(self):
+        gateway = self.open_gateway(8)
+        # A zero limit is a request error and never reaches queue admission.
+        for path in ("/v1/messages", "/v1/chat/completions"):
+            request = body("text")
+            request["max_tokens"] = 0
+            response = gateway.request(path, request)
+            self.assert_error(response, 400, "invalid_request")
+            self.assertIn("at least 1", response[2]["error"]["message"], path)
+        self.assertFalse(any(item["event"] == "accepted" for item in gateway.trace()))
+        self.assertEqual(gateway.metrics()['apxinf_requests_total{status="failed"}'], 0)
+
+        self.assertEqual(gateway.request("/v1/messages/count_tokens", body())[2], {"input_tokens": 2})
+
+        # An omitted limit reserves the deployment budget, so the worker emits
+        # exactly that many tokens instead of receiving 512 and failing it.
+        status, _, reply = gateway.request("/v1/chat/completions", without_limit("slow"))
+        self.assertEqual(status, 200, reply)
+        self.assertEqual(reply["choices"][0]["finish_reason"], "length", reply)
+        self.assertEqual(reply["usage"]["completion_tokens"], 8, reply)
+        status, _, reply = gateway.request("/v1/messages", without_limit("slow"))
+        self.assertEqual(status, 200, reply)
+        self.assertEqual(reply["stop_reason"], "max_tokens", reply)
+        self.assertEqual(reply["usage"]["output_tokens"], 8, reply)
+
+        gateway.idle()
+        self.assertEqual(len([item for item in gateway.trace() if item["event"] == "accepted"]), 2)
+        self.assertEqual(gateway.metrics()['apxinf_requests_total{status="completed"}'], 3)
+        self.assert_reaped(gateway)
+
+    def test_exhausted_output_budget_rejects_generation_but_counts_tokens(self):
+        gateway = self.open_gateway(0)
+        self.assertEqual(gateway.request("/readyz")[0], 200)
+        for path in ("/v1/messages", "/v1/chat/completions"):
+            response = gateway.request(path, without_limit())
+            self.assert_error(response, 400, "invalid_request")
+            self.assertEqual(response[2]["error"]["message"],
+                             "This deployment allows no output tokens.", path)
+        # An explicit limit above an exhausted deployment keeps the older message.
+        over = body("text")
+        over["max_tokens"] = 1
+        response = gateway.request("/v1/chat/completions", over)
+        self.assert_error(response, 400, "invalid_request")
+        self.assertEqual(response[2]["error"]["message"],
+                         "max_tokens exceeds the deployment output limit.")
+
+        self.assertEqual(gateway.request("/v1/messages/count_tokens", body())[2], {"input_tokens": 2})
+        gateway.idle()
+        self.assertFalse(any(item["event"] == "accepted" for item in gateway.trace()))
+        self.assertEqual(gateway.metrics()['apxinf_requests_total{status="failed"}'], 0)
+        self.assert_reaped(gateway)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
+    parser.add_argument("--select", action="append", default=[],
+                        help="Run only these case names or classes.")
+    parser.add_argument("--exclude", action="append", default=[],
+                        help="Skip these case names or classes.")
     args = parser.parse_args()
     BINARY = str(Path(args.binary).resolve(strict=True))
     base = Path(os.environ.get("APXINF_HTTP_TEST_OUTPUT", str(ROOT / "devlocal/serving-http-integration"))).resolve()
     base.mkdir(parents=True, exist_ok=True)
     RUN_ROOT = Path(tempfile.mkdtemp(prefix="http-gateway-", dir=base))
     print("CPU HTTP fixture evidence: " + str(RUN_ROOT), file=sys.stderr)
-    unittest.main(argv=[sys.argv[0]], verbosity=2)
+    cases = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    selected = unittest.TestSuite(
+        test for test in flatten(cases)
+        if (not args.select or matches(test, args.select)) and not matches(test, args.exclude))
+    if args.select and not selected.countTestCases():
+        raise AssertionError("No test matched: " + ", ".join(args.select))
+    result = unittest.TextTestRunner(verbosity=2).run(selected)
+    sys.exit(0 if result.wasSuccessful() else 1)

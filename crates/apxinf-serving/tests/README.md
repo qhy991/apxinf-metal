@@ -1,10 +1,14 @@
 # HTTP integration checks
 
-`http_gateway.rs` starts the real `apxinf-serve` binary through a Python test runner.
+`http_gateway.rs` and `http_output_budget.rs` start the real `apxinf-serve` binary through the same Python test runner.
 The runner uses Python standard-library HTTP clients and loopback TCP sockets.
 Each case starts a separate gateway and an original CPU worker fixture.
 The fixture sends the serial protocol through the normal process pipes.
 Startup checks the fixture manifest against local files and the actual interpreter.
+
+The runner owns fixture layout, gateway lifecycle, process groups, and diagnostics.
+Its `--select` and `--exclude` options map cases onto the Rust test targets;
+`http_output_budget.rs` selects the output-budget cases and `http_gateway.rs` runs the rest.
 
 These checks use the existing [local HTTP profile](../../../doc/serving/local-service-v0.1.md)
 and [serial worker profile](../../../doc/serving/serial-profile-v0.1.md).
@@ -30,17 +34,9 @@ They do not establish real inference, model quality, performance, or Claude Code
 | Deadline | Expiry emits an error, records one expired outcome, and releases resources after worker settlement. |
 | Worker exit | Readiness returns 503. Health remains available. New generation requests fail. |
 | CLI shutdown | The binary exits successfully and reaps its worker process. |
-
-## Output budget checks
-
-`http_output_budget.rs` starts the same real binary and CPU worker fixture.
-It covers the public output-budget contract on the HTTP boundary:
-
-| Boundary | Required observation |
-| --- | --- |
-| Omitted limit | The deployment budget reaches the worker and bounds generation, so a small deployment stays usable. |
-| Explicit zero | HTTP 400 `invalid_request` before queue admission on both generation APIs. |
-| Exhausted deployment | Readiness and token counting stay available; generation receives HTTP 400 `invalid_request`. |
+| Output budget | An omitted limit returns 200 with `completion_tokens`/`output_tokens` equal to the deployment budget and `finish_reason=length` / `stop_reason=max_tokens`. |
+| Rejected output limit | An explicit zero returns 400 `invalid_request` before admission on both generation APIs. |
+| Exhausted output budget | Readiness and token counting stay available; both text-generation routes return 400 `invalid_request`. |
 
 ## Run the checks
 
