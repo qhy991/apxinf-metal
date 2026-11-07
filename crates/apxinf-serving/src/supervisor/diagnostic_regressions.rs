@@ -497,6 +497,9 @@ fn a_probe_that_stops_making_progress_is_detected() {
     let _ = child.wait();
 }
 
+// Deleting the hard-limit branch would make this test wait until the synthetic
+// child exits; a mutation that returns the wrong variant instead fails within
+// milliseconds and is the preferred way to audit this branch.
 #[test]
 fn a_probe_that_keeps_progressing_hits_the_hard_limit() {
     let mut child = ProbeCommand::new("/bin/sh")

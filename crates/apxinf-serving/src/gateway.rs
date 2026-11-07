@@ -1887,6 +1887,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cors_is_not_enabled_by_default() {
+        let (service, _) = gateway_test_service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = router(service);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        // A cross-origin browser request must not receive CORS permissions
+        // unless the operator adds them explicitly outside this router.
+        for (method, path) in [
+            ("GET", "/healthz"),
+            ("GET", "/readyz"),
+            ("GET", "/v1/models"),
+            ("POST", "/v1/messages"),
+        ] {
+            let response =
+                request_with_origin(address, method, path, "http://example.invalid").await;
+            assert!(
+                response.starts_with("HTTP/1.1 "),
+                "{method} {path}: {response}"
+            );
+            assert!(
+                !response.to_ascii_lowercase().contains("access-control-"),
+                "{method} {path} must not advertise CORS: {response}"
+            );
+        }
+        let (status, response) = route_request(address, "OPTIONS", "/v1/messages", "").await;
+        assert_eq!(
+            status, 405,
+            "A preflight must stay a framework response: {response}"
+        );
+        assert!(
+            !response.to_ascii_lowercase().contains("access-control-"),
+            "A preflight must not advertise CORS: {response}"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn published_gate_serves_every_declared_route() {
         let (service, _) = gateway_test_service();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1918,6 +1959,23 @@ mod tests {
         assert_eq!(status, 405, "{response}");
         server.abort();
         let _ = server.await;
+    }
+
+    async fn request_with_origin(
+        address: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        origin: &str,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
     }
 
     async fn route_request(
