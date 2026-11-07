@@ -338,10 +338,13 @@ fn text_tensor(name: &str) -> Option<(MlxDType, Vec<usize>)> {
     }
 }
 
-/// SafeTensors dtype, shape and file of one tensor.
-type Header = (String, Vec<usize>, PathBuf);
+/// SafeTensors dtype, shape, file and absolute payload byte range of one tensor.
+type Header = (String, Vec<usize>, PathBuf, u64, u64);
 
-fn header_entries(raw: &[u8], payload_bytes: u64) -> Result<HashMap<String, (String, Vec<usize>)>> {
+fn header_entries(
+    raw: &[u8],
+    payload_bytes: u64,
+) -> Result<HashMap<String, (String, Vec<usize>, u64, u64)>> {
     let header: HashMap<String, serde_json::Value> = serde_json::from_slice(raw)
         .map_err(|error| Error::Other(format!("Qwen-Image SafeTensors header: {error}")))?;
     if let Some(value) = header.get("__metadata__") {
@@ -395,7 +398,7 @@ fn header_entries(raw: &[u8], payload_bytes: u64) -> Result<HashMap<String, (Str
             return Err(Error::Other(format!("tensor `{name}` data_offsets [{start}, {end}] do not match {bytes} bytes within payload {payload_bytes}")));
         }
         ranges.push((start, end, name.clone()));
-        entries.insert(name, (dtype.to_owned(), shape));
+        entries.insert(name, (dtype.to_owned(), shape, start, end));
     }
     ranges.sort_unstable();
     let mut consumed = 0;
@@ -439,11 +442,12 @@ fn headers(files: &[PathBuf]) -> Result<HashMap<String, Header>> {
             .len()
             .checked_sub(8 + length)
             .ok_or_else(|| fail("truncated SafeTensors header".into()))?;
-        for (name, (dtype, shape)) in
+        for (name, (dtype, shape, start, end)) in
             header_entries(&raw, payload_bytes).map_err(|error| fail(error.to_string()))?
         {
+            let base = 8 + length;
             if out
-                .insert(name.clone(), (dtype, shape, file.clone()))
+                .insert(name.clone(), (dtype, shape, file.clone(), base + start, base + end))
                 .is_some()
             {
                 return Err(fail(format!("duplicate tensor `{name}`")));
@@ -458,12 +462,15 @@ fn headers(files: &[PathBuf]) -> Result<HashMap<String, Header>> {
 pub struct TextEncoderFiles {
     /// Tensor name -> shard file.
     shards: HashMap<String, PathBuf>,
+    /// Tensor name -> absolute payload byte range inside its shard file.
+    spans: HashMap<String, (u64, u64)>,
 }
 
 impl TextEncoderFiles {
     pub fn open(dir: &Path) -> Result<Self> {
         let mut shards = HashMap::new();
-        for (name, (dtype, shape, file)) in headers(&files(dir)?)? {
+        let mut spans = HashMap::new();
+        for (name, (dtype, shape, file, start, end)) in headers(&files(dir)?)? {
             let Some((want_dtype, want_shape)) = text_tensor(&name) else {
                 return Err(Error::Other(format!(
                     "Qwen-Image text encoder has an unrecognized tensor `{name}`"
@@ -479,7 +486,8 @@ impl TextEncoderFiles {
                      got {dtype} {shape:?}"
                 )));
             }
-            shards.insert(name, file);
+            shards.insert(name.clone(), file);
+            spans.insert(name, (start, end));
         }
         // Every name is known and unique, so the count proves completeness.
         if shards.len() != 3 + 11 * TEXT_LAYERS {
@@ -489,7 +497,41 @@ impl TextEncoderFiles {
                 3 + 11 * TEXT_LAYERS
             )));
         }
-        Ok(Self { shards })
+        Ok(Self { shards, spans })
+    }
+
+    /// Absolute shard ranges of one decoder layer's tensors, merged per file.
+    pub fn layer_ranges(&self, i: usize) -> Vec<(PathBuf, u64, u64)> {
+        let p = format!("layers.{i}.");
+        self.ranges(|name| name.starts_with(&p))
+    }
+
+    /// Group the selected tensors by shard and merge touching byte ranges.
+    fn ranges(&self, keep: impl Fn(&str) -> bool) -> Vec<(PathBuf, u64, u64)> {
+        let mut per_file: HashMap<&Path, Vec<(u64, u64)>> = HashMap::new();
+        for (name, &(start, end)) in &self.spans {
+            if keep(name) {
+                per_file
+                    .entry(self.shards[name].as_path())
+                    .or_default()
+                    .push((start, end));
+            }
+        }
+        let mut out = Vec::new();
+        for (file, mut spans) in per_file {
+            spans.sort_unstable();
+            let mut merged: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+            for (start, end) in spans {
+                match merged.last_mut() {
+                    Some((_, last_end)) if start <= *last_end => *last_end = end.max(*last_end),
+                    _ => merged.push((start, end)),
+                }
+            }
+            for (start, end) in merged {
+                out.push((file.to_path_buf(), start, end));
+            }
+        }
+        out
     }
 
     fn load(&self, stream: &Stream, keep: impl Fn(&str) -> bool) -> Result<Take> {
@@ -540,6 +582,107 @@ impl TextEncoderFiles {
     }
 }
 
+/// Above this image-token count the text-encoder prefetch stays off: at
+/// 1328² (6,889 tokens) warming 15.1 GB of shard pages into the cache
+/// triggered heavy paging on the 16 GB qualification host (EngineTailor
+/// #217). Measured-safe tiers: 512² (1,024 tokens) and 1024×576 (2,304).
+pub const PREFETCH_MAX_IMAGE_TOKENS: usize = 2304;
+
+fn prefetch_decision(forced: Option<bool>, image_tokens: usize) -> bool {
+    forced.unwrap_or(image_tokens <= PREFETCH_MAX_IMAGE_TOKENS)
+}
+
+/// `APXINF_QWEN_IMAGE_TEXT_PREFETCH`: `0`/`false`/`off`/`no` forces the
+/// on-demand reads back on; `1`/`true`/`on`/`yes` forces prefetch on for
+/// measurement; unset admits it only up to `PREFETCH_MAX_IMAGE_TOKENS`.
+pub fn prefetch_enabled(image_tokens: usize) -> bool {
+    use std::sync::OnceLock;
+    static FORCED: OnceLock<Option<bool>> = OnceLock::new();
+    let forced = *FORCED.get_or_init(|| {
+        std::env::var("APXINF_QWEN_IMAGE_TEXT_PREFETCH").ok().map(|v| {
+            !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+        })
+    });
+    prefetch_decision(forced, image_tokens)
+}
+
+/// Background disk prefetcher for the text encoder's per-layer loads.
+///
+/// The encoder reads its weights one layer at a time; while a layer computes
+/// on the device, this worker reads the *next* layers' exact shard bytes so
+/// the OS page cache already holds them when the graph mmaps and evaluates
+/// them. The bytes the loader sees are unchanged — prefetching moves the
+/// disk wait, not the computation — so outputs are bit-exact. Read failures
+/// are ignored: every tensor is still read synchronously by the real load.
+pub struct TextPrefetch {
+    sender: Option<std::sync::mpsc::Sender<Option<Vec<(PathBuf, u64, u64)>>>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TextPrefetch {
+    pub fn new() -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("qwen-image-text-prefetch".into())
+            .spawn(move || Self::run(receiver));
+        let worker = match worker {
+            Ok(worker) => worker,
+            // Prefetch is an optional hint: a thread that cannot spawn is no
+            // reason to reject the request; the reads stay synchronous.
+            Err(_) => return Self { sender: None, worker: None },
+        };
+        Self {
+            sender: Some(sender),
+            worker: Some(worker),
+        }
+    }
+
+    /// Queue these absolute file ranges for a cache-warming read.
+    pub fn submit(&self, ranges: Vec<(PathBuf, u64, u64)>) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(Some(ranges));
+        }
+    }
+
+    fn run(receiver: std::sync::mpsc::Receiver<Option<Vec<(PathBuf, u64, u64)>>>) {
+        use std::io::{Read, Seek, SeekFrom};
+        const CHUNK: usize = 8 << 20;
+        let mut buf = vec![0_u8; CHUNK];
+        while let Ok(Some(ranges)) = receiver.recv() {
+            for (file, start, end) in ranges {
+                let Ok(mut input) = std::fs::File::open(&file) else {
+                    continue;
+                };
+                if input.seek(SeekFrom::Start(start)).is_err() {
+                    continue;
+                }
+                let mut left = end - start;
+                while left > 0 {
+                    let want = left.min(CHUNK as u64) as usize;
+                    match input.read(&mut buf[..want]) {
+                        Ok(0) => break,
+                        Ok(read) => left -= read as u64,
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for TextPrefetch {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(None);
+        }
+        if let Some(worker) = self.worker.take() {
+            // Wait out the queued reads; prefetch is on the encode critical
+            // path's shadow, never on a later phase's.
+            let _ = worker.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,7 +704,7 @@ mod tests {
     fn parse_header(
         value: &serde_json::Value,
         payload_bytes: u64,
-    ) -> Result<HashMap<String, (String, Vec<usize>)>> {
+    ) -> Result<HashMap<String, (String, Vec<usize>, u64, u64)>> {
         header_entries(&serde_json::to_vec(value).unwrap(), payload_bytes)
     }
 
@@ -571,7 +714,7 @@ mod tests {
             serde_json::json!({"x": {"dtype": "BF16", "shape": [2], "data_offsets": [0, 4]}});
         assert_eq!(
             parse_header(&value, 4).unwrap()["x"],
-            ("BF16".into(), vec![2])
+            ("BF16".into(), vec![2], 0, 4)
         );
         value["__metadata__"] =
             serde_json::json!({"quantization_level": "4", "mflux_version": "0.19.2"});
@@ -624,6 +767,19 @@ mod tests {
         assert!(parse_header(&value, 6).is_err());
         value["y"]["data_offsets"] = serde_json::json!([6, 10]);
         assert!(parse_header(&value, 10).is_err());
+    }
+
+    #[test]
+    fn prefetch_gate_defaults_to_measured_safe_tiers() {
+        // Measured-safe: 512² (1024 tokens) and 1024×576 (2304); off at 1328²
+        // (6889) and above; env forces either way.
+        assert!(prefetch_decision(None, 1024));
+        assert!(prefetch_decision(None, 2304));
+        assert!(!prefetch_decision(None, 2305));
+        assert!(!prefetch_decision(None, 4096));
+        assert!(!prefetch_decision(None, 6889));
+        assert!(!prefetch_decision(Some(false), 1024));
+        assert!(prefetch_decision(Some(true), 6889));
     }
 
     #[test]
