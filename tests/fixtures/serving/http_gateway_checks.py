@@ -327,6 +327,28 @@ class HttpGatewayTests(GatewayChecks, unittest.TestCase):
             self.assert_error(gateway.request(path, body(temperature=0.5)), 400, "unsupported_feature")
         self.assert_error(gateway.request("/v1/messages", body(thinking={"type": "adaptive"})), 400, "unsupported_feature")
         self.assert_error(gateway.request("/v1/chat/completions", body(max_completion_tokens=4)), 400, "invalid_request")
+        # Tool declarations and tool history are checked with actionable messages
+        # instead of the generic prepared-input contract failure.
+        for document, message in (
+            ({"tools": [{"type": "function"}]}, "requires a function object"),
+            ({"tools": [{"type": "function", "function": {"name": 7}}]},
+             "Tool function name must be a non-empty string."),
+            ({"tools": [{"type": "function", "function": {"name": "read", "parameters": []}}]},
+             "Tool parameters must be an object."),
+            ({"messages": [{"role": "user", "content": "x", "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "read", "arguments": {}}}]}]},
+             "Only assistant messages can contain tool_calls."),
+            ({"messages": [{"role": "tool", "content": "x"}]},
+             "Tool messages require a tool_call_id."),
+            ({"messages": [{"role": "assistant", "content": None, "tool_calls": [
+                {"id": 5, "type": "function", "function": {"name": "read", "arguments": {}}}]}]},
+             "Tool call id must be a non-empty string."),
+        ):
+            request = body("text")
+            request.update(document)
+            response = gateway.request("/v1/chat/completions", request)
+            self.assert_error(response, 400, "invalid_request")
+            self.assertIn(message, response[2]["error"]["message"])
         self.assertEqual(gateway.request("/v1/messages", raw=" " * 1_000_001)[0], 413)
         self.assertEqual(gateway.request("/not-a-route")[0], 404)
         self.assertEqual(gateway.request("/v1/messages", method="GET")[0], 405)

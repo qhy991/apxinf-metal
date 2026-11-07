@@ -565,11 +565,63 @@ fn normalize(
                 }
                 tools.push(json!({"type":"function","function":function}));
             } else {
-                if tool["function"]["strict"] == true {
+                // Validate the OpenAI declaration here so a shape error is
+                // reported with an actionable message, not as a generic
+                // prepared-input contract failure.
+                let function = tool["function"].as_object().ok_or_else(|| {
+                    ApiError::invalid("Each OpenAI tool requires a function object.")
+                })?;
+                if function.get("strict").is_some_and(|value| value == true) {
                     return Err(ApiError::new(
                         400,
                         "unsupported_feature",
                         "This profile does not provide strict schema generation.",
+                    ));
+                }
+                if tool["type"] != "function" {
+                    return Err(ApiError::invalid("OpenAI tools must use type function."));
+                }
+                if tool.as_object().is_some_and(|object| {
+                    object.keys().any(|key| key != "type" && key != "function")
+                }) {
+                    return Err(ApiError::invalid(
+                        "OpenAI tools accept only type and function fields.",
+                    ));
+                }
+                if !function
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| !name.is_empty())
+                {
+                    return Err(ApiError::invalid(
+                        "Tool function name must be a non-empty string.",
+                    ));
+                }
+                if function
+                    .get("description")
+                    .is_some_and(|value| !value.is_string())
+                {
+                    return Err(ApiError::invalid(
+                        "Tool function description must be a string.",
+                    ));
+                }
+                if function
+                    .get("parameters")
+                    .is_some_and(|value| !value.is_object())
+                {
+                    return Err(ApiError::invalid("Tool parameters must be an object."));
+                }
+                if function
+                    .get("strict")
+                    .is_some_and(|value| !value.is_boolean())
+                {
+                    return Err(ApiError::invalid("Tool strict must be a Boolean."));
+                }
+                if function.keys().any(|key| {
+                    !["name", "description", "parameters", "strict"].contains(&key.as_str())
+                }) {
+                    return Err(ApiError::invalid(
+                        "Tool functions accept only name, description, parameters, and strict fields.",
                     ));
                 }
                 tools.push(tool.clone());
@@ -660,8 +712,63 @@ fn normalize(
             if message["content"].is_array() {
                 message["content"] = openai_content(&message["content"], &role, service)?;
             }
-            if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            if message.get("tool_calls").is_some() {
+                if role != "assistant" {
+                    return Err(ApiError::invalid(
+                        "Only assistant messages can contain tool_calls.",
+                    ));
+                }
+                let calls = message["tool_calls"]
+                    .as_array_mut()
+                    .ok_or_else(|| ApiError::invalid("Message tool_calls must be an array."))?;
                 for call in calls {
+                    if call["function"].as_object().is_none() {
+                        return Err(ApiError::invalid("Tool calls require a function object."));
+                    }
+                    if call["type"] != "function" {
+                        return Err(ApiError::invalid("Tool calls must use type function."));
+                    }
+                    if call.as_object().is_some_and(|object| {
+                        object
+                            .keys()
+                            .any(|key| !["id", "type", "function"].contains(&key.as_str()))
+                    }) {
+                        return Err(ApiError::invalid(
+                            "Tool calls accept only id, type, and function fields.",
+                        ));
+                    }
+                    if !call["id"].as_str().is_some_and(|id| !id.is_empty()) {
+                        return Err(ApiError::invalid(
+                            "Tool call id must be a non-empty string.",
+                        ));
+                    }
+                    let function = call["function"].as_object().expect("checked above");
+                    if function
+                        .keys()
+                        .any(|key| !["name", "arguments"].contains(&key.as_str()))
+                    {
+                        return Err(ApiError::invalid(
+                            "Tool call functions accept only name and arguments fields.",
+                        ));
+                    }
+                    if !function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.is_empty())
+                    {
+                        return Err(ApiError::invalid(
+                            "Tool call function name must be a non-empty string.",
+                        ));
+                    }
+                    match function.get("arguments").unwrap_or(&Value::Null) {
+                        Value::Object(_) => {}
+                        Value::String(_) => {}
+                        _ => {
+                            return Err(ApiError::invalid(
+                                "Tool call arguments must be an object or a JSON string.",
+                            ))
+                        }
+                    }
                     if let Some(s) = call["function"]["arguments"].as_str() {
                         call["function"]["arguments"] =
                             crate::contracts::parse_document(s.as_bytes()).map_err(|_| {
@@ -671,6 +778,8 @@ fn normalize(
                             })?;
                     }
                 }
+            } else if role == "tool" && message.get("tool_call_id").is_none() {
+                return Err(ApiError::invalid("Tool messages require a tool_call_id."));
             }
             messages.push(message);
             continue;
@@ -1572,6 +1681,140 @@ mod tests {
                 Err(mpsc::error::TryRecvError::Empty)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn openai_tool_shapes_fail_before_admission_with_actionable_errors() {
+        let (service, mut observed) = gateway_test_service();
+        let tool = |function: Value| json!([{"type":"function","function":function}]);
+        for (tools, message) in [
+            (
+                json!([{"type":"function"}]),
+                "Each OpenAI tool requires a function object.",
+            ),
+            (
+                tool(json!({"name":17})),
+                "Tool function name must be a non-empty string.",
+            ),
+            (
+                tool(json!({"name":""})),
+                "Tool function name must be a non-empty string.",
+            ),
+            (
+                tool(json!({"name":"read","parameters":[]})),
+                "Tool parameters must be an object.",
+            ),
+            (
+                json!([{"type":"other","function":{"name":"read"}}]),
+                "OpenAI tools must use type function.",
+            ),
+            (
+                json!([{"type":"function","function":{"name":"read"},"extra":true}]),
+                "OpenAI tools accept only type and function fields.",
+            ),
+        ] {
+            let mut value = openai_request(json!([{"role":"user","content":"hello"}]));
+            value["tools"] = tools;
+            let error = request_error(service.clone(), value, Api::OpenAi).await;
+            assert_eq!(
+                (error.status, error.code.as_str()),
+                (400, "invalid_request"),
+                "{message}"
+            );
+            assert_eq!(error.message, message);
+        }
+
+        let call = |call: Value| json!([call]);
+        let history = |calls: Value| {
+            json!([
+                {"role":"assistant","content":null,"tool_calls":calls},
+                {"role":"tool","tool_call_id":"call-a","content":"x"}
+            ])
+        };
+        for (messages, message) in [
+            (
+                history(call(
+                    json!({"id":17,"type":"function","function":{"name":"read","arguments":{}}}),
+                )),
+                "Tool call id must be a non-empty string.",
+            ),
+            (
+                history(call(
+                    json!({"id":"call-a","type":"other","function":{"name":"read","arguments":{}}}),
+                )),
+                "Tool calls must use type function.",
+            ),
+            (
+                history(call(
+                    json!({"id":"call-a","type":"function","function":{"arguments":{}}}),
+                )),
+                "Tool call function name must be a non-empty string.",
+            ),
+            (
+                history(call(
+                    json!({"id":"call-a","type":"function","function":{"name":"read","arguments":[]}}),
+                )),
+                "Tool call arguments must be an object or a JSON string.",
+            ),
+            (
+                history(call(
+                    json!({"id":"call-a","type":"function","function":{"name":"read","arguments":{}},"extra":1}),
+                )),
+                "Tool calls accept only id, type, and function fields.",
+            ),
+        ] {
+            let error = request_error(service.clone(), openai_request(messages), Api::OpenAi).await;
+            assert_eq!(
+                (error.status, error.code.as_str()),
+                (400, "invalid_request"),
+                "{message}"
+            );
+            assert_eq!(error.message, message);
+        }
+
+        for (messages, message) in [
+            (
+                json!([{"role":"user","content":"x","tool_calls":[{"id":"call-a","type":"function","function":{"name":"read","arguments":{}}}]}]),
+                "Only assistant messages can contain tool_calls.",
+            ),
+            (
+                json!([{"role":"tool","content":"x"}]),
+                "Tool messages require a tool_call_id.",
+            ),
+        ] {
+            let error = request_error(service.clone(), openai_request(messages), Api::OpenAi).await;
+            assert_eq!(
+                (error.status, error.code.as_str()),
+                (400, "invalid_request"),
+                "{message}"
+            );
+            assert_eq!(error.message, message);
+        }
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        // A well-formed declaration and tool history still reaches admission.
+        let value = json!({
+            "model":"test-model","max_tokens":4,
+            "tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}],
+            "messages":[
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call-a","type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]},
+                {"role":"tool","tool_call_id":"call-a","content":"file"}
+            ]
+        });
+        let error = request_error(service.clone(), value, Api::OpenAi).await;
+        assert_eq!(error.message, "Test coordinator observed admission.");
+        let admitted = observed
+            .try_recv()
+            .expect("A valid tool history must reach admission.");
+        assert_eq!(admitted.messages[1]["content"], "file");
+        assert_eq!(
+            admitted.messages[0]["tool_calls"][0]["function"]["arguments"],
+            json!({"path":"a"})
+        );
     }
 
     #[tokio::test]
