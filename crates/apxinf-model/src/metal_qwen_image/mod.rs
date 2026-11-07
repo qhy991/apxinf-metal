@@ -316,7 +316,7 @@ impl ImageRuntime for QwenImage {
         let (lh, lw) = (height / SCALE, width / SCALE);
         let phase = std::time::Instant::now();
         let tokens = text::tokenize(&self.tokenizer, request.prompt)?;
-        let prompt = text::encode(&self.text, &tokens, ops)?;
+        let prompt = text::encode(&self.text, &tokens, ops, lh * lw)?;
         if timing {
             eprintln!(
                 "qimage-timing: text_encode {:.3}s raw_tokens={}",

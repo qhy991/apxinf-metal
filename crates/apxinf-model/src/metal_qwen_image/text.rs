@@ -101,14 +101,19 @@ fn layer(h: &Array, w: &TextLayer, cos: &Array, sin: &Array, ops: &Ops) -> Resul
 }
 
 /// Prompt states after the final norm, without the system prefix: `[1, T, 4096]` BF16.
-pub fn encode(files: &TextEncoderFiles, tokens: &PromptTokens, ops: &Ops) -> Result<Array> {
+pub fn encode(
+    files: &TextEncoderFiles,
+    tokens: &PromptTokens,
+    ops: &Ops,
+    image_tokens: usize,
+) -> Result<Array> {
     let stream = ops.stream();
     let timing = super::timing_enabled();
     // Overlap the per-layer disk reads with the previous layer's device
     // compute: the worker warms the page cache for the next layers while
     // this thread evaluates the current one. Scheduling only; the bytes and
     // kernels are unchanged, so the encoded states stay bit-exact.
-    let prefetch = weights::prefetch_enabled().then(|| {
+    let prefetch = weights::prefetch_enabled(image_tokens).then(|| {
         let prefetch = weights::TextPrefetch::new();
         prefetch.submit(files.layer_ranges(0));
         if TEXT_LAYERS > 1 {

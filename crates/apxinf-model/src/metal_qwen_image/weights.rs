@@ -582,15 +582,28 @@ impl TextEncoderFiles {
     }
 }
 
-/// `APXINF_QWEN_IMAGE_TEXT_PREFETCH=0` (or `false`/`off`/`no`) selects the
-/// rollback path: encoder layers are read exactly when the graph needs them.
-pub fn prefetch_enabled() -> bool {
+/// Above this image-token count the text-encoder prefetch stays off: at
+/// 1328² (6,889 tokens) warming 15.1 GB of shard pages into the cache
+/// triggered heavy paging on the 16 GB qualification host (EngineTailor
+/// #217). Measured-safe tiers: 512² (1,024 tokens) and 1024×576 (2,304).
+pub const PREFETCH_MAX_IMAGE_TOKENS: usize = 2304;
+
+fn prefetch_decision(forced: Option<bool>, image_tokens: usize) -> bool {
+    forced.unwrap_or(image_tokens <= PREFETCH_MAX_IMAGE_TOKENS)
+}
+
+/// `APXINF_QWEN_IMAGE_TEXT_PREFETCH`: `0`/`false`/`off`/`no` forces the
+/// on-demand reads back on; `1`/`true`/`on`/`yes` forces prefetch on for
+/// measurement; unset admits it only up to `PREFETCH_MAX_IMAGE_TOKENS`.
+pub fn prefetch_enabled(image_tokens: usize) -> bool {
     use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("APXINF_QWEN_IMAGE_TEXT_PREFETCH") {
-        Ok(v) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
-        Err(_) => true,
-    })
+    static FORCED: OnceLock<Option<bool>> = OnceLock::new();
+    let forced = *FORCED.get_or_init(|| {
+        std::env::var("APXINF_QWEN_IMAGE_TEXT_PREFETCH").ok().map(|v| {
+            !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+        })
+    });
+    prefetch_decision(forced, image_tokens)
 }
 
 /// Background disk prefetcher for the text encoder's per-layer loads.
@@ -754,6 +767,19 @@ mod tests {
         assert!(parse_header(&value, 6).is_err());
         value["y"]["data_offsets"] = serde_json::json!([6, 10]);
         assert!(parse_header(&value, 10).is_err());
+    }
+
+    #[test]
+    fn prefetch_gate_defaults_to_measured_safe_tiers() {
+        // Measured-safe: 512² (1024 tokens) and 1024×576 (2304); off at 1328²
+        // (6889) and above; env forces either way.
+        assert!(prefetch_decision(None, 1024));
+        assert!(prefetch_decision(None, 2304));
+        assert!(!prefetch_decision(None, 2305));
+        assert!(!prefetch_decision(None, 4096));
+        assert!(!prefetch_decision(None, 6889));
+        assert!(!prefetch_decision(Some(false), 1024));
+        assert!(prefetch_decision(Some(true), 6889));
     }
 
     #[test]
