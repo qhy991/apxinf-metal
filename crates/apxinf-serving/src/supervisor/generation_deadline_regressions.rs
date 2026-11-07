@@ -21,9 +21,16 @@ impl GenerationProbe {
     }
 }
 
+impl GenerationProbe {
+    fn release(&self) {
+        std::fs::write(format!("{}.release", self.0.display()), b"release").unwrap();
+    }
+}
+
 impl Drop for GenerationProbe {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(format!("{}.release", self.0.display()));
     }
 }
 
@@ -33,9 +40,16 @@ async fn service_for(
 ) -> (Arc<Service>, tokio::task::JoinHandle<()>) {
     // Model execution is absent. Real pipes carry the complete checked protocol.
     let script = r#"
-import hashlib, json, queue, struct, sys, threading, time
+import hashlib, json, os, queue, struct, sys, threading, time
 mode, trace_path = sys.argv[1:]
+release_path = trace_path + ".release"
 generation = 0
+def hold():
+    until = time.monotonic() + 30
+    while not os.path.exists(release_path):
+        if time.monotonic() >= until:
+            raise RuntimeError("The probe release marker did not arrive.")
+        time.sleep(0.005)
 commands = queue.Queue()
 def receive():
     for line in sys.stdin:
@@ -65,25 +79,25 @@ while True:
         selected = mode if generation == 0 else "normal"
         generation += 1
         identity = dict(request_id=command["request_id"], attempt=command["attempt"])
-        if selected == "delayed_accept": time.sleep(0.8)
+        if selected == "delayed_accept": hold()
         if selected == "cancel_before_accept": time.sleep(22)
         emit(command, "accepted", event_seq=0, **identity)
         if selected == "fault":
-            time.sleep(0.8)
+            hold()
             sys.exit(0)
-        if selected == "late_tokens": time.sleep(0.8)
+        if selected == "late_tokens": hold()
         text = "prefix STOP hidden" if selected == "stop" else "visible"
         emit(command, "tokens", event_seq=1, output_index=0, token_ids=[10], text_delta=text, **identity)
         if selected == "stop":
             stopped = read()
             control(stopped, "accepted")
-            time.sleep(0.8)
+            hold()
         emit(command, "terminal", event_seq=2, status="completed",
              cause="stop_sequence" if selected == "stop" else "length",
              usage=dict(input_tokens=2, output_tokens=1),
              state_result=dict(validity="none", consumed_position=3, history_count=3),
              text_delta="", metrics=dict(elapsed_ns=20, ttft_ns=10, peak_memory_bytes=2048), **identity)
-        if selected == "terminal_before_deadline": time.sleep(0.8)
+        if selected == "terminal_before_deadline": hold()
         if selected == "cancel_after_terminal": time.sleep(22)
         emit(command, "resources_released", event_seq=3,
              released_lease_ids=command["capacity_lease_ids"], retained_lease_ids=[], **identity)
@@ -129,10 +143,13 @@ while True:
         available: AtomicBool::new(true),
         rotating: AtomicBool::new(false),
         metrics: Metrics::default(),
+        // Held stages only progress after the test releases them, so the
+        // deadline is the only thing that ends the first request. The budget
+        // also leaves room for the follow-up request under a loaded host.
         timeout: if mode.starts_with("cancel_") {
             Duration::from_secs(60)
         } else {
-            Duration::from_millis(180)
+            Duration::from_millis(1000)
         },
         memory_budget: 4096,
         restart: RestartPolicy::immediate(3),
@@ -215,7 +232,7 @@ fn assert_public_expiry_holds_resources(service: &Service) {
 }
 
 async fn require_expiry(ticket: &mut Ticket) {
-    let event = tokio::time::timeout(Duration::from_millis(450), ticket.output.recv())
+    let event = tokio::time::timeout(Duration::from_millis(2500), ticket.output.recv())
         .await
         .expect("The public deadline must not wait for worker settlement.");
     match event {
@@ -250,9 +267,9 @@ async fn next_request(service: &Service) {
 
 #[tokio::test]
 async fn generation_deadline_before_acceptance_ends_begin_without_late_success() {
-    run_probe("delayed_accept", |service, _probe| async move {
+    run_probe("delayed_accept", |service, probe| async move {
         let mut ticket = service.enqueue(request()).unwrap();
-        let begin = tokio::time::timeout(Duration::from_millis(450), &mut ticket.begin)
+        let begin = tokio::time::timeout(Duration::from_millis(2500), &mut ticket.begin)
             .await
             .expect("A delayed accepted event must not extend the public deadline.")
             .unwrap();
@@ -261,6 +278,7 @@ async fn generation_deadline_before_acceptance_ends_begin_without_late_success()
             Ok(_) => panic!("Expired admission must not return success."),
         }
         assert_public_expiry_holds_resources(&service);
+        probe.release();
         require_no_late_output(&mut ticket, &service).await;
         assert_eq!(
             metric(
@@ -277,12 +295,13 @@ async fn generation_deadline_before_acceptance_ends_begin_without_late_success()
 
 #[tokio::test]
 async fn generation_deadline_after_terminal_waits_for_cleanup_without_public_success() {
-    run_probe("terminal_before_deadline", |service, _probe| async move {
+    run_probe("terminal_before_deadline", |service, probe| async move {
         let mut ticket = service.enqueue(request()).unwrap();
         assert!((&mut ticket.begin).await.unwrap().is_ok());
         assert!(matches!(ticket.output.recv().await, Some(Event::Part(_))));
         require_expiry(&mut ticket).await;
         assert_public_expiry_holds_resources(&service);
+        probe.release();
         require_no_late_output(&mut ticket, &service).await;
         assert_eq!(
             metric(
@@ -307,6 +326,7 @@ async fn generation_deadline_after_stop_control_does_not_send_a_second_control()
     assert!(matches!(ticket.output.recv().await, Some(Event::Part(Part::Text(text))) if text == "prefix "));
     require_expiry(&mut ticket).await;
     assert_public_expiry_holds_resources(&service);
+    probe.release();
     require_no_late_output(&mut ticket, &service).await;
     assert_eq!(probe.commands(), ["prepare_input", "submit", "stop_generation"]);
     next_request(&service).await;
@@ -315,11 +335,12 @@ async fn generation_deadline_after_stop_control_does_not_send_a_second_control()
 
 #[tokio::test]
 async fn generation_deadline_suppresses_tokens_that_arrive_after_public_expiry() {
-    run_probe("late_tokens", |service, _probe| async move {
+    run_probe("late_tokens", |service, probe| async move {
         let mut ticket = service.enqueue(request()).unwrap();
         assert!((&mut ticket.begin).await.unwrap().is_ok());
         require_expiry(&mut ticket).await;
         assert_public_expiry_holds_resources(&service);
+        probe.release();
         require_no_late_output(&mut ticket, &service).await;
         assert_eq!(
             metric(
@@ -344,11 +365,12 @@ async fn generation_deadline_suppresses_tokens_that_arrive_after_public_expiry()
 
 #[tokio::test]
 async fn generation_deadline_survives_later_worker_fault_without_a_second_outcome() {
-    run_probe("fault", |service, _probe| async move {
+    run_probe("fault", |service, probe| async move {
         let mut ticket = service.enqueue(request()).unwrap();
         assert!((&mut ticket.begin).await.unwrap().is_ok());
         require_expiry(&mut ticket).await;
         assert_public_expiry_holds_resources(&service);
+        probe.release();
         assert!(
             tokio::time::timeout(Duration::from_secs(2), service.wait_stopped())
                 .await
