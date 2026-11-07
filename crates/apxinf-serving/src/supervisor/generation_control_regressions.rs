@@ -65,6 +65,7 @@ fn request_fixture(timeout: Duration) -> (Service, Job, Ticket) {
         metrics: Metrics::default(),
         timeout,
         memory_budget: 4096,
+        restart: RestartPolicy::immediate(3),
     };
     service.metrics.active.store(1, Ordering::Relaxed);
     service

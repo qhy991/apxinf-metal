@@ -125,6 +125,7 @@ fn service() -> Service {
         metrics: Metrics::default(),
         timeout: Duration::from_secs(5),
         memory_budget: 4194304,
+        restart: RestartPolicy::immediate(3),
     }
 }
 

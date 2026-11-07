@@ -135,6 +135,7 @@ while True:
             Duration::from_millis(180)
         },
         memory_budget: 4096,
+        restart: RestartPolicy::immediate(3),
     });
     let task = tokio::spawn(coordinate_and_report(
         worker,

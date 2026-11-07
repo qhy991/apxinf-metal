@@ -174,17 +174,24 @@ async fn probe_lifecycle(scenario: &str, model: PathBuf) {
         sender,
     ));
     if scenario == "fault" {
-        let error = service.wait_stopped().await.unwrap_err();
-        assert!(!service.available.load(Ordering::Acquire));
-        assert!(service.queue.is_closed());
+        // Unavailable diagnostic output must not prevent the supervisor from
+        // fencing and restarting the faulted worker.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while service.metrics.worker_restarts.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("A checked worker fault must restart the worker.");
+        assert!(service.available.load(Ordering::Acquire));
         assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 1);
-        assert!(
-            matches!(
-                error.as_str(),
-                "Worker stdout ended." | "The idle worker output pipe closed."
-            ),
-            "A checked worker fault must reach the stop report: {error}"
+        assert_eq!(service.metrics.worker_restarts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            service.metrics.worker_restart_failures.load(Ordering::Relaxed),
+            0
         );
+        service.shutdown();
+        service.wait_stopped().await.unwrap();
     } else {
         require_completed_request(&service, first.as_mut().unwrap()).await;
         let mut second = service.enqueue(request(false)).unwrap();

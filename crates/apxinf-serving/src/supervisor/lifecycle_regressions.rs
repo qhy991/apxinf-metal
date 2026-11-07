@@ -96,6 +96,7 @@ fn cpu_service_with_completion(
         metrics: Metrics::default(),
         timeout,
         memory_budget: 4096,
+        restart: RestartPolicy::immediate(3),
     });
     (service, sender)
 }
@@ -677,6 +678,7 @@ sys.stdin.readline()
             metrics: Metrics::default(),
             timeout: Duration::from_millis(150),
             memory_budget: 1024,
+            restart: RestartPolicy::immediate(3),
         });
         let content = if blocked_write {
             "x".repeat(700_000)
@@ -808,17 +810,22 @@ async fn preparation_grace_expiry_fences_without_a_second_public_terminal() {
     );
     assert!(service.available.load(Ordering::Acquire));
     assert_eq!(service.metrics.reserved_bytes.load(Ordering::Relaxed), 1024);
-    tokio::time::timeout(Duration::from_secs(25), task)
-        .await
-        .unwrap()
-        .unwrap()
-        .expect_err("An unresponsive worker must produce a failed coordinator outcome.");
-    assert!(!service.available.load(Ordering::Acquire));
+    // The 20-second preparation grace still fences the worker; the supervisor
+    // then restarts it instead of ending the service.
+    tokio::time::timeout(Duration::from_secs(25), async {
+        while service.metrics.worker_restarts.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("An unresponsive worker must be fenced and replaced after its grace.");
     assert_eq!(service.metrics.expired.load(Ordering::Relaxed), 1);
     assert_eq!(service.metrics.failed.load(Ordering::Relaxed), 0);
     assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 1);
+    assert_eq!(service.metrics.worker_restart_failures.load(Ordering::Relaxed), 0);
     assert_eq!(service.metrics.active.load(Ordering::Relaxed), 0);
     assert_eq!(service.metrics.reserved_bytes.load(Ordering::Relaxed), 0);
+    stop_coordinator(&service, task).await;
 }
 
 #[tokio::test]
@@ -888,7 +895,7 @@ async fn wait_stopped_reports_a_disappearing_completion_sender() {
 }
 
 #[tokio::test]
-async fn wait_stopped_reports_worker_failure_after_reaping() {
+async fn wait_stopped_owns_the_recovered_worker_after_a_fault() {
     let model = CpuModel::new(json!({}));
     let (mut worker, ready) = cpu_worker(model.model()).await.unwrap();
     let (service, completion) = cpu_service_with_completion(ready, Duration::from_secs(1), 1);
@@ -902,13 +909,24 @@ async fn wait_stopped_reports_worker_failure_after_reaping() {
         completion,
     ));
 
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while service.metrics.worker_restarts.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("A worker fault must be recovered by a replacement.");
+    assert!(service.available.load(Ordering::Acquire));
+    assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 1);
+    assert_eq!(service.metrics.worker_restarts.load(Ordering::Relaxed), 1);
+    // Shutdown after recovery still confirms the replacement process reaping.
+    service.shutdown();
     tokio::time::timeout(Duration::from_secs(3), service.wait_stopped())
         .await
         .unwrap()
-        .expect_err("Worker failure must remain a failed coordinator outcome.");
+        .unwrap();
     task.await.unwrap();
     assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 1);
-    assert!(!service.available.load(Ordering::Acquire));
 }
 
 #[tokio::test]
@@ -1006,9 +1024,7 @@ fn shutdown_wins_over_concurrent_availability_publication() {
         let other = barrier.clone();
         let thread = std::thread::spawn(move || {
             other.wait();
-            publication
-                .queue
-                .publish_availability(&publication.available);
+            publication.queue.resume(&publication.available);
         });
         barrier.wait();
         service.shutdown();

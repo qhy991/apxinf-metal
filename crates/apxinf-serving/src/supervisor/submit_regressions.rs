@@ -135,6 +135,7 @@ sys.stdin.buffer.readline()
         metrics: Metrics::default(),
         timeout,
         memory_budget: 4096,
+        restart: RestartPolicy::immediate(3),
     });
     let task = tokio::spawn(coordinate_and_report(
         worker,

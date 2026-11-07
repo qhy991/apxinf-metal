@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 struct State {
     jobs: VecDeque<Job>,
     closed: bool,
+    paused: bool,
 }
 
 pub(super) struct PendingQueue {
@@ -23,14 +24,6 @@ pub(super) struct PendingQueue {
 }
 
 impl PendingQueue {
-    pub(super) fn publish_availability(&self, available: &AtomicBool) {
-        let state = self
-            .state
-            .lock()
-            .expect("The waiting queue lock is poisoned.");
-        available.store(!state.closed, Ordering::Release);
-    }
-
     pub(super) fn is_closed(&self) -> bool {
         self.state
             .lock()
@@ -55,6 +48,7 @@ impl PendingQueue {
             state: Mutex::new(State {
                 jobs: VecDeque::new(),
                 closed: false,
+                paused: false,
             }),
             changed: Notify::new(),
             capacity,
@@ -74,6 +68,11 @@ impl PendingQueue {
         Self::sweep_locked(&mut state, metrics, timeout);
         if state.closed {
             return Err(ApiError::worker("The request coordinator is unavailable."));
+        }
+        if state.paused {
+            return Err(ApiError::worker(
+                "The model worker is restarting after a fault.",
+            ));
         }
         if state.jobs.len() >= self.capacity {
             return Err(ApiError::new(
@@ -116,6 +115,7 @@ impl PendingQueue {
                 if state.closed {
                     return None;
                 }
+                // A paused queue holds no work until the supervisor resumes it.
             }
             changed.await;
         }
@@ -127,7 +127,50 @@ impl PendingQueue {
             .lock()
             .expect("The waiting queue lock is poisoned.");
         state.closed = true;
+        state.paused = true;
         Self::sweep_locked(&mut state, metrics, timeout);
+        Self::drain_locked(&mut state, metrics, "The service is shutting down.");
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    /// Stops admission and rejects waiting work without ending the service.
+    pub(super) fn pause(&self, metrics: &Metrics, timeout: Duration) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("The waiting queue lock is poisoned.");
+        if state.closed {
+            return;
+        }
+        state.paused = true;
+        Self::sweep_locked(&mut state, metrics, timeout);
+        Self::drain_locked(
+            &mut state,
+            metrics,
+            "The model worker is restarting after a fault.",
+        );
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    /// Reopens admission after a worker restart. Returns false during shutdown.
+    pub(super) fn resume(&self, available: &AtomicBool) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .expect("The waiting queue lock is poisoned.");
+        if state.closed {
+            return false;
+        }
+        state.paused = false;
+        available.store(true, Ordering::Release);
+        drop(state);
+        self.changed.notify_waiters();
+        true
+    }
+
+    fn drain_locked(state: &mut State, metrics: &Metrics, message: &str) {
         while let Some(job) = state.jobs.pop_front() {
             metrics.queued.fetch_sub(1, Ordering::Relaxed);
             metrics.failed.fetch_add(1, Ordering::Relaxed);
@@ -136,12 +179,8 @@ impl PendingQueue {
             job.observation.settled(&metrics.observations, now);
             job.observation
                 .public_terminal(&metrics.observations, Outcome::Failed, now);
-            let _ = job
-                .begin
-                .send(Err(ApiError::worker("The worker requires a restart.")));
+            let _ = job.begin.send(Err(ApiError::worker(message)));
         }
-        drop(state);
-        self.changed.notify_waiters();
     }
 
     fn sweep_locked(state: &mut State, metrics: &Metrics, timeout: Duration) {

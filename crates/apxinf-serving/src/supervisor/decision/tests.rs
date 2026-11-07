@@ -413,10 +413,16 @@ async fn decision_nonzero_exit_and_extra_output_discard_pending_success() {
             matches!(ticket.output.recv().await, Some(Event::Error(_))),
             "{mode}"
         );
-        assert!(task.await.unwrap().is_err());
+        // The supervisor restarts the faulted worker instead of ending the service.
+        available(&service).await;
         assert_eq!(service.metrics.completed.load(Ordering::Relaxed), 0);
+        assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 1);
+        assert_eq!(service.metrics.worker_restarts.load(Ordering::Relaxed), 1);
+        assert_eq!(service.metrics.worker_restart_failures.load(Ordering::Relaxed), 0);
         assert_eq!(service.metrics.active.load(Ordering::Relaxed), 0);
         assert_eq!(service.metrics.reserved_bytes.load(Ordering::Relaxed), 0);
+        stop(&service, task).await;
+        assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 1);
     }
 }
 

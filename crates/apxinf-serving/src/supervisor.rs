@@ -20,6 +20,8 @@ mod memory_regressions;
 #[cfg(test)]
 mod rotation_pressure_regressions;
 #[cfg(test)]
+mod restart_regressions;
+#[cfg(test)]
 mod shutdown_regressions;
 #[cfg(test)]
 mod submit_regressions;
@@ -61,6 +63,10 @@ const OUTPUT_PART_CAPACITY: usize = 64;
 const REQUEST_COMMAND_ALLOWANCE: u64 = 4;
 const SETTLEMENT_GRACE: Duration = Duration::from_secs(20);
 const QUEUE_SWEEP_INTERVAL: Duration = Duration::from_millis(20);
+/// First delay before the supervisor retries a faulted worker process.
+pub const WORKER_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+/// Ceiling for the bounded exponential worker restart backoff.
+pub const WORKER_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 type StopResult = Result<(), String>;
 
 #[derive(Debug, Clone)]
@@ -82,6 +88,37 @@ impl ApiError {
     }
     fn worker(message: impl Into<String>) -> Self {
         Self::new(503, "worker_lost", message)
+    }
+}
+
+/// Bounds how often the supervisor retries a faulted worker before it fences
+/// the service. Production keeps no attempt limit and relies on the capped
+/// backoff; tests inject bounded budgets so fixture coordinators terminate.
+#[derive(Clone, Copy, Debug)]
+pub struct RestartPolicy {
+    pub max_attempts: Option<u32>,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl Default for RestartPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: None,
+            initial_backoff: WORKER_RESTART_INITIAL_BACKOFF,
+            max_backoff: WORKER_RESTART_MAX_BACKOFF,
+        }
+    }
+}
+
+impl RestartPolicy {
+    /// A bounded policy without backoff delays for CPU fixtures.
+    pub const fn immediate(max_attempts: u32) -> Self {
+        Self {
+            max_attempts: Some(max_attempts),
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+        }
     }
 }
 
@@ -320,6 +357,8 @@ pub struct Metrics {
     pub peak_bytes: AtomicU64,
     pub worker_rotations: AtomicU64,
     pub worker_faults: AtomicU64,
+    pub worker_restarts: AtomicU64,
+    pub worker_restart_failures: AtomicU64,
 }
 
 pub struct Service {
@@ -334,6 +373,7 @@ pub struct Service {
     pub metrics: Metrics,
     pub timeout: Duration,
     pub memory_budget: u64,
+    restart: RestartPolicy,
 }
 
 impl Service {
@@ -496,11 +536,13 @@ impl Service {
             "apxinf_requests_total{{status=\"completed\"}} {}\napxinf_requests_total{{status=\"cancelled\"}} {}\napxinf_requests_total{{status=\"failed\"}} {}\napxinf_requests_total{{status=\"expired\"}} {}\n",
             "apxinf_input_tokens_total {}\napxinf_output_tokens_total {}\napxinf_queue_seconds_sum {}\napxinf_request_seconds_sum {}\n",
             "apxinf_capacity_reserved_bytes {}\napxinf_worker_peak_bytes {}\napxinf_memory_budget_bytes {}\n",
-            "apxinf_worker_rotations_total {}\napxinf_worker_faults_total {}\n"),
+            "apxinf_worker_rotations_total {}\napxinf_worker_faults_total {}\n",
+            "apxinf_worker_restarts_total {}\napxinf_worker_restart_failures_total {}\n"),
             get(&m.queued), get(&m.active), outcomes[0], outcomes[1], outcomes[2], outcomes[3],
             get(&m.input_tokens), get(&m.output_tokens), get(&m.queue_ns) as f64 / 1e9, get(&m.elapsed_ns) as f64 / 1e9,
             get(&m.reserved_bytes), get(&m.peak_bytes), self.memory_budget,
-            get(&m.worker_rotations), get(&m.worker_faults));
+            get(&m.worker_rotations), get(&m.worker_faults),
+            get(&m.worker_restarts), get(&m.worker_restart_failures));
         text.push_str(&observations);
         self.host_pressure.append_metrics(&mut text);
         diagnostics::append_metrics(&mut text);
@@ -976,6 +1018,7 @@ async fn start_inner(
         metrics: Metrics::default(),
         timeout: config.timeout,
         memory_budget: config.memory_budget,
+        restart: RestartPolicy::default(),
     });
     service.metrics.peak_bytes.store(peak, Ordering::Relaxed);
     start_queue_sweeper(&service);
@@ -1026,8 +1069,8 @@ fn start_queue_sweeper(service: &Arc<Service>) {
 fn withdraw_worker(service: &Service) {
     service.available.store(false, Ordering::Release);
     service.rotating.store(false, Ordering::Release);
-    service.host_pressure.stop();
-    service.queue.close(&service.metrics, service.timeout);
+    // A fault pauses admission and rejects waiting work; only shutdown closes the queue.
+    service.queue.pause(&service.metrics, service.timeout);
 }
 
 async fn fence_worker(worker: &mut Worker, service: &Service, error: ApiError) {
@@ -1064,6 +1107,167 @@ async fn coordinate_and_report<F, Fut, E>(
     stopped.send_replace(Some(result));
 }
 
+struct RestartBackoff {
+    policy: RestartPolicy,
+    next: Duration,
+}
+
+impl RestartBackoff {
+    fn new(policy: RestartPolicy) -> Self {
+        Self {
+            policy,
+            next: policy.initial_backoff,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next.min(self.policy.max_backoff);
+        self.next = (delay * 2).min(self.policy.max_backoff);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.next = self.policy.initial_backoff;
+    }
+}
+
+fn settle_pending_recovery(shared: &Service, pending: &mut Option<Arc<RequestObservation>>) {
+    if let Some(observation) = pending.take() {
+        observation.settled(&shared.metrics.observations, Instant::now());
+    }
+}
+
+fn emit_restart_failure(shared: &Service, attempt: u64, worker: &Worker, message: &str) {
+    shared
+        .metrics
+        .worker_restart_failures
+        .fetch_add(1, Ordering::Relaxed);
+    diagnostics::emit(format_args!(
+        "{}",
+        json!({"event":"worker_restart_failed","attempt":attempt,"error":message,"worker_epoch":worker.epoch})
+    ));
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Recovery {
+    Ready,
+    Stopped,
+    Exhausted,
+}
+
+/// Reaps the faulted worker and retries the approved launch with bounded
+/// exponential backoff. `Ready` reopens admission; `Stopped` lets shutdown win;
+/// `Exhausted` reports a fenced service after the configured attempt budget.
+async fn recover_worker<F, Fut, E>(
+    worker: &mut Worker,
+    shared: &Arc<Service>,
+    launch: &mut F,
+    backoff: &mut RestartBackoff,
+) -> Recovery
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(Worker, Value), E>>,
+    E: Into<LaunchError>,
+{
+    let mut attempt: u64 = 0;
+    loop {
+        if shared.queue.is_closed() {
+            return Recovery::Stopped;
+        }
+        if backoff
+            .policy
+            .max_attempts
+            .is_some_and(|limit| attempt >= u64::from(limit))
+        {
+            return Recovery::Exhausted;
+        }
+        attempt += 1;
+        let delay = backoff.next_delay();
+        diagnostics::emit(format_args!(
+            "{}",
+            json!({"event":"worker_restart_scheduled","attempt":attempt,
+                "delay_ms":delay.as_millis() as u64,"worker_epoch":worker.epoch})
+        ));
+        let closed = shared.queue.wait_closed();
+        tokio::pin!(closed);
+        tokio::select! {
+            biased;
+            _ = &mut closed => return Recovery::Stopped,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        let (replacement, ready) = match launch().await.map_err(Into::into) {
+            Ok(loaded) => loaded,
+            Err(LaunchError::Stopped) => return Recovery::Stopped,
+            Err(error) => {
+                emit_restart_failure(shared, attempt, worker, &error.message());
+                continue;
+            }
+        };
+        if shared.queue.is_closed() {
+            let mut replacement = replacement;
+            let _ = stop_child(&mut replacement.child).await;
+            return Recovery::Stopped;
+        }
+        match adopt_replacement(worker, shared, replacement, ready).await {
+            Ok(()) => {
+                shared.metrics.worker_restarts.fetch_add(1, Ordering::Relaxed);
+                shared.rotating.store(false, Ordering::Release);
+                if !shared.queue.resume(&shared.available) {
+                    return Recovery::Stopped;
+                }
+                backoff.reset();
+                diagnostics::emit(format_args!(
+                    "{}",
+                    json!({"event":"worker_restarted","attempts":attempt,"worker_epoch":worker.epoch})
+                ));
+                return Recovery::Ready;
+            }
+            Err(error) => emit_restart_failure(shared, attempt, worker, &error.message),
+        }
+    }
+}
+
+/// Checks the replacement identity and publishes its readiness snapshot.
+/// The caller owns `replacement` until a successful adoption.
+async fn adopt_replacement(
+    worker: &mut Worker,
+    service: &Service,
+    mut replacement: Worker,
+    ready: Value,
+) -> Result<(), ApiError> {
+    let old_epoch = worker.epoch.clone();
+    if replacement.epoch == old_epoch
+        || ready["worker_epoch"] != replacement.epoch
+        || ready["model_revision"] != service.ready["model_revision"]
+        || ready["capability_revision"] != service.ready["capability_revision"]
+    {
+        let message = startup_failure(
+            "The replacement worker identity differs from the approved profile.".into(),
+            stop_child(&mut replacement.child).await,
+        );
+        return Err(ApiError::worker(message));
+    }
+    let (_, peak) = match ready_memory_totals(&ready) {
+        Ok(memory) => memory,
+        Err(error) => {
+            return Err(ApiError::worker(startup_failure(
+                error,
+                stop_child(&mut replacement.child).await,
+            )));
+        }
+    };
+    service
+        .metrics
+        .peak_bytes
+        .fetch_max(peak, Ordering::Relaxed);
+    *service
+        .ready_state
+        .write()
+        .expect("The worker readiness lock is poisoned.") = ready;
+    *worker = replacement;
+    Ok(())
+}
+
 async fn coordinate<F, Fut, E>(
     mut worker: Worker,
     shared: Arc<Service>,
@@ -1075,20 +1279,28 @@ where
     Fut: Future<Output = Result<(Worker, Value), E>>,
     E: Into<LaunchError>,
 {
-    let mut fault = None;
+    let mut backoff = RestartBackoff::new(shared.restart);
     let mut pending_recovery: Option<Arc<RequestObservation>> = None;
+    let mut fault: Option<String> = None;
     loop {
         if shared.queue.is_closed() {
             break;
         }
         if worker.requires_rotation() {
             match rotate_worker(&mut worker, &shared, &mut launch).await {
-                Ok(Rotation::Ready) => {}
+                Ok(Rotation::Ready) => backoff.reset(),
                 Ok(Rotation::Stopped) => break,
                 Err(error) => {
-                    fault = Some(error.message.clone());
                     fence_worker(&mut worker, &shared, error).await;
-                    break;
+                    settle_pending_recovery(&shared, &mut pending_recovery);
+                    match recover_worker(&mut worker, &shared, &mut launch, &mut backoff).await {
+                        Recovery::Ready => continue,
+                        Recovery::Stopped => break,
+                        Recovery::Exhausted => {
+                            fault = Some(exhaust_restart_budget(&shared));
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1101,9 +1313,15 @@ where
                     None => Err(ApiError::worker("The idle worker output pipe closed.")),
                 };
                 if let Err(error) = result {
-                    fault = Some(error.message.clone());
                     fence_worker(&mut worker, &shared, error).await;
-                    break;
+                    match recover_worker(&mut worker, &shared, &mut launch, &mut backoff).await {
+                        Recovery::Ready => continue,
+                        Recovery::Stopped => break,
+                        Recovery::Exhausted => {
+                            fault = Some(exhaust_restart_budget(&shared));
+                            break;
+                        }
+                    }
                 }
                 continue;
             }
@@ -1150,7 +1368,6 @@ where
             execute(&mut worker, &shared, job, shared.timeout).await
         };
         if let Err(failure) = result {
-            fault = Some(failure.error.message.clone());
             if !failure.reported {
                 shared.metrics.failed.fetch_add(1, Ordering::Relaxed);
                 observation.public_terminal(
@@ -1161,7 +1378,15 @@ where
             }
             pending_recovery = Some(observation);
             fence_worker(&mut worker, &shared, failure.error).await;
-            break;
+            settle_pending_recovery(&shared, &mut pending_recovery);
+            match recover_worker(&mut worker, &shared, &mut launch, &mut backoff).await {
+                Recovery::Ready => continue,
+                Recovery::Stopped => break,
+                Recovery::Exhausted => {
+                    fault = Some(exhaust_restart_budget(&shared));
+                    break;
+                }
+            }
         }
         shared.metrics.active.store(0, Ordering::Relaxed);
         shared.metrics.reserved_bytes.store(0, Ordering::Relaxed);
@@ -1169,12 +1394,23 @@ where
     }
     // A closed coordinator must not leave its owned child running.
     stop_child(&mut worker.child).await?;
-    if let Some(observation) = pending_recovery {
-        observation.settled(&shared.metrics.observations, Instant::now());
-    }
+    settle_pending_recovery(&shared, &mut pending_recovery);
     shared.metrics.active.store(0, Ordering::Relaxed);
     shared.metrics.reserved_bytes.store(0, Ordering::Relaxed);
     fault.map_or(Ok(()), Err)
+}
+
+/// Fences the service after the configured restart budget is exhausted.
+/// The process stays alive with `/readyz` unavailable until an operator restarts it.
+fn exhaust_restart_budget(shared: &Service) -> String {
+    let limit = shared.restart.max_attempts.unwrap_or(0);
+    shared.queue.close(&shared.metrics, shared.timeout);
+    shared.available.store(false, Ordering::Release);
+    diagnostics::emit(format_args!(
+        "{}",
+        json!({"event":"worker_restart_exhausted","attempts":limit})
+    ));
+    format!("The worker restart budget of {limit} attempts is exhausted.")
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1247,7 +1483,7 @@ where
         service.rotating.store(false, Ordering::Release);
         return Ok(Rotation::Stopped);
     }
-    let (mut replacement, ready) = match launch().await.map_err(Into::into) {
+    let (replacement, ready) = match launch().await.map_err(Into::into) {
         Ok(loaded) => loaded,
         Err(LaunchError::Stopped) => {
             service.rotating.store(false, Ordering::Release);
@@ -1255,41 +1491,15 @@ where
         }
         Err(error) => return Err(ApiError::worker(error.message())),
     };
-    if replacement.epoch == old_epoch
-        || ready["worker_epoch"] != replacement.epoch
-        || ready["model_revision"] != service.ready["model_revision"]
-        || ready["capability_revision"] != service.ready["capability_revision"]
-    {
-        let message = startup_failure(
-            "The replacement worker identity differs from the approved profile.".into(),
-            stop_child(&mut replacement.child).await,
-        );
-        return Err(ApiError::worker(message));
-    }
-    let (_, peak) = match ready_memory_totals(&ready) {
-        Ok(memory) => memory,
-        Err(error) => {
-            return Err(ApiError::worker(startup_failure(
-                error,
-                stop_child(&mut replacement.child).await,
-            )));
-        }
-    };
-    service
-        .metrics
-        .peak_bytes
-        .fetch_max(peak, Ordering::Relaxed);
-    *service
-        .ready_state
-        .write()
-        .expect("The worker readiness lock is poisoned.") = ready;
-    *worker = replacement;
+    adopt_replacement(worker, service, replacement, ready).await?;
     service
         .metrics
         .worker_rotations
         .fetch_add(1, Ordering::Relaxed);
     service.rotating.store(false, Ordering::Release);
-    service.queue.publish_availability(&service.available);
+    if !service.queue.resume(&service.available) {
+        return Ok(Rotation::Stopped);
+    }
     diagnostics::emit(format_args!(
         "{}",
         json!({"event":"worker_rotated", "previous_epoch":old_epoch, "worker_epoch":worker.epoch})
@@ -2295,6 +2505,7 @@ fn gateway_test_service_config(
         metrics: Metrics::default(),
         timeout: Duration::from_secs(1),
         memory_budget: 1024,
+        restart: RestartPolicy::immediate(3),
     });
     let coordinator = service.clone();
     tokio::spawn(async move {
@@ -2331,6 +2542,7 @@ mod lifecycle_tests {
             metrics: Metrics::default(),
             timeout: Duration::from_secs(1),
             memory_budget: 1024,
+            restart: RestartPolicy::immediate(3),
         })
     }
 
@@ -2573,7 +2785,7 @@ mod lifecycle_tests {
                 .err()
                 .expect("Queued work must fail before preparation.");
             assert_eq!(error.code, "worker_lost");
-            assert_eq!(error.message, "The worker requires a restart.");
+            assert_eq!(error.message, "The model worker is restarting after a fault.");
         }
         assert!(!service.available.load(Ordering::Acquire));
         assert_eq!(service.metrics.queued.load(Ordering::Relaxed), 0);
