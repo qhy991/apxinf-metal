@@ -206,9 +206,10 @@ fn probed_gemm(stream: &Stream) -> Option<MppBf16GemmNt> {
 /// Env-gated (`APXINF_QWEN_IMAGE_TIMING=1`) stderr phase and per-step timing
 /// for the long-prompt attention probe (EngineTailor #205): text encode,
 /// text-prefix K/V build, compiled-step preparation, each denoise step, VAE
-/// decode and the allocator peak. Off by default; when off, each probe point
-/// costs one `Instant::now` pair whose delta is discarded.
-fn timing_enabled() -> bool {
+/// decode and the allocator peak, plus the text encoder's per-layer
+/// load/compute split (EngineTailor #217). Off by default; when off, each
+/// probe point costs one `Instant::now` pair whose delta is discarded.
+pub(crate) fn timing_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {

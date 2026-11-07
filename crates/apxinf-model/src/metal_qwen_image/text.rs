@@ -1,9 +1,7 @@
 //! Prompt encoding: the fixed Qwen-Image-2.1 template and the Qwen3-VL text
 //! stack (mflux `Qwen21TextEncoder`), read from disk one layer at a time.
 use super::ops::Ops;
-use super::weights::{
-    TextEncoderFiles, TextLayer, DIM, HEADS, HEAD_DIM, TEXT_KV_HEADS, TEXT_LAYERS,
-};
+use super::weights::{self, TextEncoderFiles, TextLayer, DIM, HEADS, HEAD_DIM, TEXT_KV_HEADS, TEXT_LAYERS};
 use apxinf_core::{Error, Result};
 use apxinf_mlx::{Array, MlxDType};
 use apxinf_tokenizer::Tokenizer;
@@ -105,14 +103,30 @@ fn layer(h: &Array, w: &TextLayer, cos: &Array, sin: &Array, ops: &Ops) -> Resul
 /// Prompt states after the final norm, without the system prefix: `[1, T, 4096]` BF16.
 pub fn encode(files: &TextEncoderFiles, tokens: &PromptTokens, ops: &Ops) -> Result<Array> {
     let stream = ops.stream();
+    let timing = super::timing_enabled();
+    // Overlap the per-layer disk reads with the previous layer's device
+    // compute: the worker warms the page cache for the next layers while
+    // this thread evaluates the current one. Scheduling only; the bytes and
+    // kernels are unchanged, so the encoded states stay bit-exact.
+    let prefetch = weights::prefetch_enabled().then(|| {
+        let prefetch = weights::TextPrefetch::new();
+        prefetch.submit(files.layer_ranges(0));
+        if TEXT_LAYERS > 1 {
+            prefetch.submit(files.layer_ranges(1));
+        }
+        prefetch
+    });
+    let mut next = 2;
     let length = tokens.ids.len();
     let ids: Vec<i32> = tokens.ids.iter().map(|&id| id as i32).collect();
+    let embed_start = std::time::Instant::now();
     let mut h = {
         let embedding = files.tensor(stream, "embed_tokens.weight")?;
         let h = embedding.take(&Array::from_i32(stream, &[1, length], &ids)?, 0)?;
         h.eval()?;
         h
     };
+    let embed_elapsed = embed_start.elapsed();
     // Text positions repeat on all three MRoPE axes, so the interleave is the identity.
     let inv_freq = files.tensor(stream, "rotary_emb.inv_freq")?;
     let positions: Vec<f32> = (0..length).map(|p| p as f32).collect();
@@ -123,11 +137,40 @@ pub fn encode(files: &TextEncoderFiles, tokens: &PromptTokens, ops: &Ops) -> Res
     let emb = Array::concat(&[&freqs, &freqs], 1)?.reshape(&[1, 1, length, HEAD_DIM])?;
     let cos = emb.cos()?.cast(h.dtype())?;
     let sin = emb.sin()?.cast(h.dtype())?;
+    let mut load_total = std::time::Duration::ZERO;
+    let mut compute_total = std::time::Duration::ZERO;
     for i in 0..TEXT_LAYERS {
+        let load_start = std::time::Instant::now();
         let weights = files.layer(stream, i)?;
+        let load = load_start.elapsed();
+        if let Some(prefetch) = &prefetch {
+            if next < TEXT_LAYERS {
+                prefetch.submit(files.layer_ranges(next));
+                next += 1;
+            }
+        }
+        let compute_start = std::time::Instant::now();
         h = layer(&h, &weights, &cos, &sin, ops)?;
         // Release this layer's weights before reading the next one.
         h.eval()?;
+        let compute = compute_start.elapsed();
+        load_total += load;
+        compute_total += compute;
+        if timing {
+            eprintln!(
+                "qimage-timing: text_layer {i} load={:.3}s compute={:.3}s",
+                load.as_secs_f64(),
+                compute.as_secs_f64(),
+            );
+        }
+    }
+    if timing {
+        eprintln!(
+            "qimage-timing: text_layers embed={:.3}s load={:.3}s compute={:.3}s",
+            embed_elapsed.as_secs_f64(),
+            load_total.as_secs_f64(),
+            compute_total.as_secs_f64(),
+        );
     }
     let norm = files.tensor(stream, "norm.weight")?;
     let h = rms_norm(&h, &norm, ops)?.slice_axis(1, tokens.drop, length)?;
