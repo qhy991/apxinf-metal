@@ -9,6 +9,16 @@ use apxinf_mlx::{Array, Compiled, MlxDType};
 use std::rc::Rc;
 
 const EPS: f32 = 1e-6;
+/// Process-wide count of text-prefix K/V computations. The long-prompt probe
+/// (EngineTailor #205) asserts the prefix is built once per request, not per
+/// denoise step; read it back with [`text_cache_call_count`].
+static TEXT_CACHE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of `text_cache` computations since process start.
+pub fn text_cache_call_count() -> usize {
+    TEXT_CACHE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Smallest image-token count that uses the MPP GEMM. MLX quantized matmul
 /// switches to another reduction for small output grids (observed on M4 at
 /// 64 tokens), where MPP no longer reproduces it.
@@ -246,6 +256,7 @@ impl Dit {
 
     /// The text prefix with the t = 0 modulation row; FP32 RoPE tables `[T, 64]`.
     pub fn text_cache(&self, prompt: &Array, cos: &Array, sin: &Array) -> Result<TextCache> {
+        TEXT_CACHE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let stream = self.ops.stream();
         let tokens = prompt.shape()[1];
         let temb = self.time_embedding(&Array::zeros(stream, &[2], MlxDType::F32)?)?;

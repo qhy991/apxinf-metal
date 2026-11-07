@@ -73,14 +73,7 @@ fn linear(x: &Array, weight: &Array) -> Result<Array> {
     x.matmul(&weight.transpose(&[1, 0])?)
 }
 
-fn layer(
-    h: &Array,
-    w: &TextLayer,
-    cos: &Array,
-    sin: &Array,
-    mask: &Array,
-    ops: &Ops,
-) -> Result<Array> {
+fn layer(h: &Array, w: &TextLayer, cos: &Array, sin: &Array, ops: &Ops) -> Result<Array> {
     let length = h.shape()[1];
     let x = rms_norm(h, &w.input_norm, ops)?;
     let heads = |p: &Array, n: usize| p.reshape(&[1, length, n, HEAD_DIM]);
@@ -102,14 +95,17 @@ fn layer(
     };
     let (k, v) = (repeat(&k)?, repeat(&v)?);
     let scale = (1.0 / (HEAD_DIM as f64).sqrt()) as f32;
+    // Causal self-attention over the templated prompt, in FP32 like the
+    // reference. The causal flag selects MLX's masked-tile-skipping kernel;
+    // it computes the same kept-set softmax as an additive -inf mask.
     let attn = q
         .cast(MlxDType::F32)?
         .sdpa(
             &k.cast(MlxDType::F32)?,
             &v.cast(MlxDType::F32)?,
             scale,
-            false,
-            Some(mask),
+            true,
+            None,
         )?
         .cast(q.dtype())?
         .transpose(&[0, 2, 1, 3])?
@@ -131,17 +127,6 @@ pub fn encode(files: &TextEncoderFiles, tokens: &PromptTokens, ops: &Ops) -> Res
         h.eval()?;
         h
     };
-    // Additive causal mask; the unpadded prompt adds a zero padding mask.
-    let mask: Vec<f32> = (0..length * length)
-        .map(|i| {
-            if i % length > i / length {
-                f32::NEG_INFINITY
-            } else {
-                0.0
-            }
-        })
-        .collect();
-    let mask = Array::from_f32(stream, &[1, 1, length, length], &mask)?;
     // Text positions repeat on all three MRoPE axes, so the interleave is the identity.
     let inv_freq = files.tensor(stream, "rotary_emb.inv_freq")?;
     let positions: Vec<f32> = (0..length).map(|p| p as f32).collect();
@@ -154,7 +139,7 @@ pub fn encode(files: &TextEncoderFiles, tokens: &PromptTokens, ops: &Ops) -> Res
     let sin = emb.sin()?.cast(h.dtype())?;
     for i in 0..TEXT_LAYERS {
         let weights = files.layer(stream, i)?;
-        h = layer(&h, &weights, &cos, &sin, &mask, ops)?;
+        h = layer(&h, &weights, &cos, &sin, ops)?;
         // Release this layer's weights before reading the next one.
         h.eval()?;
     }
