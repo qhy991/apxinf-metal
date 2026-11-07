@@ -147,6 +147,26 @@ committed, because they contain checkpoint-derived weights.
   about 2.4 GB was observed on the M1 Pro. Exceeding it reloads programs on
   every switch. The family owns the per-layer budget.
 
+### Diagnostic selection gate
+
+`APXINF_CLEF_COMPOSITION` forces `reference`, `gpu`, `gpu-ane-columns` or
+`gpu-ane-neurons` for a measured campaign or a diagnostic run. Unset (or empty)
+keeps the architecture-qualified `auto` choice; an explicit
+`LoadOptions::model_variant` request wins over the environment. The gate
+bypasses qualification, so it is never a default: it exists to measure a
+composition on hardware where it did not qualify (for example the M4 column
+split) and to expose a measured optimum behind an environment variable until a
+KEEP decision changes the default.
+
+The column share stays `APXINF_CLEF_ANE_COLUMNS`: the GPU keeps the first `C`
+of 12288 intermediate columns and the Neural Engine runs `[C, 12288)`. Unset is
+the qualified 6656. The accepted depths are the measured ones
+(6656/6144/5632/5120/4608/4096/3584/3072); 6656 is the only qualified default.
+The down weight is K-split into at most 4096-wide parts, and a share that does
+not divide into 64-multiple part widths is zero-padded at the tail (8704
+columns run as three 2944-wide parts), so the padded columns contribute
+nothing to the GPU+ANE sum.
+
 ### Stage placement and permitted CPU work
 
 Apple's [CPU and Neural Engine compute-unit option](https://developer.apple.com/documentation/coreml/mlcomputeunits/cpuandneuralengine)
