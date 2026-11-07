@@ -10,6 +10,8 @@ mod causal_conv;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod device_caps;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod bf16_qk_table_rope;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod ffi;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use array::{

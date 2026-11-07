@@ -5,7 +5,7 @@
 //! enginetailor/models/mlx/m4/kernels.py. See README.md and LICENSE.engine-tailor.
 
 use super::{
-    config::{attention_width, Qwen3Config, Variant},
+    config::{attention_width, PrefillChunk, PrefillPlan, Qwen3Config, Variant},
     weights::{LayerWeights, Weights},
 };
 use crate::llm_trait::{
@@ -13,7 +13,7 @@ use crate::llm_trait::{
 };
 use apxinf_core::{Backend, Device, Error, Result, Tensor};
 use apxinf_loader::ModelConfig;
-use apxinf_mlx::fusions::QkNormRope;
+use apxinf_mlx::fusions::{Bf16QkTableRope, QkNormRope};
 use apxinf_mlx::{Array, Compiled, MlxBackend, MlxDType, Stream};
 use std::{
     collections::{HashMap, HashSet},
@@ -24,13 +24,19 @@ fn err(message: impl Into<String>) -> Error {
     Error::Other(message.into())
 }
 
-fn norm(x: &Array, weight_fp32: &Array, epsilon: f32) -> Result<Array> {
-    let f = x.cast(MlxDType::F32)?;
-    let variance = f.mul(&f)?.mean(&[-1], true)?;
-    let reciprocal = variance
-        .add(&Array::scalar(x.stream(), epsilon, MlxDType::F32)?)?
-        .rsqrt()?;
-    f.mul(&reciprocal)?.mul(weight_fp32)?.cast(x.dtype())
+fn norm(x: &Array, weight: &Array, epsilon: f32) -> Result<Array> {
+    match weight.dtype() {
+        MlxDType::BF16 if x.dtype() == MlxDType::BF16 => x.fast_rms_norm(weight, epsilon),
+        MlxDType::F32 => {
+            let f = x.cast(MlxDType::F32)?;
+            let variance = f.mul(&f)?.mean(&[-1], true)?;
+            let reciprocal = variance
+                .add(&Array::scalar(x.stream(), epsilon, MlxDType::F32)?)?
+                .rsqrt()?;
+            f.mul(&reciprocal)?.mul(weight)?.cast(x.dtype())
+        }
+        _ => Err(err("unsupported Qwen3 prepared norm dtype pair")),
+    }
 }
 
 fn rotate(x: &Array, cos: &Array, sin: &Array, dim: usize) -> Result<Array> {
@@ -73,7 +79,7 @@ impl Seams {
         let dims = config.head_dim;
         let norm = Compiled::new(stream, 1, move |a| {
             if a.len() != 2 {
-                return Err(err("norm trace requires x and FP32 weight"));
+                return Err(err("norm trace requires x and prepared weight"));
             }
             Ok(vec![norm(&a[0], &a[1], eps)?])
         })?;
@@ -85,7 +91,10 @@ impl Seams {
         })?;
         let c = config.clone();
         let block = if decoder {
-            Some(Compiled::new(stream, 3, move |a| decoder_block(a, &c))?)
+            let table_rope = Bf16QkTableRope::new(stream)?;
+            Some(Compiled::new(stream, 3, move |a| {
+                decoder_block(a, &c, &table_rope)
+            })?)
         } else {
             None
         };
@@ -95,7 +104,7 @@ impl Seams {
 
 /// Pure B=1/L=1 block. Weights, index, table row and KV state are explicit inputs.
 /// No mutable request state, host readback, or model object is captured.
-fn decoder_block(a: &[Array], c: &Qwen3Config) -> Result<Vec<Array>> {
+fn decoder_block(a: &[Array], c: &Qwen3Config, table_rope: &Bf16QkTableRope) -> Result<Vec<Array>> {
     if a.len() != 18 {
         return Err(err("Qwen3 decoder block expects 18 arrays"));
     }
@@ -122,8 +131,7 @@ fn decoder_block(a: &[Array], c: &Qwen3Config) -> Result<Vec<Array>> {
         .matmul(&a[12])?
         .reshape(&[1, 1, c.num_key_value_heads, c.head_dim])?
         .transpose(&[0, 2, 1, 3])?;
-    let q = rotate(&q, cos, sin, c.head_dim)?;
-    let k = rotate(&k, cos, sin, c.head_dim)?;
+    let (q, k) = table_rope.call(&q, &k, cos, sin)?;
     let keys = keys.slice_update(&k, index, &[2])?;
     let values = values.slice_update(&v, index, &[2])?;
     let width = a[17].shape()[0];
@@ -148,6 +156,7 @@ fn decoder_block(a: &[Array], c: &Qwen3Config) -> Result<Vec<Array>> {
 pub struct Qwen3Model {
     config: Qwen3Config,
     variant: Variant,
+    prefill_chunk: Option<PrefillChunk>,
     backend: MlxBackend,
     weights: Weights,
     seams: Option<Seams>,
@@ -182,6 +191,7 @@ impl Qwen3Model {
         variant: Variant,
     ) -> Result<Self> {
         config.validate()?;
+        let prefill_chunk = PrefillChunk::from_env()?;
         if variant == Variant::MixedW8 {
             config.validate_checkpoint_scope()?;
         }
@@ -216,6 +226,7 @@ impl Qwen3Model {
         let mut model = Self {
             config,
             variant,
+            prefill_chunk,
             backend,
             weights,
             seams,
@@ -324,18 +335,24 @@ impl Qwen3Model {
         if prompt_len <= 2048 {
             self.warm_length(prompt_len)?;
         }
-        // Source append_logits evaluates cache-only chunks, followed by one
-        // last-token forward. Register every prompt shape outside inference.
-        let prefix = prompt_len - 1;
-        if prefix >= 512 {
-            self.warm_length(512)?;
-        }
-        if prefix % 512 != 0 {
-            self.warm_length(prefix % 512)?;
+        for rows in self.prefill_plan(prompt_len)?.required_rows() {
+            self.warm_length(rows)?;
         }
         self.warm_decoder()?;
         self.backend.stream().synchronize()?;
         Ok(())
+    }
+
+    fn prefill_plan(&self, prompt: usize) -> Result<PrefillPlan> {
+        PrefillPlan::new(
+            prompt,
+            self.prefill_chunk
+                .unwrap_or(if self.variant == Variant::Bf16Compiled {
+                    PrefillChunk::Tokens2048
+                } else {
+                    PrefillChunk::Tokens512
+                }),
+        )
     }
 
     fn warm_length(&mut self, len: usize) -> Result<()> {
@@ -786,18 +803,19 @@ impl LlmTrait for Qwen3Model {
             return Err(err("Qwen3 does not support images"));
         }
         self.validate_input(input.token_ids, 0)?;
-        let prefix = input.token_ids.len() - 1;
+        let plan = self.prefill_plan(input.token_ids.len())?;
         // Check the entire schedule before consuming any part of the prompt.
-        if !self.prepared_lengths.contains(&1)
-            || (prefix >= 512 && !self.prepared_lengths.contains(&512))
-            || (prefix % 512 != 0 && !self.prepared_lengths.contains(&(prefix % 512)))
+        if !plan
+            .required_rows()
+            .iter()
+            .all(|rows| self.prepared_lengths.contains(rows))
         {
             return Err(err("Qwen3 prefill schedule was not prepared"));
         }
-        for chunk in input.token_ids[..prefix].chunks(512) {
-            self.execute(chunk, self.position, false)?;
+        for range in plan.chunks() {
+            self.execute(&input.token_ids[range], self.position, false)?;
         }
-        self.execute(&input.token_ids[prefix..], self.position, true)?
+        self.execute(&input.token_ids[plan.prefix_len..], self.position, true)?
             .ok_or_else(|| err("missing Qwen3 prefill logits"))
     }
 

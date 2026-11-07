@@ -59,8 +59,13 @@ combinations fail at construction with an explicit error.
 `LlmTrait::forward` retains its full `[seq_len, vocab_size]` logits contract.
 The generation-oriented `prefill(LlmInput)` hook may consume the whole prompt
 and return only `[1, vocab_size]`. Qwen3 uses cache-only prefix chunks of at
-most 512 followed by a final-token forward; MiniCPM5 uses 512-token chunks above
-4096 prompt tokens and projects the final normalized row of each chunk.
+most 2048 in compiled BF16 mode followed by a final-token forward. MiniCPM5
+uses 1024-token chunks above 4096 prompt tokens in compiled mode and projects
+the last row of the final chunk. Other variants retain the 512-token default.
+Experimental family-specific `APXINF_QWEN3_PREFILL_CHUNK` and
+`APXINF_MINICPM5_PREFILL_CHUNK` overrides select 512/1024/2048 at construction.
+Each family derives preparation and execution from the same private range plan;
+Mini's override preserves whole prompts through 4096 and all DSpark behavior.
 Long preparation advertises bounded chunk shapes, not a full prompt-sized
 forward. Call `forward` on an admitted shape for every input row's logits. Ordinary
 generation uses the shared sampler/EOS loop; DSpark overrides the request-level
@@ -113,10 +118,10 @@ Metal; Qwen3 checkpoint detection still works.
 | Family selection | Profile admitted by current code | Actual prepared execution |
 | --- | --- | --- |
 | Qwen3 `bf16-public` | Qwen3-0.6B BF16, B1, up to 40960 total positions | Ordered device composition; source public SwiGLU remains locally compiled |
-| Qwen3 `bf16-compiled` (default) | Same profile | Local norm/RoPE compilation plus explicit-state B1/L1 decoder blocks after prefix state exists; no whole-step callable |
+| Qwen3 `bf16-compiled` (default) | Same profile | Native weighted RMSNorm with prepared BF16 weights; local norm/RoPE compilation plus explicit-state B1/L1 decoder blocks after prefix state exists; no whole-step callable |
 | Qwen3 `mixed-w8` | Same profile; affine W8/group 64 | Transformer projections use W8 at M1 and BF16 for larger M; fused gate/up; the tied input/output table is packed at every M; local norm/RoPE and fixed Q/K norm-to-RoPE Metal fusion; no BF16 decoder-block callable |
 | MiniCPM5 `bf16-public` | Official 2B BF16 geometry, B1, up to 65792 total positions, including 65536 prompt + 256 output | Ordered device composition; source public SwiGLU remains locally compiled |
-| MiniCPM5 `bf16-compiled` (default) | Same profile | Local norm/RoPE and complete decode-step compilation, including the packed residual/RMSNorm kernel |
+| MiniCPM5 `bf16-compiled` (default) | Same profile | KV-only evaluation of non-final prefill chunks, native weighted prefill RMSNorm with BF16 rounding before weight multiplication, local RoPE and complete decode-step compilation with packed residual/RMSNorm |
 | MiniCPM5 `dspark` | Same target plus the pinned official BF16 drafter; 1–256 output tokens within a separate 4096-total-position limit | Compiled five-layer draft and sequential Markov-head proposal chain, plus compiled target verification for up to eight rows; explicit accept/trim/pending-token schedule |
 | d3-lite `bf16` (default), also `auto` / `bf16-compiled` | `vllm-sr/d3-lite` BF16 text path: hidden 1024, 24 layers (18 GDN + 6 non-causal full attention), B1, up to 262144 positions, 255-code FP32 readout; image requests add the `visual.*` tower (12 × 768 blocks + merger to 1024) over **one still image** per request | Text: whole-request `Compiled` forward (`ids [1,L]`, `candidate_count [1]` → masked FP32 probabilities); one `(length, candidate_count)` profile traced on first use and replayed without retracing; eager lazy graph retained for the compiled/eager acceptance test. Image: eager checkpoint-fixed preprocess (`preprocess.rs`) + eager vision tower (`vision.rs`), then a second `Compiled` forward (`ids`, `[3,L]` mRoPE positions, `candidate_count`, merged features, one placeholder-run start) with one `(length, candidate_count, image_tokens)` profile; the text callable and its profiles are untouched. Video and multi-image requests are rejected by name |
 
@@ -127,6 +132,14 @@ arrays and guarded fusions in [apxinf-mlx](../crates/apxinf-mlx/README.md).
 Qwen3 reads `head_dim` explicitly (128, although hidden/heads is 64). MiniCPM5's
 official `model_type` is `llama`, so select `--model-name metal_minicpm5` explicitly.
 DSpark requires the named `draft` asset and is never selected by default.
+
+`Bf16QkTableRope` is a safe backend operation for BF16 Q `[1,Hq,1,D]`, K
+`[1,Hk,1,D]` and tables `[1,1,1,D]`, with positive heads and positive even D.
+It accepts array views and rounds each half-split product and sum to BF16.
+Qwen3 selects it only inside established-prefix `bf16-compiled` decoder blocks,
+after native Q/K normalization. Local prefill RoPE, `bf16-public`, and
+`mixed-w8` retain their existing operations. The backend owns launch geometry
+and bounds checks; Qwen3 owns table preparation, position and KV updates.
 
 The MLX allocator cache budget is process-wide and belongs to the embedding
 application, applied once before model loading. A cache limit does not cap
@@ -410,6 +423,23 @@ lazy payload-read error propagation. Matching function signatures in 0.31.2
 do not establish that guarantee. Native CPU regression tests cover failure
 after header validation, before payload evaluation completes.
 
+Qwen3 `bf16-compiled` retains BF16 checkpoint norm weights and uses native
+weighted RMSNorm for all input, post-attention, Q, K, and final norms in prefill
+and decode. Its private norm helper selects arithmetic from the prepared weight
+dtype. BF16 weights require BF16 activations; FP32 weights retain the ordered
+FP32 expression used by `bf16-public` and `mixed-w8`. This changes 222 of 1024
+text-fixed tokens relative to b2d58ea. External-teacher agreement is 221/222
+with no per-language regression. Five clean 1K blocks improve total time
+against ordered normalization; the full MLX matrix remains pending.
+
+MiniCPM5 compiled prefill uses native weighted RMSNorm with its existing BF16
+weights. The pinned MLX 0.32.3 Metal kernel casts the normalized value to BF16
+before multiplying the weight. Public and DSpark retain ordered normalization,
+and compiled decode retains packed residual/RMSNorm. Short-token, teacher and
+eight long logits/state checks match the unweighted path. Five clean 1K blocks
+give a median total-time ratio of 0.9961 against that path; the full matrix
+remains pending.
+
 Keep structural checks at preparation where possible, preserve safe operand and
 resource checks at invocation, and compare the actual compiled/fused path with
 its pinned reference. No implicit CPU fallback, reduced precision or changed
@@ -425,8 +455,12 @@ capture instead of fabricating a no-op graph.
 The current text implementations select compiled execution through explicit
 family variants and fallible family `prepare` methods. `Compiled` owns the pure
 Rust callback; `call` is lazy and `call_and_eval` completes all returned arrays.
-Preparation uses `Compiled::prepare`, which evaluates twice and rejects any
-Rust trace callback on the second invocation. Callable construction rejects
+`Compiled::prepare` evaluates twice and rejects any Rust trace callback on the
+second invocation. `Compiled::prepare_trace` checks graph reuse without evaluation.
+The opt-in MiniCPM5 exact-attention path evaluates its first and last
+widths and uses graph-only preparation for intermediate widths. Their first
+device evaluation can still compile shaders and allocate buffers; cold-request
+timing includes that work. Callable construction rejects
 the presence of `MLX_DISABLE_COMPILE`, even when its value is `0`; that MLX
 setting otherwise disables compilation silently. The reuse check observes
 Rust tracing, not all native shader compilation.
@@ -453,7 +487,7 @@ norm/RoPE kernel is not proof that full-step compilation was assessed.
 | --- | --- |
 | Construct | Bind device/runtime identity, weights, public semantics and supported profiles |
 | Prepare | Validate structural contracts; materialize immutable weights; create kernels/closures; trace/compile/warm supported profiles; establish memory bounds |
-| Run | Check live operands; bind explicit state; call the prepared closure; enqueue device work without retracing, retuning or creating persistent resources |
+| Run | Check live operands; bind explicit state; call the prepared closure without new Rust graph traces; include deferred device JIT/allocation in cold timing when preparation was graph-only |
 | Complete | Evaluate required outputs and new state on the correct stream; publish state only after successful completion |
 | Reset / invalidate | Make old request state unreachable; preserve retained resources or invalidate dependents before replacing them |
 | Release | Retain resources until dependent asynchronous work is complete; release partial preparations on failure |
