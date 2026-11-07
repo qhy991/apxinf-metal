@@ -194,7 +194,7 @@ The supervisor checks the replacement model and capability revisions against the
 The service publishes the complete replacement `ready` snapshot after readiness checks pass.
 This snapshot includes the new worker epoch and current memory values.
 Queued requests retain their order and original deadlines during rotation.
-Other worker faults still require a service restart.
+Worker faults follow the separate bounded restart policy in the [local service guide](local-service-v0.1.md#metrics-and-shutdown).
 
 `command_id` identifies each preparation operation before an attempt exists.
 Cancellation or expiry ends its public request without waiting for the preparation response.

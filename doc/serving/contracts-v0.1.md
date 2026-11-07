@@ -381,7 +381,8 @@ It does not silently forget duplicate detection for a live epoch.
 Planned rotation stops the old worker before the supervisor loads its replacement.
 The replacement must pass the original model and capability identity checks.
 The service exposes its new epoch only after these checks pass.
-Rotation does not replay completed requests or authorize recovery from other worker faults.
+Rotation does not replay completed requests.
+A worker fault uses the separate bounded restart policy in the [local service guide](local-service-v0.1.md#metrics-and-shutdown) and does not replay requests either.
 
 ## Result and stop semantics
 

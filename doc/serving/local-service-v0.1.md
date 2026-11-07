@@ -404,8 +404,19 @@ The gateway rejects a full queue with HTTP 429.
 It rejects context overflow before generation.
 A worker protocol fault fences the worker epoch.
 The supervisor stops the failed worker before releasing uncertain reservations.
-This revision requires a service restart after a worker fault.
-It does not replay requests automatically.
+It then restarts that worker through the approved launch and identity checks.
+The restart uses a bounded exponential backoff.
+The first retry waits 250 milliseconds and each later retry doubles up to a 30-second cap.
+The default restart policy has no attempt limit, so a persistently failing worker keeps retrying at the cap instead of ending the service.
+`apxinf_worker_restarts_total`, `apxinf_worker_restart_failures_total`, and the `worker_restart_scheduled` diagnostics expose that loop.
+A configured attempt budget ends in a fenced service whose `/readyz` stays unavailable until an operator restarts the process.
+An in-flight request still fails with HTTP 503 `worker_lost`.
+The service does not replay that request or its partial output.
+Requests waiting in the queue are rejected with HTTP 503 `worker_lost` when the fault fences the worker.
+Admission stays closed during the backoff: new requests receive HTTP 503 and `/readyz` reports 503.
+A successful restart publishes the replacement epoch and reopens admission, so `/readyz` returns 200 and new requests are served.
+Shutdown takes priority over a pending restart.
+A signal received during the backoff or during replacement loading reaps the owned process and exits without another load.
 
 Planned command-history rotation uses a separate lifecycle path.
 Before preparation, the supervisor reserves four command records for preparation, submission, one control, and shutdown.
@@ -423,7 +434,8 @@ New requests receive `model_unavailable` while the worker rotates.
 
 Pressure after replacement loading requires process reaping before another load attempt.
 Service shutdown ends the pressure wait without a worker fault.
-Worker faults and failed process reaping remain failures, including during shutdown.
+Worker faults are recovered by the bounded restart instead of a service restart.
+Failed process reaping remains a failure, including during shutdown.
 
 A request can expire or receive cancellation while its template and tokenizer run.
 The service ends that public request immediately and retains the execution position.
@@ -444,6 +456,8 @@ These counters include terminal outcomes during queue waiting, preparation, and 
 Each queued request increments one status counter at its public terminal result.
 `apxinf_worker_rotations_total` counts successful planned rotations.
 `apxinf_worker_faults_total` counts worker faults separately from public request outcomes.
+`apxinf_worker_restarts_total` counts replacements loaded after a worker fault.
+`apxinf_worker_restart_failures_total` counts fault-restart attempts that did not publish a replacement.
 
 The [observability contract](contracts-v0.1.md#observability-contract) defines the new duration histograms and fixed bucket boundaries.
 The operation label is `generate` or `count_tokens`.

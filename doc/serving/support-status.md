@@ -47,7 +47,10 @@ Thinking-budget control does not establish drawing or tool-use quality.
 Vision transport and image grounding do not establish successful image-driven task revision.
 Clef diagnostic requests do not establish admission under the default host-pressure policy.
 
-CPU contract tests check schemas, shared fixtures, protocol ordering, and controlled failure paths.
+CPU contract tests check schemas, shared fixtures, protocol ordering, controlled failure paths, and bounded worker restart behavior.
+The restart path is covered for process faults: the supervisor fences the failed worker, rejects the in-flight request with HTTP 503 `worker_lost`, reports `/readyz` 503 during the backoff, and reopens admission after a successful replacement.
+Restart timing, repeated fault handling, and shutdown priority are covered by CPU fixtures only.
+A real device OOM, a crashed native MLX process, and a persistently failing replacement load are not covered by those fixtures.
 Test workers do not prove model computation, dependency identity, or device cancellation.
 Actual model and client checks use the declared checkpoint, runtime, source, inputs, and generation policy.
 Keep numerical comparisons, complete task outcomes, performance measurements, and resource observations separate.

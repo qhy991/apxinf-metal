@@ -107,7 +107,7 @@ Gateway buffers output within a fixed limit. A slow connection cannot block the 
 P1a adds planned worker rotation before command history exhaustion.
 Rotation preserves approved model and capability identities and exposes the replacement epoch.
 It waits for old process exit before replacement loading and does not replay completed requests.
-Other worker faults retain their documented manual restart policy.
+Other worker faults follow the documented bounded automatic restart policy.
 
 P1a separates public preparation expiry from operation settlement.
 A cancelled or expired request ends before the supervisor consumes its late preparation response.
