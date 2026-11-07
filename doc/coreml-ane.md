@@ -167,6 +167,15 @@ not divide into 64-multiple part widths is zero-padded at the tail (8704
 columns run as three 2944-wide parts), so the padded columns contribute
 nothing to the GPU+ANE sum.
 
+The neuron split's qualified ANE share is 5632 INT8 + 1248 FP16 neurons per
+layer. `APXINF_CLEF_NEURON_SHARE` is the matching diagnostic gate for that
+composition: a percentage of the 12288 intermediate neurons to place on the
+Neural Engine, keeping the qualified INT8:FP16 ratio. Unset keeps the
+qualified counts exactly; the total is rounded to a 32-multiple (the GPU's
+remaining Q4 rows decode in whole 32-row blocks), the INT8 count to a
+64-multiple whose down parts are whole, and the FP16 share must stay positive.
+A value that cannot form the geometry is rejected.
+
 ### Stage placement and permitted CPU work
 
 Apple's [CPU and Neural Engine compute-unit option](https://developer.apple.com/documentation/coreml/mlcomputeunits/cpuandneuralengine)

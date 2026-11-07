@@ -231,6 +231,69 @@ pub fn program(mlp: &Mlp) -> Result<Package> {
 pub const NEURON_INT8: usize = 5632;
 pub const NEURON_FP16: usize = 1248;
 pub const NEURON_TILE: usize = 128;
+const NEURON_TOTAL: usize = NEURON_INT8 + NEURON_FP16;
+
+/// `(int8 neurons, fp16 neurons)` on the Neural Engine. Unset (or empty) keeps
+/// the qualified M4 split exactly. `APXINF_CLEF_NEURON_SHARE` is a diagnostic
+/// M4 gate: a percentage of the 12288 intermediate neurons to place on the
+/// Neural Engine, keeping the qualified INT8:FP16 ratio. The INT8 count is
+/// rounded to a 64-multiple whose down split is whole, and the FP16 share must
+/// stay positive; a value that cannot form that geometry is rejected instead
+/// of silently reaching an unverified program.
+pub fn neuron_counts() -> Result<(usize, usize)> {
+    let Some(value) = std::env::var("APXINF_CLEF_NEURON_SHARE")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok((NEURON_INT8, NEURON_FP16));
+    };
+    let percent = value
+        .parse::<f64>()
+        .ok()
+        .filter(|percent| percent.is_finite() && *percent > 0.0 && *percent <= 100.0)
+        .ok_or_else(|| {
+            Error::Contract("APXINF_CLEF_NEURON_SHARE must be a percentage in (0, 100]")
+        })?;
+    // The GPU keeps `12288 - total` neurons and decodes their Q4 gate/up rows
+    // in whole 32-row blocks, so the ANE total must be a multiple of 32.
+    let total = ((INTERMEDIATE as f64 * percent / 100.0 / 32.0).round() as usize) * 32;
+    let want_int8 = (total as f64 * NEURON_INT8 as f64 / NEURON_TOTAL as f64).round() as usize;
+    let int8 = ((want_int8 + 32) / 64) * 64;
+    if total == 0 || total >= INTERMEDIATE || int8 == 0 || int8 >= total {
+        return Err(Error::Contract(
+            "APXINF_CLEF_NEURON_SHARE leaves no room for a positive FP16 share",
+        ));
+    }
+    let fp16 = total - int8;
+    validate_neuron_split(int8, fp16)?;
+    Ok((int8, fp16))
+}
+
+/// The neuron split's program geometry: a positive INT8 count whose down parts
+/// are whole and 64-multiple wide, a positive FP16 count, and at most the
+/// intermediate width in total.
+pub fn validate_neuron_split(int8: usize, fp16: usize) -> Result<()> {
+    if int8 < 64 || fp16 == 0 || int8 + fp16 > INTERMEDIATE {
+        return Err(Error::Contract(
+            "Clef neuron split needs a positive INT8 and FP16 share within 12288 neurons",
+        ));
+    }
+    let parts = int8.div_ceil(DOWN_PART);
+    let width = int8 / parts;
+    if int8 % parts != 0 || width > DOWN_PART || width % 64 != 0 {
+        return Err(Error::Contract(
+            "Clef neuron split's INT8 down parts must be whole, 64-multiple wide and at most 4096",
+        ));
+    }
+    // The GPU's remaining neurons are decoded as Q4 rows in whole 32-row
+    // blocks, so its share must keep that granularity.
+    if (INTERMEDIATE - int8 - fp16) % 32 != 0 {
+        return Err(Error::Contract(
+            "Clef neuron split's GPU share must be whole 32-row Q4 decode blocks",
+        ));
+    }
+    Ok(())
+}
 
 /// numpy 2.x `einsum("ij,ij->i", r, r, dtype=float64)` on Apple Silicon: one
 /// two-lane accumulator, each 8-element block fused-multiply-added from its
@@ -370,7 +433,8 @@ impl DenseMlp {
         })
     }
 
-    pub fn split(&self) -> NeuronSplit {
+    pub fn split(&self, int8: usize, fp16: usize) -> Result<NeuronSplit> {
+        validate_neuron_split(int8, fp16)?;
         let (ng, eg) = row_stats(&self.gate, HIDDEN);
         let (nu, eu) = row_stats(&self.up, HIDDEN);
         let (nd, ed) = column_stats(&self.down, INTERMEDIATE);
@@ -384,11 +448,11 @@ impl DenseMlp {
             v.sort_unstable();
             v
         };
-        NeuronSplit {
-            int8: sorted(&order[..NEURON_INT8]),
-            fp16: sorted(&order[NEURON_INT8..NEURON_INT8 + NEURON_FP16]),
-            gpu: sorted(&order[NEURON_INT8 + NEURON_FP16..]),
-        }
+        Ok(NeuronSplit {
+            int8: sorted(&order[..int8]),
+            fp16: sorted(&order[int8..int8 + fp16]),
+            gpu: sorted(&order[int8 + fp16..]),
+        })
     }
 
     /// Rows `neurons` of a `[INTERMEDIATE, HIDDEN]` weight.
@@ -1083,6 +1147,66 @@ mod tests {
     }
 
     #[test]
+    fn neuron_share_defaults_to_the_qualified_split_and_scales_the_ane_share() -> Result<()> {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var_os("APXINF_CLEF_NEURON_SHARE");
+        std::env::remove_var("APXINF_CLEF_NEURON_SHARE");
+        assert_eq!(
+            neuron_counts()?,
+            (NEURON_INT8, NEURON_FP16),
+            "unset keeps the qualified split"
+        );
+        std::env::set_var("APXINF_CLEF_NEURON_SHARE", "");
+        assert_eq!(neuron_counts()?, (NEURON_INT8, NEURON_FP16));
+        for (value, expected) in [
+            ("28", (2816, 640)),
+            ("42", (4224, 928)),
+            ("56", (5632, 1248)),
+            ("70", (7040, 1568)),
+            ("84", (8448, 1888)),
+        ] {
+            std::env::set_var("APXINF_CLEF_NEURON_SHARE", value);
+            assert_eq!(neuron_counts()?, expected, "share {value}");
+        }
+        for value in ["0", "100", "-1", "101", "abc", "nan", "inf", ""] {
+            if value.is_empty() {
+                continue;
+            }
+            std::env::set_var("APXINF_CLEF_NEURON_SHARE", value);
+            assert!(
+                neuron_counts().is_err(),
+                "accepted unqualified neuron share {value}"
+            );
+        }
+        // A 64-multiple INT8 count whose two down parts would not be whole.
+        std::env::set_var("APXINF_CLEF_NEURON_SHARE", "41.4");
+        assert!(neuron_counts().is_err(), "accepted an unwhole down split");
+        match prior {
+            Some(value) => std::env::set_var("APXINF_CLEF_NEURON_SHARE", value),
+            None => std::env::remove_var("APXINF_CLEF_NEURON_SHARE"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn neuron_split_geometry_requires_whole_parts_and_both_shares() {
+        assert!(validate_neuron_split(NEURON_INT8, NEURON_FP16).is_ok());
+        for (int8, fp16) in [
+            (0, 1000),
+            (100, 1000),
+            (8192, 0),
+            (8000, 5000),
+            (4160, 100),
+            (5632, 1250),
+        ] {
+            assert!(
+                validate_neuron_split(int8, fp16).is_err(),
+                "accepted int8={int8} fp16={fp16}"
+            );
+        }
+    }
+
+    #[test]
     fn placement_retries_only_the_transient_inspect_races() {
         for message in [
             "invalid operator or storage input: Clef runtime placement is unknown",
@@ -1242,7 +1366,9 @@ mod tests {
     fn neuron_programs_match_the_recorded_packages() {
         layer_programs_match_recorded("APXINF_CLEF_NEURONS_RECORDED", "neuron", |mlp| {
             let dense = DenseMlp::new(mlp).unwrap();
-            dense.program(&dense.split()).unwrap()
+            dense
+                .program(&dense.split(NEURON_INT8, NEURON_FP16).unwrap())
+                .unwrap()
         });
     }
 
