@@ -339,12 +339,15 @@ The gateway accepts omitted `top_p` or `top_p` one.
 Other sampling settings receive an explicit error.
 The OpenAI route also accepts compatibility fields only at values that leave generation unchanged: `n=1`, zero `presence_penalty` and `frequency_penalty`, `logprobs=false`, `response_format={"type":"text"}`, and `parallel_tool_calls=true`.
 A value that needs unimplemented behavior, such as multiple choices, non-zero penalties, log probabilities, JSON output, or a single-tool limit, receives HTTP 400 `unsupported_feature`.
-A wrong JSON type receives HTTP 400 `invalid_request`.
+The `n` field accepts only one, and the text `response_format` accepts no keys besides its type.
+A `response_format` object with another key receives HTTP 400 `unsupported_feature` rather than being ignored.
+A wrong JSON type, `n=0`, and any other invalid `n` value receive HTTP 400 `invalid_request`.
 OpenAI requests can set either `max_tokens` or `max_completion_tokens`.
 The gateway rejects requests that set both fields.
 A request that omits both fields uses 512 output tokens or the deployment output limit, whichever is smaller.
 A client-supplied `max_tokens` of zero is invalid, and a value above the deployment output limit receives HTTP 400 `invalid_request`.
 Counting tokens ignores the output limit.
+A deployment with an output limit of zero still reports readiness and counts tokens, but every generation request receives HTTP 400 `invalid_request`.
 
 Anthropic messages support text, `tool_use`, and `tool_result` blocks.
 Tool results must precede text within their user message.

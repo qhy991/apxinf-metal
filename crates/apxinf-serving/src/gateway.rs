@@ -307,6 +307,9 @@ fn openai_compatibility(value: &Value) -> Result<(), ApiError> {
     if let Some(n) = value.get("n") {
         match n.as_u64() {
             Some(1) => {}
+            // Zero is an invalid value rather than an unimplemented behavior,
+            // so it keeps the same error class as other malformed fields.
+            Some(0) => return Err(ApiError::invalid("n must be a positive integer.")),
             Some(_) => return Err(unsupported("This profile returns exactly one choice.")),
             None => return Err(ApiError::invalid("n must be a positive integer.")),
         }
@@ -343,6 +346,13 @@ fn openai_compatibility(value: &Value) -> Result<(), ApiError> {
                 ))
             }
             None => return Err(ApiError::invalid("response_format requires a type.")),
+        }
+        // The accepted shape has no behavior behind any other key, so an extra
+        // key is an unsupported request instead of a silently ignored one.
+        if format.keys().any(|key| key != "type") {
+            return Err(unsupported(
+                "response_format accepts no keys besides the type.",
+            ));
         }
     }
     if let Some(parallel) = value.get("parallel_tool_calls") {
@@ -1352,6 +1362,9 @@ mod tests {
                 "response_format",
                 json!({"type":"json_schema","json_schema":{}}),
             ),
+            // A text response format cannot carry unrelated behavior.
+            ("response_format", json!({"type":"text","json_schema":{}})),
+            ("response_format", json!({"type":"text","unsupported":true})),
             ("parallel_tool_calls", json!(false)),
         ] {
             let (name, replacement) = field;
@@ -1365,6 +1378,7 @@ mod tests {
             );
         }
         for field in [
+            ("n", json!(0)),
             ("n", json!("1")),
             ("n", json!(1.5)),
             ("presence_penalty", json!("0")),
@@ -1372,6 +1386,7 @@ mod tests {
             ("logprobs", json!(0)),
             ("response_format", json!({"type":3})),
             ("response_format", json!({})),
+            ("response_format", json!({"json_schema":{}})),
             ("parallel_tool_calls", json!("true")),
         ] {
             let (name, replacement) = field;
