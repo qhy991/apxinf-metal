@@ -595,6 +595,14 @@ fn image_operators_follow_mlx_semantics() -> Result<()> {
 }
 
 #[test]
+fn cache_limit_reports_the_previous_limit() -> Result<()> {
+    let original = apxinf_mlx::set_cache_limit(1 << 30)?;
+    assert_eq!(apxinf_mlx::set_cache_limit(2 << 30)?, 1 << 30);
+    assert_eq!(apxinf_mlx::set_cache_limit(original)?, 2 << 30);
+    Ok(())
+}
+
+#[test]
 fn audio_operators_and_key_sequence_follow_mlx() -> Result<()> {
     // Expected values from MLX Python 0.32.3 on the CPU device.
     let s = Stream::cpu()?;
