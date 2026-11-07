@@ -380,6 +380,7 @@ It does not claim complete JSON Schema enforcement or constrained decoding.
 The gateway rejects `strict: true` on OpenAI function tools.
 An OpenAI tool declaration uses `type: function` with a non-empty function name and optional object parameters.
 An OpenAI assistant tool call uses `type: function` with a non-empty id, a non-empty function name, and an object `arguments` value or a JSON string that encodes an object.
+A tool declaration, a tool call, and its function accept only the documented fields, and an extra field receives HTTP 400 `invalid_request`.
 A malformed tool declaration or tool history receives HTTP 400 `invalid_request` with an actionable message before admission.
 The service never executes a tool.
 The client applies its own tool permissions and executes permitted calls.
@@ -392,9 +393,8 @@ Readiness explicitly reports no prompt-cache capability.
 
 ## Streaming and failures
 
-A request that the gateway or its worker rejects with a contract error code returns a JSON document with `type` set to `error`.
-Its `error` object contains `type`, `code`, and `message`.
-A request that fails with an error record from request validation or the model worker uses a contract error code, and its HTTP status follows the
+A request rejected by request validation or by the model worker with a contract error code returns a JSON document with `type` set to `error`.
+Its `error` object contains `type`, `code`, and `message`, and its HTTP status follows the
 [error-code table](contracts-v0.1.md#faults-and-recovery).
 Transport-level rejections keep the HTTP framework response instead of this envelope: an unknown route or unsupported method returns an empty body, and an oversized body returns `text/plain`.
 A cancellation uses HTTP 499 `cancelled`, which is outside that table.
