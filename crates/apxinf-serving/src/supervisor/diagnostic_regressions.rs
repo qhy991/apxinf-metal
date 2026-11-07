@@ -20,7 +20,9 @@ const MAX_TRANSCRIPT_BYTES: usize = 64 * 1024;
 /// record the observation instead of treating the stall as a probe bug.
 const PROBE_STALL_GRACE: Duration = Duration::from_secs(30);
 /// The absolute upper bound only catches a probe that keeps making progress
-/// without ever finishing; it must stay well above a loaded full-suite run.
+/// without ever finishing. It bounds one isolated probe run, not the whole
+/// suite, and the 30-second stall grace is the effective bound for a loaded
+/// host.
 const PROBE_HARD_LIMIT: Duration = Duration::from_secs(120);
 /// Probe wait limits, parameterized so both branches are unit-tested.
 #[derive(Debug, Clone, Copy)]
@@ -520,8 +522,10 @@ fn a_probe_that_keeps_progressing_hits_the_hard_limit() {
         &mut child,
         &last_progress,
         Instant::now(),
+        // The stall grace stays far above the hard limit, so a frozen test
+        // process that resumes late cannot report a stall before the hard limit.
         ProbeLimits {
-            stall: Duration::from_secs(5),
+            stall: Duration::from_secs(30),
             hard: Duration::from_millis(100),
         },
     );
