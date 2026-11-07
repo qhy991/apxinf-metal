@@ -350,15 +350,24 @@ The selected provider fixes its own context and output limits, and startup rejec
 | Provider | Context limit | Output limit |
 | --- | --- | --- |
 | `python-mlx-lm` | 1 through 131072 | 0 through 65536, at most the context limit |
-| `python-clef` | 1 through 4096 | exactly 0 |
-| `mlx-vlm-minicpmv47` | 1 through 16384 | 0 through 8192 |
+| `python-clef` | 1 through 4096 | exactly 0, at most the context limit |
+| `mlx-vlm-minicpmv47` | 1 through 16384 | 0 through 8192, at most the context limit |
 | native MiniCPM5 profiles | 1 through 16384 | 0 through 65536, at most the context limit |
+
+The context bounds above are provider bounds.
+A nonzero output limit additionally requires the context to fit the default output budget plus one input token (see above).
+With the default 2048-token output limit that minimum is 513 positions; with a smaller nonzero output limit it is that limit plus one.
+Only a zero output limit permits a context limit of 1.
 
 The generic Python provider cannot check the loaded model capacity before the worker starts, so the operator owns that bound.
 The native profiles keep 16384 positions for launch compatibility even though the model layer can address more.
 Raising that limit needs device memory and quality measurements, so the service does not claim it.
 
 ## HTTP interface
+
+The gateway emits no CORS headers.
+A cross-origin browser client cannot read these responses, and its preflight request receives the framework's method response (HTTP 405).
+Serve browser clients from the same origin, or place a reverse proxy in front of the service that applies the CORS policy you intend.
 
 | Route | Operation |
 | --- | --- |
