@@ -108,7 +108,7 @@ class Gateway:
         ], stdout=self.log, stderr=self.log, start_new_session=True, cwd=ROOT)
         try:
             self.port = until(self.listener, "gateway startup", seconds=15)
-            until(lambda: self.request("/readyz")[0] == 200, "HTTP readiness")
+            until(lambda: self.request("/readyz")[0] == 200, "HTTP readiness", seconds=15)
         except BaseException:
             self.close()
             raise
@@ -172,7 +172,7 @@ class Gateway:
         def settled():
             metrics = self.metrics()
             return all(metrics.get(name) == 0 for name in names)
-        return until(settled, "resource settlement")
+        return until(settled, "resource settlement", seconds=15)
 
     def close(self):
         if self.closed:
@@ -247,6 +247,8 @@ class HttpGatewayTests(GatewayChecks, unittest.TestCase):
         for path in ("/v1/messages", "/v1/chat/completions"):
             status, headers, reply = gateway.request(path, body())
             self.assertEqual(status, 200, reply)
+            self.assertNotIn("transfer-encoding", headers, path)
+            self.assertGreater(int(headers["content-length"]), 0, path)
             uuid.UUID(headers["x-request-id"])
             self.assertEqual(headers["x-apxinf-model-revision"], ready["worker"]["model_revision"])
             self.assertEqual(reply["model"], MODEL)
@@ -498,17 +500,24 @@ if __name__ == "__main__":
                         help="Run only these case names or classes.")
     parser.add_argument("--exclude", action="append", default=[],
                         help="Skip these case names or classes.")
+    parser.add_argument("--expect-cases", type=int,
+                        help="Fail unless exactly this many cases are selected.")
     args = parser.parse_args()
     BINARY = str(Path(args.binary).resolve(strict=True))
-    base = Path(os.environ.get("APXINF_HTTP_TEST_OUTPUT", str(ROOT / "devlocal/serving-http-integration"))).resolve()
-    base.mkdir(parents=True, exist_ok=True)
-    RUN_ROOT = Path(tempfile.mkdtemp(prefix="http-gateway-", dir=base))
-    print("CPU HTTP fixture evidence: " + str(RUN_ROOT), file=sys.stderr)
     cases = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
     selected = unittest.TestSuite(
         test for test in flatten(cases)
         if (not args.select or matches(test, args.select)) and not matches(test, args.exclude))
-    if args.select and not selected.countTestCases():
+    count = selected.countTestCases()
+    if args.select and not count:
         raise AssertionError("No test matched: " + ", ".join(args.select))
+    # A stale --select/--exclude mapping must fail instead of silently
+    # re-running other cases or an empty suite.
+    if args.expect_cases is not None and count != args.expect_cases:
+        raise AssertionError(f"Expected {args.expect_cases} selected cases, got {count}.")
+    base = Path(os.environ.get("APXINF_HTTP_TEST_OUTPUT", str(ROOT / "devlocal/serving-http-integration"))).resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    RUN_ROOT = Path(tempfile.mkdtemp(prefix="http-gateway-", dir=base))
+    print("CPU HTTP fixture evidence: " + str(RUN_ROOT), file=sys.stderr)
     result = unittest.TextTestRunner(verbosity=2).run(selected)
     sys.exit(0 if result.wasSuccessful() else 1)

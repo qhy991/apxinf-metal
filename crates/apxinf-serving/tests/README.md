@@ -9,6 +9,7 @@ Startup checks the fixture manifest against local files and the actual interpret
 The runner owns fixture layout, gateway lifecycle, process groups, and diagnostics.
 Its `--select` and `--exclude` options map cases onto the Rust test targets;
 `http_output_budget.rs` selects the output-budget cases and `http_gateway.rs` runs the rest.
+Each target also passes `--expect-cases`, so a renamed case fails the selection instead of silently moving cases between targets.
 
 These checks use the existing [local HTTP profile](../../../doc/serving/local-service-v0.1.md)
 and [serial worker profile](../../../doc/serving/serial-profile-v0.1.md).

@@ -14,6 +14,8 @@ fn omitted_limit_is_admitted_with_the_deployment_budget() {
     python_fixture::run(&[
         "--select",
         "OutputBudgetTests.test_omitted_limit_is_admitted_with_the_deployment_budget",
+        "--expect-cases",
+        "1",
     ]);
 }
 
@@ -22,5 +24,7 @@ fn exhausted_output_budget_rejects_generation_but_counts_tokens() {
     python_fixture::run(&[
         "--select",
         "OutputBudgetTests.test_exhausted_output_budget_rejects_generation_but_counts_tokens",
+        "--expect-cases",
+        "1",
     ]);
 }
