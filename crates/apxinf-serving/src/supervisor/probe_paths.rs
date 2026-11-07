@@ -61,6 +61,10 @@ mod tests {
         assert!(first.file("trace.jsonl").starts_with(first.path()));
         first.cleanup();
         assert!(!first.path().exists());
+        assert!(
+            root().is_dir(),
+            "The shared root stays as an empty directory after a clean run."
+        );
         assert!(second.path().is_dir(), "Another run keeps its directory.");
     }
 

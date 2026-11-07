@@ -97,13 +97,22 @@ async fn start(
 fn request() -> crate::decision::DecisionRequest {
     parse_decision_request(br#"{"model":"cpu-fixture","state":"warm","questions":{"grade":{"type":"score","instructions":"Rate","criteria":["low","high"]},"choice":{"type":"choice","instructions":"Choose","criteria":{"a":"A","b":"B"}},"warm":{"type":"noul","instructions":"Warm?"}}}"#).unwrap()
 }
-async fn stop(service: &Service, task: tokio::task::JoinHandle<StopResult>) {
+async fn stop(service: &Service, task: tokio::task::JoinHandle<StopResult>, probe: &Probe) {
     service.shutdown();
     tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
+    // Reaping is confirmed, so the worker can no longer recreate the fixture
+    // files: remove the run directory and require the whole directory to be
+    // gone instead of relying only on Drop.
+    probe.0.cleanup();
+    assert!(
+        !probe.0.path().exists(),
+        "The probe run directory must be removed: {}",
+        probe.0.path().display()
+    );
 }
 async fn available(service: &Service) {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -398,7 +407,7 @@ async fn decision_result_stays_private_until_clean_process_reap() {
     assert!(service
         .metrics_text()
         .contains("operation=\"decision\",status=\"completed\"} 1"));
-    stop(&service, task).await;
+    stop(&service, task, &probe).await;
 }
 
 #[tokio::test]
@@ -420,7 +429,7 @@ async fn decision_nonzero_exit_and_extra_output_discard_pending_success() {
         assert_eq!(service.metrics.worker_restart_failures.load(Ordering::Relaxed), 0);
         assert_eq!(service.metrics.active.load(Ordering::Relaxed), 0);
         assert_eq!(service.metrics.reserved_bytes.load(Ordering::Relaxed), 0);
-        stop(&service, task).await;
+        stop(&service, task, &probe).await;
         assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 1);
     }
 }
@@ -451,7 +460,7 @@ async fn decision_context_rejection_reaps_and_loads_a_replacement() {
     let mut next = service.enqueue_decision(request()).unwrap();
     next.begin.await.unwrap().unwrap();
     assert!(matches!(next.output.recv().await, Some(Event::Decision(_))));
-    stop(&service, task).await;
+    stop(&service, task, &probe).await;
     assert_eq!(
         cleanup_count, 1.0,
         "A checked Clef failure must contribute one worker cleanup sample."
@@ -509,7 +518,7 @@ async fn decision_inference_failure_reaps_and_records_worker_cleanup() {
     let mut next = service.enqueue_decision(request()).unwrap();
     next.begin.await.unwrap().unwrap();
     assert!(matches!(next.output.recv().await, Some(Event::Decision(_))));
-    stop(&service, task).await;
+    stop(&service, task, &probe).await;
     assert_eq!(
         cleanup_count, 1.0,
         "A checked inference failure must contribute one worker cleanup sample."
@@ -564,7 +573,7 @@ async fn decision_deadline_and_cancel_kill_before_capacity_release() {
         available(&service).await;
         assert_eq!(service.metrics.reserved_bytes.load(Ordering::Relaxed), 0);
         assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 0);
-        stop(&service, task).await;
+        stop(&service, task, &probe).await;
     }
 }
 
@@ -607,7 +616,7 @@ async fn decision_queue_expires_during_replacement_loading() {
     assert_eq!(error.code, "deadline_exceeded");
     assert!(!service.available.load(Ordering::Acquire));
     assert_eq!(service.metrics.queued.load(Ordering::Relaxed), 0);
-    stop(&service, task).await;
+    stop(&service, task, &probe).await;
 }
 
 #[tokio::test]
@@ -626,7 +635,7 @@ async fn decision_http_projection_and_schema_rejection() {
         if status=="200"{let (_,body)=response.split_once("\r\n\r\n").unwrap();let result:Value=serde_json::from_str(body).unwrap();assert_eq!(result["usage"],json!({"input_tokens":9,"output_tokens":0}));assert_eq!(result["answers"]["choice"]["choice"],"a");assert_eq!(result["answers"]["grade"]["score"],0.5);assert_eq!(result["answers"]["warm"]["noul"],0.5);}
     }
     server.abort();
-    stop(&service, task).await;
+    stop(&service, task, &probe).await;
 }
 
 #[tokio::test]
@@ -666,7 +675,7 @@ async fn decision_disconnect_and_service_shutdown_reap_owned_processes() {
             .await
             .unwrap();
             available(&service).await;
-            stop(&service, task).await;
+            stop(&service, task, &probe).await;
         }
         let alive = Command::new("kill")
             .args(["-0", &pid.to_string()])

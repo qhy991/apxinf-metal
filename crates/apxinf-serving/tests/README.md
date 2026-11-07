@@ -76,7 +76,9 @@ The CI workflow uploads this directory after success or failure.
 The CPU protocol probes in the library tests create one directory per run under
 `${TMPDIR:-/tmp}/apxinf-serving-tests/<pid>-<uuid>/`.
 The directory holds the probe trace and its release marker.
-A completed run removes its own directory.
+A completed run removes its own directory and leaves no files behind; the
+shared root directory itself can remain as an empty directory, and the cleanup
+command below removes it.
 A test process killed while a probe is active cannot run its cleanup, so it
 leaves one recognisable directory under that root instead of files scattered
 through the system temp root.
