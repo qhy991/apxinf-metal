@@ -348,6 +348,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vision_profile_rejects_public_top_k_and_seed() {
+        let (service, _) = gateway_test_service_with_protocol(contracts::VISION_PROTOCOL);
+        let mut value = request(json!([{"role":"user","content":"hello"}]));
+        value["top_k"] = json!(5);
+        let error = normalize(&value, Api::Anthropic, false, &service)
+            .err()
+            .expect("The vision profile must reject top_k.");
+        assert_eq!(
+            (error.status, error.code.as_str()),
+            (400, "unsupported_feature")
+        );
+        assert!(error.message.contains("top_k"), "{}", error.message);
+        let mut value = request(json!([{"role":"user","content":"hello"}]));
+        value["seed"] = json!(42);
+        let error = normalize(&value, Api::OpenAi, false, &service)
+            .err()
+            .expect("The vision profile must reject seed.");
+        assert_eq!(
+            (error.status, error.code.as_str()),
+            (400, "unsupported_feature")
+        );
+        assert!(error.message.contains("request ID"), "{}", error.message);
+    }
+
+    #[tokio::test]
     async fn image_limits_count_occurrences_across_history() {
         let (service, _) = gateway_test_service_with_protocol(contracts::VISION_PROTOCOL);
         let mut messages = vec![

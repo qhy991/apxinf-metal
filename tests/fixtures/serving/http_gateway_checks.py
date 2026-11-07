@@ -373,6 +373,12 @@ class HttpGatewayTests(GatewayChecks, unittest.TestCase):
             response = gateway.request("/v1/chat/completions", request)
             self.assert_error(response, 400, "invalid_request")
             self.assertIn(message, response[2]["error"]["message"])
+        # An integer above the safe range never reaches the normalizer.
+        unsafe = gateway.request(
+            "/v1/chat/completions",
+            raw='{"model":"original-cpu-fixture","seed":9007199254740992,"messages":[]}')
+        self.assert_error(unsafe, 400, "invalid_request")
+        self.assertIn("unsafe integer", unsafe[2]["error"]["message"])
         self.assertEqual(gateway.request("/v1/messages", raw=" " * 1_000_001)[0], 413)
         self.assertEqual(gateway.request("/not-a-route")[0], 404)
         self.assertEqual(gateway.request("/v1/messages", method="GET")[0], 405)

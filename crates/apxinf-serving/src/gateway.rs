@@ -307,6 +307,8 @@ fn array<'a>(value: &'a Value, label: &str) -> Result<&'a Vec<Value>, ApiError> 
 fn openai_compatibility(value: &Value, service: &Service) -> Result<(), ApiError> {
     let unsupported = |message: &str| ApiError::new(400, "unsupported_feature", message);
     if let Some(seed) = value.get("seed") {
+        // The request parser rejects integers above the safe range, so this
+        // bound only protects callers that normalize a JSON value directly.
         if !seed
             .as_u64()
             .is_some_and(|seed| seed <= crate::contracts::MAX_SAFE_INTEGER)
@@ -1741,6 +1743,29 @@ mod tests {
                 "{seed}"
             );
         }
+
+        // The request parser rejects unsafe integers first, so the normalizer's
+        // own bound is checked directly against a JSON value.
+        let mut value = openai_request(json!([{"role":"user","content":"hello"}]));
+        value["seed"] = json!(crate::contracts::MAX_SAFE_INTEGER);
+        let (request, _) = normalize(&value, Api::OpenAi, false, &service).unwrap();
+        assert!(matches!(
+            request.selection,
+            crate::sampling::Selection::Greedy
+        ));
+        let mut value = openai_request(json!([{"role":"user","content":"hello"}]));
+        value["seed"] = json!(crate::contracts::MAX_SAFE_INTEGER + 1);
+        let error = normalize(&value, Api::OpenAi, false, &service)
+            .err()
+            .expect("An unsafe seed must fail.");
+        assert_eq!(
+            (error.status, error.code.as_str(), error.message.as_str()),
+            (
+                400,
+                "invalid_request",
+                "seed must be a non-negative safe integer."
+            )
+        );
 
         // A sampling profile derives the seed from the request ID.
         let (sampled, _) = crate::supervisor::gateway_test_service_with_protocol(
