@@ -342,8 +342,10 @@ Generation uses greedy decoding.
 The gateway accepts omitted temperature or temperature zero.
 The gateway accepts omitted `top_p` or `top_p` one.
 Other sampling settings that would change generation receive an explicit error.
-An Anthropic `top_k` value is accepted on a greedy profile because greedy selection ignores it, and a sampled profile rejects it.
+An Anthropic `top_k` must be a positive integer.
+A greedy profile accepts it because greedy selection ignores it; a sampled or vision profile rejects it.
 The OpenAI route also accepts compatibility fields only at values that leave generation unchanged: `n=1`, zero `presence_penalty` and `frequency_penalty`, `logprobs=false`, `response_format={"type":"text"}`, `parallel_tool_calls=true`, and `seed` on a greedy profile.
+An OpenAI `seed` must be a non-negative safe integer.
 A sampled or vision profile derives its sampling seed from the request ID, so it rejects `seed` instead of ignoring it.
 A value that needs unimplemented behavior, such as multiple choices, non-zero penalties, log probabilities, JSON output, or a single-tool limit, receives HTTP 400 `unsupported_feature`.
 The `n` field accepts only one, and the text `response_format` accepts no keys besides its type.
