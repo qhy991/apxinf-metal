@@ -304,8 +304,23 @@ fn array<'a>(value: &'a Value, label: &str) -> Result<&'a Vec<Value>, ApiError> 
 /// Local clients often send these fields explicitly. A value that would need
 /// behavior this profile does not implement remains an `unsupported_feature`
 /// error instead of being silently ignored.
-fn openai_compatibility(value: &Value) -> Result<(), ApiError> {
+fn openai_compatibility(value: &Value, service: &Service) -> Result<(), ApiError> {
     let unsupported = |message: &str| ApiError::new(400, "unsupported_feature", message);
+    if let Some(seed) = value.get("seed") {
+        if !seed
+            .as_u64()
+            .is_some_and(|seed| seed <= crate::contracts::MAX_SAFE_INTEGER)
+        {
+            return Err(ApiError::invalid(
+                "seed must be a non-negative safe integer.",
+            ));
+        }
+        if service.sampling_enabled() {
+            return Err(unsupported(
+                "This profile derives the sampling seed from the request ID.",
+            ));
+        }
+    }
     if let Some(n) = value.get("n") {
         match n.as_u64() {
             Some(1) => {}
@@ -416,6 +431,7 @@ fn normalize(
             "frequency_penalty",
             "response_format",
             "parallel_tool_calls",
+            "seed",
         ]
     };
     unknown(value, &allowed, "Request")?;
@@ -427,7 +443,7 @@ fn normalize(
         ));
     }
     if api == Api::OpenAi {
-        openai_compatibility(value)?;
+        openai_compatibility(value, service)?;
     }
     let selection = if service.image_enabled() {
         crate::sampling::Selection::from_vision_request(value)?
@@ -1698,6 +1714,50 @@ mod tests {
                 Err(mpsc::error::TryRecvError::Empty)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn openai_seed_is_a_noop_only_where_generation_is_deterministic() {
+        let (service, mut observed) = gateway_test_service();
+        let mut value = openai_request(json!([{"role":"user","content":"hello"}]));
+        value["seed"] = json!(42);
+        let error = request_error(service.clone(), value, Api::OpenAi).await;
+        assert_eq!(error.message, "Test coordinator observed admission.");
+        let admitted = observed
+            .try_recv()
+            .expect("A greedy seed must reach admission.");
+        assert!(matches!(
+            admitted.selection,
+            crate::sampling::Selection::Greedy
+        ));
+
+        for seed in [json!("42"), json!(-1), json!(1.5), json!(true)] {
+            let mut value = openai_request(json!([{"role":"user","content":"hello"}]));
+            value["seed"] = seed.clone();
+            let error = request_error(service.clone(), value, Api::OpenAi).await;
+            assert_eq!(
+                (error.status, error.code.as_str()),
+                (400, "invalid_request"),
+                "{seed}"
+            );
+        }
+
+        // A sampling profile derives the seed from the request ID.
+        let (sampled, _) = crate::supervisor::gateway_test_service_with_protocol(
+            crate::contracts::NATIVE_SAMPLED_PROTOCOL,
+        );
+        let mut value = openai_request(json!([{"role":"user","content":"hello"}]));
+        value["seed"] = json!(42);
+        let error = request_error(sampled, value, Api::OpenAi).await;
+        assert_eq!(
+            (error.status, error.code.as_str()),
+            (400, "unsupported_feature")
+        );
+        assert!(error.message.contains("request ID"));
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

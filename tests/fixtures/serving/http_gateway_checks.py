@@ -318,6 +318,25 @@ class HttpGatewayTests(GatewayChecks, unittest.TestCase):
         self.assert_error(response, 400, "unsupported_feature")
         gateway.idle()
 
+    def test_greedy_profiles_accept_noop_sampling_fields(self):
+        # Greedy selection ignores top_k, and a deterministic result satisfies
+        # any seed, so both fields are accepted without changing generation.
+        request = body("text", top_k=5)
+        status, _, reply = self.gateway.request("/v1/messages", request)
+        self.assertEqual(status, 200, reply)
+        self.assertEqual(reply["content"], [{"type": "text", "text": "Original reply."}])
+        request = body("text", seed=42)
+        status, _, reply = self.gateway.request("/v1/chat/completions", request)
+        self.assertEqual(status, 200, reply)
+        self.assertEqual(reply["choices"][0]["message"]["content"], "Original reply.")
+        # An invalid value stays an actionable request error.
+        for path, document in (
+            ("/v1/messages", body("text", top_k=0)),
+            ("/v1/chat/completions", body("text", seed="42")),
+        ):
+            self.assert_error(self.gateway.request(path, document), 400, "invalid_request")
+        self.gateway.idle()
+
     def test_invalid_input_never_reaches_worker(self):
         gateway = self.gateway
         for path in ("/v1/messages", "/v1/chat/completions", "/v1/messages/count_tokens"):

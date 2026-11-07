@@ -71,8 +71,15 @@ impl Selection {
 
     pub fn from_request(value: &Value, sampled: bool) -> Result<Self, ApiError> {
         let unsupported = |message| ApiError::new(400, "unsupported_feature", message);
-        if value.get("top_k").is_some() {
-            return Err(unsupported("This profile does not support top_k."));
+        if let Some(top_k) = value.get("top_k") {
+            if sampled {
+                return Err(unsupported("This profile does not support top_k."));
+            }
+            // Greedy selection ignores top_k, so a valid value leaves the
+            // deterministic result unchanged.
+            if !top_k.as_u64().is_some_and(|top_k| top_k >= 1) {
+                return Err(ApiError::invalid("top_k must be a positive integer."));
+            }
         }
         if !sampled {
             for (key, expected) in [("temperature", 0.0), ("top_p", 1.0)] {
@@ -198,6 +205,40 @@ mod tests {
         ] {
             assert!(Selection::from_request(&value, true).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn greedy_selection_accepts_top_k_as_a_noop() {
+        for value in [
+            json!({"top_k":5}),
+            json!({"temperature":0,"top_k":1}),
+            json!({"temperature":0,"top_p":1,"top_k":100}),
+        ] {
+            assert_eq!(
+                Selection::from_request(&value, false).unwrap(),
+                Selection::Greedy,
+                "{value}"
+            );
+        }
+        for value in [
+            json!({"top_k":0}),
+            json!({"top_k":"5"}),
+            json!({"top_k":-1}),
+            json!({"top_k":1.5}),
+            json!({"top_k":true}),
+        ] {
+            let error = Selection::from_request(&value, false).unwrap_err();
+            assert_eq!(
+                (error.status, error.code.as_str()),
+                (400, "invalid_request"),
+                "{value}"
+            );
+        }
+        let error = Selection::from_request(&json!({"top_k":5}), true).unwrap_err();
+        assert_eq!(
+            (error.status, error.code.as_str()),
+            (400, "unsupported_feature")
+        );
     }
 
     #[test]
