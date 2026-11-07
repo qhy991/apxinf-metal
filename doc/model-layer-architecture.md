@@ -77,6 +77,15 @@ protocols. A family implements the one it supports, and loading wraps it in
 `decide_schema` rejects a code model, with an error naming the protocol the
 model does take.
 
+The optional `LlmTrait::token_sequence` hook changes token production while the
+shared driver retains publication, EOS, budget and cancellation. Its default is
+synchronous. `mlx_decode.rs` owns the one-step greedy cursor used by compiled
+Qwen3 and MiniCPM5; each family builds its own lazy step and drains/trims its KV.
+The backend owns array operations and greedy selection, not the request schedule.
+`LoadedModel::generate_streaming_cancellable` accepts a sticky
+`GenerationCancellation` handle. Cancellation is cooperative at token boundaries;
+DSpark's specialized schedule rejects this new entry explicitly.
+
 `LlmTrait::preparation_status` exposes `TextPreparationStatus` as data only:
 state, selected implementation/variant, prepared compilation scopes and shape
 profiles, capacity and retained error. Only successful preparation reports
