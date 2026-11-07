@@ -27,8 +27,9 @@ use apxinf_mlx::fusions::{
 use apxinf_mlx::fusions::{AneTileHandoff, AneTileMerge, MppF16Gemm, SplitMppF16Gemm};
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::rc::{Rc, Weak};
 
 const EPS: f32 = 1e-6;
 const HEAD_EPS: f32 = 1e-5;
@@ -379,6 +380,11 @@ pub struct Network {
     /// Prompt token IDs for the current request, kept so `backbone_cached`
     /// can hash and slice the prefix without re-reading device memory.
     last_prefix_ids: RefCell<Option<Vec<u32>>>,
+    /// Prepared whole-backbone callables, keyed by `(chunk1 tokens, prefix
+    /// tokens)`. Empty unless `APXINF_CLEF_COMPILE=1` and profiles were
+    /// supplied; the eager path is the default and the fallback for any
+    /// shape that was not prepared (the demo's dynamic lengths).
+    compiled: RefCell<BTreeMap<(usize, usize), Compiled>>,
 }
 
 /// Per-layer state saved for the Tier-1 prefix cache (Q23): the F32 gated-delta
@@ -649,6 +655,7 @@ impl Network {
             tier2_cache: RefCell::new(None),
             recent_image_keys: RefCell::new(VecDeque::with_capacity(RECENT_IMAGE_KEYS)),
             last_prefix_ids: RefCell::new(None),
+            compiled: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -1063,6 +1070,73 @@ impl Network {
         tokens: usize,
         cache: Option<&PrefixCache>,
     ) -> Result<Array> {
+        if let Some(cache) = cache {
+            if let Some(hidden) = self.run_compiled(embeds, positions, tokens, cache)? {
+                return Ok(hidden);
+            }
+        }
+        self.forward_layers(embeds, positions, tokens, cache.map(|c| c.layers.as_slice()))
+    }
+
+    /// One prepared whole-backbone call for an exact (chunk1 tokens, prefix
+    /// tokens) profile. Returns `None` when the profile was not prepared, so
+    /// the caller uses the eager path (the demo's dynamic lengths).
+    ///
+    /// The compiled callable replays the 32-layer graph without running the
+    /// host-side graph build; the prefix cache's per-layer state is passed as
+    /// explicit inputs, in the same layer order the eager loop indexes.
+    fn run_compiled(
+        &self,
+        embeds: &Array,
+        positions: &Array,
+        tokens: usize,
+        cache: &PrefixCache,
+    ) -> Result<Option<Array>> {
+        let key = (tokens, cache.prefix_tokens);
+        let compiled = self.compiled.borrow();
+        let Some(callable) = compiled.get(&key) else {
+            if std::env::var_os("APXINF_CLEF_COMPILE_TRACE").is_some() {
+                eprintln!("Clef compiled backbone miss key={key:?}");
+            }
+            return Ok(None);
+        };
+        if std::env::var_os("APXINF_CLEF_COMPILE_TRACE").is_some() {
+            eprintln!("Clef compiled backbone hit key={key:?}");
+        }
+        let mut inputs = Vec::with_capacity(2 + 2 * cache.layers.len());
+        inputs.push(embeds.clone());
+        inputs.push(positions.clone());
+        for layer in &cache.layers {
+            match (&layer.keys, &layer.values) {
+                (Some(keys), Some(values)) => {
+                    inputs.push(keys.clone());
+                    inputs.push(values.clone());
+                }
+                _ => {
+                    inputs.push(layer.state.clone());
+                    inputs.push(layer.conv.clone());
+                }
+            }
+        }
+        let mut outputs = callable.call(&inputs)?;
+        if outputs.len() != 1 {
+            return Err(Error::Other(format!(
+                "Clef compiled backbone returned {} outputs",
+                outputs.len()
+            )));
+        }
+        Ok(Some(outputs.remove(0)))
+    }
+
+    /// The eager layer loop, shared with the compiled body. `cached` is the
+    /// per-layer prefix state in layer order; `None` is the uncached path.
+    fn forward_layers(
+        &self,
+        embeds: &Array,
+        positions: &Array,
+        tokens: usize,
+        cached: Option<&[CachedLayer]>,
+    ) -> Result<Array> {
         let mut h = embeds.clone();
         // Env-gated per-layer spans (same flag as the rest of the trace).
         // These are host wall times of the lazy graph *build* per layer —
@@ -1077,7 +1151,7 @@ impl Network {
         };
         for (index, layer) in self.backbone.layers.iter().enumerate() {
             let layer_start = std::time::Instant::now();
-            let cached = cache.and_then(|c| c.layers.get(index));
+            let cached = cached.and_then(|layers| layers.get(index));
             let (mixer, mixer_c) = match &layer.mixer {
                 Mixer::GatedDelta(_) => ("gated_delta", c"gated_delta"),
                 Mixer::Attention(_) => ("attention", c"attention"),
@@ -1572,6 +1646,185 @@ impl Network {
             );
         }
         Ok(logits)
+    }
+}
+
+/// `APXINF_CLEF_COMPILE=1` opts into the prepared whole-backbone callable.
+/// Default OFF: the eager path is bit-for-bit the established implementation.
+fn compiled_enabled() -> bool {
+    matches!(
+        std::env::var("APXINF_CLEF_COMPILE").as_deref(),
+        Ok("1" | "true" | "on" | "yes")
+    )
+}
+
+/// `APXINF_CLEF_COMPILE_PROFILES=L:P,L:P,...` lists the prompt-token and
+/// prefix-token pairs to prepare at load. The 42-case suite needs the three
+/// prompt lengths only; any other shape (the demo's dynamic lengths) falls
+/// back to eager. An enabled compile with no profiles is a start-up error
+/// rather than a silent eager run, so a measurement can never claim a
+/// compiled arm it did not get.
+fn compiled_profiles() -> Result<Option<Vec<(usize, usize)>>> {
+    if !compiled_enabled() {
+        return Ok(None);
+    }
+    let raw = std::env::var("APXINF_CLEF_COMPILE_PROFILES").map_err(|_| {
+        Error::Contract(
+            "APXINF_CLEF_COMPILE=1 requires APXINF_CLEF_COMPILE_PROFILES=L:P,...".into(),
+        )
+    })?;
+    let mut profiles = Vec::new();
+    for part in raw.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+        let (prompt, prefix) = part.split_once(':').ok_or_else(|| {
+            Error::Other(format!(
+                "APXINF_CLEF_COMPILE_PROFILES entry {part:?} is not L:P"
+            ))
+        })?;
+        let prompt: usize = prompt.trim().parse().map_err(|_| {
+            Error::Other(format!("APXINF_CLEF_COMPILE_PROFILES prompt {prompt:?} is not a length"))
+        })?;
+        let prefix: usize = prefix.trim().parse().map_err(|_| {
+            Error::Other(format!("APXINF_CLEF_COMPILE_PROFILES prefix {prefix:?} is not a length"))
+        })?;
+        if prompt <= prefix {
+            return Err(Error::Other(format!(
+                "APXINF_CLEF_COMPILE_PROFILES {part:?} needs prompt > prefix"
+            )));
+        }
+        profiles.push((prompt, prefix));
+    }
+    if profiles.is_empty() {
+        return Err(Error::Contract(
+            "APXINF_CLEF_COMPILE_PROFILES lists no profiles".into(),
+        ));
+    }
+    Ok(Some(profiles))
+}
+
+/// Prepare one shape-specialized whole-backbone callable per profile. The
+/// callable captures the network weakly: the compiled graph and the network
+/// are one object, so a strong capture would be a reference cycle.
+///
+/// Called once after `Network::new` (load time). Each profile is traced and
+/// replayed twice by `Compiled::prepare`, the established 2.2-2.8 s cost.
+pub fn install_compiled(network: &Rc<Network>) -> Result<()> {
+    let Some(profiles) = compiled_profiles()? else {
+        return Ok(());
+    };
+    // The compiled body replays the reference layer loop (Q4 qmm + SDPA +
+    // gated-delta kernels). The GPU/ANE compositions enqueue Core ML calls
+    // that `mx.compile` cannot replay, so the flag is reference-only.
+    if network.gpu.is_some() {
+        return Err(Error::Other(
+            "APXINF_CLEF_COMPILE supports the reference composition only".into(),
+        ));
+    }
+    let count = profiles.len();
+    for (prompt, prefix) in profiles {
+        let rest = prompt - prefix;
+        let inputs = network.compiled_inputs(rest, prefix)?;
+        let weak: Weak<Network> = Rc::downgrade(network);
+        let callable = Compiled::new(&network.stream, 1, move |args| {
+            let network = weak.upgrade().ok_or_else(|| {
+                Error::Other("Clef compiled backbone: network was dropped".into())
+            })?;
+            network.forward_compiled(args)
+        })?;
+        callable.prepare(&inputs)?;
+        network
+            .compiled
+            .borrow_mut()
+            .insert((rest, prefix), callable);
+    }
+    eprintln!(
+        "Clef: prepared {count} whole-backbone compile profile(s) (APXINF_CLEF_COMPILE)"
+    );
+    Ok(())
+}
+
+impl Network {
+    /// The exact input shapes of one prepared profile, in the order
+    /// `run_compiled`/`forward_compiled` use: hidden, positions, then two
+    /// arrays per layer (attention keys/values or gated-delta state/conv).
+    fn compiled_inputs(&self, rest: usize, prefix: usize) -> Result<Vec<Array>> {
+        let t = &self.config.text;
+        let width = t.hidden_size;
+        let mut inputs = Vec::with_capacity(2 + 2 * self.backbone.layers.len());
+        inputs.push(Array::zeros(
+            &self.stream,
+            &[1, rest, width],
+            MlxDType::BF16,
+        )?);
+        inputs.push(Array::zeros(
+            &self.stream,
+            &[3, 1, rest],
+            MlxDType::I32,
+        )?);
+        let (hk, hv) = (t.linear_num_key_heads, t.linear_num_value_heads);
+        let (dk, dv) = (t.linear_key_head_dim, t.linear_value_head_dim);
+        let conv_dim = 2 * hk * dk + hv * dv;
+        for layer in &self.backbone.layers {
+            match &layer.mixer {
+                Mixer::GatedDelta(_) => {
+                    inputs.push(Array::zeros(
+                        &self.stream,
+                        &[1, hv, dv, dk],
+                        MlxDType::F32,
+                    )?);
+                    inputs.push(Array::zeros(
+                        &self.stream,
+                        &[1, t.linear_conv_kernel_dim - 1, conv_dim],
+                        MlxDType::BF16,
+                    )?);
+                }
+                Mixer::Attention(_) => {
+                    let (kv, d) = (t.num_key_value_heads, t.head_dim);
+                    let shape = [1, kv, prefix, d];
+                    inputs.push(Array::zeros(&self.stream, &shape, MlxDType::BF16)?);
+                    inputs.push(Array::zeros(&self.stream, &shape, MlxDType::BF16)?);
+                }
+            }
+        }
+        Ok(inputs)
+    }
+
+    /// The compiled body: rebuild the per-layer cache view from the explicit
+    /// inputs and run the same eager layer loop. It only executes while the
+    /// profile is traced/prepared; replay goes straight to the compiled graph.
+    fn forward_compiled(&self, args: &[Array]) -> Result<Vec<Array>> {
+        let count = self.backbone.layers.len();
+        if args.len() != 2 + 2 * count {
+            return Err(Error::Other(format!(
+                "Clef compiled backbone takes {} inputs, got {}",
+                2 + 2 * count,
+                args.len()
+            )));
+        }
+        let mut layers = Vec::with_capacity(count);
+        for (index, layer) in self.backbone.layers.iter().enumerate() {
+            let first = &args[2 + 2 * index];
+            let second = &args[3 + 2 * index];
+            layers.push(match &layer.mixer {
+                Mixer::GatedDelta(_) => CachedLayer {
+                    state: first.clone(),
+                    conv: second.clone(),
+                    keys: None,
+                    values: None,
+                },
+                Mixer::Attention(_) => CachedLayer {
+                    state: Array::zeros(&self.stream, &[1, 1, 1, 1], MlxDType::F32)?,
+                    conv: Array::zeros(&self.stream, &[1, 1, 1], MlxDType::BF16)?,
+                    keys: Some(first.clone()),
+                    values: Some(second.clone()),
+                },
+            });
+        }
+        let hidden = &args[0];
+        let positions = &args[1];
+        let tokens = hidden.shape()[1];
+        Ok(vec![
+            self.forward_layers(hidden, positions, tokens, Some(&layers))?
+        ])
     }
 }
 

@@ -34,11 +34,14 @@ use apxinf_mlx::{Array, MlxBackend, MlxDType};
 use apxinf_tokenizer::Tokenizer;
 use model::{Composition, Network};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 
 pub struct ClefRunner {
     tokenizer: Tokenizer,
-    network: Network,
+    /// `Rc` so the prepared whole-backbone callable can hold a weak reference
+    /// back to the model it replays (see `model::install_compiled`).
+    network: Rc<Network>,
     /// Placeholder token the processor writes per merged image row.
     image_token_id: u32,
     /// Prompt IDs encoded for the most recent request, for parity evidence.
@@ -168,9 +171,13 @@ pub fn load(
     let head = weights::Head::load(&config, &stream, &path.join("joint_head.safetensors"))?;
     let vision = vision::Vision::load(&config, &stream, path)?;
     let image_token_id = config.image_token_id;
+    let network = Rc::new(Network::new(
+        config, stream, backbone, head, vision, composition,
+    )?);
+    model::install_compiled(&network)?;
     Ok(LoadedModel::Decision(Box::new(ClefRunner {
         tokenizer,
-        network: Network::new(config, stream, backbone, head, vision, composition)?,
+        network,
         image_token_id,
         last_input_ids: Vec::new(),
     })))
