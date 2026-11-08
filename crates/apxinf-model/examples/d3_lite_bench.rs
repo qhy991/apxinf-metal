@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use apxinf_core::{Device, Tensor};
 use apxinf_model::metal_d3_lite;
-use apxinf_model::{AutoModel, DecisionInput, ImageInput, LoadOptions};
+use apxinf_model::{AutoModel, DecisionInput, DecisionModel, ImageInput, LoadOptions, LoadedModel};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -92,6 +92,14 @@ struct ReferenceCase {
 }
 
 #[derive(Debug, Serialize)]
+struct StageRecord {
+    layout_ms: f64,
+    vision_ms: f64,
+    forward_ms: f64,
+    sync_ms: f64,
+}
+
+#[derive(Debug, Serialize)]
 struct CaseRecord {
     id: String,
     bucket: usize,
@@ -101,6 +109,9 @@ struct CaseRecord {
     hex: String,
     decision: usize,
     margin: f32,
+    /// Per-call stage attribution when the runtime reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stages: Option<Vec<StageRecord>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     latency_ms: Option<Vec<f64>>,
     /// Host-side PNG decode + checkpoint-fixed preprocess, before `decide`.
@@ -614,6 +625,7 @@ fn image_main(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         // per-series swap deltas; no ABBA because there is no optimization
         // candidate in this phase.
         let mut latencies = Vec::with_capacity(options.rounds);
+        let mut stages: Vec<StageRecord> = Vec::with_capacity(options.rounds);
         let mut text_latencies = Vec::with_capacity(options.rounds);
         let mut swapout_deltas = Vec::with_capacity(options.rounds);
         let mut swapin_deltas = Vec::with_capacity(options.rounds);
@@ -625,6 +637,16 @@ fn image_main(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             let start = Instant::now();
             model.decide(input)?;
             latencies.push(start.elapsed().as_secs_f64() * 1e3);
+            if let LoadedModel::Decision(DecisionModel::Code(runtime)) = &model {
+                if let Some(profile) = runtime.last_stage_profile() {
+                    stages.push(StageRecord {
+                        layout_ms: profile.layout_ms,
+                        vision_ms: profile.vision_ms,
+                        forward_ms: profile.forward_ms,
+                        sync_ms: profile.sync_ms,
+                    });
+                }
+            }
             let outs_mid = swapouts();
             let ins_mid = swapins();
             swapout_deltas.push(outs_mid.saturating_sub(outs_before));
@@ -658,6 +680,7 @@ fn image_main(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             decision: decision_of(&probabilities),
             margin: margin_of(&probabilities),
             latency_ms: Some(latencies),
+            stages: if stages.is_empty() { None } else { Some(stages) },
             input_prep_ms: Some(input_prep_ms),
             text_latency_ms: Some(text_latencies),
             swapouts: Some(swapout_deltas),
@@ -831,6 +854,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let probabilities = first.ok_or("repeat produced no output")?;
 
         let mut latencies = Vec::with_capacity(options.rounds);
+        let mut stages: Vec<StageRecord> = Vec::with_capacity(options.rounds);
         let mut swapout_deltas = Vec::with_capacity(options.rounds);
         let mut swapin_deltas = Vec::with_capacity(options.rounds);
         for _ in 0..options.rounds {
@@ -839,6 +863,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let start = Instant::now();
             model.decide(DecisionInput::text(&case.token_ids, count))?;
             latencies.push(start.elapsed().as_secs_f64() * 1e3);
+            if let LoadedModel::Decision(DecisionModel::Code(runtime)) = &model {
+                if let Some(profile) = runtime.last_stage_profile() {
+                    stages.push(StageRecord {
+                        layout_ms: profile.layout_ms,
+                        vision_ms: profile.vision_ms,
+                        forward_ms: profile.forward_ms,
+                        sync_ms: profile.sync_ms,
+                    });
+                }
+            }
             let outs_after = swapouts();
             let ins_after = swapins();
             swapout_deltas.push(outs_after.saturating_sub(outs_before));
@@ -889,6 +923,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             },
+            stages: if stages.is_empty() { None } else { Some(stages) },
             input_prep_ms: None,
             text_latency_ms: None,
             swapouts: Some(swapout_deltas),
