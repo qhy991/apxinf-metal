@@ -408,3 +408,37 @@ chip too. The two numbers are not directly comparable — the M4 figure is a thr
 paired campaign on the 8-case timing set, this one is a single pass over the 48-case gate
 suite. Flipping the default would need a proper three-round reverse-order campaign on each
 chip; the knob stays opt-in until then.
+
+## Clean-window cross-machine campaign (2026-11-09)
+
+Every earlier cross-machine number in this document was taken without the swap gate. On the
+M4 the runs showed `Swapouts` between 5 000 and 28 000 per run and the same configuration
+swung between 2 784 ms and 4 753 ms; on the M1 Pro a long-lived agent session added CPU
+contention and inflated the eight-case total to 5 973 ms. Both machines were re-measured in
+an idle window with the standing gates (every run `Swapouts == 0`, reverse arm order,
+`warmup 2` / `repeat 3`):
+
+| Machine | `separate` (median of 3) | `fused_prep` (median of 3) | fused gain |
+| --- | --- | --- | --- |
+| M1 Pro | **3 356.2 ms** | **3 302.5 ms** | +1.6 % |
+| M4 (16 GB) | **2 866.5 ms** | **2 705.2 ms** | +3.4 % |
+
+EngineTailor's own bench, re-run on the same idle M4 (`swap` unchanged at 553 MB before and
+after, `contaminated: false` in all three blocks):
+
+| Arm | suite total |
+| --- | --- |
+| MLX stock | 3 278.4 ms |
+| MLX promoted | **2 901.1 ms** (+12.9 % over stock) |
+
+### What that settles
+
+1. **The M4 is ~1.2× the M1 Pro on this workload**, not the 2–3× ratios the contaminated runs
+   suggested and certainly not slower.
+2. **Native `fused_prep` is the fastest of the four arms on the M4**: 2 705.2 ms against
+   EngineTailor promoted 2 901.1 ms (**6.8 % faster**) and stock 3 278.4 ms (**17.5 %**).
+   Even the default `separate` arm (2 866.5 ms) is 1.2 % ahead of ET promoted.
+3. The earlier "native is 27 % behind MLX promoted" claim was a cold-window artifact on the
+   native side and a paging artifact on the ET side; neither survives a clean window.
+4. d3-lite has no ANE path, so this is a pure GPU/CPU comparison; the M4's advantage comes
+   from its newer GPU rather than from its Neural Engine.
