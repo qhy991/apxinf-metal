@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="736" viewBox="0 0 980 736" font-family="Helvetica, Arial, sans-serif">
+<rect width="980" height="736" fill="white"/>
+<text x="250" y="34" font-size="18" font-weight="600" fill="#24292f">gdn_block=fused_prep vs native base: before / after per timing case</text>
+<text x="250" y="56" font-size="12" fill="#5b6770">8 timing cases, median of 3 reverse-order rounds; base = native defaults, candidate = opt-in gate(s). Host: Apple M4 16 GB.</text>
+<rect x="250" y="68" width="12" height="12" fill="#5b6770"/>
+<text x="268" y="79" font-size="12" fill="#24292f">base</text>
+<rect x="320" y="68" width="12" height="12" fill="#1f6feb"/>
+<text x="338" y="79" font-size="12" fill="#24292f">candidate (median gain +4.04 %, CI95 [+3.49, +7.62] %)</text>
+<line x1="250.0" y1="86" x2="250.0" y2="412" stroke="#c9d1d9" stroke-width="1"/>
+<text x="250.0" y="80" font-size="10" fill="#5b6770" text-anchor="middle">0</text>
+<line x1="644.0" y1="86" x2="644.0" y2="412" stroke="#c9d1d9" stroke-width="1"/>
+<text x="644.0" y="80" font-size="10" fill="#5b6770" text-anchor="middle">500</text>
+<text x="240" y="106" font-size="11" fill="#24292f" text-anchor="end">b0150_engines_kind</text>
+<rect x="250" y="92" width="47.7" height="13" fill="#5b6770"/>
+<rect x="250" y="108" width="46.6" height="13" fill="#1f6feb"/>
+<text x="303.7" y="103" font-size="10" fill="#5b6770">61</text>
+<text x="302.6" y="119" font-size="10" fill="#1f6feb">59 (-2.4 %)</text>
+<text x="240" y="146" font-size="11" fill="#24292f" text-anchor="end">b0150_quickstart_route</text>
+<rect x="250" y="132" width="37.9" height="13" fill="#5b6770"/>
+<rect x="250" y="148" width="34.9" height="13" fill="#1f6feb"/>
+<text x="293.9" y="143" font-size="10" fill="#5b6770">48</text>
+<text x="290.9" y="159" font-size="10" fill="#1f6feb">44 (-7.9 %)</text>
+<text x="240" y="186" font-size="11" fill="#24292f" text-anchor="end">b0400_license_kind</text>
+<rect x="250" y="172" width="115.3" height="13" fill="#5b6770"/>
+<rect x="250" y="188" width="111.9" height="13" fill="#1f6feb"/>
+<text x="371.3" y="183" font-size="10" fill="#5b6770">146</text>
+<text x="367.9" y="199" font-size="10" fill="#1f6feb">142 (-3.0 %)</text>
+<text x="240" y="226" font-size="11" fill="#24292f" text-anchor="end">b0400_kitreadme_topic</text>
+<rect x="250" y="212" width="117.2" height="13" fill="#5b6770"/>
+<rect x="250" y="228" width="113.6" height="13" fill="#1f6feb"/>
+<text x="373.2" y="223" font-size="10" fill="#5b6770">149</text>
+<text x="369.6" y="239" font-size="10" fill="#1f6feb">144 (-3.1 %)</text>
+<text x="240" y="266" font-size="11" fill="#24292f" text-anchor="end">b1000_suite_kind</text>
+<rect x="250" y="252" width="268.8" height="13" fill="#5b6770"/>
+<rect x="250" y="268" width="259.3" height="13" fill="#1f6feb"/>
+<text x="524.8" y="263" font-size="10" fill="#5b6770">341</text>
+<text x="515.3" y="279" font-size="10" fill="#1f6feb">329 (-3.5 %)</text>
+<text x="240" y="306" font-size="11" fill="#24292f" text-anchor="end">b1000_readme_topic</text>
+<rect x="250" y="292" width="271.1" height="13" fill="#5b6770"/>
+<rect x="250" y="308" width="260.8" height="13" fill="#1f6feb"/>
+<text x="527.1" y="303" font-size="10" fill="#5b6770">344</text>
+<text x="516.8" y="319" font-size="10" fill="#1f6feb">331 (-3.8 %)</text>
+<text x="240" y="346" font-size="11" fill="#24292f" text-anchor="end">b2400_suite_kind</text>
+<rect x="250" y="332" width="680.0" height="13" fill="#5b6770"/>
+<rect x="250" y="348" width="654.4" height="13" fill="#1f6feb"/>
+<text x="936.0" y="343" font-size="10" fill="#5b6770">863</text>
+<text x="910.4" y="359" font-size="10" fill="#1f6feb">831 (-3.8 %)</text>
+<text x="240" y="386" font-size="11" fill="#24292f" text-anchor="end">b2400_readme_topic</text>
+<rect x="250" y="372" width="679.6" height="13" fill="#5b6770"/>
+<rect x="250" y="388" width="654.9" height="13" fill="#1f6feb"/>
+<text x="935.6" y="383" font-size="10" fill="#5b6770">862</text>
+<text x="910.9" y="399" font-size="10" fill="#1f6feb">831 (-3.6 %)</text>
+<text x="250" y="476" font-size="14" font-weight="600" fill="#24292f">suite total per round (8 cases, ms)</text>
+<rect x="308.3" y="496.0" width="40.8" height="90.0" fill="#5b6770"/>
+<text x="328.7" y="506.0" font-size="10" fill="#5b6770" text-anchor="middle">3021</text>
+<rect x="361.7" y="504.2" width="40.8" height="81.8" fill="#1f6feb"/>
+<text x="382.1" y="514.2" font-size="10" fill="#1f6feb" text-anchor="middle">2746</text>
+<text x="356.9" y="604" font-size="11" fill="#24292f" text-anchor="middle">round 1 (+8.9 % median case)</text>
+<rect x="502.6" y="502.3" width="40.8" height="83.7" fill="#5b6770"/>
+<text x="523.0" y="512.3" font-size="10" fill="#5b6770" text-anchor="middle">2812</text>
+<rect x="556.0" y="505.3" width="40.8" height="80.7" fill="#1f6feb"/>
+<text x="576.4" y="515.3" font-size="10" fill="#1f6feb" text-anchor="middle">2711</text>
+<text x="551.1" y="604" font-size="11" fill="#24292f" text-anchor="middle">round 2 (+3.5 % median case)</text>
+<rect x="696.9" y="502.3" width="40.8" height="83.7" fill="#5b6770"/>
+<text x="717.3" y="512.3" font-size="10" fill="#5b6770" text-anchor="middle">2809</text>
+<rect x="750.3" y="505.7" width="40.8" height="80.3" fill="#1f6feb"/>
+<text x="770.7" y="515.7" font-size="10" fill="#1f6feb" text-anchor="middle">2696</text>
+<text x="745.4" y="604" font-size="11" fill="#24292f" text-anchor="middle">round 3 (+3.8 % median case)</text>
+</svg>

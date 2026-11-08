@@ -65,10 +65,13 @@ d3-lite geometry that the CUDA copy does not accept) rather than imported.
 | Safetensors → Array | `apxinf_mlx::load_safetensors` | primitive bridge, no host staging, evaluated per file | **used** at load; vision tensors excluded by the keep-filter |
 | Compiled execution | `Compiled::with_shapeless` / `prepare` / `call_and_eval` | prepared compiled callable (MLX compile; **not** a CUDA Graph) | **used** as the whole-request execution: `(ids [1,L], count [1]) → [1,255]` probabilities |
 
-Not ported (out of scope for an unoptimized baseline; these are the
-EngineTailor `PROMOTED` optimization points for P3): `gated_delta_eight_lanes`,
-`causal_depthwise_conv`, `gdn_fused_prep`, and F16 weight copies
-(`gemm_dtype=f16`). Consequently this baseline contains no F16 drift.
+The EngineTailor `PROMOTED` optimization points were out of scope for the
+P1a baseline. `causal_depthwise_conv`, `gated_delta_eight_lanes` and the
+last-row prune were ported in P3/P4; `gdn_fused_prep` and F16 weight copies
+(`gemm_dtype=f16`) were ported in the issue #52 migration behind
+`APXINF_D3_GDN_BLOCK` and `APXINF_D3_GEMM_DTYPE` (opt-in, measured in
+[`../docs/mario-opt/ET-TO-APXINF-MIGRATION.md`](../docs/mario-opt/ET-TO-APXINF-MIGRATION.md)).
+The baseline receipt in this report contains no F16 drift.
 
 ## 4. Registration and public path
 
@@ -108,7 +111,8 @@ each other — (a) the whole forward runs as one `mx.compile`d graph rather than
 an eager lazy graph, and (b) the apxinf `GatedDeltaRecurrence` and
 `HalfSplitRope` kernels use their own FP32 SIMD reduction order and single
 output rounding where the stock arm uses the vendored kernel and
-`mx.fast.rope`. No F16 weights are involved (`gemm_dtype=f16` is not ported).
+`mx.fast.rope`. No F16 weights are involved: the F16 projection arm is
+opt-in behind `APXINF_D3_GEMM_DTYPE` and is not part of this baseline receipt.
 The result stays inside the declared 2×-stock budget on both the maximum and
 the mean.
 

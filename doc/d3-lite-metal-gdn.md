@@ -34,9 +34,11 @@ also that revision's, so the restored code is the project's own historical
 implementation, not a new kernel.
 
 EngineTailor's aligned option names are `conv1d=apxinf`,
-`gdn_core=apxinf_eight_lanes` and `gdn_block=fused_prep`; this port exposes
-the first two. `gdn_block=fused_prep` and `gemm_dtype=f16` are **not** part of
-this change (§7).
+`gdn_core=apxinf_eight_lanes` and `gdn_block=fused_prep`; this leg exposed
+the first two. `gdn_block=fused_prep` and `gemm_dtype=f16` were ported later
+(issue #52) behind `APXINF_D3_GDN_BLOCK` and `APXINF_D3_GEMM_DTYPE`, both
+opt-in; their gates and measurements are in
+[`../docs/mario-opt/ET-TO-APXINF-MIGRATION.md`](../docs/mario-opt/ET-TO-APXINF-MIGRATION.md).
 
 ## 2. Mechanism (written before measurement)
 
