@@ -209,13 +209,14 @@ impl Dit {
         })
     }
 
-    /// Runs the fused blocks' MLP split with the Neural Engine.
-    #[cfg(feature = "coreml")]
     /// Where the ANE blocks spent their wall time, once the loop is done.
+    #[cfg(feature = "coreml")]
     pub fn ane_spent(&self) -> Option<&AneSpent> {
         self.ane.as_deref().map(|a| &a.spent)
     }
 
+    /// Runs the fused blocks' MLP split with the Neural Engine.
+    #[cfg(feature = "coreml")]
     pub fn with_ane(mut self, ane: Option<Rc<AneShare>>) -> Self {
         self.ane = ane;
         self
