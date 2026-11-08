@@ -133,6 +133,25 @@ def kv_bytes_per_token(text_config: dict[str, Any]) -> int | None:
     return int(2 * layers * heads * head_dim * dtype_bytes)
 
 
+def check_kv_options(kv_bits: int | None, quantized_kv_start: int,
+                     max_context: int) -> tuple[int, bool]:
+    """Return ``(effective_start, clamped)`` for the worker KV options.
+
+    The offset only matters when KV quantisation is enabled. With kv8 and an
+    offset at or beyond the context the cache never leaves bf16, which matches
+    upstream mlx-lm; clamp to the context and warn instead of failing startup.
+    """
+    if kv_bits is None:
+        if quantized_kv_start < 0:
+            raise ValueError("The KV quantisation start is outside the context.")
+        return quantized_kv_start, False
+    if not 0 <= quantized_kv_start:
+        raise ValueError("The KV quantisation start is outside the context.")
+    if quantized_kv_start > max_context:
+        return max_context, True
+    return quantized_kv_start, False
+
+
 def kv_generation_options(kv_bits: int | None, quantized_kv_start: int) -> dict[str, Any]:
     """generate_step options for the enabled KV quantisation, else nothing."""
     if kv_bits is None:
@@ -911,8 +930,17 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("The memory limit is invalid.")
     if arguments.kv_bits not in (None, 0, 8):
         parser.error("Only --kv-bits 8 is supported; 4-bit KV degrades quality (measured PPL 17.5x).")
-    if not 0 <= arguments.quantized_kv_start <= arguments.max_context:
-        parser.error("The KV quantisation start is outside the context.")
+    try:
+        quantized_kv_start, clamped = check_kv_options(
+            None if arguments.kv_bits in (None, 0) else arguments.kv_bits,
+            arguments.quantized_kv_start,
+            arguments.max_context,
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    if clamped:
+        print("kv8 enabled but quantized_kv_start is at or beyond the context; "
+              "the KV cache stays bf16.", file=sys.stderr)
     output_fd = sys.stdout.fileno()
 
     def write_all(payload: bytes) -> None:
@@ -926,7 +954,7 @@ def main(argv: list[str] | None = None) -> int:
         runtime = MLXRuntime(arguments.model, arguments.max_context, arguments.prefill_step_size,
                              arguments.output_batch_tokens, arguments.memory_limit_bytes,
                              kv_bits=arguments.kv_bits or None,
-                             quantized_kv_start=arguments.quantized_kv_start)
+                             quantized_kv_start=quantized_kv_start)
         worker = TextWorker(runtime, arguments.worker_epoch, outbox.put,
                             max_output_tokens=arguments.max_output_tokens,
                             output_batch_tokens=arguments.output_batch_tokens)

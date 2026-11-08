@@ -154,6 +154,15 @@ pub fn context_budget_plan(
 /// A worker that cannot compute its KV geometry (custom model code, an
 /// unfamiliar architecture) omits the field; the supervisor then warns and
 /// skips the check instead of failing the launch.
+/// KV options forwarded to the python worker, clamped to the launch context.
+pub(crate) fn python_kv_options(config: &Config) -> Option<(u8, u64)> {
+    let bits = config.kv_bits?;
+    Some((
+        bits,
+        config.quantized_kv_start.min(config.max_context as u64),
+    ))
+}
+
 fn python_context_budget(
     config: &Config,
     resident: u64,
@@ -402,9 +411,9 @@ impl Config {
                     );
                 }
             }
-            if self.kv_bits.is_some() && self.quantized_kv_start > self.max_context as u64 {
-                return Err("The KV quantisation start must not exceed the context limit.".into());
-            }
+            // mlx-lm only quantizes once the offset is reached, so an offset at
+            // or beyond the context simply keeps bf16 KV; python_kv_options
+            // clamps it for the worker instead of rejecting the launch.
             match self.safety_margin.checked_add(self.prefill_transient) {
                 Some(fixed) if fixed < self.memory_budget => {}
                 _ => {
@@ -982,12 +991,18 @@ async fn launch_worker_until(
         .arg("--memory-limit-bytes")
         .arg(config.memory_budget.to_string());
     if matches!(config.runtime, WorkerRuntime::Python) {
-        if let Some(bits) = config.kv_bits {
+        if let Some((bits, start)) = python_kv_options(config) {
+            if start < config.quantized_kv_start {
+                diagnostics::emit(format_args!(
+                    "kv8 enabled but quantized_kv_start {} is at or beyond the context {}; the KV cache stays bf16.",
+                    config.quantized_kv_start, config.max_context
+                ));
+            }
             command
                 .arg("--kv-bits")
                 .arg(bits.to_string())
                 .arg("--quantized-kv-start")
-                .arg(config.quantized_kv_start.to_string());
+                .arg(start.to_string());
         }
     }
     command

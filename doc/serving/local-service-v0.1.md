@@ -398,6 +398,12 @@ target/release/apxinf-serve \
   --python .apxinf/toolchains/mlx-lm-0.31.3-copies/bin/python
 ```
 
+The quantisation offset is a hint rather than a hard requirement.
+When `--kv-bits 8` is enabled and the effective offset is at or beyond the context
+(for example the 5000 default with a 4096-token context), startup clamps it to the context and logs
+`kv8 enabled but quantized_kv_start ... stays bf16`; the KV cache then stays bf16.
+The offset is ignored entirely when `--kv-bits` is not set, so the legacy command keeps working with any context size.
+
 The eight-bit KV cache showed no detectable quality difference in the measurement sample
 (one document, 64 continuation tokens); it still needs a task-level quality gate before longer
 contexts are claimed. These five options are rejected for every other provider, whose behavior

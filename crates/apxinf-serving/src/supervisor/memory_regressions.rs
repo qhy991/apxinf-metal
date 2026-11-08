@@ -488,11 +488,10 @@ fn python_provider_accepts_kv_eight_and_rejects_other_widths() {
         .contains("Only --kv-bits 8"));
     config.kv_bits = Some(8);
     config.validate_memory().unwrap();
+    // A quantisation offset at or beyond the context keeps bf16 KV and must not
+    // reject the launch; the forwarded offset is clamped instead.
     config.quantized_kv_start = 40_961;
-    assert!(config
-        .validate_memory()
-        .unwrap_err()
-        .contains("KV quantisation start"));
+    config.validate_memory().unwrap();
 }
 
 #[test]
@@ -517,4 +516,17 @@ fn python_provider_requires_budget_room_for_the_fixed_terms() {
         .validate_memory()
         .unwrap_err()
         .contains("safety margin and prefill transient"));
+}
+
+#[test]
+fn python_kv_options_clamp_the_offset_to_the_launch_context() {
+    let mut config = python_budget_config(8 * 1024u64.pow(3));
+    config.max_context = 4_096;
+    assert_eq!(python_kv_options(&config), None);
+    config.kv_bits = Some(8);
+    config.quantized_kv_start = 5_000;
+    // The default 5000 is clamped: legacy 4096-token launches stay usable.
+    assert_eq!(python_kv_options(&config), Some((8, 4_096)));
+    config.quantized_kv_start = 2_000;
+    assert_eq!(python_kv_options(&config), Some((8, 2_000)));
 }

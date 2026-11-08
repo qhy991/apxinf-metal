@@ -875,3 +875,28 @@ class KVCapabilityTests(unittest.TestCase):
         contracts.validate_frame(ready)
         self.assertNotIn("kv_bytes_per_token", ready["capabilities"])
         self.assertNotIn("kv_bits", ready["capabilities"])
+
+
+class KVStartRegressionTests(unittest.TestCase):
+    def test_legacy_launch_ignores_the_default_kv_start(self):
+        effective, clamped = worker_module.check_kv_options(None, 5000, 4096)
+        self.assertEqual((effective, clamped), (5000, False))
+
+    def test_kv8_start_beyond_the_context_is_clamped_not_rejected(self):
+        effective, clamped = worker_module.check_kv_options(8, 5000, 4096)
+        self.assertEqual((effective, clamped), (4096, True))
+
+    def test_negative_start_is_still_rejected(self):
+        with self.assertRaises(ValueError):
+            worker_module.check_kv_options(8, -1, 4096)
+        with self.assertRaises(ValueError):
+            worker_module.check_kv_options(None, -1, 4096)
+
+    def test_worker_cli_accepts_legacy_context_without_kv8(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = worker_module.main(["--model", "/definitely/missing-model",
+                                       "--worker-epoch", EPOCH,
+                                       "--max-context", "4096"])
+        self.assertEqual(code, 1)  # the missing model fails later, not argparse
+        self.assertNotIn("KV quantisation", stderr.getvalue())
