@@ -112,15 +112,16 @@ per-layer cost, consistent with the two knobs native does not enable
 
 The review pair (`ET promoted 2808 ms` vs `native 3693 ms`) predates PR #21. On the
 current main, native sits **between** ET stock and ET promoted: **14.2 % faster
-than ET stock**, **8.7 % behind the full promoted point**. The mechanism is
-quantified: of ET's +26.8 % promoted gain, native already owns the equivalent of
-≈18 points (GDN eight-lanes + apxinf conv + rope + compile + its own last-row
-pruning); the open ≈8.7 points track the two knobs still opt-in on main
-(`APXINF_D3_GDN_BLOCK=fused_prep`, `APXINF_D3_GEMM_DTYPE=f16`). The gap is
-**significant enough to justify step 2** (an M1 Pro paired campaign for
-`fused_prep`, then `f16` separately — the M4 verdicts do not transfer: M4 measured
-`fused_prep` +3.55 % KEEP and `f16` −3.68 % NOT-WORTH, but ET's promoted point,
-which includes F16, was promoted on this M1 Pro).
+than ET stock**, **8.7 % behind the full promoted point**. On suite sums the
+promoted point buys 21.0 % over stock; native already captures 14.2 of those
+points (GDN eight-lanes + apxinf conv + rope + compile, plus its own last-row
+pruning that ET lacks), and the remaining native→promoted step (8.7 %) tracks the
+two knobs still opt-in on main (`APXINF_D3_GDN_BLOCK=fused_prep`,
+`APXINF_D3_GEMM_DTYPE=f16`). The gap is **significant enough to justify step 2**
+(an M1 Pro paired campaign for `fused_prep`, then `f16` separately — the M4
+verdicts do not transfer: M4 measured `fused_prep` +3.55 % KEEP and `f16`
+−3.68 % NOT-WORTH, but ET's promoted point, which includes F16, was promoted on
+this M1 Pro).
 
 ### Validity notes
 
