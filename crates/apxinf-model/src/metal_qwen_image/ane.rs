@@ -54,7 +54,10 @@ fn sysctl(name: &str) -> Option<String> {
 
 /// Used swap in MiB, from `vm.swapusage` (`total = ... used = 123.45M ...`).
 fn swap_used_mb() -> Option<f64> {
-    let text = sysctl("vm.swapusage")?;
+    parse_swap_used_mb(&sysctl("vm.swapusage")?)
+}
+
+fn parse_swap_used_mb(text: &str) -> Option<f64> {
     let used = text.split("used = ").nth(1)?;
     used.split('M').next()?.trim().parse().ok()
 }
@@ -64,7 +67,10 @@ fn available_mb() -> Option<f64> {
     let out = std::process::Command::new("/usr/bin/vm_stat")
         .output()
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    parse_available_mb(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_available_mb(text: &str) -> Option<f64> {
     let page: f64 = text
         .split("page size of ")
         .nth(1)?
@@ -448,6 +454,57 @@ mod tests {
             manifest(&["0.safetensors=sha256:bb".into()], 0, "Mac16,10")
         );
         assert!(a.contains(RECIPE));
+    }
+
+    /// `vm_stat` on this M4 while another measurement lane held ~11 GB wired.
+    const VM_STAT_LOADED: &str = "Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                     5833.
+Pages active:                                  84276.
+Pages inactive:                                77565.
+Pages speculative:                              5455.
+Pages throttled:                                   0.
+Pages wired down:                             766651.
+Pages purgeable:                                 472.
+File-backed pages:                             73493.
+Anonymous pages:                               93803.
+";
+
+    /// The same host minutes later, after that lane released its memory.
+    const VM_STAT_FREED: &str = "Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                   408852.
+Pages active:                                  60757.
+Pages inactive:                                53936.
+Pages speculative:                              5673.
+Pages throttled:                                   0.
+Pages wired down:                             150903.
+Pages purgeable:                                 174.
+";
+
+    #[test]
+    fn available_counts_only_the_reclaimable_pages() {
+        // (5833 + 77565 + 5455 + 472) pages of 16 KiB.
+        let loaded = parse_available_mb(VM_STAT_LOADED).unwrap();
+        assert!((loaded - 1395.7).abs() < 0.1, "{loaded}");
+        let freed = parse_available_mb(VM_STAT_FREED).unwrap();
+        assert!((freed - 7322.4).abs() < 0.1, "{freed}");
+        // Active and wired pages are not headroom; counting them would admit
+        // the split on the very host that cannot hold it.
+        assert!(loaded < 4096.0, "the loaded host must fail the default floor");
+        assert!(freed > 4096.0, "the freed host must clear the default floor");
+        assert_eq!(parse_available_mb("not vm_stat output"), None);
+    }
+
+    #[test]
+    fn swap_used_reads_the_used_field_not_the_total_or_free() {
+        assert_eq!(
+            parse_swap_used_mb("total = 4096.00M  used = 3227.75M  free = 868.25M  (encrypted)"),
+            Some(3227.75)
+        );
+        assert_eq!(
+            parse_swap_used_mb("total = 10240.00M  used = 9627.94M  free = 612.06M  (encrypted)"),
+            Some(9627.94)
+        );
+        assert_eq!(parse_swap_used_mb("total = 4096.00M"), None);
     }
 
     #[test]
