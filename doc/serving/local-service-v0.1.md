@@ -399,10 +399,13 @@ target/release/apxinf-serve \
 ```
 
 The quantisation offset is a hint rather than a hard requirement.
-When `--kv-bits 8` is enabled and the effective offset is at or beyond the context
+An explicitly requested offset beyond the context is rejected at startup.
+When `--kv-bits 8` is enabled with the default offset and it is at or beyond the context
 (for example the 5000 default with a 4096-token context), startup clamps it to the context and logs
 `kv8 enabled but quantized_kv_start ... stays bf16`; the KV cache then stays bf16.
 The offset is ignored entirely when `--kv-bits` is not set, so the legacy command keeps working with any context size.
+The budget always reserves bf16 KV: enabling `--kv-bits 8` lowers the runtime peak but does not raise
+the maximum context that passes the launch budget check.
 
 The eight-bit KV cache showed no detectable quality difference in the measurement sample
 (one document, 64 continuation tokens); it still needs a task-level quality gate before longer

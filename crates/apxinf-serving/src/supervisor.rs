@@ -99,7 +99,10 @@ pub struct ContextBudget {
 
 /// Raise a launch context to the worker's 256-token KV allocation step.
 pub fn align_context(context: u64) -> u64 {
-    context.div_ceil(KV_CONTEXT_ALIGNMENT) * KV_CONTEXT_ALIGNMENT
+    context
+        .saturating_add(KV_CONTEXT_ALIGNMENT - 1)
+        .div_euclid(KV_CONTEXT_ALIGNMENT)
+        .saturating_mul(KV_CONTEXT_ALIGNMENT)
 }
 
 /// Check `resident + KV(aligned context) + prefill transient + safety margin`
@@ -992,7 +995,7 @@ async fn launch_worker_until(
         .arg(config.memory_budget.to_string());
     if matches!(config.runtime, WorkerRuntime::Python) {
         if let Some((bits, start)) = python_kv_options(config) {
-            if start < config.quantized_kv_start {
+            if start >= config.max_context as u64 {
                 diagnostics::emit(format_args!(
                     "kv8 enabled but quantized_kv_start {} is at or beyond the context {}; the KV cache stays bf16.",
                     config.quantized_kv_start, config.max_context

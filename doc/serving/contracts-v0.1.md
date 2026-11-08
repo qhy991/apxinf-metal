@@ -223,6 +223,16 @@ The service capability set intersects four constraint sets:
 
 **CP-05.** The worker must report the actual provider and quality profile.
 
+### Python-mlx-lm capability fields
+
+The `python-mlx-lm` worker may add these optional fields to its capability document.
+Native frames must not send them, and the contract rejects them there.
+
+| Field | Meaning |
+| --- | --- |
+| `kv_bytes_per_token` | Per-token KV cache bytes derived from the text model geometry; used by the launch-time context budget. |
+| `kv_bits` | KV cache quantisation width; only 8 is accepted. Omitted when quantisation is off. |
+
 ## Prepared input
 
 `PreparedInput` binds input data to its model revision and prompt artifacts.
@@ -478,8 +488,6 @@ The resume capsule reports the following metadata:
 | Field | Meaning |
 | --- | --- |
 | `state_schema` | The version of the state layout. |
-| `kv_bytes_per_token` | Optional. Per-token KV cache bytes reported by `python-mlx-lm` for the context budget; native frames must not send it. |
-| `kv_bits` | Optional. KV cache quantisation width reported by `python-mlx-lm`; only 8 is accepted and native frames must not send it. |
 | `model_revision` | The bound model identity. |
 | `history_digest` | The committed canonical history identity. |
 | `history_count` | The number of tokens in that history. |
