@@ -23,6 +23,14 @@
 //! `APXINF_D3_CONV1D=stock` restores the composed MLX `conv1d` over an
 //! explicit zero history. See `doc/d3-lite-metal-gdn.md` (P3, D3-A) and
 //! `doc/notworth-audit.md` §4.2.
+//!
+//! Two further EngineTailor promoted knobs are opt-in here:
+//! `APXINF_D3_GEMM_DTYPE=f16` runs every projection on an F16 weight copy with
+//! F16 inputs and rounds the result back to BF16, and
+//! `APXINF_D3_GDN_BLOCK=fused_prep` runs the GDN operand chain (conv, SiLU,
+//! q/k/v split and q/k l2norm) as one kernel with FP32 intermediates. Neither
+//! changes a default; the migration's gap matrix, parity and measured verdicts
+//! are in `docs/mario-opt/ET-TO-APXINF-MIGRATION.md`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -30,7 +38,7 @@ use std::time::Instant;
 
 use apxinf_core::{Error, Result};
 use apxinf_mlx::fusions::{
-    CausalDepthwiseConv, GatedDeltaLayout, GatedDeltaRecurrence, HalfSplitRope,
+    CausalDepthwiseConv, GatedDeltaLayout, GatedDeltaRecurrence, GdnFusedPrep, HalfSplitRope,
 };
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 
@@ -86,6 +94,35 @@ const GDN_CORE_IMAGE: &str = "APXINF_D3_GDN_CORE_IMAGE";
 ///   drift from a different one-row SDPA kernel if `full` misses a gate.
 const LAST_ROW_VALUES: &[&str] = &["full", "off", "attn"];
 const LAST_ROW: &str = "APXINF_D3_LAST_ROW";
+
+/// The projection GEMM dtype. `bf16` (default) is the checkpoint's own
+/// storage and the native port's base; `f16` runs every layer projection on an
+/// F16 weight copy with F16 inputs and rounds the result back to BF16 —
+/// EngineTailor's `gemm_dtype=f16` (`(x.astype(f16) @ W16.T).astype(bf16)`).
+/// This is the promoted point's largest lever: the projections are ~68 % of
+/// the request's device time (Graft's M1 Pro attribution), and Apple GPUs have
+/// the higher matmul peak in F16.
+const GEMM_DTYPE_VALUES: &[&str] = &["bf16", "f16"];
+const GEMM_DTYPE: &str = "APXINF_D3_GEMM_DTYPE";
+
+/// EngineTailor's `gdn_block` option over the GDN operand chain.
+///
+/// `separate` (default) is the native base: the causal-conv kernel, then
+/// SiLU, then the q/k/v split and two RMSNorm nodes — each a BF16 node, so
+/// the chain rounds between them. `fused_prep` runs the whole chain as one
+/// kernel ([`GdnFusedPrep`]) over one read of the raw `in_proj_qkv` row, keeps
+/// the intermediates in FP32 and rounds q, k and v once. It requires
+/// `APXINF_D3_CONV1D=apxinf`, because its convolution is the ApxInf tap-order
+/// convolution; selecting it over `stock` is refused rather than silently
+/// ignored (EngineTailor's `resolve` makes the same rule).
+const GDN_BLOCK_VALUES: &[&str] = &["separate", "fused_prep"];
+const GDN_BLOCK: &str = "APXINF_D3_GDN_BLOCK";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GdnBlock {
+    Separate,
+    FusedPrep,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LastRow {
@@ -154,6 +191,11 @@ struct Parts {
     /// composes it from MLX primitives inside `gated_delta_forward`.
     conv1d: Conv1d,
     causal_conv: Option<CausalDepthwiseConv>,
+    /// How the GDN operand chain is composed (`APXINF_D3_GDN_BLOCK`).
+    gdn_block: GdnBlock,
+    /// The fused conv + SiLU + split + q/k-norm kernel; `None` when the chain
+    /// is `separate`.
+    fused_prep: Option<GdnFusedPrep>,
     /// How far the final layer may shrink to the readout's single row
     /// (`APXINF_D3_LAST_ROW`); both callables share it, because the text and
     /// image paths run the same `stack` under different rotary arguments.
@@ -187,8 +229,20 @@ fn silu(x: &Array) -> Result<Array> {
 }
 
 /// `nn.Linear` without bias: `x @ W.T` (`W` is `[out, in]` as stored).
+///
+/// An F16 weight selects `gemm_dtype=f16`: the activation is rounded to F16,
+/// multiplied with the F16 copy and the F16 result is rounded back to BF16, the
+/// same three conversions EngineTailor's `_linear` performs. The BF16 weight
+/// (the base) takes the plain projection with no intermediate rounding.
 fn project(x: &Array, weight: &Array) -> Result<Array> {
-    x.matmul(&weight.transpose(&[1, 0])?)
+    let transposed = weight.transpose(&[1, 0])?;
+    if weight.dtype() == MlxDType::F16 {
+        x.cast(MlxDType::F16)?
+            .matmul(&transposed)?
+            .cast(MlxDType::BF16)
+    } else {
+        x.matmul(&transposed)
+    }
 }
 
 /// `compute_g`: `exp(-exp(A_log_f32) * softplus(a + dt_bias))`; beta:
@@ -210,7 +264,7 @@ impl Model {
     pub fn new(
         config: &Config,
         stream: Stream,
-        weights: Weights,
+        mut weights: Weights,
         vision_weights: VisionWeights,
     ) -> Result<Self> {
         let geometry = config.geometry;
@@ -223,6 +277,30 @@ impl Model {
             "apxinf" => Conv1d::ApxInf,
             other => unreachable!("the conv1d list only names known kernels: {other}"),
         };
+        // F16 projections are a load-time weight conversion, not a per-request
+        // cast: every projection keeps exactly one weight copy (its F16 copy
+        // replaces the BF16 one), so the on-device footprint is unchanged.
+        let f16_gemm = match GEMM_DTYPE_VALUES[env_gate(GEMM_DTYPE, GEMM_DTYPE_VALUES)?] {
+            "bf16" => false,
+            "f16" => true,
+            other => unreachable!("the gemm dtype list only names known dtypes: {other}"),
+        };
+        if f16_gemm {
+            weights.convert_projections_to_f16(&stream)?;
+        }
+        // The fused operand chain reuses the ApxInf tap-order convolution, so
+        // a `stock` conv with `fused_prep` is refused rather than ignored.
+        let gdn_block = match GDN_BLOCK_VALUES[env_gate(GDN_BLOCK, GDN_BLOCK_VALUES)?] {
+            "separate" => GdnBlock::Separate,
+            "fused_prep" => GdnBlock::FusedPrep,
+            other => unreachable!("the gdn block list only names known compositions: {other}"),
+        };
+        if gdn_block == GdnBlock::FusedPrep && conv1d != Conv1d::ApxInf {
+            return Err(Error::Contract(
+                "APXINF_D3_GDN_BLOCK=fused_prep runs the ApxInf tap-order convolution; pair it \
+                 with APXINF_D3_CONV1D=apxinf, not stock",
+            ));
+        }
         // Resolve by the selected *name*, not the list index, so a gate's
         // default can move by reordering its value list without silently
         // selecting the wrong kernel.
@@ -259,6 +337,18 @@ impl Model {
             Conv1d::Stock => None,
             Conv1d::ApxInf => Some(CausalDepthwiseConv::new(&stream)?),
         };
+        let fused_prep = match gdn_block {
+            GdnBlock::Separate => None,
+            GdnBlock::FusedPrep => Some(GdnFusedPrep::new(
+                &stream,
+                geometry.k_heads,
+                geometry.k_dim,
+                geometry.v_heads,
+                geometry.v_dim,
+                geometry.conv_kernel,
+                geometry.conv_dim(),
+            )?),
+        };
         let parts = Rc::new(Parts {
             geometry,
             weights,
@@ -270,6 +360,8 @@ impl Model {
             recurrence_image,
             conv1d,
             causal_conv,
+            gdn_block,
+            fused_prep,
             last_row,
             rope: HalfSplitRope::new(&stream, geometry.rope_dims)?,
             inv_freq: inverse_frequencies(&stream, geometry)?,
@@ -1065,65 +1157,79 @@ fn gated_delta_forward(
     ])?;
     let b = project(input, &gated_delta.b.weight)?;
     let a = project(input, &gated_delta.a.weight)?;
-    let convolved = match parts.conv1d {
-        Conv1d::Stock => {
-            // Stock reference: a depthwise causal convolution over `S - 1`
-            // zero rows, composed from MLX primitives.
-            let history = Array::zeros(
-                &parts.stream,
-                &[1, geometry.conv_kernel - 1, conv_dim],
-                qkv.dtype(),
-            )?;
-            let convolved = Array::concat(&[&history, &qkv], 1)?.conv1d(
-                &gated_delta.conv,
-                1,
-                0,
-                1,
-                conv_dim,
-            )?;
-            silu(&convolved)?
-        }
-        Conv1d::ApxInf => {
-            let kernel = parts.causal_conv.as_ref().ok_or_else(|| {
-                Error::Contract("APXINF_D3_CONV1D=apxinf was selected without its kernel")
+    let (queries, keys, values) = match parts.gdn_block {
+        GdnBlock::FusedPrep => {
+            let kernel = parts.fused_prep.as_ref().ok_or_else(|| {
+                Error::Contract("APXINF_D3_GDN_BLOCK=fused_prep was selected without its kernel")
             })?;
-            // Same arithmetic contract — causal depthwise conv with zero
-            // history, FP32 accumulation in tap order, one BF16 rounding —
-            // but one launch with no zero-history concat and no im2col-style
-            // padding materialization.
-            silu(&kernel.call(&qkv, &gated_delta.conv)?)?
+            // One read of the raw qkv row: the causal conv, SiLU, q/k/v split
+            // and the q/k l2-norm stay in FP32 and each output rounds once.
+            kernel.call(&qkv, &gated_delta.conv)?
+        }
+        GdnBlock::Separate => {
+            let convolved = match parts.conv1d {
+                Conv1d::Stock => {
+                    // Stock reference: a depthwise causal convolution over
+                    // `S - 1` zero rows, composed from MLX primitives.
+                    let history = Array::zeros(
+                        &parts.stream,
+                        &[1, geometry.conv_kernel - 1, conv_dim],
+                        qkv.dtype(),
+                    )?;
+                    let convolved = Array::concat(&[&history, &qkv], 1)?.conv1d(
+                        &gated_delta.conv,
+                        1,
+                        0,
+                        1,
+                        conv_dim,
+                    )?;
+                    silu(&convolved)?
+                }
+                Conv1d::ApxInf => {
+                    let kernel = parts.causal_conv.as_ref().ok_or_else(|| {
+                        Error::Contract("APXINF_D3_CONV1D=apxinf was selected without its kernel")
+                    })?;
+                    // Same arithmetic contract — causal depthwise conv with
+                    // zero history, FP32 accumulation in tap order, one BF16
+                    // rounding — but one launch with no zero-history concat
+                    // and no im2col-style padding materialization.
+                    silu(&kernel.call(&qkv, &gated_delta.conv)?)?
+                }
+            };
+            let queries = convolved.slice_axis(2, 0, key_dim)?.reshape(&[
+                1,
+                length,
+                geometry.k_heads,
+                geometry.k_dim,
+            ])?;
+            let keys = convolved.slice_axis(2, key_dim, 2 * key_dim)?.reshape(&[
+                1,
+                length,
+                geometry.k_heads,
+                geometry.k_dim,
+            ])?;
+            let values = convolved.slice_axis(2, 2 * key_dim, conv_dim)?.reshape(&[
+                1,
+                length,
+                geometry.v_heads,
+                geometry.v_dim,
+            ])?;
+            // Official GDN q/k l2-norm: `x * rsqrt(sum(x^2) + 1e-6)`, written
+            // as an RMSNorm whose epsilon is on the mean (`1e-6 / k_dim`),
+            // then scaled by `k_dim^-1` for q and `k_dim^-0.5` for k. The
+            // mlx-lm variant uses a mean epsilon of `1e-6` and differs enough
+            // to move the probabilities; the checkpoint's own model uses this
+            // form.
+            let mean_epsilon = 1e-6 / geometry.k_dim as f32;
+            let queries = queries
+                .fast_rms_norm_unweighted(mean_epsilon)?
+                .mul(&scalar(&queries, (geometry.k_dim as f64).powf(-1.0))?)?;
+            let keys = keys
+                .fast_rms_norm_unweighted(mean_epsilon)?
+                .mul(&scalar(&keys, (geometry.k_dim as f64).powf(-0.5))?)?;
+            (queries, keys, values)
         }
     };
-    let queries = convolved.slice_axis(2, 0, key_dim)?.reshape(&[
-        1,
-        length,
-        geometry.k_heads,
-        geometry.k_dim,
-    ])?;
-    let keys = convolved.slice_axis(2, key_dim, 2 * key_dim)?.reshape(&[
-        1,
-        length,
-        geometry.k_heads,
-        geometry.k_dim,
-    ])?;
-    let values = convolved.slice_axis(2, 2 * key_dim, conv_dim)?.reshape(&[
-        1,
-        length,
-        geometry.v_heads,
-        geometry.v_dim,
-    ])?;
-    // Official GDN q/k l2-norm: `x * rsqrt(sum(x^2) + 1e-6)`, written as an
-    // RMSNorm whose epsilon is on the mean (`1e-6 / k_dim`), then scaled by
-    // `k_dim^-1` for q and `k_dim^-0.5` for k. The mlx-lm variant uses a mean
-    // epsilon of `1e-6` and differs enough to move the probabilities; the
-    // checkpoint's own model uses this form.
-    let mean_epsilon = 1e-6 / geometry.k_dim as f32;
-    let queries = queries
-        .fast_rms_norm_unweighted(mean_epsilon)?
-        .mul(&scalar(&queries, (geometry.k_dim as f64).powf(-1.0))?)?;
-    let keys = keys
-        .fast_rms_norm_unweighted(mean_epsilon)?
-        .mul(&scalar(&keys, (geometry.k_dim as f64).powf(-0.5))?)?;
     let (decay, beta) = decay_beta(&gated_delta.a_log, &a, &b, &gated_delta.dt_bias)?;
     let state = Array::zeros(
         &parts.stream,
@@ -1277,6 +1383,8 @@ mod tests {
             (GDN_CORE, GDN_CORE_VALUES),
             (GDN_CORE_IMAGE, GDN_CORE_IMAGE_VALUES),
             (LAST_ROW, LAST_ROW_VALUES),
+            (GEMM_DTYPE, GEMM_DTYPE_VALUES),
+            (GDN_BLOCK, GDN_BLOCK_VALUES),
         ] {
             assert_eq!(parse_gate(None, values, name).unwrap(), 0, "{name} unset");
             for (index, value) in values.iter().enumerate() {
@@ -1416,6 +1524,38 @@ mod tests {
         stream.eval(&[output.clone()]).unwrap();
         assert_eq!(output.shape(), &[1, 2, 2]);
         assert_eq!(output.to_f32_vec().unwrap(), [-2.0, -2.0, 3.0, 9.0],);
+    }
+
+    /// An F16 weight selects the `gemm_dtype=f16` contract: the activation is
+    /// rounded to F16, the matmul runs in F16, and the result is rounded back
+    /// to BF16. The projection must not return F16, or the next BF16 node
+    /// (norm, conv, gated norm) would silently promote.
+    #[test]
+    fn project_f16_weight_rounds_through_f16_and_returns_bf16() {
+        let stream = stream();
+        let weight = Array::from_f32(&stream, &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap()
+            .cast(MlxDType::F16)
+            .unwrap();
+        let input = Array::from_f32(&stream, &[1, 2, 3], &[1.0, 0.0, -1.0, 0.5, 2.0, -0.5])
+            .unwrap()
+            .cast(MlxDType::BF16)
+            .unwrap();
+        let output = project(&input, &weight).unwrap();
+        stream.eval(&[output.clone()]).unwrap();
+        assert_eq!(output.dtype(), MlxDType::BF16);
+        assert_eq!(output.shape(), &[1, 2, 2]);
+        for (actual, expected) in output
+            .to_f32_vec()
+            .unwrap()
+            .into_iter()
+            .zip([-2.0, -2.0, 3.0, 9.0])
+        {
+            assert!(
+                (actual - expected).abs() < 1e-2,
+                "F16 projection drift too large: {actual} vs {expected}"
+            );
+        }
     }
 
     /// End-to-end device acceptance for the prepared whole-request callable:

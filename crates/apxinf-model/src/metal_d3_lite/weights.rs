@@ -9,6 +9,9 @@
 //!   left untouched, matching the reference loader.
 //! - `linear_attn.conv1d.weight` is stored `[C, 1, S]` and transposed to the
 //!   MLX conv1d `[C, S, 1]` layout.
+//! - Under `APXINF_D3_GEMM_DTYPE=f16` every layer projection is replaced by an
+//!   F16 copy (`convert_projections_to_f16`); norms, conv taps, the embedding
+//!   and the readout stay as stored.
 //! - The vision patch embedding Conv3d weight `[C_out, C_in, T, P, P]` is
 //!   reshaped to the `[C_out, C_in·T·P·P]` matrix its kernel = stride equals.
 //!
@@ -175,6 +178,56 @@ impl Take {
 }
 
 impl Weights {
+    /// Replace every layer projection's BF16 weight with its F16 copy
+    /// (`APXINF_D3_GEMM_DTYPE=f16`, EngineTailor's `gemm_dtype=f16`).
+    ///
+    /// The projections are attention `q/k/v/o`, the GDN
+    /// `in_proj_qkv/z/b/a` and `out_proj`, and the MLP `gate/up/down` — the
+    /// exact set the reference converts. Every F16 copy **replaces** its BF16
+    /// source, so the device footprint is unchanged (one copy per
+    /// projection), unlike an arm that keeps both dtypes resident. Norms, the
+    /// convolution taps, the embedding and the FP32 readout stay as stored.
+    pub fn convert_projections_to_f16(&mut self, stream: &Stream) -> Result<()> {
+        let convert = |linear: &mut Linear| -> Result<()> {
+            let converted = linear.weight.cast(MlxDType::F16)?;
+            // Materialize before the BF16 source is dropped: MLX is lazy, and
+            // a `cast` left on the graph would keep the BF16 tensor alive and
+            // re-run the conversion inside every traced profile.
+            stream.eval(std::slice::from_ref(&converted))?;
+            linear.weight = converted;
+            Ok(())
+        };
+        for layer in &mut self.layers {
+            match &mut layer.mixer {
+                Mixer::Attention(attention) => {
+                    for weight in [
+                        &mut attention.q,
+                        &mut attention.k,
+                        &mut attention.v,
+                        &mut attention.o,
+                    ] {
+                        convert(weight)?;
+                    }
+                }
+                Mixer::GatedDelta(gated_delta) => {
+                    for weight in [
+                        &mut gated_delta.qkv,
+                        &mut gated_delta.z,
+                        &mut gated_delta.b,
+                        &mut gated_delta.a,
+                        &mut gated_delta.out,
+                    ] {
+                        convert(weight)?;
+                    }
+                }
+            }
+            for weight in [&mut layer.mlp.gate, &mut layer.mlp.up, &mut layer.mlp.down] {
+                convert(weight)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Loads every text tensor of the d3-lite package. The caller supplies a
     /// validated [`Geometry`]; shapes below are derived from it so a geometry
     /// change cannot silently reuse the wrong layout.
