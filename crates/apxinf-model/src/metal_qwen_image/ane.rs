@@ -1,8 +1,9 @@
 //! The Neural Engine share of each image-block MLP (EngineTailor A007, #236).
 //! MLP rows `[GPU_ROWS(), MLP)` of gate/up and the matching columns of `out`
 //! run as one Core ML program per block; the GPU keeps rows `[0, GPU_ROWS())`
-//! on the fused kernels, and the two shares are summed on the GPU. Opt in
-//! with `APXINF_QWEN_IMAGE_ANE=1` (default off).
+//! on the fused kernels, and the two shares are summed on the GPU. On by
+//! default; `APXINF_QWEN_IMAGE_ANE=0` is the rollback, and the memory gate
+//! drops back to GPU-only on its own when the host cannot hold the programs.
 //!
 //! The program: gate and up as per-row symmetric INT8 1x1 convolutions on an
 //! input pre-scaled by `2^a` (`r = 2^-a` undoes it), SiLU as
@@ -82,9 +83,36 @@ pub const TILE: usize = 1152;
 /// Bumped whenever the program, its quantizer or the writer changes.
 const RECIPE: &str = "qwen-image21/a007-mlp-columns/v1";
 
-/// Whether the caller asked for the Neural Engine share.
+/// Whether this process takes the Neural Engine share. On by default.
+///
+/// The default says which path serves most callers, not that the quality
+/// gate passes. It does not: images that render dense text are measurably
+/// degraded and ship that way under the owner's override (#236, and the
+/// module README's known limitation). A caller that depends on faithful
+/// lettering sets `APXINF_QWEN_IMAGE_ANE=0`, which is also the rollback.
 pub fn requested() -> bool {
-    std::env::var("APXINF_QWEN_IMAGE_ANE").is_ok_and(|v| v == "1")
+    enabled(std::env::var("APXINF_QWEN_IMAGE_ANE").ok().as_deref())
+}
+
+/// `None` is an unset variable, which takes the default. Anything that is
+/// neither `0` nor `1` keeps the GPU, because guessing the other way would
+/// ship the artifact to someone whose spelling of "off" this does not know;
+/// [`enable_refusal`] says so rather than letting it look deliberate.
+fn enabled(value: Option<&str>) -> bool {
+    matches!(value, None | Some("1"))
+}
+
+/// Why `APXINF_QWEN_IMAGE_ANE` could not be read as an answer, if it could
+/// not. Paired with [`enabled`]: a value named here always keeps the GPU.
+pub fn enable_refusal() -> Option<String> {
+    refusal_for(std::env::var("APXINF_QWEN_IMAGE_ANE").ok().as_deref())
+}
+
+fn refusal_for(value: Option<&str>) -> Option<String> {
+    let raw = value?;
+    (!matches!(raw, "0" | "1")).then(|| {
+        format!("APXINF_QWEN_IMAGE_ANE={raw:?} is neither 1 nor 0, so it is taken as 0")
+    })
 }
 
 fn env_mb(name: &str, default: u64) -> u64 {
@@ -661,6 +689,32 @@ Pages purgeable:                                 174.
         assert!(spent < 60.0, "cpu_seconds reported an implausible {spent}s");
     }
 
+    /// The default is on, which puts the degradation the README records on
+    /// the path a caller gets without asking for it. Two things have to hold
+    /// for that to be a decision rather than an accident: the rollback keeps
+    /// working, and a value this does not understand keeps the GPU and says
+    /// so, instead of being read as a request for the split (#236).
+    #[test]
+    fn the_split_is_on_unless_the_rollback_says_otherwise() {
+        assert!(enabled(None), "an unset variable takes the default, which is on");
+        assert!(enabled(Some("1")), "the old opt-in spelling still means on");
+        assert!(!enabled(Some("0")), "APXINF_QWEN_IMAGE_ANE=0 is the rollback");
+
+        for value in ["", "0 ", "true", "false", "no", "yes", "2", "ON", "off"] {
+            assert!(!enabled(Some(value)), "{value:?} was read as a request for the split");
+            assert!(
+                refusal_for(Some(value)).is_some_and(|why| why.contains(value)),
+                "{value:?} kept the GPU without naming itself, so it reads as a GPU-only host"
+            );
+        }
+        for understood in [None, Some("0"), Some("1")] {
+            assert!(
+                refusal_for(understood).is_none(),
+                "{understood:?} is an answer, not a typo to complain about"
+            );
+        }
+    }
+
     /// The split is open to every prompt, including the ones whose renders
     /// FAIL the project's automatic quality gate.
     ///
@@ -675,8 +729,9 @@ Pages purgeable:                                 174.
     /// path reads the prompt, and the degradation the rubric measures on
     /// text-heavy images (poster-zh-512 hottest 9.43, poster-zh-1024 18.77 at
     /// PSNR 38.02, poster-en-1024 21.66 at PSNR 34.47, all against a ceiling
-    /// of 8.0) ships with it under that override. `APXINF_QWEN_IMAGE_ANE=0`,
-    /// the default, is the rollback.
+    /// of 8.0) ships with it under that override, and since the owner turned
+    /// the split on it ships on the default path. `APXINF_QWEN_IMAGE_ANE=0`
+    /// is the rollback.
     ///
     /// This test is the removal's receipt: it fails if someone reintroduces a
     /// prompt-dependent refusal without revisiting that decision (#236).
