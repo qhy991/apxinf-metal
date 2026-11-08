@@ -12,3 +12,7 @@ apxinf-core = { path = "../apxinf-core" }
 half = "2"
 [build-dependencies]
 cc = "1"
+
+[[example]]
+name = "qmm_bm64_probe"
+required-features = ["native"]

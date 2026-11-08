@@ -10,6 +10,7 @@ use apxinf_mlx::fusions::{
     MppGemmDecodeQ4Rows, MppGemmGatedResidual, MppGemmHeadRmsRope, MppGemmHeadsWithPrefix,
     MppGemmSwigluPairs,
 };
+use apxinf_mlx::qmm_bm64::QmmBm64;
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 use std::rc::Rc;
 
@@ -82,6 +83,24 @@ fn select_skip_steps(signals: &[f32], dim: usize, ratio: f32) -> Vec<bool> {
 /// Image-token counts that run the fused blocks: multiples of 64 within the
 /// range their kernels admit, from the smallest qualified image (512²).
 pub const FUSED_TOKENS: std::ops::RangeInclusive<usize> = 1024..=4096;
+/// Smallest image-token count whose non-fused `project()` fallback may run
+/// the BM64 retiled qmm instead of the stock op (round 24, #237): the win is
+/// weight-tile reuse, which needs many M rows. Ragged rows engage only with
+/// a sizeable remainder: the op probe measured BM64 *slower* at M=1092
+/// (tail 4, −1.5%) and +5.2–6.0% at the 6889-row tier (tail 41), mirroring
+/// the python lane's round-16 min-tail rule.
+pub const QMM_BM64_MIN_TOKENS: usize = 1024;
+/// Minimum nonzero `tokens % 64` remainder for which ragged BM64 engages.
+pub const QMM_BM64_MIN_TAIL: usize = 32;
+/// Ragged BM64 further requires this many rows (large-ragged tiers only).
+pub const QMM_BM64_RAGGED_MIN_TOKENS: usize = 4096;
+
+/// Whether the fallback tier at `tokens` rows may use the BM64 retile.
+pub fn qmm_bm64_wanted(tokens: usize) -> bool {
+    let rem = tokens % 64;
+    tokens >= QMM_BM64_MIN_TOKENS
+        && (rem == 0 || (rem >= QMM_BM64_MIN_TAIL && tokens >= QMM_BM64_RAGGED_MIN_TOKENS))
+}
 
 /// The image-token block as seven fused kernels (see the family README):
 /// norm + modulation, Q/K with head RMSNorm and RoPE, V in the head-major
@@ -149,6 +168,9 @@ pub struct Dit {
     /// The Neural Engine share of each fused block's MLP, when enabled.
     #[cfg(feature = "coreml")]
     ane: Option<Rc<AneShare>>,
+    /// The BM64 retiled affine qmm for the non-fused image fallback tier
+    /// (e.g. 1328x1328's 6889 rows), when the install probe matched stock.
+    qmm_bm64: Option<Rc<QmmBm64>>,
 }
 
 /// Which engine runs the offloaded half of the MLP: Core ML on the Neural
@@ -217,6 +239,7 @@ impl Dit {
         ops: &Ops,
         gemm: Option<Rc<MppBf16GemmNt>>,
         fused: Option<Rc<Fused>>,
+        qmm_bm64: Option<Rc<QmmBm64>>,
     ) -> Result<Self> {
         let stream = ops.stream();
         let freqs = super::tables::timestep_frequencies(128);
@@ -229,6 +252,7 @@ impl Dit {
             fused,
             #[cfg(feature = "coreml")]
             ane: None,
+            qmm_bm64,
         })
     }
 
@@ -291,13 +315,22 @@ impl Dit {
     /// `nn.QuantizedLinear`. At least `MPP_MIN_TOKENS` image tokens in a
     /// multiple of 64 decode the weight per call and use the probe-selected
     /// MPP GEMM. Full-image parity requires separate qualification for the
-    /// selected device and profile.
+    /// selected device and profile. The non-fused image fallback (ragged or
+    /// oversized token counts, e.g. 1328x1328) runs the BM64 retiled qmm
+    /// when it is installed and this call is eligible; anything else keeps
+    /// the stock op. Both selections are bit-exact against stock.
     fn project(&self, w: &Q4, x: &Array, image: bool) -> Result<Array> {
         let tokens = x.shape()[1];
         match &self.gemm {
             Some(gemm) if image && tokens.is_multiple_of(64) && tokens >= MPP_MIN_TOKENS => {
                 gemm.call(x, &w.weight.dequantize(&w.scales, &w.biases, 64, 4)?)
             }
+            _ if image && qmm_bm64_wanted(tokens) => match &self.qmm_bm64 {
+                Some(bm64) if bm64.eligible(x, &w.weight, &w.scales, &w.biases) => {
+                    bm64.call(x, &w.weight, &w.scales, &w.biases)
+                }
+                _ => w.apply(x),
+            },
             _ => w.apply(x),
         }
     }
@@ -839,5 +872,24 @@ mod tests {
             biases: rows(0, 48, 1),
         };
         assert!(interleave_gate_up(&odd, &odd).is_err());
+    }
+}
+
+#[cfg(test)]
+mod bm64_tests {
+    use super::qmm_bm64_wanted;
+
+    #[test]
+    fn bm64_engagement_covers_the_fallback_tier_only() {
+        // Standard fused tiers never reach the fallback; the 1328x1328
+        // tier (6889 rows, tail 41) does and must engage.
+        assert!(qmm_bm64_wanted(6889));
+        assert!(qmm_bm64_wanted(6144)); // divisible, oversized
+        assert!(qmm_bm64_wanted(1024)); // divisible control
+        assert!(!qmm_bm64_wanted(1092)); // small ragged tail 4: measured slower
+        assert!(!qmm_bm64_wanted(4097)); // sliver tail 1
+        assert!(!qmm_bm64_wanted(512)); // below tile-reuse floor
+        assert!(!qmm_bm64_wanted(2084)); // tail 28 < 32
+        assert!(qmm_bm64_wanted(4132)); // tail 36, large
     }
 }

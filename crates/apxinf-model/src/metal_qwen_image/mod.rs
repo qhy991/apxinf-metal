@@ -22,13 +22,14 @@ use crate::image::{GeneratedImage, ImageRequest, ImageRuntime};
 use crate::{LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Backend, Device, Error, Result};
 use apxinf_mlx::fusions::MppBf16GemmNt;
+use apxinf_mlx::qmm_bm64::QmmBm64;
 use apxinf_mlx::{Array, MlxBackend, MlxDType, Stream};
 use apxinf_tokenizer::Tokenizer;
 use ops::Ops;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use weights::{Decoder, TextEncoderFiles, Transformer, LATENT, MLP};
+use weights::{Decoder, TextEncoderFiles, Transformer, DIM, LATENT, MLP};
 
 /// The only schedule this family has validated: 40 linear steps, guidance 1.
 pub const STEPS: usize = 40;
@@ -57,6 +58,9 @@ pub struct QwenImage {
     /// loaded once.
     #[cfg(feature = "coreml")]
     ane: Option<Rc<dit::AneShare>>,
+    /// Present in auto mode when the BM64 retiled qmm's install probe matched
+    /// stock quantized matmul; the non-fused image fallback uses it.
+    qmm_bm64: Option<Rc<QmmBm64>>,
     /// `Qwen21Rope` cos/sin tables for the 16- and 56-wide axes.
     rope16: (Vec<f32>, Vec<f32>),
     rope56: (Vec<f32>, Vec<f32>),
@@ -152,6 +156,11 @@ pub fn load(
         fused,
         #[cfg(feature = "coreml")]
         ane,
+        qmm_bm64: if reference {
+            None
+        } else {
+            qmm_bm64_install(&stream)
+        },
         rope16: tables::rope_axis(16, 10000.0),
         rope56: tables::rope_axis(56, 10000.0),
     })))
@@ -235,6 +244,87 @@ const MPP_MEASURED_ARCHITECTURES: &[&str] = &["applegpu_g16g"];
 /// three block projection shapes `(K, N)` at `dit::MPP_MIN_TOKENS` rows, on
 /// seeded device data. This does not qualify checkpoint weights, larger token
 /// counts or image outputs.
+/// MLX architectures where the BM64 qmm retile was measured faster than the
+/// stock op: the M4. Other architectures keep the stock op until measured.
+const QMM_BM64_MEASURED_ARCHITECTURES: &[&str] = &["applegpu_g16g"];
+
+/// Rollback for the round-24 BM64 lever: `APXINF_QWEN_IMAGE_QMM_BM64=0`
+/// restores the stock quantized matmul on the non-fused image tier.
+fn qmm_bm64_disabled_from_env() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::env::var("APXINF_QWEN_IMAGE_QMM_BM64")
+            .is_ok_and(|v| matches!(v.as_str(), "0" | "false" | "off" | "no"))
+    })
+}
+
+/// Enables the BM64 retiled qmm on a measured architecture after a
+/// bit-identical probe against the stock op: the three block projection
+/// shapes at a ragged row count (17*64 + 4, exercising the kernel's native
+/// M-tail masking) plus a BM-divisible control, on seeded device data. The
+/// retile is bit-exact by construction (same `qmm_t_impl`, only the compile
+/// time tile changes); the probe guards against lane-specific surprises
+/// before the fallback tier routes to it.
+fn qmm_bm64_install(stream: &Stream) -> Option<Rc<QmmBm64>> {
+    let architecture = stream
+        .metal_caps()
+        .map_or("", |caps| caps.architecture.as_str());
+    if qmm_bm64_disabled_from_env() {
+        eprintln!("Qwen-Image: BM64 qmm disabled (APXINF_QWEN_IMAGE_QMM_BM64=0); image fallback uses stock quantized matmul");
+        return None;
+    }
+    if !QMM_BM64_MEASURED_ARCHITECTURES.contains(&architecture) {
+        eprintln!(
+            "Qwen-Image: BM64 qmm not used (not measured on {architecture:?}); image fallback uses stock quantized matmul"
+        );
+        return None;
+    }
+    let probe = || -> Result<Option<Rc<QmmBm64>>> {
+        let bm64 = Rc::new(QmmBm64::new(stream)?);
+        let normal = |shape: &[usize], seed: u64, scale: f32| -> Result<Array> {
+            Array::random_normal(shape, MlxDType::F32, &Array::random_key(stream, seed)?)?
+                .mul(&Array::scalar(stream, scale, MlxDType::F32)?)?
+                .cast(MlxDType::BF16)
+        };
+        let shapes = [
+            (17 * 64 + 4, DIM, DIM),
+            (17 * 64 + 4, DIM, MLP * 2),
+            (17 * 64 + 4, MLP, DIM),
+            (16 * 64, DIM, DIM),
+        ];
+        for (seed, &(m, k, n)) in shapes.iter().enumerate() {
+            let dense = normal(&[n, k], 2 * seed as u64, 0.02)?;
+            let [weight, scales, biases] = dense.quantize(64, 4)?;
+            let scales = scales.cast(MlxDType::BF16)?;
+            let biases = biases.cast(MlxDType::BF16)?;
+            let x = normal(&[1, m, k], 2 * seed as u64 + 1, 1.0)?;
+            let reference = x.quantized_matmul(&weight, &scales, &biases, true, 64, 4)?;
+            let out = bm64.call(&x, &weight, &scales, &biases)?;
+            if out.to_bytes()? != reference.to_bytes()? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(bm64))
+    };
+    match probe() {
+        Ok(Some(bm64)) => {
+            eprintln!("Qwen-Image: BM64 qmm enabled (probe bit-identical to stock)");
+            Some(bm64)
+        }
+        outcome => {
+            let reason = match outcome {
+                Err(e) => e.to_string(),
+                _ => "results differ from quantized matmul".to_owned(),
+            };
+            eprintln!(
+                "Qwen-Image: BM64 qmm not used ({reason}); image fallback uses stock quantized matmul"
+            );
+            None
+        }
+    }
+}
+
 fn probed_gemm(stream: &Stream) -> Option<MppBf16GemmNt> {
     let architecture = stream
         .metal_caps()
@@ -428,7 +518,13 @@ impl ImageRuntime for QwenImage {
             Some(t) => t,
             None => Transformer::load(stream, &self.dir.join("transformer"))?,
         };
-        let dit = dit::Dit::new(transformer, ops, self.gemm.clone(), self.fused.clone())?;
+        let dit = dit::Dit::new(
+            transformer,
+            ops,
+            self.gemm.clone(),
+            self.fused.clone(),
+            self.qmm_bm64.clone(),
+        )?;
         #[cfg(feature = "coreml")]
         let dit = dit.with_ane(self.ane.clone());
         let mut dit = dit;

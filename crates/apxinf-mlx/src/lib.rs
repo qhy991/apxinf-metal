@@ -48,4 +48,6 @@ mod q4_f16;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod qk_norm_rope;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+pub mod qmm_bm64;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod swiglu_gemv;
