@@ -11,9 +11,11 @@ mod ane;
 #[cfg(feature = "coreml")]
 mod ane_sim;
 mod dit;
+mod disk_cache;
 mod encode_cache;
 mod ops;
 mod tables;
+mod text_kv_cache;
 mod text;
 mod vae;
 mod weights;
@@ -529,11 +531,23 @@ impl ImageRuntime for QwenImage {
         let dit = dit.with_ane(self.ane.clone());
         let mut dit = dit;
         let phase = std::time::Instant::now();
-        let cache = dit.text_cache(
-            &prompt,
-            &table(&cos[..split], text_len)?,
-            &table(&sin[..split], text_len)?,
-        )?;
+        // Disk-persistent DiT text-K/V cache (round 23): a hit replaces the
+        // whole `text_cache` phase with a byte-identical load of a previous
+        // evaluation's per-block K/V on the same checkpoints. The K/V are
+        // read-only for the denoise loop, so the hit is bit-identical by
+        // construction; `text_cache_call_count` below stays 0 on a hit.
+        let cache = match text_kv_cache::load(&self.text, &self.dir.join("transformer"), &tokens, stream)? {
+            Some(cache) => cache,
+            None => {
+                let cache = dit.text_cache(
+                    &prompt,
+                    &table(&cos[..split], text_len)?,
+                    &table(&sin[..split], text_len)?,
+                )?;
+                text_kv_cache::store(&self.text, &self.dir.join("transformer"), &tokens, &cache)?;
+                cache
+            }
+        };
         if timing {
             eprintln!(
                 "qimage-timing: text_cache {:.3}s text_len={} calls={}",

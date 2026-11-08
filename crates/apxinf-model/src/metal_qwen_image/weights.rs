@@ -481,8 +481,17 @@ pub struct TextEncoderFiles {
 /// 15.1 GB per model open); replacing or re-exporting the checkpoint always
 /// changes size and mtime, and header bytes pin the tensor structure.
 fn shard_pin(shards: &HashMap<String, PathBuf>) -> Result<[u8; 32]> {
-    let mut hasher = Sha256::new();
     let files: BTreeSet<&PathBuf> = shards.values().collect();
+    let files: Vec<PathBuf> = files.into_iter().cloned().collect();
+    shard_files_pin(&files)
+}
+
+/// The shard-set pin over a plain file list; `shard_pin` delegates here. The
+/// text-K/V cache pins the DiT transformer shard set with this so a
+/// checkpoint swap invalidates its entries even though the text encoder
+/// (whose own pin the encode-output cache uses) is unchanged.
+pub fn shard_files_pin(files: &[PathBuf]) -> Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
     for file in files {
         let fail = |e: String| Error::Other(format!("read {}: {e}", file.display()));
         let mut reader = std::fs::File::open(file).map_err(|e| fail(e.to_string()))?;
@@ -512,6 +521,13 @@ fn shard_pin(shards: &HashMap<String, PathBuf>) -> Result<[u8; 32]> {
         hasher.update(&raw);
     }
     Ok(hasher.finalize().into())
+}
+
+/// Fingerprint of every SafeTensors shard in `dir`; the text-K/V cache keys
+/// on it together with the text-encoder pin so either checkpoint swapping
+/// alone invalidates the cached DiT text K/V.
+pub fn dir_pin(dir: &Path) -> Result<[u8; 32]> {
+    shard_files_pin(&files(dir)?)
 }
 
 impl TextEncoderFiles {

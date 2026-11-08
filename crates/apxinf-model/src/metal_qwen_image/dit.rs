@@ -233,6 +233,22 @@ pub struct TextCache {
     kv: Vec<(Array, Array)>,
 }
 
+impl TextCache {
+    /// Rebuilds a cache from arrays loaded off disk (round 23 text-K/V cache
+    /// hit path). The bytes are a previous evaluation's own tensors, and the
+    /// denoise loop only ever reads the K/V (concatenating them per step), so
+    /// a hit is bit-identical to a fresh `Dit::text_cache` computation.
+    pub(crate) fn from_kv(kv: Vec<(Array, Array)>) -> Self {
+        Self { kv }
+    }
+
+    /// The per-block post-RoPE text K/V; read-only for the denoise loop and
+    /// the round 23 disk cache's store path.
+    pub(crate) fn kv(&self) -> &[(Array, Array)] {
+        &self.kv
+    }
+}
+
 impl Dit {
     pub fn new(
         w: Transformer,
