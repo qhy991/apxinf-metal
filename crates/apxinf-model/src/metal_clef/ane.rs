@@ -764,7 +764,9 @@ impl AneMlp {
                 "Clef Core ML input needs its fixed column or neuron profile",
             ));
         };
+        let started = std::time::Instant::now();
         let admission = super::ane_admission::Admission::new(package, [1, HIDDEN, 1, tile])?;
+        super::load_stage("ane-admission", started);
         let units = ComputeUnits::CpuAndNeuralEngine;
         let timeout = std::time::Duration::from_secs(60);
         // A placement-inspect race under ANE service load is transient (the
@@ -775,9 +777,11 @@ impl AneMlp {
             "Core ML placement retry did not run".into(),
         ));
         for attempt in 0..attempts {
+            let started = std::time::Instant::now();
             let checked = cache.load_with_placement(package, units, timeout, |facts| {
                 admission.check(facts)
             });
+            super::load_stage("coreml-load-with-placement", started);
             match checked {
                 Ok(model) => { result = Ok(model); break; }
                 Err(error) => {

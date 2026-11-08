@@ -255,10 +255,19 @@ struct NeuronMlp {
 #[cfg(feature = "coreml")]
 impl NeuronMlp {
     fn new(c: &GpuKernels, cache: &apxinf_coreml::ProgramCache, mlp: &Mlp) -> Result<Self> {
+        let started = std::time::Instant::now();
         let dense = super::ane::DenseMlp::new(mlp)?;
+        super::load_stage("dense", started);
+        let started = std::time::Instant::now();
         let (int8, fp16) = super::ane::neuron_counts()?;
         let split = dense.split(int8, fp16)?;
-        let ane = super::ane::AneMlp::load_package(cache, &dense.program(&split)?)?;
+        super::load_stage("split", started);
+        let started = std::time::Instant::now();
+        let package = dense.program(&split)?;
+        super::load_stage("program", started);
+        let started = std::time::Instant::now();
+        let ane = super::ane::AneMlp::load_package(cache, &package)?;
+        super::load_stage("ane-load", started);
         drop(dense);
         let stream = mlp.gate.weight.stream();
         let neurons: Vec<i32> = split.gpu.iter().map(|&n| n as i32).collect();
@@ -596,10 +605,14 @@ impl Network {
                 });
                 let cache = apxinf_coreml::ProgramCache::new(super::ane::cache_dir());
                 let mut neurons = Vec::with_capacity(backbone.layers.len());
+                let layers_started = std::time::Instant::now();
                 for layer in &mut backbone.layers {
+                    let layer_started = std::time::Instant::now();
                     neurons.push(NeuronMlp::new(c, &cache, &layer.mlp)?);
                     layer.mlp = moved_mlp(&stream)?;
+                    super::load_stage("neuron-layer", layer_started);
                 }
+                super::load_stage("neuron-layers", layers_started);
                 let tiles = (AneTileHandoff::new(&stream)?, AneTileMerge::new(&stream)?);
                 (neurons, Some(tiles))
             }
@@ -631,10 +644,14 @@ impl Network {
         )?;
         stream.eval(&[rope_selector.clone()])?;
         #[cfg(feature = "coreml")]
-        for _ in 0..2 {
-            for model in ane.iter().chain(neurons.iter().map(|layer| &layer.ane)) {
-                model.warm()?;
+        {
+            let warm_started = std::time::Instant::now();
+            for _ in 0..2 {
+                for model in ane.iter().chain(neurons.iter().map(|layer| &layer.ane)) {
+                    model.warm()?;
+                }
             }
+            super::load_stage("warm", warm_started);
         }
         Ok(Self {
             config,

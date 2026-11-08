@@ -171,6 +171,21 @@ fn select(
     })
 }
 
+/// `APXINF_CLEF_LOAD_TIMING` prints the load stages to stderr.
+pub(crate) fn load_timing() -> bool {
+    std::env::var_os("APXINF_CLEF_LOAD_TIMING").is_some()
+}
+
+/// One named load stage in milliseconds (no-op unless the gate is set).
+pub(crate) fn load_stage(name: &str, started: std::time::Instant) {
+    if load_timing() {
+        eprintln!(
+            "clef load: {name} {:.3}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
 pub fn load(
     path: &Path,
     device: Device,
@@ -215,14 +230,24 @@ pub fn load(
     // Process-wide, as the reference engine sets it: an unbounded allocator cache grew to 4 GiB and slowed
     // requests under memory pressure on a 16 GB M1 Pro.
     apxinf_mlx::set_cache_limit(CACHE_LIMIT)?;
+    let started = std::time::Instant::now();
     let backbone = weights::Backbone::load(&config, &stream, path)?;
+    load_stage("backbone", started);
+    let started = std::time::Instant::now();
     let head = weights::Head::load(&config, &stream, &path.join("joint_head.safetensors"))?;
+    load_stage("head", started);
+    let started = std::time::Instant::now();
     let vision = vision::Vision::load(&config, &stream, path)?;
+    load_stage("vision", started);
     let image_token_id = config.image_token_id;
+    let started = std::time::Instant::now();
     let network = Rc::new(Network::new(
         config, stream, backbone, head, vision, composition,
     )?);
+    load_stage("network", started);
+    let started = std::time::Instant::now();
     model::install_compiled(&network)?;
+    load_stage("install", started);
     Ok(LoadedModel::Decision(Box::new(ClefRunner {
         tokenizer,
         network,

@@ -6,6 +6,21 @@ use sha2::{Digest, Sha256};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::time::Instant;
+
+/// `APXINF_COREML_TIMING=1` prints the compile/cache/inspect/load stages.
+fn load_timing() -> bool {
+    std::env::var_os("APXINF_COREML_TIMING").is_some()
+}
+
+fn stage(name: &str, started: Instant) {
+    if load_timing() {
+        eprintln!(
+            "coreml: {name} {:.3}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
 
 mod ffi {
     use std::ffi::{c_char, c_void};
@@ -281,6 +296,7 @@ impl ProgramCache {
     /// is the program and weight bytes and the macOS build.
     pub fn compiled(&self, package: &Package) -> Result<PathBuf> {
         let io = |e: std::io::Error| Error::Other(format!("Core ML cache: {e}"));
+        let hashed = Instant::now();
         let mut hash = Sha256::new();
         hash.update(package.model_bytes());
         hash.update(&package.weights);
@@ -291,8 +307,10 @@ impl ProgramCache {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
+        stage("hash", hashed);
         let compiled = self.dir.join(format!("{key}.mlmodelc"));
         if compiled.is_dir() {
+            stage("hit", hashed);
             return Ok(compiled);
         }
         if self.sealed {
@@ -303,6 +321,7 @@ impl ProgramCache {
         std::fs::create_dir_all(&self.dir).map_err(io)?;
         let staging = self.dir.join(format!(".{key}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&staging);
+        let compiling = Instant::now();
         let result = (|| {
             package.write(&staging.join("program.mlpackage"))?;
             let target = staging.join("program.mlmodelc");
@@ -316,6 +335,7 @@ impl ProgramCache {
             Ok(())
         })();
         let _ = std::fs::remove_dir_all(&staging);
+        stage("compile", compiling);
         result.map(|()| compiled)
     }
 
@@ -331,13 +351,21 @@ impl ProgramCache {
         admit: impl FnOnce(&crate::placement::ExpectedPlacement) -> Result<()>,
     ) -> Result<Model> {
         let timeout_ms = crate::placement::timeout_millis(timeout)?;
+        let started = Instant::now();
         let compiled = self
             .compiled(package)?
             .canonicalize()
             .map_err(|error| Error::Other(format!("Core ML compiled path: {error}")))?;
+        stage("compiled", started);
+        let inspecting = Instant::now();
         let facts = crate::placement::inspect(&compiled, units, timeout_ms)?;
+        stage("inspect", inspecting);
+        let loading = Instant::now();
         let model = Model::load(&compiled, units)?;
+        stage("load", loading);
+        let admitting = Instant::now();
         admit(&facts)?;
+        stage("admit", admitting);
         Ok(model)
     }
 }
