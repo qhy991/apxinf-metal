@@ -91,6 +91,70 @@ Select it from the CLI with `generate-image --model-variant reference`.
 - `tables.rs` reproduces the NumPy float32 sin/cos used for the RoPE tables and
   the blending ramp; tests check recorded NumPy digests.
 
+- `ane.rs` and `ane_sim.rs` run part of each image block's MLP on the Neural
+  Engine through Core ML, opt-in with `APXINF_QWEN_IMAGE_ANE=1` (default off).
+  Rows `[GPU_ROWS(), 12288)` of gate/up and the matching columns of `out`
+  become one compiled program per block, INT8 over the first 2560 output
+  columns and FP16 over the rest, in token tiles of 1152. The GPU keeps the
+  lower rows on the fused kernels and adds the two shares. Compiled programs
+  are cached under `~/.cache/apxinf/ane/`, keyed on a manifest of the weights,
+  the block index, the host model and the split, so a warm install takes about
+  1.6 s against about 40 s cold. `ane_sim.rs` is measurement scaffolding that
+  runs the same share on the GPU instead, for telling the split apart from
+  what Core ML does inside the program; it is never a production path.
+
+The split changes numerics by construction, which is the whole trade. On an
+M4 it generates a 512x512 image in 97.8 s against 141.6 s GPU-only (-30.9%)
+and a 1024x576 one in 246.5 s against 318.5 s (-22.6%), paired, same seed.
+Against a GPU-only render of the same prompt it is not bit-identical, and the
+difference concentrates on dense, high-contrast glyph edges.
+
+**Known limitation: images that render dense text fail the project's
+automatic quality gate, and ship anyway by owner override.** Under the frozen
+`semantic-five-dim-v1` rubric, cases with no text in the image pass with a
+wide margin (hottest 32x32 window 2.90 and 3.13 against a ceiling of 8.0,
+PSNR above 50 dB). Posters whose text is part of the picture FAIL the
+artifacts dimension:
+
+| case | hottest 32x32 (ceiling 8.0) | PSNR | rubric |
+|---|---|---|---|
+| poster-zh-512x512 | 9.43 | 45.31 | FAIL |
+| poster-zh-1024x576 | 18.77 | 38.02 | FAIL |
+| poster-en-1024x576 | 21.66 | 34.47 | FAIL |
+
+Lowering the Neural Engine's share to half the MLP does not fix it (18.55 and
+13.48), and a GPU-only simulation of the same split places most of the
+degradation inside the Core ML program rather than in the split itself.
+
+The owner reviewed the renders side by side, judged the split's output
+acceptable and in places preferable, and accepted the trade for this
+default-off, opt-in path. **This is a human override of a failing automatic
+gate**, the second on this project after the step-cache change, and it is
+recorded here rather than resolved: the measurement still says these images
+are degraded. Anything that depends on faithful lettering should leave the
+split off, and `APXINF_QWEN_IMAGE_ANE=0` is the rollback.
+
+Three gates decide whether a request uses it, all before the programs are
+installed, because the weight layout is chosen at load and a later request
+cannot change it:
+
+- **Fused blocks.** The split extends the fused image blocks, so it is
+  unavailable when those are not selected (`model_variant=reference`, or a GPU
+  architecture they were not qualified on).
+- **Expressible split.** `APXINF_QWEN_IMAGE_ANE_ROWS` overrides the default
+  6656 rows. A value the builder cannot express is refused by name rather than
+  silently replaced, so a measurement cannot be labelled with a split that did
+  not run.
+- **Memory.** The resident programs need about 2.9 GB, so admission requires
+  reclaimable memory above `APXINF_QWEN_IMAGE_ANE_MIN_AVAIL_MB` (default
+  4096). Swap use is logged but not gated: macOS shrinks the swap file lazily,
+  so it stays high for minutes after the pressure that caused it is gone and
+  would refuse runs that have the memory free.
+
+Each refusal names itself on stderr and falls back to GPU-only, so a request
+that did not take the split says why. `APXINF_QWEN_IMAGE_ANE=0`, the default,
+disables it entirely and is the rollback.
+
 Lifecycle: the DiT is loaded with the model, released before each VAE decode
 and read again by the next request; the VAE decoder stays loaded. The image CLI
 sets its process-wide MLX allocator cache limit to 1 GB before loading.

@@ -661,6 +661,45 @@ Pages purgeable:                                 174.
         assert!(spent < 60.0, "cpu_seconds reported an implausible {spent}s");
     }
 
+    /// The split is open to every prompt, including the ones whose renders
+    /// FAIL the project's automatic quality gate.
+    ///
+    /// A CJK language gate existed on this path twice and is gone for good.
+    /// It was first built on the reading that the artifact was CJK-specific,
+    /// which the English poster refuted by failing worse (hottest 21.66
+    /// against 18.77). It was then restored as a conservative default and
+    /// removed again when the owner reviewed the Chinese renders directly,
+    /// judged the split's output acceptable, and admitted CJK prompts.
+    ///
+    /// So admission is now memory and configuration only. Nothing in this
+    /// path reads the prompt, and the degradation the rubric measures on
+    /// text-heavy images (poster-zh-512 hottest 9.43, poster-zh-1024 18.77 at
+    /// PSNR 38.02, poster-en-1024 21.66 at PSNR 34.47, all against a ceiling
+    /// of 8.0) ships with it under that override. `APXINF_QWEN_IMAGE_ANE=0`,
+    /// the default, is the rollback.
+    ///
+    /// This test is the removal's receipt: it fails if someone reintroduces a
+    /// prompt-dependent refusal without revisiting that decision (#236).
+    #[test]
+    fn admission_does_not_read_the_prompt() {
+        // `admit` and `split_refusal` are the whole runtime policy, and
+        // neither takes text: a prompt-dependent gate could not be added
+        // without changing a signature this test names.
+        let admitted = admit(Some(9000.0), Some(0.0), 4096.0).expect("ample memory admits");
+        let refused = admit(Some(1200.0), Some(0.0), 4096.0).expect_err("1.2GB cannot hold 2.9GB");
+
+        for reason in [&admitted, &refused] {
+            let lower = reason.to_lowercase();
+            for word in ["prompt", "language", "cjk", "text"] {
+                assert!(
+                    !lower.contains(word),
+                    "admission still speaks of {word:?}, so something reads the prompt: {reason}"
+                );
+            }
+            assert!(reason.contains("available="), "memory is the stated reason: {reason}");
+        }
+    }
+
     #[test]
     fn the_gate_admits_on_reclaimable_memory_even_while_swap_is_still_high() {
         // The case that refused a real run: the previous process had just
