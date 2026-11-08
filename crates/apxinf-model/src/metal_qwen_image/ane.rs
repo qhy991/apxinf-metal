@@ -1,6 +1,6 @@
 //! The Neural Engine share of each image-block MLP (EngineTailor A007, #236).
-//! MLP rows `[GPU_ROWS, MLP)` of gate/up and the matching columns of `out`
-//! run as one Core ML program per block; the GPU keeps rows `[0, GPU_ROWS)`
+//! MLP rows `[GPU_ROWS(), MLP)` of gate/up and the matching columns of `out`
+//! run as one Core ML program per block; the GPU keeps rows `[0, GPU_ROWS())`
 //! on the fused kernels, and the two shares are summed on the GPU. Opt in
 //! with `APXINF_QWEN_IMAGE_ANE=1` (default off).
 //!
@@ -22,9 +22,59 @@ use half::f16;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Rows the Neural Engine computes, from row `GPU_ROWS` on.
-pub const ANE_ROWS: usize = 6656;
-pub const GPU_ROWS: usize = MLP - ANE_ROWS;
+/// Rows the Neural Engine computes, from row `GPU_ROWS()` on, when nothing
+/// overrides it. 6656 of 12288 is 54.2%.
+pub const DEFAULT_ANE_ROWS: usize = 6656;
+
+/// Whether `rows` is a split the program builder can actually express: the
+/// GPU's share has to divide the fused SwiGLU's groups, and the ANE's INT8
+/// and FP16 halves both have to be non-empty and within the FP16 conv's
+/// channel limit.
+pub fn valid_split(rows: usize) -> bool {
+    rows <= MLP
+        && (MLP - rows) % 64 == 0
+        && OUT_INT8 < rows
+        && rows - OUT_INT8 <= 4096
+}
+
+/// The configured ANE share. `APXINF_QWEN_IMAGE_ANE_ROWS` moves the split for
+/// a measurement sweep; a value this builder cannot express is refused by
+/// [`split_refusal`] before any of this is reached, so the fallback here is
+/// never silently a different ratio than the one asked for.
+fn configured_ane_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("APXINF_QWEN_IMAGE_ANE_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&r| valid_split(r))
+            .unwrap_or(DEFAULT_ANE_ROWS)
+    })
+}
+
+/// Why the configured split cannot be built, if it cannot. Running the
+/// default after someone explicitly asked for a different ratio would report
+/// one experiment's numbers under another's name, so this refuses instead.
+pub fn split_refusal() -> Option<String> {
+    let raw = std::env::var("APXINF_QWEN_IMAGE_ANE_ROWS").ok()?;
+    match raw.parse::<usize>() {
+        Ok(rows) if valid_split(rows) => None,
+        Ok(rows) => Some(format!(
+            "APXINF_QWEN_IMAGE_ANE_ROWS={rows} is not a split this builder can express              (needs {OUT_INT8} < rows <= {MLP}, rows - {OUT_INT8} <= 4096,              and ({MLP} - rows) divisible by 64)"
+        )),
+        Err(_) => Some(format!("APXINF_QWEN_IMAGE_ANE_ROWS={raw:?} is not a number")),
+    }
+}
+
+#[allow(non_snake_case)]
+pub fn ANE_ROWS() -> usize {
+    configured_ane_rows()
+}
+
+#[allow(non_snake_case)]
+pub fn GPU_ROWS() -> usize {
+    MLP - configured_ane_rows()
+}
 /// `out` columns of the share stored as INT8; the remaining ones stay FP16.
 const OUT_INT8: usize = 2560;
 /// Token tile: 512² (1024 tokens) and 1024×576 (2304) pad to one or two tiles.
@@ -215,11 +265,11 @@ fn columns(w: &[f16], cols: usize, start: usize, end: usize) -> Vec<f16> {
 
 /// One block's Core ML program from its stored (separate) gate/up and `out`.
 fn program(gate: &Q4, up: &Q4, out: &Q4) -> Result<Package> {
-    let (qg, sg) = int8_rows(&dense(gate, (GPU_ROWS, MLP), (0, DIM))?, DIM);
-    let (qu, su) = int8_rows(&dense(up, (GPU_ROWS, MLP), (0, DIM))?, DIM);
-    let wo = dense(out, (0, DIM), (GPU_ROWS, MLP))?;
-    let (qo, so) = int8_rows(&columns(&wo, ANE_ROWS, 0, OUT_INT8), OUT_INT8);
-    let high = columns(&wo, ANE_ROWS, OUT_INT8, ANE_ROWS);
+    let (qg, sg) = int8_rows(&dense(gate, (GPU_ROWS(), MLP), (0, DIM))?, DIM);
+    let (qu, su) = int8_rows(&dense(up, (GPU_ROWS(), MLP), (0, DIM))?, DIM);
+    let wo = dense(out, (0, DIM), (GPU_ROWS(), MLP))?;
+    let (qo, so) = int8_rows(&columns(&wo, ANE_ROWS(), 0, OUT_INT8), OUT_INT8);
+    let high = columns(&wo, ANE_ROWS(), OUT_INT8, ANE_ROWS());
     drop(wo);
 
     let mut b = ProgramBuilder::new();
@@ -227,9 +277,9 @@ fn program(gate: &Q4, up: &Q4, out: &Q4) -> Result<Package> {
     let r = b.input("r", &[1, 1, 1, 1])?;
     let s = b.input("s", &[1, 1, 1, 1])?;
     let wg =
-        b.constexpr_blockwise_shift_scale(&qg, &[ANE_ROWS, DIM, 1, 1], &sg, &[ANE_ROWS, 1, 1, 1])?;
+        b.constexpr_blockwise_shift_scale(&qg, &[ANE_ROWS(), DIM, 1, 1], &sg, &[ANE_ROWS(), 1, 1, 1])?;
     let wu =
-        b.constexpr_blockwise_shift_scale(&qu, &[ANE_ROWS, DIM, 1, 1], &su, &[ANE_ROWS, 1, 1, 1])?;
+        b.constexpr_blockwise_shift_scale(&qu, &[ANE_ROWS(), DIM, 1, 1], &su, &[ANE_ROWS(), 1, 1, 1])?;
     let wl =
         b.constexpr_blockwise_shift_scale(&qo, &[DIM, OUT_INT8, 1, 1], &so, &[DIM, 1, 1, 1])?;
     let g = b.conv(&x, &wg)?;
@@ -242,9 +292,9 @@ fn program(gate: &Q4, up: &Q4, out: &Q4) -> Result<Package> {
     let silu = b.mul(&half, Operand::Var(&t1), None)?;
     let m = b.mul(&silu, Operand::Var(&u), None)?;
     let m = b.mul(&m, Operand::Var(&s), None)?;
-    let parts = b.split(&m, &[OUT_INT8, ANE_ROWS - OUT_INT8], 1)?;
+    let parts = b.split(&m, &[OUT_INT8, ANE_ROWS() - OUT_INT8], 1)?;
     let low = b.conv(&parts[0], &wl)?;
-    let high = b.conv_fp16(&parts[1], &high, &[DIM, ANE_ROWS - OUT_INT8, 1, 1])?;
+    let high = b.conv_fp16(&parts[1], &high, &[DIM, ANE_ROWS() - OUT_INT8, 1, 1])?;
     let y = b.add(&low, Operand::Var(&high), Some("y"))?;
     b.finish(&[&y])
 }
@@ -286,9 +336,13 @@ fn weight_identity(dir: &Path) -> Result<Vec<String>> {
 
 fn manifest(identity: &[String], block: usize, hardware: &str) -> String {
     let weights: Vec<String> = identity.iter().map(|s| format!("\"{s}\"")).collect();
+    // The split is part of the key: moving it builds different programs, and
+    // a cache hit across ratios would serve one experiment's weights to
+    // another's run.
+    let gpu_rows = GPU_ROWS();
     format!(
         "{{\"recipe\":\"{RECIPE}\",\"block\":{block},\"weights\":[{}],\
-         \"ane_rows\":[{GPU_ROWS},{MLP}],\"out_int8\":{OUT_INT8},\"tile\":{TILE},\
+         \"ane_rows\":[{gpu_rows},{MLP}],\"out_int8\":{OUT_INT8},\"tile\":{TILE},\
          \"inputs\":\"x fp16[1,{DIM},1,{TILE}] r,s fp16[1,1,1,1]\",\
          \"program\":\"mlprogram spec9 CoreML8 fp16\",\"units\":\"cpu_and_ne\",\
          \"hardware\":\"{hardware}\"}}\n",
@@ -485,25 +539,25 @@ impl Scales {
 }
 
 /// The GPU share of a block after the text prefix: gate/up rows
-/// `[0, GPU_ROWS)` interleaved for the fused SwiGLU, and `out` columns
-/// `[0, GPU_ROWS)`. The full weights are dropped with the block's originals.
+/// `[0, GPU_ROWS())` interleaved for the fused SwiGLU, and `out` columns
+/// `[0, GPU_ROWS())`. The full weights are dropped with the block's originals.
 pub fn gpu_share(block: &mut Block) -> Result<()> {
     let GateUp::Separate { gate, up } = &block.gate_up else {
         return Ok(());
     };
     let rows = |q: &Q4| -> Result<Q4> {
         Ok(Q4 {
-            weight: q.weight.slice_axis(0, 0, GPU_ROWS)?,
-            scales: q.scales.slice_axis(0, 0, GPU_ROWS)?,
-            biases: q.biases.slice_axis(0, 0, GPU_ROWS)?,
+            weight: q.weight.slice_axis(0, 0, GPU_ROWS())?,
+            scales: q.scales.slice_axis(0, 0, GPU_ROWS())?,
+            biases: q.biases.slice_axis(0, 0, GPU_ROWS())?,
         })
     };
     let packed = super::dit::interleave_gate_up(&rows(gate)?, &rows(up)?)?;
     let o = &block.out;
     let out = Q4 {
-        weight: o.weight.slice_axis(1, 0, GPU_ROWS / 8)?.contiguous()?,
-        scales: o.scales.slice_axis(1, 0, GPU_ROWS / 64)?.contiguous()?,
-        biases: o.biases.slice_axis(1, 0, GPU_ROWS / 64)?.contiguous()?,
+        weight: o.weight.slice_axis(1, 0, GPU_ROWS() / 8)?.contiguous()?,
+        scales: o.scales.slice_axis(1, 0, GPU_ROWS() / 64)?.contiguous()?,
+        biases: o.biases.slice_axis(1, 0, GPU_ROWS() / 64)?.contiguous()?,
     };
     out.weight.stream().eval(&[
         packed.weight.clone(),
@@ -729,8 +783,25 @@ Pages purgeable:                                 174.
 
     #[test]
     fn split_covers_the_mlp() {
-        assert_eq!(GPU_ROWS + ANE_ROWS, MLP);
-        assert_eq!(GPU_ROWS % 64, 0);
-        assert!(OUT_INT8 < ANE_ROWS && ANE_ROWS - OUT_INT8 <= 4096);
+        assert_eq!(GPU_ROWS() + ANE_ROWS(), MLP);
+        assert_eq!(GPU_ROWS() % 64, 0);
+        assert!(OUT_INT8 < ANE_ROWS() && ANE_ROWS() - OUT_INT8 <= 4096);
+        assert!(valid_split(DEFAULT_ANE_ROWS), "the shipped default must be buildable");
+    }
+
+    #[test]
+    fn a_split_is_valid_only_when_the_builder_can_express_it() {
+        // The tiers the ratio sweep asks for (#236).
+        assert!(valid_split(6656), "54.2%, the default");
+        assert!(valid_split(6144), "50%");
+
+        // The GPU's share feeds the fused SwiGLU, whose groups are 64 wide.
+        assert!(!valid_split(6100), "leaves the GPU a share that is not a multiple of 64");
+
+        // Each half of the ANE program has to be non-empty, and the FP16
+        // conv's channel count is capped.
+        assert!(!valid_split(OUT_INT8), "leaves the FP16 half empty");
+        assert!(!valid_split(OUT_INT8 + 4097), "overruns the FP16 conv");
+        assert!(!valid_split(MLP + 64), "more rows than the MLP has");
     }
 }

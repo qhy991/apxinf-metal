@@ -199,6 +199,10 @@ fn ane_share(
         );
         return Ok(None);
     }
+    if let Some(why) = ane::split_refusal() {
+        eprintln!("Qwen-Image: ANE MLP split disabled: {why}; GPU-only");
+        return Ok(None);
+    }
     match ane::memory_gate() {
         Ok(facts) => eprintln!("Qwen-Image: ANE MLP split admitted by the memory gate: {facts}"),
         Err(facts) => {
