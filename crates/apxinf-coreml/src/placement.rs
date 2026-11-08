@@ -5,7 +5,7 @@ use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ComputeDeviceKind {
     Unknown,
     Cpu,
@@ -13,31 +13,31 @@ pub enum ComputeDeviceKind {
     NeuralEngine,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ComputeDevice {
     pub kind: ComputeDeviceKind,
     pub class_name: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceUsage {
     pub supported: Vec<ComputeDevice>,
     pub preferred: Option<ComputeDevice>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InputBinding {
     pub name: Option<String>,
     pub literal_present: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlacementInput {
     pub name: String,
     pub bindings: Vec<InputBinding>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OperationPlacement {
     pub path: Vec<usize>,
     pub operator: String,
@@ -47,14 +47,14 @@ pub struct OperationPlacement {
     pub usage: Option<DeviceUsage>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FunctionPlacement {
     pub name: String,
     pub root_operation_count: usize,
     pub operations: Vec<OperationPlacement>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExpectedPlacement {
     pub compiled_path: PathBuf,
     pub compute_units: ComputeUnits,

@@ -137,7 +137,7 @@ pub fn compile(package: &Path, compiled: &Path) -> Result<()> {
 }
 
 /// Where Core ML may run a loaded program.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ComputeUnits {
     All = 0,
     CpuOnly = 1,
@@ -358,7 +358,7 @@ impl ProgramCache {
             .map_err(|error| Error::Other(format!("Core ML compiled path: {error}")))?;
         stage("compiled", started);
         let inspecting = Instant::now();
-        let facts = crate::placement::inspect(&compiled, units, timeout_ms)?;
+        let facts = self.placement_facts(&compiled, units, timeout_ms)?;
         stage("inspect", inspecting);
         let loading = Instant::now();
         let model = Model::load(&compiled, units)?;
@@ -368,12 +368,74 @@ impl ProgramCache {
         stage("admit", admitting);
         Ok(model)
     }
+
+    /// The placement facts for one compiled program, memoized next to it: the
+    /// `MLComputePlan` walk is deterministic for a given compiled directory and
+    /// compute units, and it costs ~2.5 s per program, so a cache hit skips it
+    /// entirely. A missing or unreadable sidecar is a plain miss (inspect and
+    /// overwrite). The admission check still runs on every load.
+    fn placement_facts(
+        &self,
+        compiled: &std::path::Path,
+        units: ComputeUnits,
+        timeout_ms: u64,
+    ) -> Result<crate::placement::ExpectedPlacement> {
+        let sidecar = compiled.join(format!("placement-{}.json", units as i32));
+        if let Ok(text) = std::fs::read_to_string(&sidecar) {
+            if let Ok(mut facts) =
+                serde_json::from_str::<crate::placement::ExpectedPlacement>(&text)
+            {
+                facts.compiled_path = compiled.to_path_buf();
+                return Ok(facts);
+            }
+        }
+        let facts = crate::placement::inspect(compiled, units, timeout_ms)?;
+        if let Ok(json) = serde_json::to_string(&facts) {
+            let _ = std::fs::write(&sidecar, json);
+        }
+        Ok(facts)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::mem::ManuallyDrop;
+
+    #[test]
+    fn placement_facts_serialize_and_round_trip() {
+        let facts = crate::placement::ExpectedPlacement {
+            compiled_path: std::path::PathBuf::from("/tmp/x.mlmodelc"),
+            compute_units: ComputeUnits::CpuAndNeuralEngine,
+            functions: vec![crate::placement::FunctionPlacement {
+                name: "main".into(),
+                root_operation_count: 2,
+                operations: vec![crate::placement::OperationPlacement {
+                    path: vec![0, 1],
+                    operator: "conv".into(),
+                    inputs: vec![crate::placement::PlacementInput {
+                        name: "x".into(),
+                        bindings: vec![crate::placement::InputBinding {
+                            name: Some("wg".into()),
+                            literal_present: false,
+                        }],
+                    }],
+                    outputs: vec!["y".into()],
+                    child_operation_counts: vec![1],
+                    usage: Some(crate::placement::DeviceUsage {
+                        supported: vec![crate::placement::ComputeDevice {
+                            kind: crate::placement::ComputeDeviceKind::NeuralEngine,
+                            class_name: "H11".into(),
+                        }],
+                        preferred: None,
+                    }),
+                }],
+            }],
+        };
+        let json = serde_json::to_string(&facts).unwrap();
+        let back: crate::placement::ExpectedPlacement = serde_json::from_str(&json).unwrap();
+        assert_eq!(facts, back);
+    }
 
     #[test]
     fn invalid_input_extent_returns_error_before_native_prediction() {

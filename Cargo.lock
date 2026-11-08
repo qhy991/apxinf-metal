@@ -102,6 +102,8 @@ dependencies = [
  "cc",
  "half",
  "prost",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 
