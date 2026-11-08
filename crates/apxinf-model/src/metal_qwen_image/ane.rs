@@ -53,6 +53,19 @@ fn sysctl(name: &str) -> Option<String> {
 }
 
 /// Used swap in MiB, from `vm.swapusage` (`total = ... used = 123.45M ...`).
+/// Process CPU seconds. The ANE warm-up above compares this with wall time:
+/// when the ANE compiler rejects a program Core ML runs it on the CPU and says
+/// nothing (apple-ane lessons L26, L31), and a CPU fallback is slower than the
+/// GPU-only path the split replaced, so it has to be visible.
+fn cpu_seconds() -> f64 {
+    let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return f64::INFINITY;
+    }
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
+    secs(usage.ru_utime) + secs(usage.ru_stime)
+}
+
 fn swap_used_mb() -> Option<f64> {
     parse_swap_used_mb(&sysctl("vm.swapusage")?)
 }
@@ -304,8 +317,16 @@ impl Programs {
 
         let programs = Self { models };
         let zeros = vec![f16::ZERO; DIM * TILE];
+        let spent = (Instant::now(), cpu_seconds());
         for i in 0..programs.models.len() {
             programs.predict(i, &zeros, f16::ONE, f16::ONE)?;
+        }
+        let (wall, cpu) = (spent.0.elapsed().as_secs_f64(), cpu_seconds() - spent.1);
+        if cpu >= 0.5 * wall {
+            eprintln!(
+                "Qwen-Image: the ANE warm-up burned {cpu:.3}s of CPU in {wall:.3}s of wall \
+                 time; these programs are on the CPU, not the Neural Engine"
+            );
         }
         if timing {
             let total = start.elapsed().as_secs_f64();
@@ -313,7 +334,7 @@ impl Programs {
             eprintln!(
                 "qimage-timing: ane-install={total:.3} source={source} programs={} hits={hits} \
                  rebuilt={rebuilt} build+compile={built:.3}s resolve={resolved:.3}s \
-                 load={:.3}s warm={:.3}s cache={}",
+                 load={:.3}s warm={:.3}s warm_cpu={cpu:.3}s cache={}",
                 programs.models.len(),
                 loaded - resolved,
                 total - loaded,
@@ -492,6 +513,21 @@ Pages purgeable:                                 174.
         assert!(loaded < 4096.0, "the loaded host must fail the default floor");
         assert!(freed > 4096.0, "the freed host must clear the default floor");
         assert_eq!(parse_available_mb("not vm_stat output"), None);
+    }
+
+
+    #[test]
+    fn cpu_seconds_tracks_real_cpu_work() {
+        let before = cpu_seconds();
+        assert!(before.is_finite(), "getrusage failed, so every placement check passes");
+        let mut acc = 0u64;
+        for i in 0..40_000_000u64 {
+            acc = acc.wrapping_add(i.wrapping_mul(i));
+        }
+        assert_ne!(acc, 0);
+        let spent = cpu_seconds() - before;
+        assert!(spent > 0.0, "cpu_seconds did not move across 40M multiply-adds");
+        assert!(spent < 60.0, "cpu_seconds reported an implausible {spent}s");
     }
 
     #[test]
