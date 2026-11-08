@@ -12,6 +12,12 @@ revision `c78c0880dfa969d42a406e6abfadc2375bfa118d`: affine Q4/group-64 DiT
 decoder. The weights are under the Qwen Research License, which permits
 non-commercial use only; APXinf ships no weights.
 
+The family admits batch one, **40 requested linear steps** at guidance 1, and positive sides
+with a **TeaCache-style step cache on by default**: `ImageRequest.step_cache_ratio` unset
+means the family default `0.25`, so a fraction of the solver steps reuses the previous
+velocity instead of running the DiT (`0.0` disables it, `1.0` is rejected). On an M4 the
+reference composition measured **206 s stock vs 144.8 s with the cache (1.42×)** and the
+MPP (`auto`) composition stayed **bit-exact** at 189 s (1.09×).
 The family admits batch one, 40 linear steps at guidance 1, and positive sides
 that are multiples of 16 up to the RoPE table limit of 32768 pixels. Both
 variants also require `(width / 16) * (height / 16) <= 174762` image tokens.

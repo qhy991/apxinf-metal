@@ -1,0 +1,68 @@
+name: metal-smoke
+
+# macOS-side smoke test for the Core ML / Metal code path.
+#
+# Two jobs:
+#   * `coreml`  runs on a GitHub-hosted macOS runner. It builds and tests the
+#     `apxinf-coreml` crate, which does not depend on MLX (pure Rust + the
+#     system Core ML framework via a small C shim).
+#   * `mlx-metal` is opt-in (`run_mlx`) and expects a self-hosted macOS arm64
+#     runner with the MLX C++ SDK staged, because the `mlx` feature links
+#     against `libmlx.dylib`. Point `MLX_ROOT` at that SDK; without it the
+#     Metal model tests cannot be built and are skipped with a notice.
+#
+# Nothing here runs on pull requests: the hosted runner cannot build the MLX
+# side and a red check would block merges for a missing SDK rather than for a
+# regression. Dispatch it manually (or from a nightly schedule once a
+# self-hosted runner exists).
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_mlx:
+        description: "Also run the MLX/Metal tests (needs a self-hosted runner with the MLX SDK)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  coreml:
+    name: Core ML crate (macOS hosted)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build apxinf-coreml
+        run: cargo build -p apxinf-coreml --features native
+      - name: Test apxinf-coreml
+        run: cargo test -p apxinf-coreml --features native
+      - name: Note the uncovered surface
+        run: |
+          echo "::notice::The Metal model crates (apxinf-model, mlx feature) are not built on the hosted runner: the MLX C++ SDK is not available there."
+
+  mlx-metal:
+    name: MLX / Metal model tests (self-hosted)
+    if: ${{ inputs.run_mlx }}
+    runs-on: [self-hosted, macOS, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Locate the staged MLX SDK
+        run: |
+          if [ -z "${MLX_ROOT:-}" ] || [ ! -d "$MLX_ROOT/lib" ]; then
+            echo "::error::MLX_ROOT must point at a staged MLX SDK (include/ + lib/) on this runner"
+            exit 1
+          fi
+          echo "MLX_ROOT=$MLX_ROOT"
+      - name: Build the Metal model crates
+        run: |
+          cargo build --release --features mlx,coreml -p apxinf-model
+        env:
+          MLX_ROOT: ${{ env.MLX_ROOT }}
+      - name: Unit tests (Clef Metal paths)
+        run: cargo test -p apxinf-model --lib --features mlx,coreml metal_clef
+      - name: Note the parity gate
+        run: |
+          echo "::notice::The 42-case parity gate needs the local corpus; run it on a measurement host, not in CI."
