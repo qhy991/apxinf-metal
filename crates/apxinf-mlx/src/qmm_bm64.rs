@@ -48,6 +48,10 @@ const SOURCE: &str = r"
 /// MLX kernel headers concatenated in the order MLX itself uses for the
 /// affine qmm (metal::gemm() + metal::quantized_utils() + metal::quantized());
 /// the leading metal::utils() is prepended automatically by `metal_kernel`.
+/// Quoted includes are inlined recursively with whole-build dedup (the
+/// custom-kernel compiler has no search path for them and inlined text
+/// cannot use pragma-once guards), the same text transformation as the
+/// python-lane backend; angle includes resolve against the SDK.
 fn mlx_kernel_headers() -> Option<String> {
     let rel = "include/mlx/backend/metal/kernels";
     let roots: Vec<std::path::PathBuf> = [
@@ -59,6 +63,7 @@ fn mlx_kernel_headers() -> Option<String> {
     .flatten()
     .collect();
     for root in roots {
+        let mut seen = std::collections::HashSet::new();
         let mut header = String::new();
         let mut found = 0;
         for file in [
@@ -66,9 +71,10 @@ fn mlx_kernel_headers() -> Option<String> {
             "quantized_utils.h",
             "quantized.h",
         ] {
+            seen.insert(file.to_owned());
             match std::fs::read_to_string(root.join(file)) {
                 Ok(text) => {
-                    header.push_str(&text);
+                    header.push_str(&inline_quoted(&text, &root, &mut seen));
                     header.push('\n');
                     found += 1;
                 }
@@ -80,6 +86,40 @@ fn mlx_kernel_headers() -> Option<String> {
         }
     }
     None
+}
+
+/// Replace `#include "mlx/backend/metal/kernels/..."` lines with the file
+/// contents (recursively, deduplicated across the whole header build);
+/// quoted includes not under `root` are dropped, `#pragma once` lines are
+/// removed (inlined text cannot rely on them), angle includes are kept.
+/// Same transformation as the python-lane backend.
+fn inline_quoted(text: &str, root: &std::path::Path, seen: &mut std::collections::HashSet<String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("#include") {
+            if let Some(start) = trimmed.find('"') {
+                if let Some(end) = trimmed[start + 1..].find('"') {
+                    let name = &trimmed[start + 1..start + 1 + end];
+                    let rel = name.strip_prefix("mlx/backend/metal/kernels/").unwrap_or(name);
+                    let key = rel.to_owned();
+                    if !seen.contains(&key) {
+                        seen.insert(key);
+                        if let Ok(inner) = std::fs::read_to_string(root.join(rel)) {
+                            out.push_str(&inline_quoted(&inner, root, seen));
+                        }
+                    }
+                    continue; // quoted includes are expanded, not preserved
+                }
+            }
+        }
+        if trimmed.starts_with("#pragma once") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(not(windows))]
@@ -163,7 +203,9 @@ impl QmmBm64 {
         let k = *shape.last().expect("checked");
         let m = x.numel() / k;
         let n = w.shape()[0];
-        let i32s = |v: usize| Array::from_i32(&self.stream, &[1], &[v as i32]);
+        // 0-d arrays: MLX's metal_kernel passes single-element int32 inputs
+        // as `constant int&`, which is what qmm_t_impl's K/N/M expect.
+        let i32s = |v: usize| Array::from_i32(&self.stream, &[], &[v as i32]);
         let (k_arr, n_arr, m_arr) = (i32s(k)?, i32s(n)?, i32s(m)?);
         let mut out_shape = shape.to_vec();
         let last = out_shape.len() - 1;
