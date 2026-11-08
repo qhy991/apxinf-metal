@@ -1,6 +1,7 @@
 //! The single-stream DiT (mflux `Qwen21Transformer`): the text prefix runs
 //! once per prompt and caches each block's post-RoPE K/V; every denoise step
 //! then runs one compiled image-token forward against that cache.
+use std::time::Instant;
 use super::ops::Ops;
 use super::weights::{Block, GateUp, Transformer, DIM, HEADS, HEAD_DIM, Q4};
 use apxinf_core::{Error, Result};
@@ -145,6 +146,64 @@ pub struct Dit {
     gemm: Option<Rc<MppBf16GemmNt>>,
     /// The fused image blocks, when selected for this architecture.
     fused: Option<Rc<Fused>>,
+    /// The Neural Engine share of each fused block's MLP, when enabled.
+    #[cfg(feature = "coreml")]
+    ane: Option<Rc<AneShare>>,
+}
+
+/// Which engine runs the offloaded half of the MLP: Core ML on the Neural
+/// Engine, or the GPU stand-in that isolates the split and its rounding from
+/// what Core ML does inside the program (#236 H2). Everything around it --
+/// the feed, the scales, the GPU's half, the recombination -- is shared, so
+/// the two arms differ in one step and nothing else.
+#[cfg(feature = "coreml")]
+pub enum Offload {
+    Ane(super::ane::Programs),
+    Sim(super::ane_sim::Sim),
+}
+
+#[cfg(feature = "coreml")]
+impl Offload {
+    /// What the feed is carried in: FP16 for the Core ML program, and for the
+    /// stand-in whichever width its arm is testing.
+    fn dtype(&self) -> MlxDType {
+        match self {
+            Self::Ane(_) => MlxDType::F16,
+            Self::Sim(sim) => sim.dtype(),
+        }
+    }
+}
+
+/// The offload engine and the GPU kernels that feed it.
+#[cfg(feature = "coreml")]
+pub struct AneShare {
+    pub offload: Offload,
+    pub scales: super::ane::Scales,
+    pub spent: AneSpent,
+}
+
+/// Where an `ane_block` call's wall time went, summed over every block and
+/// step. The three phases are disjoint and together cover the span from the
+/// GPU submission to the summed MLP, so a split that loses to GPU-only can be
+/// attributed without a second run: `wait` is the GPU share plus whatever of
+/// the feed transform has not retired, `convert` is the host f16 round trip,
+/// and `predict` is Core ML.
+#[derive(Default)]
+pub struct AneSpent {
+    pub wait: std::cell::Cell<f64>,
+    pub convert: std::cell::Cell<f64>,
+    pub predict: std::cell::Cell<f64>,
+    pub calls: std::cell::Cell<u64>,
+    /// Tiles `tile_of` had to copy because the buffer was not f16-aligned.
+    /// Zero is the claim that the zero-copy path ran, rather than an
+    /// inference drawn from `convert` being small.
+    pub copies: std::cell::Cell<u64>,
+}
+
+impl AneSpent {
+    fn add(&self, field: &std::cell::Cell<f64>, since: std::time::Instant) {
+        field.set(field.get() + since.elapsed().as_secs_f64());
+    }
 }
 
 /// Per-block post-RoPE text K/V, `[1, 32, T, 128]` BF16 each.
@@ -168,7 +227,31 @@ impl Dit {
             ops: ops.clone(),
             gemm,
             fused,
+            #[cfg(feature = "coreml")]
+            ane: None,
         })
+    }
+
+    /// Where the ANE blocks spent their wall time, once the loop is done.
+    #[cfg(feature = "coreml")]
+    pub fn ane_spent(&self) -> Option<&AneSpent> {
+        self.ane.as_deref().map(|a| &a.spent)
+    }
+
+    /// Runs the fused blocks' MLP split with the Neural Engine.
+    #[cfg(feature = "coreml")]
+    pub fn with_ane(mut self, ane: Option<Rc<AneShare>>) -> Self {
+        self.ane = ane;
+        self
+    }
+
+    /// Whether the image forward calls Core ML, so it cannot be traced.
+    fn eager(&self) -> bool {
+        #[cfg(feature = "coreml")]
+        if self.ane.is_some() {
+            return true;
+        }
+        false
     }
 
     /// Whether `tokens` image tokens run the fused blocks.
@@ -184,6 +267,13 @@ impl Dit {
             return Ok(());
         }
         let stream = self.ops.stream().clone();
+        #[cfg(feature = "coreml")]
+        if self.ane.is_some() {
+            for b in &mut self.w.blocks {
+                super::ane::gpu_share(b)?;
+            }
+            return Ok(());
+        }
         for b in &mut self.w.blocks {
             if let GateUp::Separate { gate, up } = &b.gate_up {
                 let packed = interleave_gate_up(gate, up)?;
@@ -363,11 +453,134 @@ impl Dit {
         f.down.call(&gated, &dense(&b.out)?, &x, mod2)
     }
 
+    /// [`fused_block`](Self::fused_block) with the MLP split: the output
+    /// projection decodes only the GPU rows, the Neural Engine feed (scaled,
+    /// padded to whole tiles, channels first, FP16) and the GPU share are
+    /// queued, the host waits for the feed alone, and block `index`'s program
+    /// predicts while the GPU computes its share. `b.out` holds the GPU
+    /// columns.
+    #[cfg(feature = "coreml")]
+    #[allow(clippy::too_many_arguments)]
+    fn ane_block(
+        &self,
+        f: &Fused,
+        ane: &AneShare,
+        index: usize,
+        gate_up: &Q4,
+        b: &Block,
+        h: &Array,
+        (key_text, value_text): (&Array, &Array),
+        mod1: &Array,
+        mod2: &Array,
+        cos: &Array,
+        sin: &Array,
+    ) -> Result<Array> {
+        use super::ane::TILE;
+        use half::f16;
+        let stream = self.ops.stream();
+        let tokens = h.shape()[1];
+        let dense = |w: &Q4| w.weight.dequantize(&w.scales, &w.biases, 64, 4);
+        let x = h.contiguous()?;
+        let attn_input = f.norm.call(&x, mod1)?;
+        let q = f.qk.call(
+            &attn_input,
+            &dense(&b.to_q)?,
+            &b.norm_q,
+            cos,
+            sin,
+            key_text,
+            false,
+        )?;
+        let k = f.qk.call(
+            &attn_input,
+            &dense(&b.to_k)?,
+            &b.norm_k,
+            cos,
+            sin,
+            key_text,
+            true,
+        )?;
+        let v = f.value.call(&attn_input, &dense(&b.to_v)?, value_text)?;
+        let scale = (HEAD_DIM as f64).powf(-0.5) as f32;
+        let o = q
+            .sdpa(&k, &v, scale, false, None)?
+            .transpose(&[0, 2, 1, 3])?
+            .reshape(&[1, tokens, DIM])?;
+        let (attention, gate_up) = f.output.call(
+            &o,
+            &dense(&b.to_out)?,
+            &gate_up.weight,
+            &gate_up.scales,
+            &gate_up.biases,
+        )?;
+        let (x, mlp_input) = f.residual_norm.call(&x, &attention, mod1, mod2)?;
+        let (up, params, inverse) = ane.scales.call(&mlp_input)?;
+        let tiles = tokens.div_ceil(TILE);
+        let feed = mlp_input
+            .mul(&up.cast(MlxDType::BF16)?)?
+            .pad(&[0, 0, 0], &[0, tiles * TILE - tokens, 0])?
+            .reshape(&[tiles, TILE, DIM])?
+            .transpose(&[0, 2, 1])?
+            .cast(ane.offload.dtype())?
+            .contiguous()?;
+        stream.async_eval(&[feed.clone(), params.clone()])?;
+        let gated = f.swiglu.call(&mlp_input, &gate_up)?;
+        let gpu = match &self.gemm {
+            Some(gemm) => gemm.call(&gated, &dense(&b.out)?)?,
+            None => b.out.apply(&gated)?,
+        };
+        stream.async_eval(&[gpu.clone(), x.clone()])?;
+        let waited = Instant::now();
+        let p = params.to_bytes_ready()?;
+        let p =
+            |i: usize| f16::from_f32(f32::from_ne_bytes(p[4 * i..4 * i + 4].try_into().unwrap()));
+        let (r, s) = (p(0), p(1));
+        let offload = match &ane.offload {
+            Offload::Ane(programs) => {
+                let fed = feed.to_bytes_ready()?;
+                ane.spent.add(&ane.spent.wait, waited);
+                let mut y = Vec::with_capacity(fed.len());
+                for tile in fed.chunks_exact(2 * DIM * TILE) {
+                    let converted = Instant::now();
+                    let tile = super::ane::tile_of(tile);
+                    ane.spent.add(&ane.spent.convert, converted);
+                    if matches!(tile, std::borrow::Cow::Owned(_)) {
+                        ane.spent.copies.set(ane.spent.copies.get() + 1);
+                    }
+                    let predicted = Instant::now();
+                    let out = programs.predict(index, &tile, r, s)?;
+                    ane.spent.add(&ane.spent.predict, predicted);
+                    let converted = Instant::now();
+                    y.extend_from_slice(super::ane::as_bytes(&out));
+                    ane.spent.add(&ane.spent.convert, converted);
+                }
+                Array::from_bytes(stream, &[tiles, DIM, TILE], MlxDType::F16, &y)?
+            }
+            Offload::Sim(sim) => {
+                ane.spent.add(&ane.spent.wait, waited);
+                let predicted = Instant::now();
+                let y = sim.call(index, &feed, r, s)?;
+                stream.eval(&[y.clone()])?;
+                ane.spent.add(&ane.spent.predict, predicted);
+                y
+            }
+        };
+        ane.spent.calls.set(ane.spent.calls.get() + 1);
+        let offload = offload
+            .transpose(&[0, 2, 1])?
+            .reshape(&[1, tiles * TILE, DIM])?
+            .slice_axis(1, 0, tokens)?
+            .cast(MlxDType::BF16)?;
+        let mlp = gpu.add(&offload.mul(&inverse.cast(MlxDType::BF16)?)?)?;
+        x.add(&mod2.slice_axis(2, DIM, 2 * DIM)?.tanh()?.mul(&mlp)?)
+    }
+
     /// One block over the image tokens (`text_kv = Some`) or the causal text
     /// prefix (`None`, also returning its K/V).
     #[allow(clippy::too_many_arguments)]
     fn block(
         &self,
+        index: usize,
         b: &Block,
         h: &Array,
         text_kv: Option<(&Array, &Array)>,
@@ -384,6 +597,13 @@ impl Dit {
                 let h = self.fused_block(f, gate_up, b, h, text, mod1, mod2, cos, sin)?;
                 return Ok((h, None));
             }
+        }
+        #[cfg(feature = "coreml")]
+        if let (Some(f), Some(text), GateUp::AneSplit(gate_up), Some(ane)) =
+            (&self.fused, text_kv, &b.gate_up, &self.ane)
+        {
+            let h = self.ane_block(f, ane, index, gate_up, b, h, text, mod1, mod2, cos, sin)?;
+            return Ok((h, None));
         }
         let half = |m: &Array| -> Result<(Array, Array)> {
             Ok((m.slice_axis(2, 0, DIM)?, m.slice_axis(2, DIM, 2 * DIM)?))
@@ -430,7 +650,7 @@ impl Dit {
         let mut h = self.txt_in(prompt)?;
         let mut kv = Vec::with_capacity(self.w.blocks.len());
         for b in &self.w.blocks {
-            let (next, cached) = self.block(b, &h, None, &mod1, &mod2, cos, sin)?;
+            let (next, cached) = self.block(0, b, &h, None, &mod1, &mod2, cos, sin)?;
             h = next;
             kv.push(cached.expect("the text prefix returns its K/V"));
         }
@@ -451,9 +671,9 @@ impl Dit {
         let (mod1, mod2) = self.modulation(&temb)?;
         let (mod1, mod2) = (Self::row(&mod1, 0, tokens)?, Self::row(&mod2, 0, tokens)?);
         let mut h = self.w.img_in.apply(latents)?;
-        for (b, kv) in self.w.blocks.iter().zip(inputs[4..].chunks(2)) {
+        for (i, (b, kv)) in self.w.blocks.iter().zip(inputs[4..].chunks(2)).enumerate() {
             let text = Some((&kv[0], &kv[1]));
-            h = self.block(b, &h, text, &mod1, &mod2, cos, sin)?.0;
+            h = self.block(i, b, &h, text, &mod1, &mod2, cos, sin)?.0;
         }
         let scale = self.w.norm_out.apply(&self.ops.silu(&temb)?)?;
         let scale = Self::row(&scale, 0, tokens)?;
@@ -461,19 +681,37 @@ impl Dit {
     }
 }
 
-/// The compiled denoise step of one request; it owns the transformer.
-pub struct Step {
-    compiled: Compiled,
+/// The denoise step of one request; it owns the transformer. The forward
+/// is one compiled graph, or eager when it calls Core ML per block.
+pub enum Step {
+    Compiled(Compiled),
+    Eager(Box<Dit>),
 }
 
 impl Step {
+    /// The ANE phase accounting, which exists only on the eager path. The
+    /// compiled path captures its `Dit` in a closure and never offloads, so
+    /// there is nothing to report.
+    #[cfg(feature = "coreml")]
+    pub fn ane_spent(&self) -> Option<&AneSpent> {
+        match self {
+            Self::Eager(dit) => dit.ane_spent(),
+            Self::Compiled(_) => None,
+        }
+    }
+
     pub fn prepare(dit: Dit, inputs: &[Array]) -> Result<(Self, Array)> {
+        if dit.eager() {
+            let first = dit.image_forward(inputs)?;
+            first.eval()?;
+            return Ok((Self::Eager(Box::new(dit)), first));
+        }
         let stream = dit.ops.stream().clone();
         let compiled = Compiled::new(&stream, 1, move |inputs| {
             Ok(vec![dit.image_forward(inputs)?])
         })?;
         let first = compiled.prepare(inputs)?.remove(0);
-        Ok((Self { compiled }, first))
+        Ok((Self::Compiled(compiled), first))
     }
 
     /// Velocity prediction `[1, N, 64]` BF16 for one timestep.
@@ -490,7 +728,10 @@ impl Step {
     }
 
     pub fn call(&self, inputs: &[Array]) -> Result<Array> {
-        Ok(self.compiled.call(inputs)?.remove(0))
+        match self {
+            Self::Compiled(compiled) => Ok(compiled.call(inputs)?.remove(0)),
+            Self::Eager(dit) => dit.image_forward(inputs),
+        }
     }
 }
 

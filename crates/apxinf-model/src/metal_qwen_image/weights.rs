@@ -48,6 +48,10 @@ pub struct Block {
 pub enum GateUp {
     Separate { gate: Q4, up: Q4 },
     Interleaved(Q4),
+    /// The GPU share of the Neural Engine split: rows `[0, ane::GPU_ROWS)`
+    /// interleaved; the block's `out` then holds only those columns.
+    #[cfg(feature = "coreml")]
+    AneSplit(Q4),
 }
 
 pub struct Transformer {
@@ -886,7 +890,7 @@ fn purge_enabled() -> bool {
 fn contained_pages(start: u64, end: u64, page: u64) -> Option<(u64, u64)> {
     let lo = start.checked_add(page - 1)? & !(page - 1);
     let hi = end & !(page - 1);
-    (hi > lo).then_some((lo, hi - lo))
+    (hi > lo).then(|| (lo, hi - lo))
 }
 
 /// Drop already-consumed shard bytes from the OS page cache. On this host

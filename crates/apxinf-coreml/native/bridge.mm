@@ -3,6 +3,7 @@
 #include "bridge.h"
 #import <CoreML/CoreML.h>
 #import <Foundation/Foundation.h>
+#include <os/signpost.h>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -25,6 +26,12 @@ API_AVAILABLE(macos(14.4))
 
 namespace {
 thread_local std::string last_error;
+
+// Points of Interest intervals around each prediction, so a trace can place Core ML work beside GPU activity.
+os_log_t signpost_log() {
+    static os_log_t log = os_log_create("com.apxinf.coreml", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
+    return log;
+}
 
 int fail(const std::string& message) {
     last_error = message;
@@ -317,7 +324,10 @@ int apx_coreml_predict(void* handle, const char* const* input_names, const uint1
         MLDictionaryFeatureProvider* provider = features_of(input_names, inputs, input_shapes, input_ranks, input_count);
         if (!provider) return -1;
         NSError* error = nil;
+        os_signpost_id_t interval = os_signpost_id_generate(signpost_log());
+        os_signpost_interval_begin(signpost_log(), interval, "predict");
         id<MLFeatureProvider> result = [model predictionFromFeatures:provider error:&error];
+        os_signpost_interval_end(signpost_log(), interval, "predict");
         if (!result) return fail(error, "Core ML prediction failed");
         return copy_outputs(result, output_names, outputs, output_shapes, output_ranks, output_count);
     }
