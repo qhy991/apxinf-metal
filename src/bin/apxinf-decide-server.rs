@@ -21,8 +21,21 @@
 //! `LoadedModel::decide(DecisionInput::{Schema,SchemaWithImages})`. The media
 //! contract (base64 PNG, at most four images) is the same as
 //! `apxinf-latency-worker`'s classification case, so the two stay comparable.
+//!
+//! **Resident listen mode (`--listen unix:<path>` / `--listen <host>:<port>`).**
+//! The pipe/JSONL default is unchanged. With `--listen` the process still
+//! loads the checkpoint (and runs `--warm-shapes`) once and prints its `ready`
+//! line, then accepts client connections instead of reading stdin: each
+//! connection receives the same `ready` line and then speaks the same JSONL
+//! request/response protocol. Connections are served one at a time on the
+//! single model (the demo holds one connection per episode), so a new episode
+//! costs a socket connect instead of a 93-130 s M4 ANE load. A stale unix
+//! socket file is removed only when nothing answers on it; a live server is
+//! reported instead of being stolen.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -37,7 +50,16 @@ type Fallible<T> = Result<T, String>;
 
 fn main() {
     match load() {
-        Ok(mut model) => serve(&mut model),
+        Ok(mut resident) => {
+            if let Some(address) = resident.listen.clone() {
+                if let Err(error) = listen(&mut resident.model, &resident.ready, &address) {
+                    eprintln!("listen: {error}");
+                    std::process::exit(1);
+                }
+            } else {
+                serve(&mut resident.model);
+            }
+        }
         Err(error) => {
             // The demo client reads this as a failed start-up and shows the text.
             let _ = writeln!(
@@ -58,6 +80,47 @@ struct Options {
     /// `--warm-shapes <file>` (env `APXINF_CLEF_WARM_SHAPES`). `None` keeps
     /// the cold-start behaviour: no load-time warm, lazy per-shape compile.
     warm_shapes: Option<PathBuf>,
+    /// `--listen unix:<path>` or `--listen <host>:<port>` (env
+    /// `APXINF_DECIDE_LISTEN`). `None` keeps the stdin/stdout pipe protocol.
+    listen: Option<Listen>,
+}
+
+/// Where the resident mode accepts clients. Unix sockets are the demo's
+/// default (a filesystem path the shim can be pointed at); TCP is for a
+/// remote or containerized client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Listen {
+    Unix(PathBuf),
+    Tcp(String),
+}
+
+impl Listen {
+    fn parse(value: &str) -> Fallible<Self> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("--listen needs unix:<path> or <host>:<port>".into());
+        }
+        if let Some(path) = value.strip_prefix("unix:") {
+            if path.is_empty() {
+                return Err("--listen unix: needs a socket path".into());
+            }
+            return Ok(Self::Unix(PathBuf::from(path)));
+        }
+        let address = value.strip_prefix("tcp:").unwrap_or(value);
+        if address.is_empty() || !address.contains(':') {
+            return Err(format!(
+                "--listen {value:?} is neither unix:<path> nor <host>:<port>"
+            ));
+        }
+        Ok(Self::Tcp(address.to_string()))
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Unix(path) => format!("unix:{}", path.display()),
+            Self::Tcp(address) => format!("tcp:{address}"),
+        }
+    }
 }
 
 fn parse_options() -> Fallible<Options> {
@@ -69,6 +132,11 @@ fn parse_options() -> Fallible<Options> {
         .or_else(|| std::env::var_os("APXINF_DECIDE_WARM_SHAPES"))
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty());
+    let mut listen = std::env::var("APXINF_DECIDE_LISTEN")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|value| Listen::parse(&value))
+        .transpose()?;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -83,6 +151,10 @@ fn parse_options() -> Fallible<Options> {
                     return Err("--warm-shapes needs a non-empty file".into());
                 }
                 warm_shapes = Some(PathBuf::from(value));
+            }
+            "--listen" => {
+                let value = args.next().ok_or("--listen needs unix:<path> or <host>:<port>")?;
+                listen = Some(Listen::parse(&value)?);
             }
             "--help" | "-h" => {
                 return Err(
@@ -101,11 +173,21 @@ fn parse_options() -> Fallible<Options> {
         variant,
         model_name,
         warm_shapes,
+        listen,
     })
 }
 
-/// Load the resident model and print the one `ready` line the client waits for.
-fn load() -> Fallible<LoadedModel> {
+/// The loaded resident: the model, the `ready` line shared by the pipe client
+/// and every listen-mode connection, and the optional listen address.
+struct Resident {
+    model: LoadedModel,
+    ready: Value,
+    listen: Option<Listen>,
+}
+
+/// Load the resident model, run the optional warm shapes, print the one
+/// `ready` line and return the resident (model + ready + listen address).
+fn load() -> Fallible<Resident> {
     let options = parse_options()?;
     // Parse the warm manifest before the checkpoint load so a broken explicit
     // warm request fails in milliseconds, not after a multi-second load.
@@ -134,23 +216,119 @@ fn load() -> Fallible<LoadedModel> {
         .or_else(|| AutoModel::detect_model_name(&options.model).ok())
         .unwrap_or_else(|| "clef".into());
     let variant = options.variant.unwrap_or_else(|| "auto".into());
-    writeln!(
-        std::io::stdout(),
-        "{}",
-        json!({
-            "type": "ready",
-            "model": model_name,
-            "variant": variant,
-            "load_ms": load_ms,
-            "warm_ms": warm_ms,
-            "warm_shapes": warm_rows,
-        })
-    )
-    .map_err(|e| format!("write ready: {e}"))?;
+    let ready = json!({
+        "type": "ready",
+        "model": model_name,
+        "variant": variant,
+        "load_ms": load_ms,
+        "warm_ms": warm_ms,
+        "warm_shapes": warm_rows,
+    });
+    writeln!(std::io::stdout(), "{ready}").map_err(|e| format!("write ready: {e}"))?;
     std::io::stdout()
         .flush()
         .map_err(|e| format!("flush ready: {e}"))?;
-    Ok(model)
+    Ok(Resident {
+        model,
+        ready,
+        listen: options.listen,
+    })
+}
+
+/// Bind the resident listener and serve clients one connection at a time.
+/// A unix socket path that still answers is a running server (refuse to steal
+/// it); a stale file is removed before binding.
+fn listen(model: &mut LoadedModel, ready: &Value, address: &Listen) -> Fallible<()> {
+    match address {
+        Listen::Unix(path) => {
+            if path.exists() {
+                if UnixStream::connect(path).is_ok() {
+                    return Err(format!("{} is already served by a live server", path.display()));
+                }
+                std::fs::remove_file(path)
+                    .map_err(|error| format!("remove stale socket {}: {error}", path.display()))?;
+            }
+            let listener = UnixListener::bind(path)
+                .map_err(|error| format!("bind {}: {error}", path.display()))?;
+            announce("unix", &path.display().to_string());
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let writer = match stream.try_clone() {
+                            Ok(writer) => writer,
+                            Err(error) => {
+                                eprintln!("connection: {error}");
+                                continue;
+                            }
+                        };
+                        if let Err(error) =
+                            serve_connection(model, ready, writer, BufReader::new(stream))
+                        {
+                            eprintln!("connection: {error}");
+                        }
+                    }
+                    Err(error) => eprintln!("accept: {error}"),
+                }
+            }
+            Ok(())
+        }
+        Listen::Tcp(address) => {
+            let listener =
+                TcpListener::bind(address.as_str()).map_err(|error| format!("bind {address}: {error}"))?;
+            announce("tcp", address);
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let writer = match stream.try_clone() {
+                            Ok(writer) => writer,
+                            Err(error) => {
+                                eprintln!("connection: {error}");
+                                continue;
+                            }
+                        };
+                        if let Err(error) =
+                            serve_connection(model, ready, writer, BufReader::new(stream))
+                        {
+                            eprintln!("connection: {error}");
+                        }
+                    }
+                    Err(error) => eprintln!("accept: {error}"),
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn announce(scheme: &str, address: &str) {
+    let _ = writeln!(
+        std::io::stdout(),
+        "{}",
+        json!({"type": "listening", "addr": format!("{scheme}:{address}")})
+    );
+    let _ = std::io::stdout().flush();
+}
+
+/// One connection: send the `ready` line, then answer JSONL requests until the
+/// client closes its write side. The model is reused across connections.
+fn serve_connection(
+    model: &mut LoadedModel,
+    ready: &Value,
+    mut writer: impl Write,
+    reader: impl BufRead,
+) -> Fallible<()> {
+    writeln!(writer, "{ready}").map_err(|e| format!("write ready: {e}"))?;
+    writer.flush().map_err(|e| format!("flush ready: {e}"))?;
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("read: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response = handle(model, &line);
+        writeln!(writer, "{response}").map_err(|e| format!("write: {e}"))?;
+        writer.flush().map_err(|e| format!("flush: {e}"))?;
+    }
+    Ok(())
 }
 
 /// One warm manifest shape: the question id the demo uses, the exact crop
@@ -594,6 +772,29 @@ mod tests {
         assert_eq!(decode_base64("aGVsbG8").unwrap(), b"hello");
         assert_eq!(decode_base64("aGVsbA==").unwrap(), b"hell");
         assert!(decode_base64("a").is_err());
+    }
+
+    #[test]
+    fn listen_addresses_parse_unix_and_tcp_and_reject_the_rest() {
+        assert_eq!(
+            Listen::parse("unix:/tmp/clef.sock").unwrap(),
+            Listen::Unix(PathBuf::from("/tmp/clef.sock"))
+        );
+        assert_eq!(
+            Listen::parse("tcp:127.0.0.1:8080").unwrap(),
+            Listen::Tcp("127.0.0.1:8080".into())
+        );
+        assert_eq!(
+            Listen::parse("127.0.0.1:8080").unwrap(),
+            Listen::Tcp("127.0.0.1:8080".into())
+        );
+        for bad in ["", "unix:", "bogus", "tcp:"] {
+            assert!(Listen::parse(bad).is_err(), "accepted {bad:?}");
+        }
+        assert_eq!(
+            Listen::Unix(PathBuf::from("/tmp/x.sock")).describe(),
+            "unix:/tmp/x.sock"
+        );
     }
 
     #[test]
