@@ -6,6 +6,8 @@
 //! The checkpoint is the mflux 4-bit export (affine Q4 DiT, BF16 text
 //! encoder, F32 VAE). Its weights are under the Qwen Research License; this
 //! family ships no weights.
+#[cfg(feature = "coreml")]
+mod ane;
 mod dit;
 mod ops;
 mod tables;
@@ -48,6 +50,9 @@ pub struct QwenImage {
     /// Present in auto mode on an architecture where the fused image blocks
     /// were qualified; image-token counts in `dit::FUSED_TOKENS` use them.
     fused: Option<Rc<dit::Fused>>,
+    /// The Neural Engine MLP share (`APXINF_QWEN_IMAGE_ANE=1`), loaded once.
+    #[cfg(feature = "coreml")]
+    ane: Option<Rc<dit::AneShare>>,
     /// `Qwen21Rope` cos/sin tables for the 16- and 56-wide axes.
     rope16: (Vec<f32>, Vec<f32>),
     rope56: (Vec<f32>, Vec<f32>),
@@ -110,6 +115,24 @@ pub fn load(
     let transformer = Transformer::load(&stream, &path.join("transformer"))?;
     let decoder = Decoder::load(&stream, &path.join("vae"))?;
     let reference = options.model_variant.as_deref() == Some("reference");
+    let fused = if reference {
+        None
+    } else {
+        fused_blocks(&stream)?.map(Rc::new)
+    };
+    #[cfg(feature = "coreml")]
+    let ane = ane_share(
+        &stream,
+        &transformer,
+        &path.join("transformer"),
+        fused.is_some(),
+    )?;
+    #[cfg(not(feature = "coreml"))]
+    if std::env::var("APXINF_QWEN_IMAGE_ANE").is_ok_and(|v| v == "1") {
+        eprintln!(
+            "Qwen-Image: APXINF_QWEN_IMAGE_ANE=1 ignored: built without the coreml feature; GPU-only"
+        );
+    }
     Ok(LoadedModel::Image(Box::new(QwenImage {
         dir: path.to_path_buf(),
         tokenizer,
@@ -122,11 +145,9 @@ pub fn load(
         } else {
             probed_gemm(&stream).map(Rc::new)
         },
-        fused: if reference {
-            None
-        } else {
-            fused_blocks(&stream)?.map(Rc::new)
-        },
+        fused,
+        #[cfg(feature = "coreml")]
+        ane,
         rope16: tables::rope_axis(16, 10000.0),
         rope56: tables::rope_axis(56, 10000.0),
     })))
@@ -135,6 +156,39 @@ pub fn load(
 /// MLX architectures where the fused image blocks were qualified against
 /// their reference implementation (pixels, memory, paired whole-image
 /// timing): the M4. They do not reproduce mflux bit for bit (see the README).
+/// The Neural Engine MLP share when `APXINF_QWEN_IMAGE_ANE=1`, the fused
+/// blocks are in use and the memory gate admits it; otherwise GPU-only, with
+/// the reason logged.
+#[cfg(feature = "coreml")]
+fn ane_share(
+    stream: &Stream,
+    transformer: &Transformer,
+    dir: &Path,
+    fused: bool,
+) -> Result<Option<Rc<dit::AneShare>>> {
+    if !ane::requested() {
+        return Ok(None);
+    }
+    if !fused {
+        eprintln!(
+            "Qwen-Image: ANE MLP split needs the fused image blocks (not selected here); GPU-only"
+        );
+        return Ok(None);
+    }
+    match ane::memory_gate() {
+        Ok(facts) => eprintln!("Qwen-Image: ANE MLP split admitted by the memory gate: {facts}"),
+        Err(facts) => {
+            eprintln!("Qwen-Image: ANE MLP split disabled by the memory gate: {facts}; GPU-only");
+            return Ok(None);
+        }
+    }
+    let programs = ane::Programs::install(transformer, dir, timing_enabled())?;
+    Ok(Some(Rc::new(dit::AneShare {
+        programs,
+        scales: ane::Scales::new(stream)?,
+    })))
+}
+
 const FUSED_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g16g"];
 
 fn fused_blocks(stream: &Stream) -> Result<Option<dit::Fused>> {
@@ -339,7 +393,10 @@ impl ImageRuntime for QwenImage {
             Some(t) => t,
             None => Transformer::load(stream, &self.dir.join("transformer"))?,
         };
-        let mut dit = dit::Dit::new(transformer, ops, self.gemm.clone(), self.fused.clone())?;
+        let dit = dit::Dit::new(transformer, ops, self.gemm.clone(), self.fused.clone())?;
+        #[cfg(feature = "coreml")]
+        let dit = dit.with_ane(self.ane.clone());
+        let mut dit = dit;
         let phase = std::time::Instant::now();
         let cache = dit.text_cache(
             &prompt,
@@ -396,8 +453,9 @@ impl ImageRuntime for QwenImage {
                 _ => {
                     let velocity = match first.take() {
                         Some(velocity) => velocity,
-                        None => step
-                            .call(&dit::Step::inputs(&latents, &sigma(t)?, &cos, &sin, &cache))?,
+                        None => {
+                            step.call(&dit::Step::inputs(&latents, &sigma(t)?, &cos, &sin, &cache))?
+                        }
                     };
                     previous_velocity = Some(velocity.clone());
                     velocity

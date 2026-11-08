@@ -112,6 +112,14 @@ fn checked_fp16_count(shape: &[usize]) -> Result<usize> {
     Ok(count)
 }
 
+fn system_version() -> Vec<u8> {
+    std::fs::read("/System/Library/CoreServices/SystemVersion.plist").unwrap_or_default()
+}
+
+fn hex16(digest: &[u8]) -> String {
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Compiles the `.mlpackage` directory `package` into `compiled`, which must
 /// not exist. [`ProgramCache`] is the normal entry; this compiles a package
 /// written elsewhere, such as a reference.
@@ -288,21 +296,90 @@ impl ProgramCache {
         package: &Package,
         compiler: impl FnOnce(&Path, &Path) -> Result<()>,
     ) -> Result<PathBuf> {
-        let io = |e: std::io::Error| Error::Other(format!("Core ML cache: {e}"));
         let mut hash = Sha256::new();
         hash.update(package.model_bytes());
         hash.update(&package.weights);
-        hash.update(
-            std::fs::read("/System/Library/CoreServices/SystemVersion.plist").unwrap_or_default(),
-        );
-        let key: String = hash.finalize()[..16]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        hash.update(system_version());
+        let key = hex16(&hash.finalize());
         let compiled = self.dir.join(format!("{key}.mlmodelc"));
         if compiled.is_dir() {
             return Ok(compiled);
         }
+        self.publish(&key, package, compiler)
+    }
+
+    /// The compiled directory for the program `manifest` describes, building
+    /// and compiling it with `build` only on a miss. The caller's manifest
+    /// must name everything the program depends on (weight identity, shapes,
+    /// numerics, writer version); the macOS build is added here. Returns the
+    /// path and whether it was a hit.
+    ///
+    /// The manifest is stored beside the program as `<key>.json`, and it is
+    /// that file, written after the program is in place, that completes the
+    /// entry. A directory without its manifest is a publish that did not
+    /// finish, so it is discarded and rebuilt rather than handed to Core ML.
+    pub fn compiled_for(
+        &self,
+        manifest: &str,
+        build: impl FnOnce() -> Result<Package>,
+    ) -> Result<(PathBuf, bool)> {
+        self.compiled_for_with(manifest, build, compile)
+    }
+
+    fn compiled_for_with(
+        &self,
+        manifest: &str,
+        build: impl FnOnce() -> Result<Package>,
+        compiler: impl FnOnce(&Path, &Path) -> Result<()>,
+    ) -> Result<(PathBuf, bool)> {
+        let mut hash = Sha256::new();
+        hash.update(manifest.as_bytes());
+        hash.update(system_version());
+        let key = hex16(&hash.finalize());
+        let compiled = self.dir.join(format!("{key}.mlmodelc"));
+        let record = self.dir.join(format!("{key}.json"));
+        if compiled.is_dir() && std::fs::read(&record).is_ok_and(|r| r == manifest.as_bytes()) {
+            return Ok((compiled, true));
+        }
+        if self.sealed {
+            return Err(Error::Contract(
+                "Core ML programs are compiled before the cache is sealed",
+            ));
+        }
+        self.evict(&compiled)?;
+        let compiled = self.publish(&key, &build()?, compiler)?;
+        std::fs::write(&record, manifest)
+            .map_err(|e| Error::Other(format!("Core ML cache: {e}")))?;
+        Ok((compiled, false))
+    }
+
+    /// Discards the entry `compiled` and its manifest, so the next request for
+    /// it builds and compiles again. Core ML refusing to load a stored program
+    /// is the other way an entry turns out to be unusable.
+    pub fn evict(&self, compiled: &Path) -> Result<()> {
+        for path in [compiled.to_path_buf(), compiled.with_extension("json")] {
+            let removed = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            match removed {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::Other(format!("Core ML cache: {e}"))),
+            }
+        }
+        Ok(())
+    }
+
+    fn publish(
+        &self,
+        key: &str,
+        package: &Package,
+        compiler: impl FnOnce(&Path, &Path) -> Result<()>,
+    ) -> Result<PathBuf> {
+        let io = |e: std::io::Error| Error::Other(format!("Core ML cache: {e}"));
+        let compiled = self.dir.join(format!("{key}.mlmodelc"));
         if self.sealed {
             return Err(Error::Contract(
                 "Core ML programs are compiled before the cache is sealed",
@@ -448,6 +525,67 @@ mod tests {
             .compiled_with(&package, |_, _| panic!("sealed miss compiled"))
             .is_err());
         assert_eq!(std::fs::read_dir(missing.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn manifest_keyed_hits_skip_building_and_misses_record_the_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cache = ProgramCache::new(root.path());
+        let (first, hit) = cache
+            .compiled_for_with("block 0", || Ok(package()), |_, t| write_compiled(t))
+            .unwrap();
+        assert!(!hit && first.join("compiled").is_file());
+        let key = first.file_stem().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(format!("{key}.json"))).unwrap(),
+            "block 0"
+        );
+        cache.seal();
+        let (again, hit) = cache
+            .compiled_for_with("block 0", || panic!("a hit built the package"), |_, _| {
+                panic!("a hit compiled")
+            })
+            .unwrap();
+        assert!(hit && again == first);
+        assert!(cache
+            .compiled_for_with("block 1", || panic!("a sealed miss built"), |_, t| write_compiled(t))
+            .is_err());
+    }
+
+    #[test]
+    fn a_damaged_entry_rebuilds_instead_of_counting_as_a_hit() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = ProgramCache::new(root.path());
+        let build = || {
+            cache
+                .compiled_for_with("block 0", || Ok(package()), |_, t| write_compiled(t))
+                .unwrap()
+        };
+        let (compiled, hit) = build();
+        assert!(!hit);
+        let record = compiled.with_extension("json");
+
+        // A publish that placed the program but died before its manifest.
+        std::fs::remove_file(&record).unwrap();
+        std::fs::remove_file(compiled.join("compiled")).unwrap();
+        let (again, hit) = build();
+        assert!(!hit, "an entry without its manifest counted as a hit");
+        assert_eq!(again, compiled);
+        assert_eq!(
+            std::fs::read(compiled.join("compiled")).unwrap(),
+            b"same program",
+            "the rebuild left the damaged program in place"
+        );
+
+        // A manifest that describes some other program.
+        std::fs::write(&record, "block 7").unwrap();
+        let (_, hit) = build();
+        assert!(!hit, "an entry whose manifest differs counted as a hit");
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "block 0");
+
+        let (_, hit) = build();
+        assert!(hit, "the repaired entry did not become a hit");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
     }
 
     #[test]

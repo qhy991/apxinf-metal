@@ -46,6 +46,10 @@ pub struct Block {
 pub enum GateUp {
     Separate { gate: Q4, up: Q4 },
     Interleaved(Q4),
+    /// The GPU share of the Neural Engine split: rows `[0, ane::GPU_ROWS)`
+    /// interleaved; the block's `out` then holds only those columns.
+    #[cfg(feature = "coreml")]
+    AneSplit(Q4),
 }
 
 pub struct Transformer {
