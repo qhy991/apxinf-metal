@@ -69,12 +69,6 @@ pub struct LoadOptions {
     /// checkpoint. Model loaders must reject missing or unknown required
     /// assets instead of discovering them through process-global state.
     pub assets: BTreeMap<String, PathBuf>,
-    /// Text the request will be conditioned on, when the caller knows it
-    /// before loading. Native Metal image families choose a weight layout at
-    /// load that a later request cannot change, so a policy that depends on
-    /// the text has to be decided here. `None` means the text is unknown,
-    /// which such a policy must treat as unproven rather than as safe.
-    pub conditioning_text: Option<String>,
     /// Enable online operator autotuning (GEMM and, on cuda-new, Attention)
     /// on recipe misses during preparation or first execution. When false,
     /// missing records resolve once to a safe inference fallback.

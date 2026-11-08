@@ -1213,7 +1213,6 @@ fn run_generate_image(
     let options = LoadOptions {
         model_name: Some(model_name.clone()),
         model_variant: model_variant.map(str::to_owned),
-        conditioning_text: Some(request.prompt.to_owned()),
         ..LoadOptions::default()
     };
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
