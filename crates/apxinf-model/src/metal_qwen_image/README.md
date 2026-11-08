@@ -98,7 +98,8 @@ Select it from the CLI with `generate-image --model-variant reference`.
   the blending ramp; tests check recorded NumPy digests.
 
 - `ane.rs` and `ane_sim.rs` run part of each image block's MLP on the Neural
-  Engine through Core ML, opt-in with `APXINF_QWEN_IMAGE_ANE=1` (default off).
+  Engine through Core ML. **This is the default path**; set
+  `APXINF_QWEN_IMAGE_ANE=0` to roll back to GPU-only.
   Rows `[GPU_ROWS(), 12288)` of gate/up and the matching columns of `out`
   become one compiled program per block, INT8 over the first 2560 output
   columns and FP16 over the rest, in token tiles of 1152. The GPU keeps the
@@ -133,16 +134,29 @@ Lowering the Neural Engine's share to half the MLP does not fix it (18.55 and
 degradation inside the Core ML program rather than in the split itself.
 
 The owner reviewed the renders side by side, judged the split's output
-acceptable and in places preferable, and accepted the trade for this
-default-off, opt-in path. **This is a human override of a failing automatic
-gate**, the second on this project after the step-cache change, and it is
-recorded here rather than resolved: the measurement still says these images
-are degraded. Anything that depends on faithful lettering should leave the
-split off, and `APXINF_QWEN_IMAGE_ANE=0` is the rollback.
+acceptable and in places preferable, and accepted the trade. **This is a
+human override of a failing automatic gate**, the second on this project
+after the step-cache change, and it is recorded here rather than resolved:
+the measurement still says these images are degraded. The override then went
+further, and this is the part to read before trusting the default: the split
+was turned on for everyone, so **a caller who asks for nothing gets the
+degradation above**. Nothing in the rubric changed to allow that, and no
+verdict was softened.
+
+**If your output depends on faithful lettering, set
+`APXINF_QWEN_IMAGE_ANE=0` explicitly.** That is also the rollback, and it is
+the one switch that restores the numerics this module shipped before the
+split. The engine will not make that call for you, because the artifact
+follows glyph density rather than anything a request declares, so there is no
+property of a prompt it could read to decide (a CJK gate was tried twice and
+refuted both times; `admission_does_not_read_the_prompt` is what keeps it
+from coming back).
 
 Three gates decide whether a request uses it, all before the programs are
 installed, because the weight layout is chosen at load and a later request
-cannot change it:
+cannot change it. A fourth, `APXINF_QWEN_IMAGE_ANE` itself, now admits by
+default: unset means on, `0` means off, and anything else is refused by name
+and keeps the GPU, so a typo for "off" never reads as "on".
 
 - **Fused blocks.** The split extends the fused image blocks, so it is
   unavailable when those are not selected (`model_variant=reference`, or a GPU
@@ -158,8 +172,9 @@ cannot change it:
   would refuse runs that have the memory free.
 
 Each refusal names itself on stderr and falls back to GPU-only, so a request
-that did not take the split says why. `APXINF_QWEN_IMAGE_ANE=0`, the default,
-disables it entirely and is the rollback.
+that did not take the split says why. A host without the memory therefore
+degrades to GPU-only on its own rather than failing, and
+`APXINF_QWEN_IMAGE_ANE=0` disables the split entirely.
 
 Lifecycle: the DiT is loaded with the model, released before each VAE decode
 and read again by the next request; the VAE decoder stays loaded. The image CLI

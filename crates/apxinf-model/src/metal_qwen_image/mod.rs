@@ -53,7 +53,8 @@ pub struct QwenImage {
     /// Present in auto mode on an architecture where the fused image blocks
     /// were qualified; image-token counts in `dit::FUSED_TOKENS` use them.
     fused: Option<Rc<dit::Fused>>,
-    /// The Neural Engine MLP share (`APXINF_QWEN_IMAGE_ANE=1`), loaded once.
+    /// The Neural Engine MLP share (on unless `APXINF_QWEN_IMAGE_ANE=0`),
+    /// loaded once.
     #[cfg(feature = "coreml")]
     ane: Option<Rc<dit::AneShare>>,
     /// `Qwen21Rope` cos/sin tables for the 16- and 56-wide axes.
@@ -159,9 +160,9 @@ pub fn load(
 /// MLX architectures where the fused image blocks were qualified against
 /// their reference implementation (pixels, memory, paired whole-image
 /// timing): the M4. They do not reproduce mflux bit for bit (see the README).
-/// The Neural Engine MLP share when `APXINF_QWEN_IMAGE_ANE=1`, the fused
-/// blocks are in use and the memory gate admits it; otherwise GPU-only, with
-/// the reason logged.
+/// The Neural Engine MLP share unless `APXINF_QWEN_IMAGE_ANE=0`, when the
+/// fused blocks are in use and the memory gate admits it; otherwise GPU-only,
+/// with the reason logged.
 #[cfg(feature = "coreml")]
 fn ane_share(
     stream: &Stream,
@@ -169,6 +170,9 @@ fn ane_share(
     dir: &Path,
     fused: bool,
 ) -> Result<Option<Rc<dit::AneShare>>> {
+    if let Some(why) = ane::enable_refusal() {
+        eprintln!("Qwen-Image: ANE MLP split disabled: {why}; GPU-only");
+    }
     if !ane::requested() {
         return Ok(None);
     }
