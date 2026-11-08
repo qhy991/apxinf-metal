@@ -191,6 +191,7 @@ dependencies = [
  "cc",
  "half",
  "image",
+ "libc",
  "once_cell",
  "prost",
  "serde",

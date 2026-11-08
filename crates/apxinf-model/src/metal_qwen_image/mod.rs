@@ -9,6 +9,7 @@
 #[cfg(feature = "coreml")]
 mod ane;
 mod dit;
+mod encode_cache;
 mod ops;
 mod tables;
 mod text;
@@ -370,7 +371,17 @@ impl ImageRuntime for QwenImage {
         let (lh, lw) = (height / SCALE, width / SCALE);
         let phase = std::time::Instant::now();
         let tokens = text::tokenize(&self.tokenizer, request.prompt)?;
-        let prompt = text::encode(&self.text, &tokens, ops, lh * lw)?;
+        // Disk-persistent encode-output cache (round 22): a hit replaces the
+        // whole text encode with a byte-identical load of a previous
+        // evaluation's prompt states on the same weights.
+        let prompt = match encode_cache::load(&self.text, &tokens, stream)? {
+            Some(prompt) => prompt,
+            None => {
+                let prompt = text::encode(&self.text, &tokens, ops, lh * lw)?;
+                encode_cache::store(&self.text, &tokens, &prompt)?;
+                prompt
+            }
+        };
         if timing {
             eprintln!(
                 "qimage-timing: text_encode {:.3}s raw_tokens={}",

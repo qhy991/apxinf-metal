@@ -110,18 +110,53 @@ pub fn encode(
     let stream = ops.stream();
     let timing = super::timing_enabled();
     // Overlap the per-layer disk reads with the previous layer's device
-    // compute: the worker warms the page cache for the next layers while
-    // this thread evaluates the current one. Scheduling only; the bytes and
-    // kernels are unchanged, so the encoded states stay bit-exact.
-    let prefetch = weights::prefetch_enabled(image_tokens).then(|| {
-        let prefetch = weights::TextPrefetch::new();
-        prefetch.submit(files.layer_ranges(0));
-        if TEXT_LAYERS > 1 {
-            prefetch.submit(files.layer_ranges(1));
+    // compute: the worker warms the page cache only `window` layers ahead
+    // and purges each consumed layer's pages again right after use, so the
+    // cache holds a ~0.8 GB window instead of the full 15.1 GB and the
+    // 16 GB host does not page at the largest tier. The memory gate
+    // degrades to purge-only reads when the host is already tight.
+    // Scheduling only; the bytes, kernels and evaluation order are
+    // unchanged, so the encoded states stay bit-exact.
+    let plan = weights::prefetch_plan(image_tokens);
+    let active = match &plan {
+        weights::PrefetchPlan::Active(plan) => Some(plan),
+        weights::PrefetchPlan::Disabled(_) => None,
+    };
+    if let Some(plan) = active {
+        if plan.warm {
+            for k in 0..=plan.window.min(TEXT_LAYERS - 1) {
+                plan.worker.warm(files.layer_ranges(k));
+            }
         }
-        prefetch
-    });
-    let mut next = 2;
+    }
+    if timing {
+        match &plan {
+            weights::PrefetchPlan::Active(plan) => {
+                let mib = |bytes: u64| format!("{}MiB", bytes >> 20);
+                let (avail, swap) = match plan.gate {
+                    weights::PrefetchGate::Admit(stats) => stats,
+                    weights::PrefetchGate::Memory(stats) => Some(stats),
+                    _ => None,
+                }
+                .map(|s| (mib(s.available_bytes), mib(s.swap_used_bytes)))
+                .unwrap_or_else(|| ("?".into(), "?".into()));
+                eprintln!(
+                    "qimage-timing: text_prefetch enabled={} window={} purge={} avail={} swap_used={}",
+                    usize::from(plan.warm),
+                    plan.window,
+                    usize::from(plan.purge),
+                    avail,
+                    swap,
+                );
+            }
+            weights::PrefetchPlan::Disabled(_) => {
+                eprintln!("qimage-timing: text_prefetch enabled=0 window=0 purge=0");
+            }
+        }
+    }
+    let mut next = active
+        .filter(|plan| plan.warm)
+        .map_or(usize::MAX, |plan| plan.window + 1);
     let length = tokens.ids.len();
     let ids: Vec<i32> = tokens.ids.iter().map(|&id| id as i32).collect();
     let embed_start = std::time::Instant::now();
@@ -131,6 +166,13 @@ pub fn encode(
         h.eval()?;
         h
     };
+    if let Some(plan) = active {
+        if plan.purge {
+            // The ~0.8 GB embedding table is read once; drop its pages at
+            // once instead of keeping them cached for the rest of the run.
+            plan.worker.purge(files.tensor_ranges("embed_tokens.weight"));
+        }
+    }
     let embed_elapsed = embed_start.elapsed();
     // Text positions repeat on all three MRoPE axes, so the interleave is the identity.
     let inv_freq = files.tensor(stream, "rotary_emb.inv_freq")?;
@@ -148,9 +190,9 @@ pub fn encode(
         let load_start = std::time::Instant::now();
         let weights = files.layer(stream, i)?;
         let load = load_start.elapsed();
-        if let Some(prefetch) = &prefetch {
-            if next < TEXT_LAYERS {
-                prefetch.submit(files.layer_ranges(next));
+        if let Some(plan) = active {
+            if plan.warm && next < TEXT_LAYERS {
+                plan.worker.warm(files.layer_ranges(next));
                 next += 1;
             }
         }
@@ -159,6 +201,15 @@ pub fn encode(
         // Release this layer's weights before reading the next one.
         h.eval()?;
         let compute = compute_start.elapsed();
+        drop(weights);
+        if let Some(plan) = active {
+            if plan.purge {
+                // This layer's bytes are on the device now and never read
+                // again; the worker drops their pages so the cache keeps
+                // only the warm window.
+                plan.worker.purge(files.layer_ranges(i));
+            }
+        }
         load_total += load;
         compute_total += compute;
         if timing {
@@ -169,12 +220,16 @@ pub fn encode(
             );
         }
     }
+    let join_start = std::time::Instant::now();
+    drop(plan);
+    let join_elapsed = join_start.elapsed();
     if timing {
         eprintln!(
-            "qimage-timing: text_layers embed={:.3}s load={:.3}s compute={:.3}s",
+            "qimage-timing: text_layers embed={:.3}s load={:.3}s compute={:.3}s join={:.3}s",
             embed_elapsed.as_secs_f64(),
             load_total.as_secs_f64(),
             compute_total.as_secs_f64(),
+            join_elapsed.as_secs_f64(),
         );
     }
     let norm = files.tensor(stream, "norm.weight")?;

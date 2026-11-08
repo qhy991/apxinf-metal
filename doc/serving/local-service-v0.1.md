@@ -345,7 +345,29 @@ The default output budget is 512 tokens or the output limit, whichever is smalle
 A deployment with a zero output limit is exempt because it never emits tokens.
 The default request timeout is 300 seconds, including queue time.
 
+The selected provider fixes its own context and output limits, and startup rejects values outside them:
+
+| Provider | Context limit | Output limit |
+| --- | --- | --- |
+| `python-mlx-lm` | 1 through 131072 | 0 through 65536, at most the context limit |
+| `python-clef` | 1 through 4096 | exactly 0, at most the context limit |
+| `mlx-vlm-minicpmv47` | 1 through 16384 | 0 through 8192, at most the context limit |
+| native MiniCPM5 profiles | 1 through 16384 | 0 through 65536, at most the context limit |
+
+The context bounds above are provider bounds.
+A nonzero output limit additionally requires the context to fit the default output budget plus one input token (see above).
+The exact minimum is `min(512, --max-output-tokens) + 1`: with the default 2048-token output limit that is 513 positions, and only an output limit below 512 lowers it (for example, an output limit of 64 requires at least 65 positions).
+Only a zero output limit permits a context limit of 1.
+
+The generic Python provider cannot check the loaded model capacity before the worker starts, so the operator owns that bound.
+The native profiles keep 16384 positions for launch compatibility even though the model layer can address more.
+Raising that limit needs device memory and quality measurements, so the service does not claim it.
+
 ## HTTP interface
+
+The gateway emits no CORS headers.
+A cross-origin browser client cannot read these responses, and its preflight request receives the framework's method response (HTTP 405).
+Serve browser clients from the same origin, or place a reverse proxy in front of the service that applies the CORS policy you intend.
 
 | Route | Operation |
 | --- | --- |
@@ -355,6 +377,7 @@ The default request timeout is 300 seconds, including queue time.
 | `POST /v1/messages` | Generate an Anthropic Messages response, with optional SSE output. |
 | `POST /v1/messages/count_tokens` | Apply the same template and count its tokens. |
 | `POST /v1/chat/completions` | Generate an OpenAI Chat Completions response, with optional SSE output. |
+| `POST /v1/systemone` | Run a Clef decision request. Other providers reject it with HTTP 400 `unsupported_feature`. |
 | `GET /metrics` | Read counters in Prometheus text format. |
 
 These routes implement the declared subset only.
