@@ -890,7 +890,7 @@ fn purge_enabled() -> bool {
 fn contained_pages(start: u64, end: u64, page: u64) -> Option<(u64, u64)> {
     let lo = start.checked_add(page - 1)? & !(page - 1);
     let hi = end & !(page - 1);
-    (hi > lo).then_some((lo, hi - lo))
+    (hi > lo).then(|| (lo, hi - lo))
 }
 
 /// Drop already-consumed shard bytes from the OS page cache. On this host
