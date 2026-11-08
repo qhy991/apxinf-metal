@@ -366,6 +366,13 @@ fn submit_fields(frame: &Value) -> Result<()> {
 }
 
 fn capabilities(value: &Value, native: bool, sampled: bool) -> Result<()> {
+    // The python-mlx-lm provider reports its KV geometry and quantisation so the
+    // supervisor can enforce a context budget. Native frames stay strict.
+    let optional: &[&str] = if native {
+        &[]
+    } else {
+        &["kv_bytes_per_token", "kv_bits"]
+    };
     fields(
         value,
         &[],
@@ -382,8 +389,14 @@ fn capabilities(value: &Value, native: bool, sampled: bool) -> Result<()> {
             "exact_append",
             "state_schema",
         ],
-        &[],
+        optional,
     )?;
+    if let Some(entry) = value.get("kv_bytes_per_token") {
+        integer(entry, 1, MAX_SAFE_INTEGER)?;
+    }
+    if let Some(entry) = value.get("kv_bits") {
+        require(entry.as_u64() == Some(8), "unsupported kv quantisation")?;
+    }
     for (key, expected) in [
         ("text", true),
         ("image", false),
@@ -604,31 +617,59 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                     frame["model_manifest"]["runtime"] == frame["runtime"],
                     "native runtime mismatch",
                 )?;
-                if prepared { object(&manifest["execution"])?; }
-                else if let Some(execution) = manifest.get("execution") { object(execution)?; }
+                if prepared {
+                    object(&manifest["execution"])?;
+                } else if let Some(execution) = manifest.get("execution") {
+                    object(execution)?;
+                }
                 if prepared {
                     let execution = &manifest["execution"];
-                    fields(execution, &[], &["provider", "precision", "variant", "parser", "enable_thinking",
-                        "max_context", "max_output_tokens", "memory_limit_bytes", "preparation_policy",
-                        "allocator_cache_limit_bytes", "retained_memory_limit_bytes"], &[])?;
-                    require(manifest["adapter_revision"] == "apxinf-native-minicpm5-prepared-v1"
-                        && execution["provider"] == "metal_minicpm5" && execution["precision"] == "bf16"
-                        && execution["variant"] == "bf16-compiled" && execution["parser"] == "minicpm5_xml"
-                        && execution["enable_thinking"] == false
-                        && execution["preparation_policy"] == "single-code-entry-v1"
-                        && frame["runtime"]["mlx"] == "0.32.3", "unsupported prepared execution identity")?;
+                    fields(
+                        execution,
+                        &[],
+                        &[
+                            "provider",
+                            "precision",
+                            "variant",
+                            "parser",
+                            "enable_thinking",
+                            "max_context",
+                            "max_output_tokens",
+                            "memory_limit_bytes",
+                            "preparation_policy",
+                            "allocator_cache_limit_bytes",
+                            "retained_memory_limit_bytes",
+                        ],
+                        &[],
+                    )?;
+                    require(
+                        manifest["adapter_revision"] == "apxinf-native-minicpm5-prepared-v1"
+                            && execution["provider"] == "metal_minicpm5"
+                            && execution["precision"] == "bf16"
+                            && execution["variant"] == "bf16-compiled"
+                            && execution["parser"] == "minicpm5_xml"
+                            && execution["enable_thinking"] == false
+                            && execution["preparation_policy"] == "single-code-entry-v1"
+                            && frame["runtime"]["mlx"] == "0.32.3",
+                        "unsupported prepared execution identity",
+                    )?;
                     integer(&execution["max_context"], 1, 16384)?;
                     integer(&execution["max_output_tokens"], 0, MAX_OUTPUT_TOKENS)?;
-                    require(execution["max_context"] == frame["capabilities"]["max_context"]
-                        && execution["max_output_tokens"] == frame["capabilities"]["max_output_tokens"],
-                        "prepared execution limits differ from capabilities")?;
+                    require(
+                        execution["max_context"] == frame["capabilities"]["max_context"]
+                            && execution["max_output_tokens"]
+                                == frame["capabilities"]["max_output_tokens"],
+                        "prepared execution limits differ from capabilities",
+                    )?;
                     let limit = integer(&execution["memory_limit_bytes"], 1, MAX_SAFE_INTEGER)?;
                     integer(&execution["allocator_cache_limit_bytes"], 1, limit)?;
                     integer(&execution["retained_memory_limit_bytes"], 1, limit)?;
                 } else {
-                    require(manifest["adapter_revision"] != "apxinf-native-minicpm5-prepared-v1"
-                        && manifest["execution"].get("preparation_policy").is_none(),
-                        "prepared execution requires protocol 2.7")?;
+                    require(
+                        manifest["adapter_revision"] != "apxinf-native-minicpm5-prepared-v1"
+                            && manifest["execution"].get("preparation_policy").is_none(),
+                        "prepared execution requires protocol 2.7",
+                    )?;
                 }
                 if sampled {
                     let manifest = &frame["model_manifest"];
@@ -936,11 +977,22 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
             )?;
         }
         "resources_released" => {
-            fields(frame, EVENT, &["released_lease_ids", "retained_lease_ids"], if prepared { &["memory"] } else { &[] })?;
+            fields(
+                frame,
+                EVENT,
+                &["released_lease_ids", "retained_lease_ids"],
+                if prepared { &["memory"] } else { &[] },
+            )?;
             if prepared {
-                counts(&frame["memory"], &["active_bytes", "cache_bytes", "peak_bytes"])?;
-                require(frame["memory"]["peak_bytes"].as_u64() >= frame["memory"]["active_bytes"].as_u64(),
-                    "active memory exceeds recorded peak")?;
+                counts(
+                    &frame["memory"],
+                    &["active_bytes", "cache_bytes", "peak_bytes"],
+                )?;
+                require(
+                    frame["memory"]["peak_bytes"].as_u64()
+                        >= frame["memory"]["active_bytes"].as_u64(),
+                    "active memory exceeds recorded peak",
+                )?;
             }
             leases(&frame["released_lease_ids"])?;
             require(
@@ -1420,37 +1472,126 @@ mod tests {
     }
 
     #[test]
+    fn python_capabilities_may_report_kv_geometry_and_quantisation() {
+        let mut ready = corpus()["templates"]["ready"].clone();
+        ready["capabilities"]["kv_bytes_per_token"] = 114_688.into();
+        ready["capabilities"]["kv_bits"] = 8.into();
+        ready["capability_revision"] =
+            canonical_identity_digest("apxinf-capability-v1", &ready["capabilities"])
+                .unwrap()
+                .into();
+        validate_frame(&ready).unwrap();
+        for (key, value) in [
+            ("kv_bits", serde_json::json!(4)),
+            ("kv_bits", serde_json::json!("8")),
+            ("kv_bytes_per_token", serde_json::json!(0)),
+            ("kv_bytes_per_token", serde_json::json!("114688")),
+        ] {
+            let mut invalid = ready.clone();
+            invalid["capabilities"][key] = value;
+            invalid["capability_revision"] =
+                canonical_identity_digest("apxinf-capability-v1", &invalid["capabilities"])
+                    .unwrap()
+                    .into();
+            assert!(validate_frame(&invalid).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn native_capabilities_reject_kv_geometry() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/serving/native-thinking-v0.1.json"
+        ))
+        .unwrap();
+        let mut ready = corpus["templates"]["ready"].clone();
+        ready["protocol"] = NATIVE_PREPARED_PROTOCOL.into();
+        ready["runtime"]["mlx"] = "0.32.3".into();
+        ready["model_manifest"]["runtime"] = ready["runtime"].clone();
+        ready["model_manifest"]["adapter_revision"] = "apxinf-native-minicpm5-prepared-v1".into();
+        ready["model_manifest"]["execution"] =
+            crate::native_identity::prepared_execution(16384, 128, 9000000, 1000000, 8000000);
+        ready["capabilities"]["sampling"] = false.into();
+        let refresh = |ready: &mut Value| {
+            ready["model_revision"] =
+                canonical_identity_digest("apxinf-model-identity-v1", &ready["model_manifest"])
+                    .unwrap()
+                    .into();
+            ready["capability_revision"] =
+                canonical_identity_digest("apxinf-capability-v1", &ready["capabilities"])
+                    .unwrap()
+                    .into();
+        };
+        refresh(&mut ready);
+        validate_frame(&ready).unwrap();
+        for (key, value) in [
+            ("kv_bytes_per_token", serde_json::json!(114_688)),
+            ("kv_bits", serde_json::json!(8)),
+        ] {
+            let mut invalid = ready.clone();
+            invalid["capabilities"][key] = value;
+            refresh(&mut invalid);
+            assert!(validate_frame(&invalid).is_err(), "{key}");
+        }
+    }
+
+    #[test]
     fn shared_native_prepared_profile() {
         let corpus: Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/serving/native-prepared-v0.1.json")).unwrap();
+            "../../../tests/fixtures/serving/native-prepared-v0.1.json"
+        ))
+        .unwrap();
         for case in corpus["frame_cases"].as_array().unwrap() {
             let mut frame = fixture(&corpus, case);
             if case["refresh_identity"] == true {
-                frame["model_revision"] = canonical_identity_digest("apxinf-model-identity-v1", &frame["model_manifest"]).unwrap().into();
-                frame["capability_revision"] = canonical_identity_digest("apxinf-capability-v1", &frame["capabilities"]).unwrap().into();
+                frame["model_revision"] =
+                    canonical_identity_digest("apxinf-model-identity-v1", &frame["model_manifest"])
+                        .unwrap()
+                        .into();
+                frame["capability_revision"] =
+                    canonical_identity_digest("apxinf-capability-v1", &frame["capabilities"])
+                        .unwrap()
+                        .into();
             }
-            assert_eq!(validate_frame(&frame).is_ok(), case["valid"].as_bool().unwrap(), "{}", case["name"]);
+            assert_eq!(
+                validate_frame(&frame).is_ok(),
+                case["valid"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
         }
     }
 
     #[test]
     fn prepared_runtime_identity_is_versioned_and_budgeted() {
         let corpus: Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/serving/native-thinking-v0.1.json")).unwrap();
+            "../../../tests/fixtures/serving/native-thinking-v0.1.json"
+        ))
+        .unwrap();
         let mut ready = corpus["templates"]["ready"].clone();
         ready["protocol"] = NATIVE_PREPARED_PROTOCOL.into();
         ready["runtime"]["mlx"] = "0.32.3".into();
         ready["model_manifest"]["runtime"] = ready["runtime"].clone();
         ready["model_manifest"]["adapter_revision"] = "apxinf-native-minicpm5-prepared-v1".into();
-        ready["model_manifest"]["execution"] = crate::native_identity::prepared_execution(16384, 128, 9000000, 1000000, 8000000);
+        ready["model_manifest"]["execution"] =
+            crate::native_identity::prepared_execution(16384, 128, 9000000, 1000000, 8000000);
         ready["capabilities"]["sampling"] = false.into();
         let refresh = |ready: &mut Value| {
-            ready["model_revision"] = canonical_identity_digest("apxinf-model-identity-v1", &ready["model_manifest"]).unwrap().into();
-            ready["capability_revision"] = canonical_identity_digest("apxinf-capability-v1", &ready["capabilities"]).unwrap().into();
+            ready["model_revision"] =
+                canonical_identity_digest("apxinf-model-identity-v1", &ready["model_manifest"])
+                    .unwrap()
+                    .into();
+            ready["capability_revision"] =
+                canonical_identity_digest("apxinf-capability-v1", &ready["capabilities"])
+                    .unwrap()
+                    .into();
         };
         refresh(&mut ready);
         validate_frame(&ready).unwrap();
-        for cache in [serde_json::json!(true), serde_json::json!(0), serde_json::json!(9000001)] {
+        for cache in [
+            serde_json::json!(true),
+            serde_json::json!(0),
+            serde_json::json!(9000001),
+        ] {
             let mut invalid = ready.clone();
             invalid["model_manifest"]["execution"]["allocator_cache_limit_bytes"] = cache;
             refresh(&mut invalid);

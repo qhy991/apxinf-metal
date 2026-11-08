@@ -89,12 +89,66 @@ def model_manifest(model_path: Path, runtime: dict[str, str], execution: dict[st
     }
 
 
+KV_DTYPE_BYTES = {
+    "bfloat16": 2, "bf16": 2, "float16": 2, "fp16": 2,
+    "float32": 4, "fp32": 4,
+}
+
+
+def kv_bytes_per_token(text_config: dict[str, Any]) -> int | None:
+    """Per-token KV cache bytes for the text model, or None when unknown.
+
+    Only full-attention layers keep per-token K/V state; hybrid Qwen3.5 models
+    also carry a constant per-sequence state that is not part of this value.
+    """
+    layers = text_config.get("num_hidden_layers")
+    if not isinstance(layers, int) or layers <= 0:
+        return None
+    layer_types = text_config.get("layer_types")
+    if isinstance(layer_types, list) and layer_types:
+        attention_layers = sum(1 for kind in layer_types if kind == "full_attention")
+        if attention_layers <= 0:
+            return None
+        layers = attention_layers
+    else:
+        interval = text_config.get("full_attention_interval")
+        if isinstance(interval, int) and interval > 1:
+            layers = max(1, layers // interval)
+    heads = text_config.get("num_key_value_heads")
+    if not isinstance(heads, int) or heads <= 0:
+        heads = text_config.get("num_attention_heads")
+    if not isinstance(heads, int) or heads <= 0:
+        return None
+    head_dim = text_config.get("head_dim")
+    if not isinstance(head_dim, int) or head_dim <= 0:
+        hidden = text_config.get("hidden_size")
+        attention_heads = text_config.get("num_attention_heads")
+        if not isinstance(hidden, int) or not isinstance(attention_heads, int) or attention_heads <= 0:
+            return None
+        head_dim = hidden // attention_heads
+    if head_dim <= 0:
+        return None
+    dtype = text_config.get("torch_dtype") or text_config.get("dtype") or "bfloat16"
+    dtype_bytes = KV_DTYPE_BYTES.get(str(dtype), 2)
+    return int(2 * layers * heads * head_dim * dtype_bytes)
+
+
+def kv_generation_options(kv_bits: int | None, quantized_kv_start: int) -> dict[str, Any]:
+    """generate_step options for the enabled KV quantisation, else nothing."""
+    if kv_bits is None:
+        return {}
+    return {"kv_bits": int(kv_bits), "quantized_kv_start": int(quantized_kv_start)}
+
+
 class MLXRuntime:
     """Use public MLX APIs on the thread that constructs this object."""
 
     def __init__(self, model_path: str, max_context: int, prefill_step_size: int,
-                 output_batch_tokens: int = 1, memory_limit_bytes: int = 10 * 1024**3):
+                 output_batch_tokens: int = 1, memory_limit_bytes: int = 10 * 1024**3,
+                 kv_bits: int | None = None, quantized_kv_start: int = 5000):
         self.owner = threading.get_ident()
+        self.kv_bits = kv_bits
+        self.quantized_kv_start = quantized_kv_start
         self.model_path = str(Path(model_path).resolve(strict=True))
         if any((Path(self.model_path) / name).exists()
                for name in ("joint_head_config.json", "joint_head.safetensors")):
@@ -153,6 +207,7 @@ class MLXRuntime:
             )
             mx.synchronize(self._load_stream)
         text_config = config.get("text_config", config)
+        self.kv_bytes_per_token = kv_bytes_per_token(text_config)
         model_limit = text_config.get("max_position_embeddings", max_context)
         self.max_context = min(max_context, int(model_limit))
         self.vocab_size = int(text_config["vocab_size"])
@@ -198,6 +253,7 @@ class MLXRuntime:
             self.consumed_position = max(self.consumed_position, consumed)
             progress(consumed)
 
+        generation_options = kv_generation_options(self.kv_bits, self.quantized_kv_start)
         with contextlib.redirect_stdout(sys.stderr):
             generator = self.generate_step(
                 self.mx.array(command["token_ids"]),
@@ -207,6 +263,7 @@ class MLXRuntime:
                 prompt_cache=self._cache,
                 prefill_step_size=self.prefill_step_size,
                 prompt_progress_callback=prompt_progress,
+                **generation_options,
             )
             try:
                 for index, (token, _) in enumerate(generator):
@@ -404,6 +461,13 @@ class TextWorker:
             "max_output_tokens": max_output_tokens, "exact_append": False,
             "state_schema": "none",
         }
+        if capabilities is None:
+            geometry = getattr(runtime, "kv_bytes_per_token", None)
+            if isinstance(geometry, int) and geometry > 0:
+                self.capabilities["kv_bytes_per_token"] = geometry
+            quantisation = getattr(runtime, "kv_bits", None)
+            if quantisation is not None:
+                self.capabilities["kv_bits"] = int(quantisation)
         self.model_revision = contracts.canonical_identity_digest(
             "apxinf-model-identity-v1", runtime.manifest
         )
@@ -829,6 +893,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prefill-step-size", type=int, default=256)
     parser.add_argument("--output-batch-tokens", type=int, default=1)
     parser.add_argument("--memory-limit-bytes", type=int, default=10 * 1024**3)
+    parser.add_argument("--kv-bits", type=int, default=None)
+    parser.add_argument("--quantized-kv-start", type=int, default=5000)
     arguments = parser.parse_args(argv)
     if arguments.protocol != "apxinf-worker/2.0":
         parser.error("The protocol version is not supported.")
@@ -843,6 +909,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("The deployment token limits are invalid.")
     if not 1 <= arguments.memory_limit_bytes <= 9007199254740991:
         parser.error("The memory limit is invalid.")
+    if arguments.kv_bits not in (None, 0, 8):
+        parser.error("Only --kv-bits 8 is supported; 4-bit KV degrades quality (measured PPL 17.5x).")
+    if not 0 <= arguments.quantized_kv_start <= arguments.max_context:
+        parser.error("The KV quantisation start is outside the context.")
     output_fd = sys.stdout.fileno()
 
     def write_all(payload: bytes) -> None:
@@ -854,7 +924,9 @@ def main(argv: list[str] | None = None) -> int:
     outbox = ByteOutbox(write_all)
     try:
         runtime = MLXRuntime(arguments.model, arguments.max_context, arguments.prefill_step_size,
-                             arguments.output_batch_tokens, arguments.memory_limit_bytes)
+                             arguments.output_batch_tokens, arguments.memory_limit_bytes,
+                             kv_bits=arguments.kv_bits or None,
+                             quantized_kv_start=arguments.quantized_kv_start)
         worker = TextWorker(runtime, arguments.worker_epoch, outbox.put,
                             max_output_tokens=arguments.max_output_tokens,
                             output_batch_tokens=arguments.output_batch_tokens)

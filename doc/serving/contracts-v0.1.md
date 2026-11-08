@@ -478,6 +478,8 @@ The resume capsule reports the following metadata:
 | Field | Meaning |
 | --- | --- |
 | `state_schema` | The version of the state layout. |
+| `kv_bytes_per_token` | Optional. Per-token KV cache bytes reported by `python-mlx-lm` for the context budget; native frames must not send it. |
+| `kv_bits` | Optional. KV cache quantisation width reported by `python-mlx-lm`; only 8 is accepted and native frames must not send it. |
 | `model_revision` | The bound model identity. |
 | `history_digest` | The committed canonical history identity. |
 | `history_count` | The number of tokens in that history. |

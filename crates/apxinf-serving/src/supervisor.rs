@@ -4,8 +4,6 @@ mod generation;
 mod pending_queue;
 
 #[cfg(test)]
-mod probe_paths;
-#[cfg(test)]
 mod cache_regressions;
 #[cfg(test)]
 mod diagnostic_regressions;
@@ -21,6 +19,8 @@ mod generation_deadline_regressions;
 mod lifecycle_regressions;
 #[cfg(test)]
 mod memory_regressions;
+#[cfg(test)]
+mod probe_paths;
 #[cfg(test)]
 mod restart_regressions;
 #[cfg(test)]
@@ -71,7 +71,113 @@ const QUEUE_SWEEP_INTERVAL: Duration = Duration::from_millis(20);
 pub const WORKER_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 /// Ceiling for the bounded exponential worker restart backoff.
 pub const WORKER_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// The python-mlx-lm provider pre-fills in 512-token chunks by default.
+pub const PYTHON_PREFILL_STEP_SIZE: usize = 512;
+/// The native, vision, and Clef providers keep the 256-token launch default.
+pub const LEGACY_PREFILL_STEP_SIZE: usize = 256;
+/// Upstream mlx-lm starts KV quantization after 5000 tokens by default.
+pub const DEFAULT_QUANTIZED_KV_START: u64 = 5000;
+/// Safety margin for the OS and other applications in the context budget.
+pub const DEFAULT_SAFETY_MARGIN_BYTES: u64 = 1_073_741_824;
+/// Conservative prefill transient estimate (serving path: 365-468 MiB at 8K).
+pub const DEFAULT_PREFILL_TRANSIENT_BYTES: u64 = 536_870_912;
+/// KV cache allocation step used by the deployed MLX worker.
+const KV_CONTEXT_ALIGNMENT: u64 = 256;
 type StopResult = Result<(), String>;
+
+/// The accounting of one python-mlx-lm context budget decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextBudget {
+    pub resident: u64,
+    pub aligned_context: u64,
+    pub kv_bytes: u64,
+    pub prefill_transient: u64,
+    pub safety_margin: u64,
+    pub required: u64,
+    pub memory_budget: u64,
+}
+
+/// Raise a launch context to the worker's 256-token KV allocation step.
+pub fn align_context(context: u64) -> u64 {
+    context.div_ceil(KV_CONTEXT_ALIGNMENT) * KV_CONTEXT_ALIGNMENT
+}
+
+/// Check `resident + KV(aligned context) + prefill transient + safety margin`
+/// against the memory budget, and report the largest context that still fits.
+pub fn context_budget_plan(
+    resident: u64,
+    reported_context: u64,
+    kv_bytes_per_token: u64,
+    prefill_transient: u64,
+    safety_margin: u64,
+    memory_budget: u64,
+) -> Result<ContextBudget, String> {
+    if kv_bytes_per_token == 0 {
+        return Err("The worker reported an empty per-token KV cache footprint.".into());
+    }
+    let aligned_context = align_context(reported_context);
+    let kv_bytes = aligned_context
+        .checked_mul(kv_bytes_per_token)
+        .ok_or("The KV cache byte count overflows the byte counter.")?;
+    let required = resident
+        .checked_add(kv_bytes)
+        .and_then(|value| value.checked_add(prefill_transient))
+        .and_then(|value| value.checked_add(safety_margin))
+        .ok_or("The context budget overflows the byte counter.")?;
+    if required > memory_budget {
+        let fixed = resident
+            .checked_add(prefill_transient)
+            .and_then(|value| value.checked_add(safety_margin))
+            .ok_or("The context budget overflows the byte counter.")?;
+        let max_supported = memory_budget
+            .saturating_sub(fixed)
+            .checked_div(kv_bytes_per_token)
+            .map(|tokens| tokens / KV_CONTEXT_ALIGNMENT * KV_CONTEXT_ALIGNMENT)
+            .unwrap_or(0);
+        return Err(format!(
+            "The model and context budget exceed the memory budget: {required} bytes are required but {memory_budget} bytes are allowed; maximum context that fits this budget is {max_supported} positions."
+        ));
+    }
+    Ok(ContextBudget {
+        resident,
+        aligned_context,
+        kv_bytes,
+        prefill_transient,
+        safety_margin,
+        required,
+        memory_budget,
+    })
+}
+
+/// Run the python-mlx-lm budget check when the worker reported its geometry.
+///
+/// A worker that cannot compute its KV geometry (custom model code, an
+/// unfamiliar architecture) omits the field; the supervisor then warns and
+/// skips the check instead of failing the launch.
+fn python_context_budget(
+    config: &Config,
+    resident: u64,
+    capabilities: &Value,
+) -> Result<Option<ContextBudget>, String> {
+    let Some(kv_bytes_per_token) = capabilities["kv_bytes_per_token"]
+        .as_u64()
+        .filter(|value| *value > 0)
+    else {
+        return Ok(None);
+    };
+    let reported_context = capabilities["max_context"]
+        .as_u64()
+        .unwrap_or(config.max_context as u64);
+    context_budget_plan(
+        resident,
+        reported_context,
+        kv_bytes_per_token,
+        config.prefill_transient,
+        config.safety_margin,
+        config.memory_budget,
+    )
+    .map(Some)
+}
 
 #[derive(Debug, Clone)]
 pub struct ApiError {
@@ -185,6 +291,14 @@ pub struct Config {
     pub max_context: usize,
     pub max_output: usize,
     pub prefill_step_size: usize,
+    /// KV quantisation width for the python-mlx-lm provider (only 8 is supported).
+    pub kv_bits: Option<u8>,
+    /// Token offset after which mlx-lm quantizes the KV cache.
+    pub quantized_kv_start: u64,
+    /// OS/other-application safety margin inside the memory budget.
+    pub safety_margin: u64,
+    /// Conservative prefill transient estimate inside the memory budget.
+    pub prefill_transient: u64,
     pub output_batch_tokens: usize,
     pub queue_capacity: usize,
     pub timeout: Duration,
@@ -238,9 +352,18 @@ impl Config {
                     .into(),
             );
         }
-        if let WorkerRuntime::NativeMiniCpm5Prepared { cache_limit_bytes, .. } = self.runtime {
-            if cache_limit_bytes == 0 || cache_limit_bytes > self.memory_budget || self.sequence_reservation >= self.memory_budget {
-                return Err("Prepared native cache and retained memory limits must fit the process budget.".into());
+        if let WorkerRuntime::NativeMiniCpm5Prepared {
+            cache_limit_bytes, ..
+        } = self.runtime
+        {
+            if cache_limit_bytes == 0
+                || cache_limit_bytes > self.memory_budget
+                || self.sequence_reservation >= self.memory_budget
+            {
+                return Err(
+                    "Prepared native cache and retained memory limits must fit the process budget."
+                        .into(),
+                );
             }
         }
         if !(1..=contracts::MAX_SAFE_INTEGER).contains(&self.memory_budget)
@@ -270,6 +393,32 @@ impl Config {
                 "The context limit must fit the default output budget and one input token; it must be at least {minimum_context} {unit}."
             ));
         }
+        if matches!(self.runtime, WorkerRuntime::Python) {
+            if let Some(bits) = self.kv_bits {
+                if bits != 8 {
+                    return Err(
+                        "Only --kv-bits 8 is supported; 4-bit KV degrades quality (measured PPL 17.5x)."
+                            .into(),
+                    );
+                }
+            }
+            if self.kv_bits.is_some() && self.quantized_kv_start > self.max_context as u64 {
+                return Err("The KV quantisation start must not exceed the context limit.".into());
+            }
+            match self.safety_margin.checked_add(self.prefill_transient) {
+                Some(fixed) if fixed < self.memory_budget => {}
+                _ => {
+                    return Err(
+                        "The safety margin and prefill transient must leave room for the model and the KV cache inside the memory budget."
+                            .into(),
+                    )
+                }
+            }
+        } else if self.kv_bits.is_some() {
+            // The CLI already rejects every python-mlx-lm budget flag for other
+            // providers; this guards direct Config construction as well.
+            return Err("--kv-bits requires --provider python-mlx-lm.".into());
+        }
         Ok(())
     }
 
@@ -285,11 +434,17 @@ impl Config {
 }
 
 fn settle_memory(service: &Service, frame: &Value) -> Result<(), ApiError> {
-    if frame["protocol"] != contracts::NATIVE_PREPARED_PROTOCOL { return Ok(()); }
+    if frame["protocol"] != contracts::NATIVE_PREPARED_PROTOCOL {
+        return Ok(());
+    }
     let mut ready = service.ready_snapshot();
     ready["memory"] = frame["memory"].clone();
-    let (_, peak) = ready_memory_totals(&ready).map_err(|e| ApiError::new(500, "protocol_fault", e))?;
-    service.metrics.peak_bytes.fetch_max(peak, Ordering::Relaxed);
+    let (_, peak) =
+        ready_memory_totals(&ready).map_err(|e| ApiError::new(500, "protocol_fault", e))?;
+    service
+        .metrics
+        .peak_bytes
+        .fetch_max(peak, Ordering::Relaxed);
     *service.ready_state.write().unwrap() = ready;
     Ok(())
 }
@@ -406,7 +561,8 @@ pub struct Service {
 impl Service {
     pub(crate) fn output_profile(&self) -> OutputProfile {
         if self.ready["model_manifest"]["execution"]["parser"] == "minicpm5_xml"
-            || self.ready["runtime"]["kind"] == "native_minicpm5" {
+            || self.ready["runtime"]["kind"] == "native_minicpm5"
+        {
             OutputProfile::MiniCpm5
         } else {
             OutputProfile::Qwen
@@ -510,11 +666,15 @@ impl Service {
         })
     }
     fn require_request_capacity(&self, reservation: u64) -> Result<(), ApiError> {
-        let required = ready_memory_totals(&self.ready_snapshot()).ok()
+        let required = ready_memory_totals(&self.ready_snapshot())
+            .ok()
             .and_then(|(resident, _)| resident.checked_add(reservation));
         if required.is_none_or(|bytes| bytes > self.memory_budget) {
-            return Err(ApiError::new(503, "capacity_unavailable",
-                "Retained model allocation and request reservation exceed the memory budget."));
+            return Err(ApiError::new(
+                503,
+                "capacity_unavailable",
+                "Retained model allocation and request reservation exceed the memory budget.",
+            ));
         }
         Ok(())
     }
@@ -820,7 +980,17 @@ async fn launch_worker_until(
         .arg("--output-batch-tokens")
         .arg(config.output_batch_tokens.to_string())
         .arg("--memory-limit-bytes")
-        .arg(config.memory_budget.to_string())
+        .arg(config.memory_budget.to_string());
+    if matches!(config.runtime, WorkerRuntime::Python) {
+        if let Some(bits) = config.kv_bits {
+            command
+                .arg("--kv-bits")
+                .arg(bits.to_string())
+                .arg("--quantized-kv-start")
+                .arg(config.quantized_kv_start.to_string());
+        }
+    }
+    command
         .env_clear()
         .env("PATH", "/opt/homebrew/bin:/usr/bin:/bin")
         .env("HF_HUB_OFFLINE", "1")
@@ -844,9 +1014,15 @@ async fn launch_worker_until(
                 .ok_or_else(|| "The Metal library needs a parent directory.".to_owned())?,
         );
     }
-    if let WorkerRuntime::NativeMiniCpm5Prepared { cache_limit_bytes, .. } = config.runtime {
-        command.arg("--cache-limit-bytes").arg(cache_limit_bytes.to_string())
-            .arg("--retained-memory-limit-bytes").arg((config.memory_budget - config.sequence_reservation).to_string());
+    if let WorkerRuntime::NativeMiniCpm5Prepared {
+        cache_limit_bytes, ..
+    } = config.runtime
+    {
+        command
+            .arg("--cache-limit-bytes")
+            .arg(cache_limit_bytes.to_string())
+            .arg("--retained-memory-limit-bytes")
+            .arg((config.memory_budget - config.sequence_reservation).to_string());
     }
     let mut child = command
         .spawn()
@@ -912,6 +1088,24 @@ async fn launch_worker_until(
         }
         let (resident, _) = ready_memory_totals(&ready)?;
         config.check_resident_capacity(resident)?;
+        if matches!(config.runtime, WorkerRuntime::Python) {
+            match python_context_budget(&config, resident, &ready["capabilities"]) {
+                Ok(Some(plan)) => diagnostics::emit(format_args!(
+                    "Context budget: resident_bytes={} kv_bytes={} aligned_context={} prefill_transient_bytes={} safety_margin_bytes={} required_bytes={} memory_budget_bytes={}",
+                    plan.resident,
+                    plan.kv_bytes,
+                    plan.aligned_context,
+                    plan.prefill_transient,
+                    plan.safety_margin,
+                    plan.required,
+                    plan.memory_budget
+                )),
+                Ok(None) => diagnostics::emit(format_args!(
+                    "Context budget check skipped: the worker did not report kv_bytes_per_token."
+                )),
+                Err(error) => return Err(error),
+            }
+        }
         Ok(ready)
     };
     let startup: Result<Option<Value>, String> = tokio::select! {
@@ -1314,7 +1508,10 @@ where
                 if !shared.queue.resume(&shared.available) {
                     return Recovery::Stopped;
                 }
-                shared.metrics.worker_restarts.fetch_add(1, Ordering::Relaxed);
+                shared
+                    .metrics
+                    .worker_restarts
+                    .fetch_add(1, Ordering::Relaxed);
                 backoff.reset();
                 diagnostics::emit(format_args!(
                     "{}",
@@ -1465,7 +1662,8 @@ where
         }
         if worker.protocol == contracts::NATIVE_PREPARED_PROTOCOL {
             if let Err(error) = shared.require_request_capacity(sequence_reservation) {
-                job.observation.settled(&shared.metrics.observations, Instant::now());
+                job.observation
+                    .settled(&shared.metrics.observations, Instant::now());
                 finish_before_execution(&mut job, &shared, error);
                 continue;
             }
@@ -1946,7 +2144,10 @@ async fn settle_stopped_submission(
                         .await?;
                     control_sent = true;
                 }
-                Some("resources_released") => { settle_memory(service, &frame)?; return Ok(()); },
+                Some("resources_released") => {
+                    settle_memory(service, &frame)?;
+                    return Ok(());
+                }
                 Some("tokens" | "terminal" | "rejected" | "prefill_progress") => {}
                 _ => {
                     return Err(ApiError::new(
@@ -2030,7 +2231,11 @@ fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
             return Err(format!("The model artifact identity differs: {name}"));
         }
     }
-    if let WorkerRuntime::NativeMiniCpm5Prepared { executable, metal_library, .. }
+    if let WorkerRuntime::NativeMiniCpm5Prepared {
+        executable,
+        metal_library,
+        ..
+    }
     | WorkerRuntime::NativeMiniCpm5 {
         executable,
         metal_library,
@@ -2064,9 +2269,17 @@ fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
         } else {
             "apxinf-native-minicpm5-v1"
         };
-        let execution = if let WorkerRuntime::NativeMiniCpm5Prepared { cache_limit_bytes, .. } = config.runtime {
-            crate::native_identity::prepared_execution(config.max_context, config.max_output, config.memory_budget,
-                cache_limit_bytes, config.memory_budget - config.sequence_reservation)
+        let execution = if let WorkerRuntime::NativeMiniCpm5Prepared {
+            cache_limit_bytes, ..
+        } = config.runtime
+        {
+            crate::native_identity::prepared_execution(
+                config.max_context,
+                config.max_output,
+                config.memory_budget,
+                cache_limit_bytes,
+                config.memory_budget - config.sequence_reservation,
+            )
         } else if bounded {
             crate::native_identity::bounded_thinking_execution(
                 config.max_context,
@@ -2633,7 +2846,10 @@ fn gateway_test_service_capabilities(
     if protocol == contracts::VISION_PROTOCOL {
         capabilities["media_limits"] = json!({"max_images":4,"max_image_bytes":131072,"max_total_bytes":262144,"max_dimension":1024,"max_host_array_bytes":67108864});
     }
-    let native = !matches!(protocol, PROTOCOL | contracts::VISION_PROTOCOL | contracts::CLEF_PROTOCOL);
+    let native = !matches!(
+        protocol,
+        PROTOCOL | contracts::VISION_PROTOCOL | contracts::CLEF_PROTOCOL
+    );
     let service = Arc::new(Service {
         queue: PendingQueue::new(8),
         host_pressure: pressure,
@@ -2936,7 +3152,10 @@ mod lifecycle_tests {
                 .err()
                 .expect("Queued work must fail before preparation.");
             assert_eq!(error.code, "worker_lost");
-            assert_eq!(error.message, "The model worker is restarting after a fault.");
+            assert_eq!(
+                error.message,
+                "The model worker is restarting after a fault."
+            );
         }
         assert!(!service.available.load(Ordering::Acquire));
         assert_eq!(service.metrics.queued.load(Ordering::Relaxed), 0);
@@ -2984,9 +3203,11 @@ mod lifecycle_tests {
             "protocol_fault"
         );
         let service = idle_service();
-        assert!(fence_worker(&mut worker, &service, ApiError::worker("Test finished."))
-            .await
-            .is_ok());
+        assert!(
+            fence_worker(&mut worker, &service, ApiError::worker("Test finished."))
+                .await
+                .is_ok()
+        );
         assert!(worker.child.try_wait().unwrap().is_some());
     }
 

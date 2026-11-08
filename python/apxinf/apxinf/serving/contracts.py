@@ -316,7 +316,14 @@ def _vision_replay(frame: dict) -> None:
 
 
 def _capabilities(value: Any, native: bool = False, sampled: bool = False) -> None:
-    _keys(value, {"text", "image", "greedy", "sampling", "token_events", "cancel_granularity", "max_active_sequences", "max_context", "max_output_tokens", "exact_append", "state_schema"})
+    # python-mlx-lm reports its KV geometry/quantisation for the context budget;
+    # native frames stay strict.
+    optional = set() if native else {"kv_bytes_per_token", "kv_bits"}
+    _keys(value, {"text", "image", "greedy", "sampling", "token_events", "cancel_granularity", "max_active_sequences", "max_context", "max_output_tokens", "exact_append", "state_schema"}, optional)
+    if "kv_bytes_per_token" in value:
+        _int(value["kv_bytes_per_token"], 1, MAX_SAFE_INTEGER)
+    if "kv_bits" in value:
+        _require(value["kv_bits"] == 8, "unsupported kv quantisation")
     for name, expected in {"text": True, "image": False, "greedy": True, "sampling": sampled, "token_events": True, "exact_append": False}.items():
         _require(type(value[name]) is bool and value[name] is expected, "unsupported serial capability")
     cancellation = {"token_or_prefill_chunk"} if sampled else ({"end_prefill_or_token", "token_or_prefill_chunk"} if native else {"token", "token_or_prefill_chunk"})

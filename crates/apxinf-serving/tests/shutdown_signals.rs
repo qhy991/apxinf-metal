@@ -40,6 +40,10 @@ fn cli_command(fixture: &Fixture, extra: &[&str]) -> Command {
             "4096",
             "--sequence-reservation-bytes",
             "1024",
+            "--safety-margin-bytes",
+            "0",
+            "--prefill-transient-bytes",
+            "0",
             "--timeout-seconds",
             "5",
         ])

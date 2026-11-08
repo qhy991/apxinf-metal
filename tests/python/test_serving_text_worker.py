@@ -802,3 +802,76 @@ class WorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KVCacheGeometryTests(unittest.TestCase):
+    def test_qwen3_geometry_matches_measured_bytes_per_token(self):
+        config = {"num_hidden_layers": 28, "num_key_value_heads": 8, "head_dim": 128,
+                  "torch_dtype": "bfloat16"}
+        self.assertEqual(worker_module.kv_bytes_per_token(config), 114_688)
+
+    def test_missing_key_value_heads_falls_back_to_attention_heads(self):
+        config = {"num_hidden_layers": 2, "num_attention_heads": 4, "head_dim": 16}
+        self.assertEqual(worker_module.kv_bytes_per_token(config), 2 * 2 * 4 * 16 * 2)
+
+    def test_missing_head_dim_is_derived_from_hidden_size(self):
+        config = {"num_hidden_layers": 2, "num_attention_heads": 4, "hidden_size": 256,
+                  "num_key_value_heads": 2}
+        self.assertEqual(worker_module.kv_bytes_per_token(config), 2 * 2 * 2 * 64 * 2)
+
+    def test_hybrid_layer_types_count_only_full_attention_layers(self):
+        config = {"num_hidden_layers": 8, "num_key_value_heads": 2, "head_dim": 32,
+                  "layer_types": ["linear_attention", "linear_attention", "linear_attention",
+                                  "full_attention", "linear_attention", "linear_attention",
+                                  "linear_attention", "full_attention"]}
+        self.assertEqual(worker_module.kv_bytes_per_token(config), 2 * 2 * 2 * 32 * 2)
+
+    def test_full_attention_interval_counts_every_nth_layer(self):
+        config = {"num_hidden_layers": 8, "full_attention_interval": 4,
+                  "num_key_value_heads": 2, "head_dim": 32}
+        self.assertEqual(worker_module.kv_bytes_per_token(config), 2 * 2 * 2 * 32 * 2)
+
+    def test_float32_dtype_doubles_the_footprint(self):
+        config = {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 8,
+                  "torch_dtype": "float32"}
+        self.assertEqual(worker_module.kv_bytes_per_token(config), 2 * 1 * 1 * 8 * 4)
+
+    def test_missing_layers_or_heads_yields_no_geometry(self):
+        self.assertIsNone(worker_module.kv_bytes_per_token({}))
+        self.assertIsNone(worker_module.kv_bytes_per_token({"num_hidden_layers": 2}))
+
+    def test_generation_options_are_empty_unless_kv8_is_enabled(self):
+        self.assertEqual(worker_module.kv_generation_options(None, 5000), {})
+        self.assertEqual(worker_module.kv_generation_options(8, 5000),
+                         {"kv_bits": 8, "quantized_kv_start": 5000})
+
+    def test_four_bit_kv_is_rejected_by_the_worker_cli(self):
+        with self.assertRaises(SystemExit):
+            worker_module.main(["--model", "/model", "--worker-epoch", EPOCH,
+                                "--kv-bits", "4"])
+
+
+class KVCapabilityTests(unittest.TestCase):
+    def make_worker(self, **runtime_attrs):
+        events = []
+        runtime = FakeRuntime()
+        for name, value in runtime_attrs.items():
+            setattr(runtime, name, value)
+        worker = worker_module.TextWorker(runtime, EPOCH,
+                                          lambda frame, critical=False: events.append(frame),
+                                          max_output_tokens=16)
+        return worker, events
+
+    def test_ready_reports_the_kv_geometry_and_quantisation(self):
+        worker, _ = self.make_worker(kv_bytes_per_token=114_688, kv_bits=8)
+        ready = worker.ready()
+        contracts.validate_frame(ready)
+        self.assertEqual(ready["capabilities"]["kv_bytes_per_token"], 114_688)
+        self.assertEqual(ready["capabilities"]["kv_bits"], 8)
+
+    def test_ready_omits_the_geometry_when_unknown(self):
+        worker, _ = self.make_worker()
+        ready = worker.ready()
+        contracts.validate_frame(ready)
+        self.assertNotIn("kv_bytes_per_token", ready["capabilities"])
+        self.assertNotIn("kv_bits", ready["capabilities"])

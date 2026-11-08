@@ -11,6 +11,12 @@ pub(super) fn configuration(memory_budget: u64, sequence_reservation: u64) -> Co
         max_context: 64,
         max_output: 16,
         prefill_step_size: 8,
+        kv_bits: None,
+        // Keep the generic memory fixture free of the python-mlx-lm budget terms;
+        // the dedicated budget tests below set them explicitly.
+        quantized_kv_start: 0,
+        safety_margin: 0,
+        prefill_transient: 0,
         output_batch_tokens: 1,
         queue_capacity: 1,
         timeout: Duration::from_secs(1),
@@ -331,7 +337,6 @@ fn memory_peak_uses_the_reported_peak_and_the_allocator_total() {
     .is_err());
 }
 
-
 #[test]
 fn prepared_settlement_refreshes_residency_before_next_admission() {
     let ready = json!({"protocol":contracts::NATIVE_PREPARED_PROTOCOL,
@@ -342,9 +347,16 @@ fn prepared_settlement_refreshes_residency_before_next_admission() {
         "memory":{"active_bytes":3000,"cache_bytes":200,"peak_bytes":4000}});
     settle_memory(&service, &frame).unwrap();
     assert_eq!(service.ready_snapshot()["memory"], frame["memory"]);
-    assert_eq!(service.require_request_capacity(1024).unwrap_err().code, "capacity_unavailable");
+    assert_eq!(
+        service.require_request_capacity(1024).unwrap_err().code,
+        "capacity_unavailable"
+    );
     assert_eq!(service.metrics.peak_bytes.load(Ordering::Relaxed), 4000);
-    settle_memory(&service, &json!({"protocol":contracts::NATIVE_PROTOCOL,"memory":{}})).unwrap();
+    settle_memory(
+        &service,
+        &json!({"protocol":contracts::NATIVE_PROTOCOL,"memory":{}}),
+    )
+    .unwrap();
     assert_eq!(service.ready_snapshot()["memory"], frame["memory"]);
 }
 
@@ -353,12 +365,156 @@ fn prepared_cache_policy_is_bound_to_the_selected_manifest() {
     let mut config = configuration(4096, 1024);
     config.prefill_step_size = 256;
     config.runtime = WorkerRuntime::NativeMiniCpm5Prepared {
-        executable: "/worker".into(), metal_library: "/libmlx.dylib".into(), cache_limit_bytes: 2048 };
+        executable: "/worker".into(),
+        metal_library: "/libmlx.dylib".into(),
+        cache_limit_bytes: 2048,
+    };
     config.validate_memory().unwrap();
-    assert_eq!(config.runtime.protocol(), contracts::NATIVE_PREPARED_PROTOCOL);
+    assert_eq!(
+        config.runtime.protocol(),
+        contracts::NATIVE_PREPARED_PROTOCOL
+    );
     config.runtime = WorkerRuntime::NativeMiniCpm5Prepared {
-        executable: "/worker".into(), metal_library: "/libmlx.dylib".into(), cache_limit_bytes: 4097 };
+        executable: "/worker".into(),
+        metal_library: "/libmlx.dylib".into(),
+        cache_limit_bytes: 4097,
+    };
     assert!(config.validate_memory().is_err());
     config.sequence_reservation = 4096;
     assert!(config.validate_memory().is_err());
+}
+
+fn python_budget_config(memory_budget: u64) -> Config {
+    let mut config = configuration(memory_budget, 1024);
+    config.max_context = 40_960;
+    config.safety_margin = DEFAULT_SAFETY_MARGIN_BYTES;
+    config.prefill_transient = DEFAULT_PREFILL_TRANSIENT_BYTES;
+    config
+}
+
+#[test]
+fn context_budget_plan_allows_the_measured_context_inside_eight_gibibytes() {
+    const RESIDENT: u64 = 1_192_000_000; // measured Qwen3-0.6B weights (~1137 MiB)
+    let plan = context_budget_plan(
+        RESIDENT,
+        40_960,
+        114_688,
+        DEFAULT_PREFILL_TRANSIENT_BYTES,
+        DEFAULT_SAFETY_MARGIN_BYTES,
+        8 * 1024u64.pow(3),
+    )
+    .unwrap();
+    assert_eq!(plan.aligned_context, 40_960);
+    assert_eq!(plan.kv_bytes, 40_960 * 114_688);
+    assert_eq!(
+        plan.required,
+        RESIDENT + 40_960 * 114_688 + DEFAULT_PREFILL_TRANSIENT_BYTES + DEFAULT_SAFETY_MARGIN_BYTES
+    );
+    assert!(plan.required <= plan.memory_budget);
+}
+
+#[test]
+fn context_budget_plan_reports_the_largest_context_that_fits() {
+    let error = context_budget_plan(
+        1_192_000_000,
+        40_960,
+        114_688,
+        DEFAULT_PREFILL_TRANSIENT_BYTES,
+        DEFAULT_SAFETY_MARGIN_BYTES,
+        4 * 1024u64.pow(3),
+    )
+    .unwrap_err();
+    // fixed = 1_192_000_000 + 536_870_912 + 1_073_741_824 = 2_802_612_736
+    // (4 GiB - fixed) / 114_688 = 13_012 tokens, floored to the 256 step.
+    assert!(
+        error.contains("maximum context that fits this budget is 12800 positions"),
+        "{error}"
+    );
+    assert!(error.contains("bytes are required"), "{error}");
+}
+
+#[test]
+fn context_budget_plan_aligns_the_context_to_the_kv_step() {
+    let plan = context_budget_plan(1_000_000, 40_961, 114_688, 0, 0, 9 * 1024u64.pow(3)).unwrap();
+    assert_eq!(plan.aligned_context, 41_216);
+    assert_eq!(plan.kv_bytes, 41_216 * 114_688);
+}
+
+#[test]
+fn context_budget_plan_rejects_an_empty_geometry() {
+    assert!(context_budget_plan(1, 16, 0, 0, 0, 1024).is_err());
+}
+
+#[test]
+fn python_context_budget_skips_workers_without_geometry() {
+    let config = python_budget_config(8 * 1024u64.pow(3));
+    let skipped = python_context_budget(
+        &config,
+        1_192_000_000,
+        &serde_json::json!({"max_context": 40_960}),
+    )
+    .unwrap();
+    assert!(skipped.is_none());
+    let plan = python_context_budget(
+        &config,
+        1_192_000_000,
+        &serde_json::json!({"max_context": 40_960, "kv_bytes_per_token": 114_688}),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(plan.aligned_context, 40_960);
+
+    let mut over = python_budget_config(4 * 1024u64.pow(3));
+    over.max_context = 40_960;
+    let error = python_context_budget(
+        &over,
+        1_192_000_000,
+        &serde_json::json!({"max_context": 40_960, "kv_bytes_per_token": 114_688}),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("maximum context that fits this budget is"),
+        "{error}"
+    );
+}
+
+#[test]
+fn python_provider_accepts_kv_eight_and_rejects_other_widths() {
+    let mut config = python_budget_config(8 * 1024u64.pow(3));
+    config.kv_bits = Some(4);
+    assert!(config
+        .validate_memory()
+        .unwrap_err()
+        .contains("Only --kv-bits 8"));
+    config.kv_bits = Some(8);
+    config.validate_memory().unwrap();
+    config.quantized_kv_start = 40_961;
+    assert!(config
+        .validate_memory()
+        .unwrap_err()
+        .contains("KV quantisation start"));
+}
+
+#[test]
+fn non_python_providers_reject_the_python_budget_options() {
+    let mut config = python_budget_config(8 * 1024u64.pow(3));
+    config.runtime = WorkerRuntime::PythonMiniCpmVision;
+    config.max_context = 16_384;
+    config.max_output = 8_192;
+    config.prefill_step_size = 256;
+    config.kv_bits = Some(8);
+    assert!(config
+        .validate_memory()
+        .unwrap_err()
+        .contains("--kv-bits requires --provider python-mlx-lm"));
+}
+
+#[test]
+fn python_provider_requires_budget_room_for_the_fixed_terms() {
+    let mut config = python_budget_config(8 * 1024u64.pow(3));
+    config.memory_budget = 1_073_741_824; // safety margin alone consumes the budget
+    assert!(config
+        .validate_memory()
+        .unwrap_err()
+        .contains("safety margin and prefill transient"));
 }

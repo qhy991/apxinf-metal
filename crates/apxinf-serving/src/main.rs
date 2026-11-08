@@ -45,9 +45,21 @@ struct Args {
     max_context: usize,
     #[arg(long, default_value_t = 2048)]
     max_output_tokens: usize,
-    /// Python prefill chunk size. Native profiles retain 256 for launch compatibility and use their family plan.
-    #[arg(long, default_value_t = 256)]
-    prefill_step_size: usize,
+    /// Python prefill chunk size. Defaults to 512 for python-mlx-lm and 256 for every other provider.
+    #[arg(long)]
+    prefill_step_size: Option<usize>,
+    /// KV cache width for python-mlx-lm. Only 8 is supported; 4-bit KV degrades quality.
+    #[arg(long)]
+    kv_bits: Option<u8>,
+    /// Token offset after which python-mlx-lm quantizes the KV cache. Defaults to 5000.
+    #[arg(long)]
+    quantized_kv_start: Option<u64>,
+    /// OS/other-application safety margin used by the context budget. Defaults to 1 GiB.
+    #[arg(long)]
+    safety_margin_bytes: Option<u64>,
+    /// Conservative prefill transient estimate used by the context budget. Defaults to 512 MiB.
+    #[arg(long)]
+    prefill_transient_bytes: Option<u64>,
     #[arg(long, default_value_t = 1)]
     output_batch_tokens: usize,
     #[arg(long, default_value_t = 16)]
@@ -92,6 +104,58 @@ async fn main() -> ExitCode {
     exit
 }
 
+/// python-mlx-lm pre-fills in 512-token chunks; every other provider keeps 256.
+fn resolve_prefill_step_size(python_mlx_lm: bool, requested: Option<usize>) -> usize {
+    requested.unwrap_or(if python_mlx_lm {
+        supervisor::PYTHON_PREFILL_STEP_SIZE
+    } else {
+        supervisor::LEGACY_PREFILL_STEP_SIZE
+    })
+}
+
+/// Reject python-mlx-lm context-budget options for every other provider.
+fn validate_provider_options(
+    python_mlx_lm: bool,
+    prefill_step_size: usize,
+    args: &Args,
+) -> Result<(), String> {
+    let python_only = args.kv_bits.is_some()
+        || args.quantized_kv_start.is_some()
+        || args.safety_margin_bytes.is_some()
+        || args.prefill_transient_bytes.is_some();
+    if !python_mlx_lm && python_only {
+        return Err("--kv-bits, --quantized-kv-start, --safety-margin-bytes, and --prefill-transient-bytes require --provider python-mlx-lm.".into());
+    }
+    if prefill_step_size == 0 {
+        return Err("A service limit is outside the supported range.".into());
+    }
+    if let Some(bits) = args.kv_bits {
+        if bits != 8 {
+            return Err(
+                "Only --kv-bits 8 is supported; 4-bit KV degrades quality (measured PPL 17.5x)."
+                    .into(),
+            );
+        }
+    }
+    if args.kv_bits.is_some() {
+        if let Some(start) = args.quantized_kv_start {
+            if start > args.max_context as u64 {
+                return Err("The KV quantisation start must not exceed the context limit.".into());
+            }
+        }
+    }
+    let safety_margin = args
+        .safety_margin_bytes
+        .unwrap_or(supervisor::DEFAULT_SAFETY_MARGIN_BYTES);
+    let prefill_transient = args
+        .prefill_transient_bytes
+        .unwrap_or(supervisor::DEFAULT_PREFILL_TRANSIENT_BYTES);
+    match safety_margin.checked_add(prefill_transient) {
+        Some(fixed) if fixed < args.memory_budget_bytes => Ok(()),
+        _ => Err("The safety margin and prefill transient must leave room for the model and the KV cache inside the memory budget.".into()),
+    }
+}
+
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Register signal handling before the optional file open, so a blocked
     // filesystem cannot leave an interactive interrupt on the default action.
@@ -109,6 +173,9 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if !args.host.is_loopback() {
         return Err("This local profile requires a loopback address.".into());
     }
+    let python_mlx_lm = args.provider == "python-mlx-lm";
+    let prefill_step_size = resolve_prefill_step_size(python_mlx_lm, args.prefill_step_size);
+    validate_provider_options(python_mlx_lm, prefill_step_size, &args)?;
     if args.queue_capacity == 0
         || args.queue_capacity > 256
         || args.max_context == 0
@@ -116,7 +183,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         || args.max_output_tokens > 65536
         || args.output_batch_tokens == 0
         || args.output_batch_tokens > 256
-        || args.prefill_step_size == 0
+        || prefill_step_size == 0
         || args.timeout_seconds == 0
         || args.timeout_seconds > 3600
     {
@@ -145,8 +212,11 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("Native provider requires --metal-library.")?,
         )?;
         if args.provider == "native-minicpm5-prepared" {
-            WorkerRuntime::NativeMiniCpm5Prepared { executable, metal_library,
-                cache_limit_bytes: args.allocator_cache_limit_bytes.unwrap_or(2147483648) }
+            WorkerRuntime::NativeMiniCpm5Prepared {
+                executable,
+                metal_library,
+                cache_limit_bytes: args.allocator_cache_limit_bytes.unwrap_or(2147483648),
+            }
         } else if args.provider == "native-minicpm5-thinking-bounded" {
             WorkerRuntime::NativeMiniCpm5BoundedThinking {
                 executable,
@@ -199,7 +269,17 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         model_id: args.model_id,
         max_context: args.max_context,
         max_output: args.max_output_tokens,
-        prefill_step_size: args.prefill_step_size,
+        prefill_step_size,
+        kv_bits: args.kv_bits,
+        quantized_kv_start: args
+            .quantized_kv_start
+            .unwrap_or(supervisor::DEFAULT_QUANTIZED_KV_START),
+        safety_margin: args
+            .safety_margin_bytes
+            .unwrap_or(supervisor::DEFAULT_SAFETY_MARGIN_BYTES),
+        prefill_transient: args
+            .prefill_transient_bytes
+            .unwrap_or(supervisor::DEFAULT_PREFILL_TRANSIENT_BYTES),
         output_batch_tokens: args.output_batch_tokens,
         queue_capacity: args.queue_capacity,
         timeout: Duration::from_secs(args.timeout_seconds),

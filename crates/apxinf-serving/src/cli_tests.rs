@@ -95,3 +95,94 @@ fn vision_launch_preserves_the_final_virtual_environment_symlink() {
     assert_eq!(old, std::fs::canonicalize(real).unwrap());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn prefill_default_follows_the_provider() {
+    assert_eq!(resolve_prefill_step_size(true, None), 512);
+    assert_eq!(resolve_prefill_step_size(false, None), 256);
+    assert_eq!(resolve_prefill_step_size(true, Some(256)), 256);
+    assert_eq!(resolve_prefill_step_size(false, Some(1024)), 1024);
+}
+
+#[test]
+fn kv_bits_is_limited_to_eight() {
+    let args =
+        Args::try_parse_from(["apxinf-serve", "--model", "/model", "--kv-bits", "4"]).unwrap();
+    let error = validate_provider_options(true, 512, &args).unwrap_err();
+    assert!(error.contains("Only --kv-bits 8"), "{error}");
+    let args =
+        Args::try_parse_from(["apxinf-serve", "--model", "/model", "--kv-bits", "8"]).unwrap();
+    validate_provider_options(true, 512, &args).unwrap();
+}
+
+#[test]
+fn python_budget_options_require_the_python_provider() {
+    let args = Args::try_parse_from([
+        "apxinf-serve",
+        "--model",
+        "/model",
+        "--provider",
+        "native-minicpm5",
+        "--kv-bits",
+        "8",
+    ])
+    .unwrap();
+    let error = validate_provider_options(false, 256, &args).unwrap_err();
+    assert!(
+        error.contains("require --provider python-mlx-lm"),
+        "{error}"
+    );
+
+    let args = Args::try_parse_from([
+        "apxinf-serve",
+        "--model",
+        "/model",
+        "--provider",
+        "mlx-vlm-minicpmv47",
+        "--safety-margin-bytes",
+        "1024",
+    ])
+    .unwrap();
+    let error = validate_provider_options(false, 256, &args).unwrap_err();
+    assert!(
+        error.contains("require --provider python-mlx-lm"),
+        "{error}"
+    );
+}
+
+#[test]
+fn quantized_kv_start_must_fit_the_context() {
+    let args = Args::try_parse_from([
+        "apxinf-serve",
+        "--model",
+        "/model",
+        "--max-context",
+        "1024",
+        "--kv-bits",
+        "8",
+        "--quantized-kv-start",
+        "2048",
+    ])
+    .unwrap();
+    let error = validate_provider_options(true, 512, &args).unwrap_err();
+    assert!(error.contains("KV quantisation start"), "{error}");
+}
+
+#[test]
+fn safety_margin_and_prefill_transient_must_leave_budget_room() {
+    let args = Args::try_parse_from([
+        "apxinf-serve",
+        "--model",
+        "/model",
+        "--memory-budget-bytes",
+        "1073741824",
+        "--safety-margin-bytes",
+        "1073741824",
+    ])
+    .unwrap();
+    let error = validate_provider_options(true, 512, &args).unwrap_err();
+    assert!(
+        error.contains("must leave room for the model and the KV cache"),
+        "{error}"
+    );
+}

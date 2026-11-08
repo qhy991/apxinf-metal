@@ -363,6 +363,46 @@ The generic Python provider cannot check the loaded model capacity before the wo
 The native profiles keep 16384 positions for launch compatibility even though the model layer can address more.
 Raising that limit needs device memory and quality measurements, so the service does not claim it.
 
+### Context budget (python-mlx-lm)
+
+The text provider checks a context budget after the worker reports readiness.
+The worker reports `kv_bytes_per_token` from the model configuration; the supervisor requires
+
+```text
+resident + KV(max_context aligned to 256 positions) + prefill transient + safety margin
+    <= --memory-budget-bytes
+```
+
+and fails the launch with an actionable error when the budget is too small, including
+`maximum context that fits this budget is N positions`.
+The check only runs for `--provider python-mlx-lm`; a worker that cannot report its KV geometry
+(an unusual architecture or custom model code) produces a warning and skips the check instead of
+failing the launch.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--prefill-step-size` | 512 for python-mlx-lm, 256 elsewhere | Prefill chunk size; explicit values are honored. |
+| `--kv-bits` | off | KV cache width. Only 8 is accepted; 4-bit KV degrades quality (measured PPL 17.5x) and is rejected. |
+| `--quantized-kv-start` | 5000 | Token offset after which mlx-lm quantizes the KV cache (the upstream default). |
+| `--safety-margin-bytes` | 1073741824 | Safety margin for the OS and other applications inside the budget. |
+| `--prefill-transient-bytes` | 536870912 | Conservative prefill transient estimate; the measured serving path is 365-468 MiB at 8K. |
+
+For example, a quantized eight-bit KV cache with the default prefill chunk:
+
+```sh
+target/release/apxinf-serve \
+  --model /absolute/path/to/local/model \
+  --provider python-mlx-lm \
+  --max-context 16384 \
+  --kv-bits 8 --quantized-kv-start 5000 \
+  --python .apxinf/toolchains/mlx-lm-0.31.3-copies/bin/python
+```
+
+The eight-bit KV cache showed no detectable quality difference in the measurement sample
+(one document, 64 continuation tokens); it still needs a task-level quality gate before longer
+contexts are claimed. These five options are rejected for every other provider, whose behavior
+and 256-token prefill default are unchanged.
+
 ## HTTP interface
 
 The gateway emits no CORS headers.

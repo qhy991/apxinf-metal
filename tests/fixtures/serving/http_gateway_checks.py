@@ -105,6 +105,9 @@ class Gateway:
             "--max-context", "128", "--max-output-tokens", str(max_output_tokens),
             "--queue-capacity", "1", "--timeout-seconds", str(timeout),
             "--memory-budget-bytes", "8192", "--sequence-reservation-bytes", "1024",
+            # The fixture worker reports no KV geometry; keep the python budget
+            # terms at zero so the tiny test budget stays meaningful.
+            "--safety-margin-bytes", "0", "--prefill-transient-bytes", "0",
         ], stdout=self.log, stderr=self.log, start_new_session=True, cwd=ROOT)
         try:
             self.port = until(self.listener, "gateway startup", seconds=15)
