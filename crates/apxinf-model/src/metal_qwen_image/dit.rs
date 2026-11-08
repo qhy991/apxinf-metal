@@ -151,10 +151,33 @@ pub struct Dit {
     ane: Option<Rc<AneShare>>,
 }
 
-/// Loaded Neural Engine programs and the GPU kernels that feed them.
+/// Which engine runs the offloaded half of the MLP: Core ML on the Neural
+/// Engine, or the GPU stand-in that isolates the split and its rounding from
+/// what Core ML does inside the program (#236 H2). Everything around it --
+/// the feed, the scales, the GPU's half, the recombination -- is shared, so
+/// the two arms differ in one step and nothing else.
+#[cfg(feature = "coreml")]
+pub enum Offload {
+    Ane(super::ane::Programs),
+    Sim(super::ane_sim::Sim),
+}
+
+#[cfg(feature = "coreml")]
+impl Offload {
+    /// What the feed is carried in: FP16 for the Core ML program, and for the
+    /// stand-in whichever width its arm is testing.
+    fn dtype(&self) -> MlxDType {
+        match self {
+            Self::Ane(_) => MlxDType::F16,
+            Self::Sim(sim) => sim.dtype(),
+        }
+    }
+}
+
+/// The offload engine and the GPU kernels that feed it.
 #[cfg(feature = "coreml")]
 pub struct AneShare {
-    pub programs: super::ane::Programs,
+    pub offload: Offload,
     pub scales: super::ane::Scales,
     pub spent: AneSpent,
 }
@@ -498,7 +521,7 @@ impl Dit {
             .pad(&[0, 0, 0], &[0, tiles * TILE - tokens, 0])?
             .reshape(&[tiles, TILE, DIM])?
             .transpose(&[0, 2, 1])?
-            .cast(MlxDType::F16)?
+            .cast(ane.offload.dtype())?
             .contiguous()?;
         stream.async_eval(&[feed.clone(), params.clone()])?;
         let gated = f.swiglu.call(&mlp_input, &gate_up)?;
@@ -512,25 +535,38 @@ impl Dit {
         let p =
             |i: usize| f16::from_f32(f32::from_ne_bytes(p[4 * i..4 * i + 4].try_into().unwrap()));
         let (r, s) = (p(0), p(1));
-        let fed = feed.to_bytes_ready()?;
-        ane.spent.add(&ane.spent.wait, waited);
-        let mut y = Vec::with_capacity(fed.len());
-        for tile in fed.chunks_exact(2 * DIM * TILE) {
-            let converted = Instant::now();
-            let tile = super::ane::tile_of(tile);
-            ane.spent.add(&ane.spent.convert, converted);
-            if matches!(tile, std::borrow::Cow::Owned(_)) {
-                ane.spent.copies.set(ane.spent.copies.get() + 1);
+        let offload = match &ane.offload {
+            Offload::Ane(programs) => {
+                let fed = feed.to_bytes_ready()?;
+                ane.spent.add(&ane.spent.wait, waited);
+                let mut y = Vec::with_capacity(fed.len());
+                for tile in fed.chunks_exact(2 * DIM * TILE) {
+                    let converted = Instant::now();
+                    let tile = super::ane::tile_of(tile);
+                    ane.spent.add(&ane.spent.convert, converted);
+                    if matches!(tile, std::borrow::Cow::Owned(_)) {
+                        ane.spent.copies.set(ane.spent.copies.get() + 1);
+                    }
+                    let predicted = Instant::now();
+                    let out = programs.predict(index, &tile, r, s)?;
+                    ane.spent.add(&ane.spent.predict, predicted);
+                    let converted = Instant::now();
+                    y.extend_from_slice(super::ane::as_bytes(&out));
+                    ane.spent.add(&ane.spent.convert, converted);
+                }
+                Array::from_bytes(stream, &[tiles, DIM, TILE], MlxDType::F16, &y)?
             }
-            let predicted = Instant::now();
-            let out = ane.programs.predict(index, &tile, r, s)?;
-            ane.spent.add(&ane.spent.predict, predicted);
-            let converted = Instant::now();
-            y.extend_from_slice(super::ane::as_bytes(&out));
-            ane.spent.add(&ane.spent.convert, converted);
-        }
+            Offload::Sim(sim) => {
+                ane.spent.add(&ane.spent.wait, waited);
+                let predicted = Instant::now();
+                let y = sim.call(index, &feed, r, s)?;
+                stream.eval(&[y.clone()])?;
+                ane.spent.add(&ane.spent.predict, predicted);
+                y
+            }
+        };
         ane.spent.calls.set(ane.spent.calls.get() + 1);
-        let offload = Array::from_bytes(stream, &[tiles, DIM, TILE], MlxDType::F16, &y)?
+        let offload = offload
             .transpose(&[0, 2, 1])?
             .reshape(&[1, tiles * TILE, DIM])?
             .slice_axis(1, 0, tokens)?

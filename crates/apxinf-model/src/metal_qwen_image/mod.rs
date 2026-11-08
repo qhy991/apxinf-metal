@@ -8,6 +8,8 @@
 //! family ships no weights.
 #[cfg(feature = "coreml")]
 mod ane;
+#[cfg(feature = "coreml")]
+mod ane_sim;
 mod dit;
 mod encode_cache;
 mod ops;
@@ -180,6 +182,10 @@ fn ane_share(
         eprintln!("Qwen-Image: ANE MLP split disabled: {why}; GPU-only");
         return Ok(None);
     }
+    if let Some(why) = ane_sim::refusal() {
+        eprintln!("Qwen-Image: ANE MLP split disabled: {why}; GPU-only");
+        return Ok(None);
+    }
     match ane::memory_gate() {
         Ok(facts) => eprintln!("Qwen-Image: ANE MLP split admitted by the memory gate: {facts}"),
         Err(facts) => {
@@ -187,9 +193,18 @@ fn ane_share(
             return Ok(None);
         }
     }
-    let programs = ane::Programs::install(transformer, dir, timing_enabled())?;
+    let offload = match ane_sim::requested() {
+        Some(precision) => {
+            eprintln!(
+                "Qwen-Image: ANE MLP split SIMULATED on the GPU in {precision:?} (#236 H2): \
+                 Core ML is not used, and this arm's timing is not comparable"
+            );
+            dit::Offload::Sim(ane_sim::Sim::share(transformer, precision)?)
+        }
+        None => dit::Offload::Ane(ane::Programs::install(transformer, dir, timing_enabled())?),
+    };
     Ok(Some(Rc::new(dit::AneShare {
-        programs,
+        offload,
         scales: ane::Scales::new(stream)?,
         spent: dit::AneSpent::default(),
     })))
