@@ -187,6 +187,7 @@ fn ane_share(
     Ok(Some(Rc::new(dit::AneShare {
         programs,
         scales: ane::Scales::new(stream)?,
+        spent: dit::AneSpent::default(),
     })))
 }
 
@@ -492,6 +493,18 @@ impl ImageRuntime for QwenImage {
                 loop_start.elapsed().as_secs_f64(),
                 dit::text_cache_call_count()
             );
+            #[cfg(feature = "coreml")]
+            if let Some(s) = step.ane_spent() {
+                eprintln!(
+                    "qimage-timing: ane_block wait={:.3}s convert={:.3}s predict={:.3}s                      calls={} per_call={:.2}ms",
+                    s.wait.get(),
+                    s.convert.get(),
+                    s.predict.get(),
+                    s.calls.get(),
+                    1e3 * (s.wait.get() + s.convert.get() + s.predict.get())
+                        / s.calls.get().max(1) as f64
+                );
+            }
         }
         // Release the DiT and its cached buffers before decoding, as mflux
         // --low-ram does.

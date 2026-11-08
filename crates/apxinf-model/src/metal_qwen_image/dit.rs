@@ -1,6 +1,7 @@
 //! The single-stream DiT (mflux `Qwen21Transformer`): the text prefix runs
 //! once per prompt and caches each block's post-RoPE K/V; every denoise step
 //! then runs one compiled image-token forward against that cache.
+use std::time::Instant;
 use super::ops::Ops;
 use super::weights::{Block, GateUp, Transformer, DIM, HEADS, HEAD_DIM, Q4};
 use apxinf_core::{Error, Result};
@@ -155,6 +156,27 @@ pub struct Dit {
 pub struct AneShare {
     pub programs: super::ane::Programs,
     pub scales: super::ane::Scales,
+    pub spent: AneSpent,
+}
+
+/// Where an `ane_block` call's wall time went, summed over every block and
+/// step. The three phases are disjoint and together cover the span from the
+/// GPU submission to the summed MLP, so a split that loses to GPU-only can be
+/// attributed without a second run: `wait` is the GPU share plus whatever of
+/// the feed transform has not retired, `convert` is the host f16 round trip,
+/// and `predict` is Core ML.
+#[derive(Default)]
+pub struct AneSpent {
+    pub wait: std::cell::Cell<f64>,
+    pub convert: std::cell::Cell<f64>,
+    pub predict: std::cell::Cell<f64>,
+    pub calls: std::cell::Cell<u64>,
+}
+
+impl AneSpent {
+    fn add(&self, field: &std::cell::Cell<f64>, since: std::time::Instant) {
+        field.set(field.get() + since.elapsed().as_secs_f64());
+    }
 }
 
 /// Per-block post-RoPE text K/V, `[1, 32, T, 128]` BF16 each.
@@ -185,6 +207,11 @@ impl Dit {
 
     /// Runs the fused blocks' MLP split with the Neural Engine.
     #[cfg(feature = "coreml")]
+    /// Where the ANE blocks spent their wall time, once the loop is done.
+    pub fn ane_spent(&self) -> Option<&AneSpent> {
+        self.ane.as_deref().map(|a| &a.spent)
+    }
+
     pub fn with_ane(mut self, ane: Option<Rc<AneShare>>) -> Self {
         self.ane = ane;
         self
@@ -475,21 +502,31 @@ impl Dit {
             None => b.out.apply(&gated)?,
         };
         stream.async_eval(&[gpu.clone(), x.clone()])?;
+        let waited = Instant::now();
         let p = params.to_bytes_ready()?;
         let p =
             |i: usize| f16::from_f32(f32::from_ne_bytes(p[4 * i..4 * i + 4].try_into().unwrap()));
         let (r, s) = (p(0), p(1));
         let fed = feed.to_bytes_ready()?;
+        ane.spent.add(&ane.spent.wait, waited);
         let mut y = Vec::with_capacity(fed.len());
         for tile in fed.chunks_exact(2 * DIM * TILE) {
+            let converted = Instant::now();
             let tile: Vec<f16> = tile
                 .chunks_exact(2)
                 .map(|v| f16::from_le_bytes([v[0], v[1]]))
                 .collect();
-            for v in ane.programs.predict(index, &tile, r, s)? {
+            ane.spent.add(&ane.spent.convert, converted);
+            let predicted = Instant::now();
+            let out = ane.programs.predict(index, &tile, r, s)?;
+            ane.spent.add(&ane.spent.predict, predicted);
+            let converted = Instant::now();
+            for v in out {
                 y.extend_from_slice(&v.to_le_bytes());
             }
+            ane.spent.add(&ane.spent.convert, converted);
         }
+        ane.spent.calls.set(ane.spent.calls.get() + 1);
         let offload = Array::from_bytes(stream, &[tiles, DIM, TILE], MlxDType::F16, &y)?
             .transpose(&[0, 2, 1])?
             .reshape(&[1, tiles * TILE, DIM])?
@@ -613,6 +650,17 @@ pub enum Step {
 }
 
 impl Step {
+    /// The ANE phase accounting, which exists only on the eager path. The
+    /// compiled path captures its `Dit` in a closure and never offloads, so
+    /// there is nothing to report.
+    #[cfg(feature = "coreml")]
+    pub fn ane_spent(&self) -> Option<&AneSpent> {
+        match self {
+            Self::Eager(dit) => dit.ane_spent(),
+            Self::Compiled(_) => None,
+        }
+    }
+
     pub fn prepare(dit: Dit, inputs: &[Array]) -> Result<(Self, Array)> {
         if dit.eager() {
             let first = dit.image_forward(inputs)?;
