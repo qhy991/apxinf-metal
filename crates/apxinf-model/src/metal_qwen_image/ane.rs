@@ -134,6 +134,43 @@ fn admit(avail: Option<f64>, swap: Option<f64>, min_avail: f64) -> std::result::
     }
 }
 
+/// The first character that bars `text` from the Neural Engine split, or
+/// `None` when the text is clear.
+///
+/// A007's artifact concentrates on dense, high-contrast glyph edges. In the
+/// case that failed the four-case gate, the four hottest 32x32 windows all
+/// landed on the same row of Chinese characters, and the Latin lettering in
+/// the same image stayed far below the rubric's ceiling (#236). So a prompt
+/// carrying CJK text routes to the GPU, which does not have the artifact,
+/// and the split keeps the prompts it was shown safe on.
+///
+/// The ranges are deliberately wide: admitting a prompt wrongly ships the
+/// artifact, while refusing one wrongly only costs speed.
+pub fn cjk_char(text: &str) -> Option<char> {
+    const BLOCKS: &[std::ops::RangeInclusive<u32>] = &[
+        0x1100..=0x11FF,   // Hangul Jamo
+        0x2E80..=0x2EFF,   // CJK Radicals Supplement
+        0x2F00..=0x2FDF,   // Kangxi Radicals
+        0x3000..=0x303F,   // CJK Symbols and Punctuation
+        0x3040..=0x309F,   // Hiragana
+        0x30A0..=0x30FF,   // Katakana
+        0x3100..=0x312F,   // Bopomofo
+        0x3130..=0x318F,   // Hangul Compatibility Jamo
+        0x31F0..=0x31FF,   // Katakana Phonetic Extensions
+        0x3400..=0x4DBF,   // CJK Unified Ideographs Extension A
+        0x4E00..=0x9FFF,   // CJK Unified Ideographs
+        0xA960..=0xA97F,   // Hangul Jamo Extended-A
+        0xAC00..=0xD7AF,   // Hangul Syllables
+        0xD7B0..=0xD7FF,   // Hangul Jamo Extended-B
+        0xF900..=0xFAFF,   // CJK Compatibility Ideographs
+        0xFE30..=0xFE4F,   // CJK Compatibility Forms
+        0xFF00..=0xFFEF,   // Halfwidth and Fullwidth Forms
+        0x20000..=0x2FA1F, // Extension B onwards, incl. Compatibility Supplement
+    ];
+    text.chars()
+        .find(|c| BLOCKS.iter().any(|block| block.contains(&(*c as u32))))
+}
+
 /// FP16 values of rows `rows` and columns `cols` of a Q4 group-64 weight,
 /// dequantized on the device as `mx.dequantize` does (BF16), then FP16.
 fn dense(q: &Q4, rows: (usize, usize), cols: (usize, usize)) -> Result<Vec<f16>> {
@@ -605,6 +642,58 @@ Pages purgeable:                                 174.
         let spent = cpu_seconds() - before;
         assert!(spent > 0.0, "cpu_seconds did not move across 40M multiply-adds");
         assert!(spent < 60.0, "cpu_seconds reported an implausible {spent}s");
+    }
+
+    #[test]
+    fn the_language_gate_routes_cjk_prompts_away_from_the_split() {
+        // The prompt that actually failed the four-case gate (#236).
+        let poster = "一张简洁的咖啡店海报，顶部写着“今日咖啡”，底部写着“COFFEE”。";
+        assert_eq!(cjk_char(poster), Some('一'));
+
+        // Mixed text is the case a naive "is the whole string ASCII" check
+        // gets right and a "does it start with ASCII" check gets wrong.
+        assert_eq!(cjk_char("A poster reading 今日咖啡 in the corner"), Some('今'));
+        assert_eq!(cjk_char("mostly english with one 字 in it"), Some('字'));
+
+        // Japanese and Korean carry the same dense glyph edges.
+        assert_eq!(cjk_char("ひらがな"), Some('ひ'));
+        assert_eq!(cjk_char("カタカナ"), Some('カ'));
+        assert_eq!(cjk_char("한글 포스터"), Some('한'));
+
+        // Fullwidth forms and ideographic punctuation travel with CJK text
+        // even when every letter beside them is Latin.
+        assert_eq!(cjk_char("ＣＯＦＦＥＥ"), Some('Ｃ'));
+        assert_eq!(cjk_char("a poster, 、 and nothing else"), Some('、'));
+    }
+
+    #[test]
+    fn the_language_gate_leaves_english_prompts_on_the_split() {
+        // The two cases the split passed, verbatim.
+        let composition = "A studio product photograph of exactly three ceramic cups on a \
+                           wooden table: a red cup on the left, a blue cup in the center, \
+                           and a green cup on the right. Plain cream background, soft \
+                           window light, no writing.";
+        assert_eq!(cjk_char(composition), None);
+
+        assert_eq!(cjk_char(""), None, "an empty prompt has no CJK to find");
+        assert_eq!(cjk_char("   "), None);
+
+        // Latin text with accents, curly quotes and symbols is not CJK, and
+        // refusing it would cost the English speedup for no reason.
+        assert_eq!(cjk_char("a café sign reading “COFFEE” — 100% arabica, €5"), None);
+        assert_eq!(cjk_char("emoji are not glyph-dense CJK: 🙂☕"), None);
+    }
+
+    #[test]
+    fn the_language_gate_covers_ideographs_outside_the_basic_plane() {
+        // Extension B lives above U+FFFF, so a 16-bit range check would miss
+        // it while the character still renders as a dense ideograph.
+        let ext_b = char::from_u32(0x20000).unwrap();
+        assert_eq!(cjk_char(&ext_b.to_string()), Some(ext_b));
+
+        // Just outside the blocks, and so not a reason to refuse.
+        assert_eq!(cjk_char(&char::from_u32(0x2FA20).unwrap().to_string()), None);
+        assert_eq!(cjk_char(&char::from_u32(0x10FF).unwrap().to_string()), None);
     }
 
     #[test]

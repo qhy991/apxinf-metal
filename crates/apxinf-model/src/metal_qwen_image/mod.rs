@@ -127,6 +127,7 @@ pub fn load(
         &transformer,
         &path.join("transformer"),
         fused.is_some(),
+        options.conditioning_text.as_deref(),
     )?;
     #[cfg(not(feature = "coreml"))]
     if std::env::var("APXINF_QWEN_IMAGE_ANE").is_ok_and(|v| v == "1") {
@@ -166,9 +167,31 @@ fn ane_share(
     transformer: &Transformer,
     dir: &Path,
     fused: bool,
+    conditioning_text: Option<&str>,
 ) -> Result<Option<Rc<dit::AneShare>>> {
     if !ane::requested() {
         return Ok(None);
+    }
+    match conditioning_text {
+        None => {
+            eprintln!(
+                "Qwen-Image: ANE MLP split disabled by the language gate: no conditioning text \
+                 was supplied, so this request cannot be shown to be one the split was \
+                 qualified on; GPU-only"
+            );
+            return Ok(None);
+        }
+        Some(text) => {
+            if let Some(c) = ane::cjk_char(text) {
+                eprintln!(
+                    "Qwen-Image: ANE MLP split disabled by the language gate: the prompt \
+                     contains {c:?} (U+{:04X}); the split's artifact lands on dense glyph \
+                     edges and fails the four-case quality gate on CJK text (#236); GPU-only",
+                    c as u32
+                );
+                return Ok(None);
+            }
+        }
     }
     if !fused {
         eprintln!(
