@@ -512,18 +512,13 @@ impl Dit {
         let mut y = Vec::with_capacity(fed.len());
         for tile in fed.chunks_exact(2 * DIM * TILE) {
             let converted = Instant::now();
-            let tile: Vec<f16> = tile
-                .chunks_exact(2)
-                .map(|v| f16::from_le_bytes([v[0], v[1]]))
-                .collect();
+            let tile = super::ane::tile_of(tile);
             ane.spent.add(&ane.spent.convert, converted);
             let predicted = Instant::now();
             let out = ane.programs.predict(index, &tile, r, s)?;
             ane.spent.add(&ane.spent.predict, predicted);
             let converted = Instant::now();
-            for v in out {
-                y.extend_from_slice(&v.to_le_bytes());
-            }
+            y.extend_from_slice(super::ane::as_bytes(&out));
             ane.spent.add(&ane.spent.convert, converted);
         }
         ane.spent.calls.set(ane.spent.calls.get() + 1);

@@ -358,6 +358,38 @@ impl Programs {
     }
 }
 
+/// Both reinterpretations below read the bytes in the host's order, so say so
+/// once here rather than letting a big-endian build fail somewhere downstream.
+const _: () = assert!(
+    cfg!(target_endian = "little"),
+    "the ANE tile path reinterprets MLX's little-endian f16 bytes in place"
+);
+
+/// Reinterprets MLX's f16 bytes as `f16`, which is the layout Core ML already
+/// wants. `None` when the buffer is not `f16`-aligned, which a caller answers
+/// by copying. Rebuilding the tiles element by element instead cost 11.72 s of
+/// a 91.91 s ANE denoise loop, 12.8% of it (#236, clean ABBA).
+fn as_f16(bytes: &[u8]) -> Option<&[f16]> {
+    let (head, body, tail) = unsafe { bytes.align_to::<f16>() };
+    (head.is_empty() && tail.is_empty()).then_some(body)
+}
+
+/// The same reinterpretation back to bytes, which never needs a fallback:
+/// every alignment that holds for `f16` holds for `u8`.
+pub fn as_bytes(values: &[f16]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
+}
+
+/// Borrows `bytes` as `f16` when the layout allows and copies when it does not.
+pub fn tile_of(bytes: &[u8]) -> std::borrow::Cow<'_, [f16]> {
+    match as_f16(bytes) {
+        Some(borrowed) => std::borrow::Cow::Borrowed(borrowed),
+        None => std::borrow::Cow::Owned(
+            bytes.chunks_exact(2).map(|v| f16::from_le_bytes([v[0], v[1]])).collect(),
+        ),
+    }
+}
+
 /// Per-call input scales chosen on the GPU (A007): `2^a` is the largest of
 /// `2^-8..2^8` with `top 2^a <= 8` (`2^-8` if none) and `2^b` the largest of
 /// `2^-14..2^8` with `26.4 top^2 2^b <= 1024` (`2^-14` if none), for `top` the
@@ -515,6 +547,39 @@ Pages purgeable:                                 174.
         assert_eq!(parse_available_mb("not vm_stat output"), None);
     }
 
+    #[test]
+    fn a_tile_reinterprets_without_changing_a_bit() {
+        // Bit patterns, not values: a reinterpretation promises the exact bits
+        // back, and the tile carries NaNs, which never compare equal.
+        let bits = |v: &[f16]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let values: Vec<f16> = (0..64)
+            .map(|i| f16::from_f32(i as f32 * 0.37 - 11.0))
+            .chain([f16::ZERO, f16::ONE, f16::NEG_INFINITY, f16::MAX, f16::NAN])
+            .collect();
+        let bytes = as_bytes(&values);
+        assert_eq!(bytes.len(), values.len() * 2);
+
+        let elementwise: Vec<f16> = bytes
+            .chunks_exact(2)
+            .map(|v| f16::from_le_bytes([v[0], v[1]]))
+            .collect();
+        assert_eq!(bits(&tile_of(bytes)), bits(&elementwise));
+        assert_eq!(bits(&tile_of(bytes)), bits(&values));
+        assert!(values.iter().any(|v| v.is_nan()), "the NaN case was dropped");
+
+        // An offset buffer is the case the borrow cannot serve; it must still
+        // produce the same bits rather than silently skipping a byte.
+        let shifted = &bytes[1..bytes.len() - 1];
+        let copied = tile_of(shifted);
+        assert_eq!(copied.len(), shifted.len() / 2);
+        assert_eq!(
+            bits(&copied),
+            bits(&shifted
+                .chunks_exact(2)
+                .map(|v| f16::from_le_bytes([v[0], v[1]]))
+                .collect::<Vec<_>>())
+        );
+    }
 
     #[test]
     fn cpu_seconds_tracks_real_cpu_work() {
