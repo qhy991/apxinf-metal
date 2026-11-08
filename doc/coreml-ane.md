@@ -1,6 +1,9 @@
 # Core ML and Apple Neural Engine execution (proposal)
 
-Status: design under review; no Core ML code is merged. On 2026-10-19 the
+Status: the host hand-off below is implemented for the Clef fixed-profile compositions
+(crate `apxinf-coreml`: ML Program construction, program cache, placement evidence); the
+upstream proposal is still under review, and no other family uses this path.
+On 2026-10-19 the
 fork operator accepted the fixed-profile Clef host-handoff scope
 below, conditional on completing every qualification gate. This decision does
 not approve unrelated interfaces, qualify an implementation or merge a PR.
