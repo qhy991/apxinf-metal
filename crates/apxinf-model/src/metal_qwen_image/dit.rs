@@ -171,6 +171,10 @@ pub struct AneSpent {
     pub convert: std::cell::Cell<f64>,
     pub predict: std::cell::Cell<f64>,
     pub calls: std::cell::Cell<u64>,
+    /// Tiles `tile_of` had to copy because the buffer was not f16-aligned.
+    /// Zero is the claim that the zero-copy path ran, rather than an
+    /// inference drawn from `convert` being small.
+    pub copies: std::cell::Cell<u64>,
 }
 
 impl AneSpent {
@@ -514,6 +518,9 @@ impl Dit {
             let converted = Instant::now();
             let tile = super::ane::tile_of(tile);
             ane.spent.add(&ane.spent.convert, converted);
+            if matches!(tile, std::borrow::Cow::Owned(_)) {
+                ane.spent.copies.set(ane.spent.copies.get() + 1);
+            }
             let predicted = Instant::now();
             let out = ane.programs.predict(index, &tile, r, s)?;
             ane.spent.add(&ane.spent.predict, predicted);

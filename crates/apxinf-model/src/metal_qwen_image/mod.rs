@@ -496,11 +496,13 @@ impl ImageRuntime for QwenImage {
             #[cfg(feature = "coreml")]
             if let Some(s) = step.ane_spent() {
                 eprintln!(
-                    "qimage-timing: ane_block wait={:.3}s convert={:.3}s predict={:.3}s                      calls={} per_call={:.2}ms",
+                    "qimage-timing: ane_block wait={:.3}s convert={:.3}s predict={:.3}s \
+                     calls={} copies={} per_call={:.2}ms",
                     s.wait.get(),
                     s.convert.get(),
                     s.predict.get(),
                     s.calls.get(),
+                    s.copies.get(),
                     1e3 * (s.wait.get() + s.convert.get() + s.predict.get())
                         / s.calls.get().max(1) as f64
                 );
