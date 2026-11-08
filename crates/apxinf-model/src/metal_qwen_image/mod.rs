@@ -308,7 +308,10 @@ fn qmm_bm64_install(stream: &Stream) -> Option<Rc<QmmBm64>> {
         Ok(Some(bm64))
     };
     match probe() {
-        Ok(Some(bm64)) => Some(bm64),
+        Ok(Some(bm64)) => {
+            eprintln!("Qwen-Image: BM64 qmm enabled (probe bit-identical to stock)");
+            Some(bm64)
+        }
         outcome => {
             let reason = match outcome {
                 Err(e) => e.to_string(),
