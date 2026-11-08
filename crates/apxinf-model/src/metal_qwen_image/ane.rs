@@ -105,19 +105,31 @@ fn parse_available_mb(text: &str) -> Option<f64> {
     Some(total * page / (1024.0 * 1024.0))
 }
 
-/// The start-up memory gate: `Err(reason)` when swap use or reclaimable memory
-/// says the ~3.1 GB of resident programs would push the host into paging.
+/// The start-up memory gate: `Err(reason)` when the host cannot spare the
+/// ~3.1 GB the resident programs need without paging for it.
 pub fn memory_gate() -> std::result::Result<String, String> {
-    let max_swap = env_mb("APXINF_QWEN_IMAGE_ANE_MAX_SWAP_MB", 4096) as f64;
-    let min_avail = env_mb("APXINF_QWEN_IMAGE_ANE_MIN_AVAIL_MB", 4096) as f64;
-    let (swap, avail) = (swap_used_mb(), available_mb());
+    admit(
+        available_mb(),
+        swap_used_mb(),
+        env_mb("APXINF_QWEN_IMAGE_ANE_MIN_AVAIL_MB", 4096) as f64,
+    )
+}
+
+/// Reclaimable memory decides; swap is reported but not consulted.
+///
+/// Swap use is a machine-global level that macOS shrinks lazily, so it stays
+/// high for minutes after the pressure that caused it is gone. Reading it as a
+/// capacity signal refused a run that had 5.6 GB free, because the previous
+/// run's 2.9 GB had only just been released (#236). Reclaimable pages answer
+/// the question the gate is actually asking, and answer it about now.
+fn admit(avail: Option<f64>, swap: Option<f64>, min_avail: f64) -> std::result::Result<String, String> {
     let facts = format!(
-        "swap_used={:.0}MB (max {max_swap:.0}) available={:.0}MB (min {min_avail:.0})",
-        swap.unwrap_or(f64::NAN),
-        avail.unwrap_or(f64::NAN)
+        "available={:.0}MB (min {min_avail:.0}) swap_used={:.0}MB (reported, not gated)",
+        avail.unwrap_or(f64::NAN),
+        swap.unwrap_or(f64::NAN)
     );
-    match (swap, avail) {
-        (Some(s), Some(a)) if s <= max_swap && a >= min_avail => Ok(facts),
+    match avail {
+        Some(a) if a >= min_avail => Ok(facts),
         _ => Err(facts),
     }
 }
@@ -593,6 +605,24 @@ Pages purgeable:                                 174.
         let spent = cpu_seconds() - before;
         assert!(spent > 0.0, "cpu_seconds did not move across 40M multiply-adds");
         assert!(spent < 60.0, "cpu_seconds reported an implausible {spent}s");
+    }
+
+    #[test]
+    fn the_gate_admits_on_reclaimable_memory_even_while_swap_is_still_high() {
+        // The case that refused a real run: the previous process had just
+        // released 2.9 GB, so memory was free but the swap file had not shrunk.
+        let admitted = admit(Some(5629.0), Some(9157.0), 4096.0).expect("free memory admits");
+        assert!(admitted.contains("swap_used=9157MB"), "swap stays in the log: {admitted}");
+
+        // And it still refuses when the memory genuinely is not there, however
+        // quiet the swap file looks.
+        let refused = admit(Some(1200.0), Some(0.0), 4096.0).expect_err("1.2GB cannot hold 3.1GB");
+        assert!(refused.contains("available=1200MB"), "{refused}");
+    }
+
+    #[test]
+    fn the_gate_refuses_when_it_cannot_read_the_memory() {
+        assert!(admit(None, Some(0.0), 4096.0).is_err(), "an unreadable host is not an admitted one");
     }
 
     #[test]
