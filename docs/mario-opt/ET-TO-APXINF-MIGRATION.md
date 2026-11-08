@@ -389,3 +389,22 @@ Every model process runs under the two standing Metal locks
 - The F16 conversion does not assert per-tensor finiteness (EngineTailor does
   at arm build). The 48-case gate and byte-identical repeats cover the
   behaviour on this checkpoint.
+
+## Cross-chip check: `fused_prep` on the M1 Pro
+
+The campaign above ran on the M4. The same two arms were replayed on the **M1 Pro**
+(`applegpu_g13s`) with the 48-case gate suite, one run per arm, same binary build and the
+same `APXINF_D3_CONV1D=apxinf` base:
+
+| Metric | Result |
+| --- | --- |
+| Decisions | **48/48 identical** (0 flips) |
+| max\|Δp\| | **0.032931** (bound 0.035) — worst case `b0400_readme_topic` |
+| Median latency | separate **273.4 ms** → `fused_prep` **268.0 ms** |
+| Gain | **+1.99 %** (42/48 pairs faster) |
+
+So the knob is not M4-specific: parity passes and the direction is positive on the older
+chip too. The two numbers are not directly comparable — the M4 figure is a three-round
+paired campaign on the 8-case timing set, this one is a single pass over the 48-case gate
+suite. Flipping the default would need a proper three-round reverse-order campaign on each
+chip; the knob stays opt-in until then.
