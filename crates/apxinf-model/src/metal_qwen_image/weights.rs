@@ -2,8 +2,10 @@
 //! VAE decoder and the BF16 text encoder (read one layer at a time).
 use apxinf_core::{Error, Result};
 use apxinf_mlx::{Array, MlxDType, Stream};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 pub const DIM: usize = 4096;
@@ -464,6 +466,48 @@ pub struct TextEncoderFiles {
     shards: HashMap<String, PathBuf>,
     /// Tensor name -> absolute payload byte range inside its shard file.
     spans: HashMap<String, (u64, u64)>,
+    /// Fingerprint of the shard files (path, size, mtime and SafeTensors
+    /// header bytes); the encode-output cache keys on it so a checkpoint
+    /// replacement invalidates every entry.
+    pin: [u8; 32],
+}
+
+/// Hashes each shard file's path, byte size, modification time and raw
+/// SafeTensors header. Content is not hashed (that would re-read the full
+/// 15.1 GB per model open); replacing or re-exporting the checkpoint always
+/// changes size and mtime, and header bytes pin the tensor structure.
+fn shard_pin(shards: &HashMap<String, PathBuf>) -> Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let files: BTreeSet<&PathBuf> = shards.values().collect();
+    for file in files {
+        let fail = |e: String| Error::Other(format!("read {}: {e}", file.display()));
+        let mut reader = std::fs::File::open(file).map_err(|e| fail(e.to_string()))?;
+        let mut length = [0u8; 8];
+        reader
+            .read_exact(&mut length)
+            .map_err(|e| fail(e.to_string()))?;
+        let length = u64::from_le_bytes(length);
+        if length > 1 << 26 {
+            return Err(fail("SafeTensors header exceeds 64 MiB".into()));
+        }
+        let mut raw = vec![0u8; length as usize];
+        reader
+            .read_exact(&mut raw)
+            .map_err(|e| fail(e.to_string()))?;
+        let meta = reader.metadata().map_err(|e| fail(e.to_string()))?;
+        hasher.update(file.as_os_str().as_bytes());
+        hasher.update(meta.len().to_le_bytes());
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        hasher.update(mtime.to_le_bytes());
+        hasher.update(length.to_le_bytes());
+        hasher.update(&raw);
+    }
+    Ok(hasher.finalize().into())
 }
 
 impl TextEncoderFiles {
@@ -497,7 +541,13 @@ impl TextEncoderFiles {
                 3 + 11 * TEXT_LAYERS
             )));
         }
-        Ok(Self { shards, spans })
+        let pin = shard_pin(&shards)?;
+        Ok(Self { shards, spans, pin })
+    }
+
+    /// Weight fingerprint the encode-output cache keys on.
+    pub fn pin(&self) -> &[u8; 32] {
+        &self.pin
     }
 
     /// Absolute shard ranges of one decoder layer's tensors, merged per file.
