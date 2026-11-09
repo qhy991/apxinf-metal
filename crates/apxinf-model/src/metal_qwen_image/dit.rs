@@ -247,6 +247,13 @@ impl TextCache {
     pub(crate) fn kv(&self) -> &[(Array, Array)] {
         &self.kv
     }
+
+    /// Text token count, recovered from the K layout `[1, HEADS, T, HEAD_DIM]`
+    /// on a disk-cache hit (round 30: the encode phase is skipped there, so no
+    /// prompt-states array exists to take it from).
+    pub(crate) fn text_len(&self) -> usize {
+        self.kv.first().map_or(0, |(k, _)| k.shape()[2])
+    }
 }
 
 impl Dit {

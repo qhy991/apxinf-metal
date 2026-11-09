@@ -487,32 +487,49 @@ impl ImageRuntime for QwenImage {
         let (lh, lw) = (height / SCALE, width / SCALE);
         let phase = std::time::Instant::now();
         let tokens = text::tokenize(&self.tokenizer, request.prompt)?;
-        // Disk-persistent encode-output cache (round 22): a hit replaces the
-        // whole text encode with a byte-identical load of a previous
-        // evaluation's prompt states on the same weights.
-        let prompt = match encode_cache::load(&self.text, &tokens, stream)? {
-            Some(prompt) => prompt,
-            None => {
-                let prompt = text::encode(&self.text, &tokens, ops, lh * lw)?;
-                encode_cache::store(&self.text, &tokens, &prompt)?;
-                prompt
-            }
+        // Disk-persistent DiT text-K/V cache (round 23, ported in round 30):
+        // consulted BEFORE text encode so a hit skips both the encode and the
+        // `text_cache` phase. The prompt states are dead once the per-block
+        // K/V exist — the denoise loop reads only the K/V — so bypassing
+        // encode on a hit is bit-identical by the same construction as the
+        // cache itself; `text_cache_call_count` below stays 0 on a hit.
+        let kv_hit = text_kv_cache::load(&self.text, &self.dir.join("transformer"), &tokens, stream)?;
+        // Disk-persistent encode-output cache (round 22): consulted only on a
+        // K/V miss; a hit replaces the whole text encode with a byte-identical
+        // load of a previous evaluation's prompt states on the same weights.
+        let prompt = match &kv_hit {
+            Some(_) => None,
+            None => Some(match encode_cache::load(&self.text, &tokens, stream)? {
+                Some(prompt) => prompt,
+                None => {
+                    let prompt = text::encode(&self.text, &tokens, ops, lh * lw)?;
+                    encode_cache::store(&self.text, &tokens, &prompt)?;
+                    prompt
+                }
+            }),
         };
         if timing {
             eprintln!(
-                "qimage-timing: text_encode {:.3}s raw_tokens={}",
+                "qimage-timing: text_encode {:.3}s raw_tokens={} kv_hit={}",
                 phase.elapsed().as_secs_f64(),
-                prompt.shape()[1] + tokens.drop
+                tokens.ids.len(),
+                matches!(kv_hit, Some(_))
             );
         }
-        // The text encoder layers are freed; release their cached buffers as
-        // mflux --low-ram does after deleting the encoder.
-        apxinf_mlx::clear_cache()?;
+        if prompt.is_some() {
+            // The text encoder layers are freed; release their cached buffers as
+            // mflux --low-ram does after deleting the encoder.
+            apxinf_mlx::clear_cache()?;
+        }
         let key = Array::random_key(stream, request.seed)?;
         let mut latents = Array::random_normal(&[1, lh * lw, LATENT], MlxDType::F32, &key)?
             .cast(MlxDType::BF16)?;
         let sigmas = sigmas(ops, width, height, request.steps)?;
-        let text_len = prompt.shape()[1];
+        let text_len = match (&kv_hit, &prompt) {
+            (Some(cache), None) => cache.text_len(),
+            (None, Some(prompt)) => prompt.shape()[1],
+            _ => unreachable!("a K/V hit and a fresh encode are mutually exclusive"),
+        };
         let (cos, sin) = rope(&self.rope16, &self.rope56, text_len, lh, lw);
         let split = text_len * 64;
         let table = |v: &[f32], rows: usize| Array::from_f32(stream, &[rows, 64], v);
@@ -531,14 +548,13 @@ impl ImageRuntime for QwenImage {
         let dit = dit.with_ane(self.ane.clone());
         let mut dit = dit;
         let phase = std::time::Instant::now();
-        // Disk-persistent DiT text-K/V cache (round 23): a hit replaces the
-        // whole `text_cache` phase with a byte-identical load of a previous
-        // evaluation's per-block K/V on the same checkpoints. The K/V are
-        // read-only for the denoise loop, so the hit is bit-identical by
-        // construction; `text_cache_call_count` below stays 0 on a hit.
-        let cache = match text_kv_cache::load(&self.text, &self.dir.join("transformer"), &tokens, stream)? {
+        // The K/V lookup already ran before encode: a hit is a byte-identical
+        // load of a previous evaluation's per-block K/V on the same
+        // checkpoints; a miss computes `text_cache` once and stores it.
+        let cache = match kv_hit {
             Some(cache) => cache,
             None => {
+                let prompt = prompt.expect("a K/V miss encodes the prompt states");
                 let cache = dit.text_cache(
                     &prompt,
                     &table(&cos[..split], text_len)?,
@@ -556,7 +572,6 @@ impl ImageRuntime for QwenImage {
                 dit::text_cache_call_count()
             );
         }
-        drop(prompt);
         dit.interleave_for_image(lh * lw)?;
         let (cos, sin) = (
             table(&cos[split..], lh * lw)?,

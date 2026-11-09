@@ -75,9 +75,19 @@ impl Index {
 
     pub fn touch(&mut self, key: &str) {
         let now = now_unix_ms();
+        // The timestamp has millisecond resolution, so rapid successive hits
+        // tie and the eviction tie-break (insertion order) can evict an entry
+        // that was just hit. Keep the hit order: a touch never moves an entry
+        // earlier than the newest existing mark.
+        let newest = self
+            .entries
+            .iter()
+            .map(|entry| entry.last_hit_unix_ms)
+            .max()
+            .unwrap_or(0);
         for entry in &mut self.entries {
             if entry.key == key {
-                entry.last_hit_unix_ms = now;
+                entry.last_hit_unix_ms = now.max(newest + 1);
                 return;
             }
         }
