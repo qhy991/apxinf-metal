@@ -20,8 +20,12 @@ weights once. `bf16-compiled` retains checkpoint BF16 norm weights.
 Unrecognized checkpoint tensors fail loading.
 
 The BF16 selections are `bf16-public` and `bf16-compiled`; the default
-selection is `mixed-w8` (W8 decode, BF16 prefill). Select `bf16-compiled`
-explicitly for the previous default behavior.
+selection is `mixed-w8` (W8 decode, BF16 prefill). The default decode path is
+therefore lossy: W8 quantization changes generated text relative to the BF16
+selections (consistency evidence:
+[docs/mario-opt/QWEN3-DECODE.md](../../../../docs/mario-opt/QWEN3-DECODE.md)).
+Select `--model-variant bf16-compiled` explicitly to restore the exact
+BF16 arithmetic.
 `bf16-public` computes norm statistics and weight multiplication in FP32 before
 the BF16 cast. `bf16-compiled` uses native weighted RMSNorm with BF16 activations
 and prepared BF16 weights for input, post-attention, Q, K, and final norms,
