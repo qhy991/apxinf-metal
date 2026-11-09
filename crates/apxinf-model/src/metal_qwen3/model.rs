@@ -18,7 +18,15 @@ use apxinf_mlx::{Array, Compiled, MlxBackend, MlxDType, Stream};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Instant,
 };
+
+/// `APXINF_QWEN3_DECODE_STAGES=1` splits every one-row step into host graph
+/// construction and device evaluation on stderr. Device steps are evaluated
+/// synchronously under the flag, so totals exclude async-lookahead overlap.
+fn decode_stages_enabled() -> bool {
+    std::env::var_os("APXINF_QWEN3_DECODE_STAGES").is_some_and(|value| value == "1")
+}
 
 fn err(message: impl Into<String>) -> Error {
     Error::Other(message.into())
@@ -171,6 +179,8 @@ pub struct Qwen3Model {
     prepared_lengths: HashSet<usize>,
     decode_positions: HashMap<usize, Array>,
     invalid: Option<String>,
+    stages: bool,
+    stage_seq: usize,
 }
 
 impl Qwen3Model {
@@ -241,9 +251,20 @@ impl Qwen3Model {
             prepared_lengths: HashSet::new(),
             decode_positions: HashMap::new(),
             invalid: None,
+            stages: decode_stages_enabled(),
+            stage_seq: 0,
         };
         model.prepare(1, 0)?;
         Ok(model)
+    }
+
+    fn report_stage(&mut self, path: &str, rows: usize, build_ms: f64, eval_ms: f64) {
+        self.stage_seq += 1;
+        eprintln!(
+            "{{\"kind\":\"decode_stage\",\"variant\":\"{}\",\"path\":\"{path}\",\"seq\":{},\"rows\":{rows},\"build_ms\":{build_ms:.4},\"eval_ms\":{eval_ms:.4}}}",
+            self.variant.name(),
+            self.stage_seq,
+        );
     }
 
     pub fn variant(&self) -> &'static str {
@@ -529,7 +550,9 @@ impl Qwen3Model {
             &[len],
             &tokens.iter().map(|&id| id as i32).collect::<Vec<_>>(),
         )?;
+        let build_started = self.stages.then(Instant::now);
         let (output, pending) = self.run_graph(&ids, end, emit_logits)?;
+        let build_ms = build_started.map(|t| t.elapsed().as_secs_f64() * 1000.);
         let output = output
             .map(|array| self.backend.from_array(array))
             .transpose()?;
@@ -542,7 +565,12 @@ impl Qwen3Model {
                 .iter()
                 .flat_map(|kv| [kv.keys.clone(), kv.values.clone()]),
         );
+        let eval_started = self.stages.then(Instant::now);
         self.backend.stream().eval(&required)?;
+        if let (Some(build_ms), Some(eval_started)) = (build_ms, eval_started) {
+            let eval_ms = eval_started.elapsed().as_secs_f64() * 1000.;
+            self.report_stage("sync", len, build_ms, eval_ms);
+        }
         Ok((output, pending))
     }
 
@@ -673,10 +701,31 @@ impl crate::mlx_decode::DeviceDecode for Qwen3Model {
             return Err(err("Qwen3 decode requires valid prepared capacity"));
         }
         let end = self.position + 1;
+        let build_started = self.stages.then(Instant::now);
         match self.run_graph(token, end, true) {
             Ok((Some(logits), pending)) => {
+                let build_ms = build_started.map(|t| t.elapsed().as_secs_f64() * 1000.);
                 self.kv = pending;
                 self.position = end;
+                if let Some(build_ms) = build_ms {
+                    // Stage attribution evaluates the step synchronously; the
+                    // returned arrays are unchanged and the driver's async
+                    // evaluation of the sampled token becomes a no-op.
+                    let eval_started = Instant::now();
+                    let mut required = Vec::with_capacity(self.kv.len() * 2 + 1);
+                    required.push(logits.clone());
+                    required.extend(
+                        self.kv
+                            .iter()
+                            .flat_map(|kv| [kv.keys.clone(), kv.values.clone()]),
+                    );
+                    if let Err(error) = self.backend.stream().eval(&required) {
+                        self.invalid = Some(error.to_string());
+                        return Err(error);
+                    }
+                    let eval_ms = eval_started.elapsed().as_secs_f64() * 1000.;
+                    self.report_stage("device", 1, build_ms, eval_ms);
+                }
                 Ok(logits)
             }
             Ok(_) => Err(err("missing Qwen3 decode logits")),
@@ -721,7 +770,9 @@ impl LlmTrait for Qwen3Model {
         params: &apxinf_core::TokenSamplingParams,
         prompt_end: u32,
     ) -> Result<Box<dyn crate::llm_trait::TokenSequence + 'a>> {
-        if self.variant == Variant::Bf16Compiled && crate::mlx_decode::enabled(params) {
+        if matches!(self.variant, Variant::Bf16Compiled | Variant::MixedW8)
+            && crate::mlx_decode::enabled(params)
+        {
             let first = self.backend.array(&first)?;
             Ok(Box::new(crate::mlx_decode::GreedySequence::new(
                 self, first, prompt_end,

@@ -19,7 +19,9 @@ weights once. `bf16-compiled` retains checkpoint BF16 norm weights.
 `bf16-public` and `mixed-w8` materialize FP32 norm weights.
 Unrecognized checkpoint tensors fail loading.
 
-The BF16 selections are `bf16-public` and `bf16-compiled` (default).
+The BF16 selections are `bf16-public` and `bf16-compiled`; the default
+selection is `mixed-w8` (W8 decode, BF16 prefill). Select `bf16-compiled`
+explicitly for the previous default behavior.
 `bf16-public` computes norm statistics and weight multiplication in FP32 before
 the BF16 cast. `bf16-compiled` uses native weighted RMSNorm with BF16 activations
 and prepared BF16 weights for input, post-attention, Q, K, and final norms,
@@ -45,7 +47,8 @@ including the final norm, with no inference-time weight cast or alternate copy.
 The existing tiny public/compiled trajectory assertions remain unchanged.
 Historical qualification below predates this arithmetic change.
 
-`mixed-w8` uses affine 8-bit quantization with group size 64: W8 Q/K/V/O,
+`mixed-w8` (default) uses affine 8-bit quantization with group size 64: W8
+Q/K/V/O,
 fused gate/up and down projections only
 at one input row, with BF16 projections for larger prompts; a single W8 tied
 table used for both embedding gather/dequantization and output projection;
@@ -56,7 +59,8 @@ BF16 prefill projections remain resident alongside their W8 decode copies.
 This is a decode-performance selection, not a guaranteed memory-saving mode;
 its resident weight memory can exceed BF16.
 This variant does not select the BF16 decoder-block callable: its inherited
-compilation boundary and valid-length attention remain explicit.
+compilation boundary and valid-length attention remain explicit. It shares the
+device greedy decode path (one-step async lookahead) with `bf16-compiled`.
 
 `Qwen3Model::prepare(prompt_len, max_new_tokens)` allocates a bounded KV profile
 and warms its sequence shapes before inference. Capacity rounds up to 256 tokens
@@ -114,7 +118,8 @@ apxinf generate --model /path/to/Qwen3-0.6B --device metal --dtype bf16 \
 Sampling capability is supplied by the MLX backend. Currently only greedy
 selection without penalties/logprob is implemented; Qwen's random-sampling
 generation defaults must be overridden explicitly. Unsupported options fail.
-The compiled BF16 variant uses device greedy IDs with one-step async lookahead.
+The compiled BF16 and mixed-w8 variants use device greedy IDs with one-step
+async lookahead.
 Set `APXINF_MLX_SYNC_DECODE=1` to use the synchronous generation path. Public
 `forward` remains synchronous. EOS and cancellation drain the extra step and
 restore the position of the published prefix; async failures invalidate state.
