@@ -636,6 +636,12 @@ impl Network {
                 model.warm()?;
             }
         }
+        // The load is the only writer: trim the cache directory now that Core ML
+        // has finished building its bundles, so it stays inside its limit.
+        #[cfg(feature = "coreml")]
+        if !ane.is_empty() || !neurons.is_empty() {
+            apxinf_coreml::ProgramCache::new(super::ane::cache_dir()).trim();
+        }
         Ok(Self {
             config,
             stream,
