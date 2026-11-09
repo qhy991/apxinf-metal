@@ -22,8 +22,8 @@ Branch `agent/weight-w8-path-388f52f6d7db`; probe `metal_text_probe` with
 
 | Host | `bf16-compiled` | `mixed-w8` (this leg) | Δ TPOT |
 |---|---:|---:|---:|
-| M1 Pro | 9.778 ms | **6.666 ms** | **−31.8%** |
-| M4 | 13.659 ms | **7.641 ms** | **−44.1%** |
+| M1 Pro | 9.809 ms | **6.702 ms** | **−31.7%** |
+| M4 | 15.007 ms | **8.392 ms** | **−44.1%** |
 
 - 1024-token consistency: free-running outputs match for the first 82 tokens
   (both hosts); teacher-forced replay (same prefix) gives **96.9% / 97.5%**
@@ -85,30 +85,37 @@ near tie, see the M4 table note).
 
 | Round | bf16-compiled TPOT (steady) | mixed-w8 TPOT (steady) |
 |---|---|---|
-| g1 | 9.869 / 9.767 | 6.693 / 6.636 |
-| g3 | 9.767 / 9.781 | 6.660 / 6.641 |
-| g4 | 9.944 / 9.774 | 6.782 / 6.673 |
-| **median** | **9.778 ms** | **6.666 ms** |
+| g5 | 9.866 / 9.879 | 6.722 / 6.661 |
+| g6 | 9.736 / 9.785 | 6.715 / 6.688 |
+| g7 | 9.832 / 9.732 | 6.718 / 6.671 |
+| **median** | **9.809 ms** | **6.702 ms** |
 
-TTFT medians: 45.0 ms (bf16) vs 39.8 ms (w8). Long-run check (1024-token
-parity case): 11.0 → 7.59 ms/token (−31%).
+TTFT medians: 46.9 ms (bf16) vs 41.2 ms (w8). Long-run check (1024-token
+parity case): 11.0 → 7.59 ms/token (−31%). Rows g5–g7 are the final PR
+binary; the pre-rebase probe (identical except inter-repeat cleanup) measured
+9.778 → 6.666 ms over rounds g1/g3/g4, within noise.
 
 ### M4 (Mac16,10)
 
 | Round | bf16-compiled TPOT (steady) | mixed-w8 TPOT (steady) |
 |---|---|---|
-| r1 | 13.720 / 13.460 | 7.434 / 7.615 |
-| r2 | 13.539 / 13.598 | 7.805 / 7.717 |
-| r3 | 13.782 / 13.795 | 7.588 / 7.668 |
-| **median** | **13.659 ms** | **7.641 ms** |
+| r1 | 13.717 / 13.643 | 8.360 / 8.644 |
+| r2 | 15.357 / 15.684 | 8.692 / 7.505 |
+| r3 | 15.199 / 14.814 | 8.425 / 7.927 |
+| **median** | **15.007 ms** | **8.392 ms** |
 
-TTFT medians: 38.2 ms (bf16) vs 32.4 ms (w8). Staged (serialized) decode
-medians on M4: build 0.145 → 0.234 ms, device eval 13.992 → 7.914 ms
-(−43.5%). Long-run parity case: 14.61 → 8.34 ms/token (−43%). The base M4's
-lower memory bandwidth makes the weight-byte halving worth more than on the
-M1 Pro. 32-token outputs on M4 agree for 31/32 tokens, diverging only at the
-final-token near tie (bf16 31806 vs w8 8357); the same 1024-token near-tie
-behavior quantified below. M4 bf16 ids match M1 Pro bf16 ids exactly.
+TTFT medians: 39.9 ms (bf16) vs 37.4 ms (w8). Staged (serialized) decode
+medians on M4 (final binary): build 0.147 → 0.244 ms, device eval 13.928 →
+8.137 ms (−41.6%). Long-run parity case: 14.55 → 8.27 ms/token (−43%), first
+divergence at token 82, both run to 1024. The pre-rebase probe suite on the
+same branch measured
+13.659 → 7.641 ms with the identical paired delta (−44.1%); M4 absolute
+times drift between suites more than M1 Pro's, so the paired delta is the
+stable figure. The base M4's lower memory bandwidth makes the weight-byte
+halving worth more than on the M1 Pro. 32-token outputs on M4 agree for
+31/32 tokens, diverging only at the final-token near tie (bf16 31806 vs w8
+8357); the same 1024-token near-tie behavior quantified below. M4 bf16 ids
+match M1 Pro bf16 ids exactly.
 
 ## Text consistency gate (1024 tokens)
 
