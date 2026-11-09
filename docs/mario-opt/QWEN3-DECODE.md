@@ -23,7 +23,7 @@ Branch `agent/weight-w8-path-388f52f6d7db`; probe `metal_text_probe` with
 | Host | `bf16-compiled` | `mixed-w8` (this leg) | Δ TPOT |
 |---|---:|---:|---:|
 | M1 Pro | 9.809 ms | **6.702 ms** | **−31.7%** |
-| M4 | 15.007 ms | **8.392 ms** | **−44.1%** |
+| M4 | 13.561 ms | **7.582 ms** | **−44.1%** |
 
 - 1024-token consistency: free-running outputs match for the first 82 tokens
   (both hosts); teacher-forced replay (same prefix) gives **96.9% / 97.5%**
@@ -97,25 +97,36 @@ binary; the pre-rebase probe (identical except inter-repeat cleanup) measured
 
 ### M4 (Mac16,10)
 
+Idle-machine re-take (review follow-up on #73): 4 paired rounds, alternating
+arm order, `vm_stat` Swapouts delta = 0 on every arm, no probe/build/lane
+processes on the mini (standing background is the Logitech Options+ agents,
+load ≈2.3–2.5 during the window, identical for both arms):
+
 | Round | bf16-compiled TPOT (steady) | mixed-w8 TPOT (steady) |
 |---|---|---|
-| r1 | 13.717 / 13.643 | 8.360 / 8.644 |
-| r2 | 15.357 / 15.684 | 8.692 / 7.505 |
-| r3 | 15.199 / 14.814 | 8.425 / 7.927 |
-| **median** | **15.007 ms** | **8.392 ms** |
+| t1 | 13.584 / 13.452 | 7.815 / 7.481 |
+| t2 | 13.430 / 13.647 | 7.449 / 7.728 |
+| t3 | 13.791 / 13.603 | 7.896 / 7.682 |
+| t4 | 13.538 / 13.429 | 7.453 / 7.414 |
+| **median** | **13.561 ms** | **7.582 ms** |
 
-TTFT medians: 39.9 ms (bf16) vs 37.4 ms (w8). Staged (serialized) decode
-medians on M4 (final binary): build 0.147 → 0.244 ms, device eval 13.928 →
-8.137 ms (−41.6%). Long-run parity case: 14.55 → 8.27 ms/token (−43%), first
-divergence at token 82, both run to 1024. The pre-rebase probe suite on the
-same branch measured
-13.659 → 7.641 ms with the identical paired delta (−44.1%); M4 absolute
-times drift between suites more than M1 Pro's, so the paired delta is the
-stable figure. The base M4's lower memory bandwidth makes the weight-byte
-halving worth more than on the M1 Pro. 32-token outputs on M4 agree for
-31/32 tokens, diverging only at the final-token near tie (bf16 31806 vs w8
-8357); the same 1024-token near-tie behavior quantified below. M4 bf16 ids
-match M1 Pro bf16 ids exactly.
+TTFT medians: 42.2 ms (bf16) vs 33.2 ms (w8). Two earlier suites on the same
+branch measured 13.659 → 7.641 ms and 15.007 → 8.392 ms (the latter under
+heavier background load); the paired delta is **−44.1% in all three suites**.
+
+The M4's absolute BF16 baseline is slower than the M1 Pro's (13.56 vs 9.81
+ms) even when idle — that is the machine, not contention: decode is
+weight-bandwidth-bound and the base M4 (Mac16,10) has ≈120 GB/s against the
+M1 Pro's ≈200 GB/s, putting the BF16 floor at ≈9.9 ms vs 5.95 ms. Measured
+against those floors the M4 is actually closer to its roofline (1.37×) than
+the M1 Pro (1.65×), and the weight-byte halving is worth more there. Staged
+(serialized) decode medians on M4: build 0.145 → 0.234 ms, device eval
+13.992 → 7.914 ms (−43.5%), consistent with the idle re-take TPOTs. Long-run
+parity case: 14.55 → 8.27 ms/token (−43%), first divergence at token 82, both
+run to 1024. 32-token outputs on M4 agree for 31/32 tokens, diverging only at
+the final-token near tie (bf16 31806 vs w8 8357); the same 1024-token
+near-tie behavior quantified below. M4 bf16 ids match M1 Pro bf16 ids
+exactly.
 
 ## Text consistency gate (1024 tokens)
 
