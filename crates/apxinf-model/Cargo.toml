@@ -131,3 +131,7 @@ required-features = ["mlx"]
 [[example]]
 name = "qimage_gpu_roles"
 required-features = ["mlx"]
+
+[[example]]
+name = "qwen_image_loop"
+required-features = ["mlx"]
