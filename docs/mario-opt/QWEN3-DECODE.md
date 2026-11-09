@@ -208,3 +208,38 @@ Evidence paths (M1 Pro): `devlocal/weight-w8-path/{logs,results,scripts}` —
 paired logs `probe_g*`, staged `probe_staged_*`, parity `parity_*`,
 teacher-forced `force_*`, kerneltap `tap_w8_*`. M4 evidence on the M4 host's
 worktree `~/Agent4Kernel/apxinf-wt/weight-w8-path-388f52f6d7db/devlocal/`.
+
+## Compiled mixed-W8 decoder block — measured NOT-WORTH (2026-11-10)
+
+The previous section left one candidate: the mixed-W8 decode step issues 628 kernels and 21
+command buffers per token, and the M1 Pro sits ~2.4 ms above the ≈3.1 ms W8 weight-byte floor.
+The natural next step was to compile the whole decode block (the same tool the `bf16-compiled`
+selection already uses) so one callable replaces the per-kernel sequence.
+
+**Implementation**: `decoder_block_w8` mirrors `decoder_block` but takes six
+`[packed, scales, biases]` triples (q, k, v, o, fused gate/up, down) plus the four norm weights,
+and runs the layer's `quantized_matmul` projections inside the compiled graph. It is prepared once
+per attention width by `warm_decoder_w8` (same mask-array scheme as the BF16 block) and selected
+only for `MixedW8` decode after prefill, behind `APXINF_QWEN3_W8_BLOCK` (default on in the
+experiment branch).
+
+**Measurement** (M1 Pro, `metal_text_probe`, `APXINF_METAL_TEXT_VARIANT=mixed-w8`, one binary,
+three alternating rounds, 32-token generation):
+
+| round | eager device decode (block off) | compiled W8 block (on) |
+|---|---|---|
+| 1 | 6.72 ms | 6.89 ms |
+| 2 | 6.68 ms | 6.91 ms |
+| 3 | 6.72 ms | 6.82 ms |
+
+The compiled block is **1.5–3 % slower**, consistently, with identical output text. It does what it
+was built to do — the per-token host graph build drops from ~0.47 ms to ~0.19 ms — but that saving
+does not reach the wall clock: the host build was already only 4.2 % of the token, and the
+remaining 2.4 ms lives on the **GPU-side dispatch timeline** (628 kernels / 21 command buffers),
+which compiling the graph does not remove. MLX's `Compiled` collapses host-side graph construction;
+it does not fuse `quantized_matmul` with its neighbours.
+
+**Conclusion**: the compiled-W8-block direction is closed. The remaining gap to the W8 floor has to
+be attacked with fewer GPU kernels (fused quantized GEMV + norm + activation, or a lower dispatch
+count per token), not with graph compilation. The code was not kept: it is a rejected direction and
+the repository does not carry dead paths.
