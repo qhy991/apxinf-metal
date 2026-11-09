@@ -31,9 +31,13 @@ mod native {
         let model_path = PathBuf::from(&args[0]).canonicalize()?;
         let corpus: Corpus = serde_json::from_slice(&std::fs::read(&args[1])?)?;
         let repeats = args[2].parse::<usize>()?;
+        let release_all = args[3] == "release-all";
         let retain = match args[3].as_str() {
             "release-all" => false,
             "retain-code" => true,
+            // Families without prepared-code retention or request-state release
+            // (metal_qwen3) take the plain path.
+            "none" => false,
             _ => return Err("unknown cleanup policy".into()),
         };
         if repeats == 0 || corpus.cases.is_empty() {
@@ -46,7 +50,12 @@ mod native {
             Device::Metal(0),
             &model_path,
             &LoadOptions {
-                model_name: Some("metal_minicpm5".into()),
+                // Registry override so the same probe can exercise another native
+                // Metal text family (for example `metal_qwen3`) without a rebuild.
+                model_name: Some(
+                    std::env::var("APXINF_METAL_TEXT_MODEL")
+                        .unwrap_or_else(|_| "metal_minicpm5".into()),
+                ),
                 model_variant: Some("bf16-compiled".into()),
                 text_weight_dtype: Some(DType::BF16),
                 ..Default::default()
@@ -129,7 +138,7 @@ mod native {
                     model
                         .text_mut()?
                         .release_request_state_retaining_preparation()?;
-                } else {
+                } else if release_all {
                     model.text_mut()?.release_request_state()?;
                 }
                 apxinf_mlx::clear_cache()?;
