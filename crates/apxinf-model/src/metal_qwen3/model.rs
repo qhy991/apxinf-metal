@@ -770,7 +770,9 @@ impl LlmTrait for Qwen3Model {
         params: &apxinf_core::TokenSamplingParams,
         prompt_end: u32,
     ) -> Result<Box<dyn crate::llm_trait::TokenSequence + 'a>> {
-        if self.variant == Variant::Bf16Compiled && crate::mlx_decode::enabled(params) {
+        if matches!(self.variant, Variant::Bf16Compiled | Variant::MixedW8)
+            && crate::mlx_decode::enabled(params)
+        {
             let first = self.backend.array(&first)?;
             Ok(Box::new(crate::mlx_decode::GreedySequence::new(
                 self, first, prompt_end,
