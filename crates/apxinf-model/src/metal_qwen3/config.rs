@@ -194,10 +194,12 @@ pub enum Variant {
 
 impl Variant {
     pub fn parse(value: Option<&str>) -> Result<Self> {
-        match value.unwrap_or("bf16-compiled") {
+        // Default: W8 decode projections with BF16 prefill (mixed-w8). The
+        // bf16-compiled selection remains available as an explicit opt-out.
+        match value.unwrap_or("mixed-w8") {
             "bf16-public" => Ok(Self::Bf16Public),
-            "auto" | "bf16-compiled" => Ok(Self::Bf16Compiled),
-            "mixed-w8" => Ok(Self::MixedW8),
+            "bf16-compiled" => Ok(Self::Bf16Compiled),
+            "auto" | "mixed-w8" => Ok(Self::MixedW8),
             other => Err(Error::Other(format!(
                 "unsupported Qwen3 MLX variant `{other}`; implemented: bf16-public, bf16-compiled, mixed-w8"
             ))),

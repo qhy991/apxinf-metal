@@ -66,9 +66,10 @@ mod tests {
 
     #[test]
     fn admission_needs_no_device_or_checkpoint() {
-        assert_eq!(admit(&options(None)).unwrap(), Variant::Bf16Compiled);
+        assert_eq!(admit(&options(None)).unwrap(), Variant::MixedW8);
+        assert_eq!(admit(&options(Some("auto"))).unwrap(), Variant::MixedW8);
         assert_eq!(
-            admit(&options(Some("auto"))).unwrap(),
+            admit(&options(Some("bf16-compiled"))).unwrap(),
             Variant::Bf16Compiled
         );
         assert_eq!(
