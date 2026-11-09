@@ -10,6 +10,21 @@ mod native {
     use std::io::Read;
     use std::{path::PathBuf, time::Instant};
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    extern "C" {
+        fn mach_absolute_time() -> u64;
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn mach_now() -> u64 {
+        unsafe { mach_absolute_time() }
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    fn mach_now() -> u64 {
+        0
+    }
+
     #[derive(Deserialize)]
     struct Corpus {
         cases: Vec<Case>,
@@ -25,29 +40,38 @@ mod native {
         let args = std::env::args().skip(1).collect::<Vec<_>>();
         if args.len() != 4 {
             return Err(
-                "usage: metal_text_probe CHECKPOINT CORPUS REPEATS release-all|retain-code".into(),
+                "usage: metal_text_probe CHECKPOINT CORPUS REPEATS release-all|retain-code|none"
+                    .into(),
             );
         }
         let model_path = PathBuf::from(&args[0]).canonicalize()?;
         let corpus: Corpus = serde_json::from_slice(&std::fs::read(&args[1])?)?;
         let repeats = args[2].parse::<usize>()?;
-        let retain = match args[3].as_str() {
-            "release-all" => false,
-            "retain-code" => true,
+        let (retain, skip_cleanup) = match args[3].as_str() {
+            "release-all" => (false, false),
+            "retain-code" => (true, false),
+            // Family-managed request state (e.g. native Qwen3) turns requests over
+            // itself; the probe neither releases request state nor clears the cache.
+            "none" => (false, true),
             _ => return Err("unknown cleanup policy".into()),
         };
         if repeats == 0 || corpus.cases.is_empty() {
             return Err("nonempty corpus and positive repeats required".into());
         }
         std::env::set_var("APXINF_MINICPM5_PREFILL_CHUNK", "256");
+        let model_name =
+            std::env::var("APXINF_METAL_TEXT_MODEL").unwrap_or_else(|_| "metal_minicpm5".into());
+        let model_variant = std::env::var("APXINF_METAL_TEXT_VARIANT")
+            .unwrap_or_else(|_| "bf16-compiled".into());
+        let markers = std::env::var_os("APXINF_METAL_TEXT_MARKERS").is_some();
         apxinf_mlx::set_memory_limit(10 * 1024 * 1024 * 1024)?;
         apxinf_mlx::set_cache_limit(2 * 1024 * 1024 * 1024)?;
         let mut model = AutoModel::load_model(
             Device::Metal(0),
             &model_path,
             &LoadOptions {
-                model_name: Some("metal_minicpm5".into()),
-                model_variant: Some("bf16-compiled".into()),
+                model_name: Some(model_name.clone()),
+                model_variant: Some(model_variant.clone()),
                 text_weight_dtype: Some(DType::BF16),
                 ..Default::default()
             },
@@ -84,6 +108,7 @@ mod native {
             "{}",
             json!({"kind":"metadata", "checkout_commit":String::from_utf8(source.stdout)?.trim(),
         "checkout_dirty":!dirty.stdout.is_empty(), "executable_sha256":format!("{:x}", checksum.finalize()), "model_path":model_path, "cleanup_policy":args[3],
+        "model_name":model_name, "model_variant":model_variant,
         "mlx_library":apxinf_mlx::loaded_library_path()?, "allocator_cache_limit_bytes":2147483648u64,
         "memory_limit_bytes":10737418240u64,"prefill_chunk_tokens":256})
         );
@@ -108,6 +133,12 @@ mod native {
                 }
                 let mut generation = GenerationOptions::greedy(case.max_tokens, None);
                 generation.eos_token_ids = Some(eos.clone());
+                if markers {
+                    println!(
+                        "{}",
+                        json!({"kind":"phase","name":"case_start","id":case.id,"repeat":repeat,"mach":mach_now()})
+                    );
+                }
                 let started = Instant::now();
                 let result = model.text_mut()?.generate_streaming_controlled_dyn(
                     GenerationRequest {
@@ -117,6 +148,12 @@ mod native {
                     &mut |_| Ok(true),
                 )?;
                 let generation_ms = started.elapsed().as_secs_f64() * 1000.;
+                if markers {
+                    println!(
+                        "{}",
+                        json!({"kind":"phase","name":"case_end","id":case.id,"repeat":repeat,"mach":mach_now()})
+                    );
+                }
                 let output = result.token_ids();
                 let visible = output
                     .iter()
@@ -125,16 +162,18 @@ mod native {
                     .collect::<Vec<_>>();
                 let content = tokenizer.decode_with_options(&visible, false)?;
                 let cleanup_started = Instant::now();
-                if retain {
-                    model
-                        .text_mut()?
-                        .release_request_state_retaining_preparation()?;
-                } else {
-                    model.text_mut()?.release_request_state()?;
+                if !skip_cleanup {
+                    if retain {
+                        model
+                            .text_mut()?
+                            .release_request_state_retaining_preparation()?;
+                    } else {
+                        model.text_mut()?.release_request_state()?;
+                    }
+                    apxinf_mlx::clear_cache()?;
                 }
-                apxinf_mlx::clear_cache()?;
                 let mut memory = apxinf_mlx::memory_stats()?;
-                if retain && memory.active_bytes + memory.cache_bytes > 9 * 1024 * 1024 * 1024 {
+                if !skip_cleanup && retain && memory.active_bytes + memory.cache_bytes > 9 * 1024 * 1024 * 1024 {
                     model.text_mut()?.release_request_state()?;
                     apxinf_mlx::clear_cache()?;
                     memory = apxinf_mlx::memory_stats()?;
