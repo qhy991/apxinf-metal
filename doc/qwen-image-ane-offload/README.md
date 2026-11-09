@@ -45,9 +45,9 @@ before any attention work, so unlike Phase A it had real overlap available.
 | `attn_predict`, the head program | 0 | 13.60 | 24.48 | 149.58 |
 | `convert` | 0.67 | 0.66 | 0.62 | 0.43 |
 | **accounted per call** | **90.29** | **100.56** | **109.11** | **436.18** |
-| per-step median, ms | 3029.9 | 3367.6 | 3644.1 | 14163.4 |
-| **vs control, per-step median** | — | **+11.1%** | **+20.3%** | **+367%** |
-| step spread | 1.07% | 12.22% | 6.57% | 22.71% |
+| per-step median, ms | 3031.9 | 3368.5 | 3662.6 | 14351.2 |
+| **vs control, per-step median** | — | **+11.1%** | **+20.8%** | **+373%** |
+| step spread | 1.00% | 12.19% | 6.03% | 21.10% |
 | resident programs | 2.94 GiB | 3.44 | 3.94 | 4.94 |
 | swapouts during the run | 50 740 | 80 224 | 295 454 | 3 179 813 |
 
@@ -55,7 +55,8 @@ The per-step median is the headline rather than end-to-end wall time. On the
 h=8 arm `text_cache` took 8.60 s against the control's 1.38 s and `vae_decode`
 5.68 s against 1.88 s, both outside the split and both memory-pressure
 artifacts of a run that moved 859 MB to swap. Block accounting and step median
-agree to within 0.6 percentage points at every head count, which is what says
+agree to within 0.3 percentage points at h=4 and h=8 (+11.37% against
++11.1%, +20.84% against +20.8%), which is what says
 the regression lives in the DiT block rather than around it.
 
 ### Mechanism 1: the per-head trade is about 3 to 1 against
