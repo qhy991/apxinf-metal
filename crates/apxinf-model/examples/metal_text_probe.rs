@@ -97,6 +97,24 @@ mod native {
         "memory_limit_bytes":10737418240u64,"prefill_chunk_tokens":256})
         );
         let options = serde_json::Map::from_iter([("enable_thinking".into(), Value::Bool(false))]);
+        // Teacher-forced parity mode: replay fixed token ids through prefill +
+        // one-row forwards, reporting each step's argmax, its probability and
+        // the forced token's probability. One deterministic pass per case.
+        let force_ids = std::env::var_os("APXINF_METAL_TEXT_FORCE_TOKENS")
+            .map(|path| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+                let value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+                value["token_ids"]
+                    .as_array()
+                    .ok_or("force file needs a token_ids array")?
+                    .iter()
+                    .map(|item| {
+                        item.as_u64()
+                            .map(|id| id as u32)
+                            .ok_or("force token_ids must be unsigned integers".into())
+                    })
+                    .collect()
+            })
+            .transpose()?;
         for repeat in 0..repeats {
             for case in &corpus.cases {
                 if case.id.is_empty() || case.max_tokens == 0 {
@@ -114,6 +132,48 @@ mod native {
                         case.id
                     )
                     .into());
+                }
+                if let Some(force) = &force_ids {
+                    if repeat > 0 {
+                        continue;
+                    }
+                    let lm = model.text_mut()?;
+                    lm.reset();
+                    lm.prewarm_decode(ids.len(), force.len());
+                    let mut logits = lm.prefill(LlmInput::text(&ids))?;
+                    let mut agree = 0usize;
+                    for (step, &forced) in force.iter().enumerate() {
+                        let values = lm.backend().to_cpu(&logits)?.to_f32_vec()?;
+                        let mut argmax = 0usize;
+                        let mut top = f32::NEG_INFINITY;
+                        for (index, &value) in values.iter().enumerate() {
+                            if value > top {
+                                top = value;
+                                argmax = index;
+                            }
+                        }
+                        let sum: f64 = values
+                            .iter()
+                            .map(|&value| ((value - top) as f64).exp())
+                            .sum();
+                        let p_max = 1.0 / sum;
+                        let p_forced = ((values[forced as usize] - top) as f64).exp() / sum;
+                        agree += (argmax as u32 == forced) as usize;
+                        println!(
+                            "{}",
+                            json!({"kind":"force_step","id":case.id,"step":step,
+                                "forced":forced,"argmax":argmax as u32,
+                                "p_forced":p_forced,"p_max":p_max})
+                        );
+                        if step + 1 < force.len() {
+                            logits = lm.forward(&[forced], (ids.len() + step) as u32)?;
+                        }
+                    }
+                    println!(
+                        "{}",
+                        json!({"kind":"force_case","id":case.id,"steps":force.len(),"agree":agree})
+                    );
+                    continue;
                 }
                 let mut generation = GenerationOptions::greedy(case.max_tokens, None);
                 generation.eos_token_ids = Some(eos.clone());
