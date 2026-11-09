@@ -309,10 +309,27 @@ fn dir_size(path: &Path) -> u64 {
 /// bundle cache as a last resort (it is regenerated on the next load, so this
 /// only costs one cold start). A `limit` of zero disables eviction.
 fn prune_to_limit(dir: &Path, limit: u64) {
-    if limit == 0 || !dir.is_dir() {
+    if limit == 0 {
         return;
     }
-    let mut total = dir_size(dir);
+    // Core ML keeps its ANE bundle cache under `~/Library/Caches/<process>/`,
+    // not inside our own cache directory, and that is usually the bulk of the
+    // space. Account for it here and let the last-resort step remove it.
+    let mut bundles: Vec<PathBuf> = vec![dir.join("com.apple.e5rt.e5bundlecache")];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(name) = exe.file_name() {
+            if let Some(home) = std::env::var_os("HOME") {
+                bundles.push(
+                    PathBuf::from(home)
+                        .join("Library/Caches")
+                        .join(name)
+                        .join("com.apple.e5rt.e5bundlecache"),
+                );
+            }
+        }
+    }
+    bundles.retain(|path| path.is_dir());
+    let mut total = dir_size(dir) + bundles.iter().map(|path| dir_size(path)).sum::<u64>();
     if total <= limit {
         return;
     }
@@ -337,9 +354,14 @@ fn prune_to_limit(dir: &Path, limit: u64) {
             total = total.saturating_sub(size);
         }
     }
-    let bundle = dir.join("com.apple.e5rt.e5bundlecache");
-    if total > limit && bundle.is_dir() {
-        let _ = std::fs::remove_dir_all(&bundle);
+    for bundle in bundles {
+        if total <= limit {
+            return;
+        }
+        let size = dir_size(&bundle);
+        if std::fs::remove_dir_all(&bundle).is_ok() {
+            total = total.saturating_sub(size);
+        }
     }
 }
 
@@ -359,6 +381,13 @@ impl ProgramCache {
         // ever seen, and the ANE bundle cache inside it is the bulk.
         prune_to_limit(&dir, cache_limit());
         Self { dir, sealed: false }
+    }
+
+    /// Trims the cache directory to `APXINF_COREML_CACHE_LIMIT` now. Callers
+    /// that finish a bulk load (which is when Core ML writes its E5 bundles)
+    /// call this once the last program is in place.
+    pub fn trim(&self) {
+        prune_to_limit(&self.dir, cache_limit());
     }
 
     pub fn seal(&mut self) {
