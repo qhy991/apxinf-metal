@@ -363,6 +363,10 @@ impl ProgramCache {
 
     pub fn seal(&mut self) {
         self.sealed = true;
+        // Loading runs the compile/write path and lets Core ML build its E5
+        // bundle cache, so the directory can exceed the limit again after the
+        // start-up prune. Trim once more now that nothing else will be written.
+        prune_to_limit(&self.dir, cache_limit());
     }
 
     /// The compiled directory for `package`, compiling it on a miss. The key
