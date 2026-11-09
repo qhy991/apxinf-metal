@@ -288,6 +288,17 @@ impl ProgramBuilder {
         self.constant(op, param, value, data_type::INT32, shape)
     }
 
+    fn boolean(&mut self, op: &str, param: &str, value: bool) -> Var {
+        let value = immediate(
+            data_type::BOOL,
+            &[],
+            tensor_value::Value::Bools(proto::RepeatedBools {
+                values: vec![value],
+            }),
+        );
+        self.constant(op, param, value, data_type::BOOL, &[])
+    }
+
     fn blob_value(
         &mut self,
         dtype: i32,
@@ -627,20 +638,30 @@ impl ProgramBuilder {
 
     /// `reduce_max` over `axes` (non-negative).
     pub fn reduce_max(&mut self, x: &Var, axes: &[i32], keep_dims: bool) -> Result<Var> {
+        self.reduce("reduce_max", x, axes, keep_dims)
+    }
+
+    fn reduce(
+        &mut self,
+        kind: &'static str,
+        x: &Var,
+        axes: &[i32],
+        keep_dims: bool,
+    ) -> Result<Var> {
         self.require_value(x)?;
         if axes
             .iter()
             .any(|&a| usize::try_from(a).map_or(true, |a| a >= x.shape.len()))
         {
-            return Err(contract("reduce_max axes must index the input"));
+            return Err(contract("reduce axes must index the input"));
         }
-        let name = self.op_name("reduce_max", None);
+        let name = self.op_name(kind, None);
         self.reserve_symbols(&[
             name.clone(),
             format!("{name}_axes_0"),
             format!("{name}_keep_dims_0"),
         ])?;
-        self.commit_op_name("reduce_max", None, &name);
+        self.commit_op_name(kind, None, &name);
         let axes_var = self.ints(&name, "axes", axes, false);
         let keep = immediate(
             data_type::BOOL,
@@ -672,7 +693,241 @@ impl ProgramBuilder {
             .into_iter()
             .map(|(k, v)| (k.to_owned(), by_name(v)))
             .collect();
-        self.push("reduce_max", &name, inputs, std::slice::from_ref(&out));
+        self.push(kind, &name, inputs, std::slice::from_ref(&out));
+        Ok(out)
+    }
+
+    /// `matmul(x, y)` with both operands activations, equal rank of at least
+    /// two and matching batch dimensions. `transpose_y` contracts `y`'s last
+    /// axis instead of its second-to-last, which is what `QK^T` wants.
+    pub fn matmul(&mut self, x: &Var, y: &Var, transpose_y: bool) -> Result<Var> {
+        self.require_value(x)?;
+        self.require_value(y)?;
+        if x.shape.len() < 2 || x.shape.len() != y.shape.len() {
+            return Err(contract("matmul operands must share a rank of at least 2"));
+        }
+        let (rows, inner) = (x.shape[x.shape.len() - 2], x.shape[x.shape.len() - 1]);
+        let (k, cols) = match transpose_y {
+            true => (y.shape[y.shape.len() - 1], y.shape[y.shape.len() - 2]),
+            false => (y.shape[y.shape.len() - 2], y.shape[y.shape.len() - 1]),
+        };
+        if inner != k || x.shape[..x.shape.len() - 2] != y.shape[..y.shape.len() - 2] {
+            return Err(contract("matmul shapes must contract and share batches"));
+        }
+        let name = self.op_name("matmul", None);
+        self.reserve_symbols(&[
+            name.clone(),
+            format!("{name}_transpose_x_0"),
+            format!("{name}_transpose_y_0"),
+        ])?;
+        self.commit_op_name("matmul", None, &name);
+        let tx = self.boolean(&name, "transpose_x", false);
+        let ty = self.boolean(&name, "transpose_y", transpose_y);
+        let shape = x.shape[..x.shape.len() - 2]
+            .iter()
+            .copied()
+            .chain([rows, cols])
+            .collect();
+        let out = Var {
+            builder: self.id,
+            name: name.clone(),
+            dtype: data_type::FLOAT16,
+            shape,
+        };
+        let inputs = [
+            ("x", x),
+            ("y", y),
+            ("transpose_x", &tx),
+            ("transpose_y", &ty),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), by_name(v)))
+        .collect();
+        self.push("matmul", &name, inputs, std::slice::from_ref(&out));
+        Ok(out)
+    }
+
+    /// `softmax` over one non-negative `axis`, shape-preserving.
+    pub fn softmax(&mut self, x: &Var, axis: usize) -> Result<Var> {
+        self.require_value(x)?;
+        if axis >= x.shape.len() {
+            return Err(contract("softmax axis must index the input"));
+        }
+        let axis =
+            i32::try_from(axis).map_err(|_| contract("ML Program softmax axis exceeds int32"))?;
+        let name = self.op_name("softmax", None);
+        self.reserve_symbols(&[name.clone(), format!("{name}_axis_0")])?;
+        self.commit_op_name("softmax", None, &name);
+        let axis = self.ints(&name, "axis", &[axis], true);
+        let out = Var {
+            builder: self.id,
+            name: name.clone(),
+            ..x.clone()
+        };
+        let inputs = [("x", x), ("axis", &axis)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push("softmax", &name, inputs, std::slice::from_ref(&out));
+        Ok(out)
+    }
+
+    /// `reshape` to `shape`, which must hold the same number of elements.
+    pub fn reshape(&mut self, x: &Var, shape: &[usize]) -> Result<Var> {
+        self.require_value(x)?;
+        if shape_elements(shape)? != shape_elements(&x.shape)? {
+            return Err(contract("reshape must preserve the element count"));
+        }
+        let dims: Vec<i32> = shape
+            .iter()
+            .map(|&d| i32::try_from(d).map_err(|_| contract("reshape dim exceeds int32")))
+            .collect::<Result<_>>()?;
+        let name = self.op_name("reshape", None);
+        self.reserve_symbols(&[name.clone(), format!("{name}_shape_0")])?;
+        self.commit_op_name("reshape", None, &name);
+        let shape_var = self.ints(&name, "shape", &dims, false);
+        let out = Var {
+            builder: self.id,
+            name: name.clone(),
+            dtype: x.dtype,
+            shape: shape.to_vec(),
+        };
+        let inputs = [("x", x), ("shape", &shape_var)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push("reshape", &name, inputs, std::slice::from_ref(&out));
+        Ok(out)
+    }
+
+    /// `transpose` by `perm`, a permutation of the input's non-negative axes.
+    pub fn transpose(&mut self, x: &Var, perm: &[usize]) -> Result<Var> {
+        self.require_value(x)?;
+        let mut seen: Vec<usize> = perm.to_vec();
+        seen.sort_unstable();
+        if perm.len() != x.shape.len() || seen != (0..x.shape.len()).collect::<Vec<_>>() {
+            return Err(contract("transpose perm must permute the input's axes"));
+        }
+        let axes: Vec<i32> = perm
+            .iter()
+            .map(|&a| i32::try_from(a).map_err(|_| contract("transpose axis exceeds int32")))
+            .collect::<Result<_>>()?;
+        let name = self.op_name("transpose", None);
+        self.reserve_symbols(&[name.clone(), format!("{name}_perm_0")])?;
+        self.commit_op_name("transpose", None, &name);
+        let perm_var = self.ints(&name, "perm", &axes, false);
+        let out = Var {
+            builder: self.id,
+            name: name.clone(),
+            dtype: x.dtype,
+            shape: perm.iter().map(|&a| x.shape[a]).collect(),
+        };
+        let inputs = [("x", x), ("perm", &perm_var)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push("transpose", &name, inputs, std::slice::from_ref(&out));
+        Ok(out)
+    }
+
+    /// `reduce_mean` over `axes` (non-negative), the mean RMSNorm needs.
+    pub fn reduce_mean(&mut self, x: &Var, axes: &[i32], keep_dims: bool) -> Result<Var> {
+        self.reduce("reduce_mean", x, axes, keep_dims)
+    }
+
+    /// `rsqrt` of `x + epsilon`. MIL requires the epsilon parameter, and this
+    /// builder emits FP16 programs throughout, so it is written in the
+    /// program's own dtype rather than MIL's nominal FP32.
+    pub fn rsqrt(&mut self, x: &Var, epsilon: f16) -> Result<Var> {
+        self.require_value(x)?;
+        let name = self.op_name("rsqrt", None);
+        self.reserve_symbols(&[name.clone(), format!("{name}_epsilon_0")])?;
+        self.commit_op_name("rsqrt", None, &name);
+        let eps = immediate(
+            data_type::FLOAT16,
+            &[],
+            tensor_value::Value::Bytes(proto::RepeatedBytes {
+                values: epsilon.to_le_bytes().to_vec(),
+            }),
+        );
+        let eps = self.constant(&name, "epsilon", eps, data_type::FLOAT16, &[]);
+        let out = Var {
+            builder: self.id,
+            name: name.clone(),
+            ..x.clone()
+        };
+        let inputs = [("x", x), ("epsilon", &eps)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push("rsqrt", &name, inputs, std::slice::from_ref(&out));
+        Ok(out)
+    }
+
+    /// `concat` of `parts` along a non-negative `axis`. Every part must agree
+    /// on rank, dtype and every other axis, which is what makes the result's
+    /// shape the sum along `axis` alone.
+    pub fn concat(&mut self, parts: &[&Var], axis: usize) -> Result<Var> {
+        let Some((first, rest)) = parts.split_first() else {
+            return Err(contract("concat needs at least one input"));
+        };
+        self.require_value(first)?;
+        if axis >= first.shape.len() {
+            return Err(contract("concat axis must index the inputs"));
+        }
+        let mut width = first.shape[axis];
+        for part in rest {
+            self.require_value(part)?;
+            let agrees = part.dtype == first.dtype
+                && part.shape.len() == first.shape.len()
+                && part
+                    .shape
+                    .iter()
+                    .zip(&first.shape)
+                    .enumerate()
+                    .all(|(i, (a, b))| i == axis || a == b);
+            if !agrees {
+                return Err(contract("concat inputs must agree off the concatenated axis"));
+            }
+            width = width
+                .checked_add(part.shape[axis])
+                .ok_or_else(|| contract("concat width overflows usize"))?;
+        }
+        let axis_i32 =
+            i32::try_from(axis).map_err(|_| contract("ML Program concat axis exceeds int32"))?;
+        let name = self.op_name("concat", None);
+        self.reserve_symbols(&[
+            name.clone(),
+            format!("{name}_axis_0"),
+            format!("{name}_interleave_0"),
+        ])?;
+        self.commit_op_name("concat", None, &name);
+        let axis_var = self.ints(&name, "axis", &[axis_i32], true);
+        let interleave = self.boolean(&name, "interleave", false);
+        let mut shape = first.shape.clone();
+        shape[axis] = width;
+        shape_elements(&shape)?;
+        let out = Var {
+            builder: self.id,
+            name: name.clone(),
+            dtype: first.dtype,
+            shape,
+        };
+        let values = proto::Argument {
+            arguments: parts
+                .iter()
+                .map(|v| proto::Binding {
+                    binding: Some(binding::Binding::Name(v.name.clone())),
+                })
+                .collect(),
+        };
+        let inputs = [
+            ("values".to_owned(), values),
+            ("axis".to_owned(), by_name(&axis_var)),
+            ("interleave".to_owned(), by_name(&interleave)),
+        ]
+        .into();
+        self.push("concat", &name, inputs, std::slice::from_ref(&out));
         Ok(out)
     }
 
