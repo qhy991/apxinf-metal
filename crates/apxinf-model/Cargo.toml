@@ -127,3 +127,7 @@ required-features = ["mlx"]
 [[example]]
 name = "metal_text_probe"
 required-features = ["mlx"]
+
+[[example]]
+name = "qimage_gpu_roles"
+required-features = ["mlx"]

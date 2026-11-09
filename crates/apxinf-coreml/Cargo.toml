@@ -13,5 +13,11 @@ half = "2"
 prost = "0.14"
 sha2 = "0.10"
 tempfile = "3"
+[dev-dependencies]
+libc = "0.2"
 [build-dependencies]
 cc = "1"
+
+[[example]]
+name = "sdpa_probe"
+required-features = ["native"]

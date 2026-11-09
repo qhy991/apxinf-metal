@@ -171,6 +171,35 @@ and keeps the GPU, so a typo for "off" never reads as "on".
   so it stays high for minutes after the pressure that caused it is gone and
   would refuse runs that have the memory free.
 
+### Why attention is not on the Neural Engine
+
+The MLP columns are the only share worth moving, and that is a measured
+result rather than an untried direction. Two ways of also moving attention
+were implemented and refused on an M4:
+
+- `to_out` columns of 8 of 32 heads: **+8.6%**. Its feed is the GPU's own
+  attention output, by which time the GPU has nothing left to overlap, so it
+  is transport-bound.
+- whole heads, q/k/v and RMSNorm and RoPE and the text prefix and the masked
+  softmax and that head's `to_out` rows: **+11.1%** at its best point. Its
+  feed is the modulated norm, so the overlap is real, and it still loses. A
+  head costs the Neural Engine about 3.46 ms and gives the GPU back about
+  1.1 ms, flat across 4, 8 and 16 heads.
+
+Two measured mechanisms explain it, and neither is visible in a probe of the
+program on its own. A second Core ML program in the same block drops to 55%
+of its standalone rate, and the MLP program beside it slows 11.3% although
+nothing touched it, because the two crowd each other for weight bandwidth.
+And each `predict` is a blocking host call, so once the host's serial Neural
+Engine time exceeds the GPU's remaining queue, taking further work off the
+GPU takes it off something that was already idle.
+
+The rule those mechanisms turn into, for judging the next offload proposal
+before implementing it, is in
+[`doc/qwen-image-ane-offload/`](../../../../doc/qwen-image-ane-offload/).
+Neither implementation is in this tree: both are routine rejects, and their
+exact diffs and measurements live in the run archive that document points to.
+
 Each refusal names itself on stderr and falls back to GPU-only, so a request
 that did not take the split says why. A host without the memory therefore
 degrades to GPU-only on its own rather than failing, and
