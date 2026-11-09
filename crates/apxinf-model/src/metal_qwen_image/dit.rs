@@ -233,6 +233,29 @@ pub struct TextCache {
     kv: Vec<(Array, Array)>,
 }
 
+impl TextCache {
+    /// Rebuilds a cache from arrays loaded off disk (round 23 text-K/V cache
+    /// hit path). The bytes are a previous evaluation's own tensors, and the
+    /// denoise loop only ever reads the K/V (concatenating them per step), so
+    /// a hit is bit-identical to a fresh `Dit::text_cache` computation.
+    pub(crate) fn from_kv(kv: Vec<(Array, Array)>) -> Self {
+        Self { kv }
+    }
+
+    /// The per-block post-RoPE text K/V; read-only for the denoise loop and
+    /// the round 23 disk cache's store path.
+    pub(crate) fn kv(&self) -> &[(Array, Array)] {
+        &self.kv
+    }
+
+    /// Text token count, recovered from the K layout `[1, HEADS, T, HEAD_DIM]`
+    /// on a disk-cache hit (round 30: the encode phase is skipped there, so no
+    /// prompt-states array exists to take it from).
+    pub(crate) fn text_len(&self) -> usize {
+        self.kv.first().map_or(0, |(k, _)| k.shape()[2])
+    }
+}
+
 impl Dit {
     pub fn new(
         w: Transformer,

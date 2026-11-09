@@ -29,6 +29,7 @@
 //! invalidates every entry. An in-place rewrite that keeps size, mtime and
 //! headers byte-identical is outside this local cache's threat model; delete
 //! the cache directory when swapping checkpoints underneath it.
+use super::disk_cache::{hex, now_unix_ms, short_key, Entry, Index};
 use super::text::PromptTokens;
 use super::weights::{TextEncoderFiles, DIM};
 use apxinf_core::Result;
@@ -83,13 +84,6 @@ fn config_from_env() -> Option<Config> {
     })
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn short_key(key: &str) -> &str {
-    key.get(..16).unwrap_or(key)
-}
 
 /// Cache identity of one prompt encoding: the truncated template ids, the
 /// text length they imply, and the text-encoder weight pin.
@@ -366,92 +360,7 @@ fn read_entry(
     )?)
 }
 
-fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Index {
-    entries: Vec<Entry>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct Entry {
-    key: String,
-    file: String,
-    bytes: u64,
-    created_unix_ms: u64,
-    last_hit_unix_ms: u64,
-}
-
-impl Index {
-    fn read(dir: &Path) -> Result<Self> {
-        let path = dir.join("index.json");
-        let Ok(raw) = std::fs::read(&path) else {
-            return Ok(Index { entries: vec![] });
-        };
-        match serde_json::from_slice(&raw) {
-            Ok(index) => Ok(index),
-            Err(_) => {
-                // A corrupt index loses LRU order only; quarantine it and
-                // start empty. Entries whose files still exist are
-                // rediscoverable only through a fresh store, which is the
-                // safe direction.
-                let _ = std::fs::rename(&path, dir.join("index.json.bad"));
-                Ok(Index { entries: vec![] })
-            }
-        }
-    }
-
-    fn write(&self, dir: &Path) -> Result<()> {
-        std::fs::create_dir_all(dir)?;
-        let tmp = dir.join(format!(".index.json.tmp{}", std::process::id()));
-        let bytes = serde_json::to_vec(self)
-            .map_err(|error| apxinf_core::Error::Other(format!("serialize cache index: {error}")))?;
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, dir.join("index.json"))?;
-        Ok(())
-    }
-
-    fn upsert(&mut self, entry: Entry) {
-        self.entries
-            .retain(|existing| existing.key != entry.key && existing.file != entry.file);
-        self.entries.push(entry);
-    }
-
-    fn touch(&mut self, key: &str) {
-        let now = now_unix_ms();
-        for entry in &mut self.entries {
-            if entry.key == key {
-                entry.last_hit_unix_ms = now;
-                return;
-            }
-        }
-    }
-
-    fn remove(&mut self, key: &str) {
-        self.entries.retain(|entry| entry.key != key);
-    }
-
-    /// Drops least-recently-hit entries until the total is within `max`.
-    /// Ties on the hit timestamp fall back to insertion order (stable sort),
-    /// so equal timestamps evict the earliest inserted entry first.
-    fn evict(&mut self, dir: &Path, max: u64) {
-        loop {
-            let total: u64 = self.entries.iter().map(|entry| entry.bytes).sum();
-            if total <= max || self.entries.is_empty() {
-                return;
-            }
-            self.entries
-                .sort_by_key(|entry| entry.last_hit_unix_ms);
-            let victim = self.entries.remove(0);
-            let _ = std::fs::remove_file(dir.join(&victim.file));
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
