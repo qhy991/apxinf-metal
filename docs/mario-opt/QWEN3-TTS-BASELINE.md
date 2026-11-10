@@ -38,3 +38,27 @@ sustains is ~34 ms, so roughly half the per-frame cost is elsewhere — most lik
 code-predictor steps, which are small sequential forwards and therefore the launch-bound shape the
 fusion rules in `doc/optimization-transfer-rules.md` describe. That is the next thing to measure, not
 a kernel to write yet.
+
+## Per-frame breakdown (M1 Pro, `APXINF_TTS_STAGES=1`)
+
+39 frames, 2.79 s wall, RTF 0.894:
+
+| stage | median per frame | total | share |
+|---|---:|---:|---:|
+| talker graph build | 0.89 ms | 0.03 s | 1 % |
+| talker forward + sampling sync | 23.35 ms | 1.01 s | 36 % |
+| **code predictor (15 groups)** | **36.99 ms** | **1.47 s** | **53 %** |
+| frame total | 61.24 ms | 2.51 s | — |
+
+The talker's own number is misleading in isolation — MLX is lazy, so its 3.4 GB pass is materialized by
+the `token.eval()` inside the sampling step, which is why that row carries 23 ms. **The code predictor
+is the largest cost**, and it is 15 strictly sequential small forwards per frame.
+
+Deeper instrumentation of the 15 groups shows the host is not the problem: each `predictor` call costs
+**0.16 ms of graph construction** and each sample **0.01 ms**, yet the frame's single `stream.eval`
+takes ~37 ms. So the predictor's cost is **device execution of 15 tiny dependent forwards**, i.e. the
+launch-bound shape this repository's rules describe — not a host or Python overhead problem.
+
+Next: measure one group's isolated GPU time (evaluate after each step instead of once per frame) to
+separate per-step dispatch from per-step work, then decide whether fusing the predictor's
+norm/add chain is worth a kernel. No kernel is proposed before that measurement.
