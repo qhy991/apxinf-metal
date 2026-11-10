@@ -163,9 +163,33 @@ of 32 or 256. Whichever of those a family ships, it cannot be handed to the Neur
 Engine in its published form. The composition's per-row int8 is the re-encoding that
 avoids this constraint, not a free choice, and a port must keep that property.
 
+An encoding that stays on the Neural Engine does keep its compression in resident
+memory. Host wired delta across load and three predictions, seven fresh processes
+per encoding, median, same M4 cell under the host's Metal lock:
+
+| encoding | package | wired | wired vs FP16 | relative RMSE |
+| --- | ---: | ---: | ---: | ---: |
+| FP16 | 25.2 MB | 35.9 MB | 1.00x | 4.98e-04 |
+| int8 per-channel | 12.6 MB | 23.5 MB | 1.53x | 8.66e-03 |
+| LUT6 grouped-channel 16 | 9.5 MB | 20.2 MB | 1.78x | 2.59e-02 |
+| LUT4 grouped-channel 16 | 6.3 MB | 17.1 MB | 2.10x | 1.10e-01 |
+| int8 per-block 32 | 13.4 MB | 0.2 MB | n/a, on CPU | 8.15e-03 |
+| int8 per-block 64 | 13.0 MB | 0.1 MB | n/a, on CPU | 8.55e-03 |
+| uint4 per-block 32 | 7.3 MB | 0.1 MB | n/a, on CPU | 6.12e-02 |
+
+The three CPU rows wire nothing, which is the check that this measures Neural
+Engine residency and not process overhead. Compression is realised about half way:
+LUT4's package is 4.0x smaller than FP16's and its wired set only 2.1x, because the
+compiled program carries a fixed cost that does not shrink with the encoding.
+
+Accuracy is where the grouped-channel LUTs fail. Against a budget of 1.77e-03,
+LUT4 is 1.10e-01, worse than the affine Q4 checkpoint it was re-encoded from, and
+LUT6 is 2.59e-02. Neither is usable at this palette granularity, which matches the
+owner's M1 Pro numbers and the `stk012` arm that failed quality in 11 of 12 cases.
+
 `constexpr_lut_to_dense` is the only sub-8-bit encoding the Neural Engine accepts.
-It does not follow that a LUT buys residency. A palette holds 16 FP16 entries
-however few weights it covers, so its granularity sets the cost:
+It does not follow that a LUT buys residency for free. A palette holds 16 FP16
+entries however few weights it covers, so its granularity sets the cost:
 
 | encoding | bytes per weight | [6144, 2048] | vs FP16 |
 | --- | ---: | ---: | ---: |
@@ -183,7 +207,14 @@ palette on top of the 0.5 byte index, which is what int8 per-channel already cos
 An exact LUT4 re-encoding therefore adds no residency headroom over the
 composition's existing int8, and is 1.78x larger than the checkpoint it reproduces.
 The 3.99x row is a different encoding that shares one palette across 16 output rows
-and does not reproduce the checkpoint.
+and does not reproduce the checkpoint; it is the 1.10e-01 row of the table above.
+
+What an exact LUT4 would be worth is a different claim, and it is untested. It
+would carry int8's bytes with zero error against the deployed checkpoint, which is
+the combination the composition currently has to choose between: the FP16 neurons
+exist because int8's error is too large for them. Measuring it needs the palette
+built per (row, 64 inputs) by hand, because `palettize_weights` groups along the
+output axis, and then the same placement and residency check as above.
 
 Speed does not separate the encodings either, once both arms are tuned. Splitting
 `conv` along K helps FP16 and does not help int8, so an unsplit comparison overstates
