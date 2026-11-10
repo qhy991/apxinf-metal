@@ -27,7 +27,7 @@
 //! Two further EngineTailor promoted knobs are opt-in here:
 //! `APXINF_D3_GEMM_DTYPE=f16` runs every projection on an F16 weight copy with
 //! F16 inputs and rounds the result back to BF16, and
-//! `APXINF_D3_GDN_BLOCK=fused_prep` runs the GDN operand chain (conv, SiLU,
+//! `APXINF_D3_GDN_BLOCK` (default `fused_prep`) runs the GDN operand chain (conv, SiLU,
 //! q/k/v split and q/k l2norm) as one kernel with FP32 intermediates. Neither
 //! changes a default; the migration's gap matrix, parity and measured verdicts
 //! are in `docs/mario-opt/ET-TO-APXINF-MIGRATION.md`.
@@ -115,8 +115,10 @@ const GEMM_DTYPE: &str = "APXINF_D3_GEMM_DTYPE";
 /// `APXINF_D3_CONV1D=apxinf`, because its convolution is the ApxInf tap-order
 /// convolution; selecting it over `stock` is refused rather than silently
 /// ignored (EngineTailor's `resolve` makes the same rule).
-const GDN_BLOCK_VALUES: &[&str] = &["separate", "fused_prep"];
+const GDN_BLOCK_VALUES: &[&str] = &["fused_prep", "separate"];
 const GDN_BLOCK: &str = "APXINF_D3_GDN_BLOCK";
+/// Image-path composition; `separate` stays the qualified image choice.
+const GDN_BLOCK_IMAGE: &str = "APXINF_D3_GDN_BLOCK_IMAGE";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GdnBlock {
@@ -193,6 +195,7 @@ struct Parts {
     causal_conv: Option<CausalDepthwiseConv>,
     /// How the GDN operand chain is composed (`APXINF_D3_GDN_BLOCK`).
     gdn_block: GdnBlock,
+    gdn_block_image: GdnBlock,
     /// The fused conv + SiLU + split + q/k-norm kernel; `None` when the chain
     /// is `separate`.
     fused_prep: Option<GdnFusedPrep>,
@@ -337,9 +340,14 @@ impl Model {
             Conv1d::Stock => None,
             Conv1d::ApxInf => Some(CausalDepthwiseConv::new(&stream)?),
         };
-        let fused_prep = match gdn_block {
-            GdnBlock::Separate => None,
-            GdnBlock::FusedPrep => Some(GdnFusedPrep::new(
+        let gdn_block_image = match GDN_BLOCK_VALUES[env_gate(GDN_BLOCK_IMAGE, GDN_BLOCK_VALUES)?] {
+            "fused_prep" => GdnBlock::FusedPrep,
+            _ => GdnBlock::Separate,
+        };
+        let fused_prep = if gdn_block == GdnBlock::FusedPrep
+            || gdn_block_image == GdnBlock::FusedPrep
+        {
+            Some(GdnFusedPrep::new(
                 &stream,
                 geometry.k_heads,
                 geometry.k_dim,
@@ -347,7 +355,9 @@ impl Model {
                 geometry.v_dim,
                 geometry.conv_kernel,
                 geometry.conv_dim(),
-            )?),
+            )?)
+        } else {
+            None
         };
         let parts = Rc::new(Parts {
             geometry,
@@ -361,6 +371,7 @@ impl Model {
             conv1d,
             causal_conv,
             gdn_block,
+            gdn_block_image,
             fused_prep,
             last_row,
             rope: HalfSplitRope::new(&stream, geometry.rope_dims)?,
@@ -923,6 +934,7 @@ fn forward(parts: &Parts, ids: &Array, candidate_count: &Array) -> Result<Vec<Ar
         hidden,
         &RopeMode::HalfSplit(&positions),
         &parts.recurrence,
+        parts.gdn_block == GdnBlock::FusedPrep,
     )?;
     readout_tail(parts, &hidden, candidate_count)
 }
@@ -982,6 +994,7 @@ fn image_forward(
             sin: &sin,
         },
         &parts.recurrence_image,
+        parts.gdn_block_image == GdnBlock::FusedPrep,
     )?;
     readout_tail(parts, &hidden, candidate_count)
 }
@@ -1001,6 +1014,7 @@ fn stack(
     mut hidden: Array,
     rope: &RopeMode<'_>,
     recurrence: &GatedDeltaRecurrence,
+    fused_gdn_block: bool,
 ) -> Result<Array> {
     let geometry = parts.geometry;
     let length = hidden.shape()[1];
@@ -1023,7 +1037,7 @@ fn stack(
             let Mixer::GatedDelta(gated_delta) = &layer.mixer else {
                 unreachable!("the validated schedule selects gated delta here")
             };
-            gated_delta_forward(parts, recurrence, &normalized, gated_delta, length)?
+            gated_delta_forward(parts, recurrence, &normalized, gated_delta, length, fused_gdn_block)?
         };
         let residual = if prune == LastRow::Off {
             hidden.add(&mixed)?
@@ -1143,6 +1157,7 @@ fn gated_delta_forward(
     input: &Array,
     gated_delta: &GatedDelta,
     length: usize,
+    fused_gdn_block: bool,
 ) -> Result<Array> {
     let geometry = parts.geometry;
     let key_dim = geometry.key_dim();
@@ -1157,7 +1172,11 @@ fn gated_delta_forward(
     ])?;
     let b = project(input, &gated_delta.b.weight)?;
     let a = project(input, &gated_delta.a.weight)?;
-    let (queries, keys, values) = match parts.gdn_block {
+    let (queries, keys, values) = match if fused_gdn_block {
+        GdnBlock::FusedPrep
+    } else {
+        GdnBlock::Separate
+    } {
         GdnBlock::FusedPrep => {
             let kernel = parts.fused_prep.as_ref().ok_or_else(|| {
                 Error::Contract("APXINF_D3_GDN_BLOCK=fused_prep was selected without its kernel")
