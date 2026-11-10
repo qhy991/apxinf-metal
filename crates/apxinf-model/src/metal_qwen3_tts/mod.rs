@@ -279,8 +279,16 @@ impl QwenTts {
                     &codes[group],
                 )?
             };
+            let forward_started = std::time::Instant::now();
             let logits = self.model.predictor(&inputs, group, &mut cache)?;
-            codes.push(self.sampler.sample(&logits, None, &[])?);
+            let forward_ms = forward_started.elapsed().as_secs_f64() * 1e3;
+            let sample_started = std::time::Instant::now();
+            let code = self.sampler.sample(&logits, None, &[])?;
+            let sample_ms = sample_started.elapsed().as_secs_f64() * 1e3;
+            if std::env::var("APXINF_TTS_STAGES").map_or(false, |v| v == "1") {
+                eprintln!("{{\"tts_group\":{{\"group\":{group},\"forward_ms\":{forward_ms:.3},\"sample_ms\":{sample_ms:.3}}}}}");
+            }
+            codes.push(code);
         }
         let all = Array::concat(&codes.iter().collect::<Vec<_>>(), 1)?;
         let mut embeds = vec![embed(&self.model.talker.codec_embedding, &codes[0])?];
@@ -315,18 +323,31 @@ impl SpeechRuntime for QwenTts {
         let limit = self.config.sampling.max_frames;
         let mut cache = new_caches(self.model.talker.layers.len());
         let mut history = sample::History::new(&stream, VOCAB)?;
+        let staged = std::env::var("APXINF_TTS_STAGES").map_or(false, |v| v == "1");
         let (frames, complete) = collect_frames(limit, |step| {
+            let frame_started = std::time::Instant::now();
             let (logits, hidden) = self.model.talker(&embeds, &mut cache)?;
+            let talker_ms = frame_started.elapsed().as_secs_f64() * 1e3;
+            let sample_started = std::time::Instant::now();
             let suppress = if step < 2 { &early } else { &control };
             let token = self.sampler.sample(&logits, Some(&history), suppress)?;
             token.eval()?;
+            let sample_ms = sample_started.elapsed().as_secs_f64() * 1e3;
             history.push(&token)?;
             let stop = token.equal(&eos)?.to_bytes()?;
             if stop[0] != 0 {
                 return Ok(None);
             }
+            let frame_started = std::time::Instant::now();
             let (codes, next) = self.frame(&hidden, &token, &pad)?;
             stream.eval(&[next.clone(), codes.clone()])?;
+            let predictor_ms = frame_started.elapsed().as_secs_f64() * 1e3;
+            if staged {
+                eprintln!(
+                    "{{\"tts_stage\":{{\"frame\":{step},\"talker_ms\":{talker_ms:.3},\
+\"sample_ms\":{sample_ms:.3},\"predictor_ms\":{predictor_ms:.3}}}}}"
+                );
+            }
             embeds = next;
             Ok(Some(codes))
         })?;
