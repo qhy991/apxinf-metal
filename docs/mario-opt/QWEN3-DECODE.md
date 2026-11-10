@@ -385,3 +385,32 @@ Consequence for the plan: fusing more small kernels is not where the remaining ~
 untried structural options keep the same shape as the one that worked — (a) defer the `down`
 residual so the *next* layer's input norm consumes it through `RmsNormAdd` (moves one more kernel
 off the chain), and (b) in-place KV writes. Both are worth trying; neither is a sure thing.
+
+## In-place KV: the probe says it is not worth it (2026-11-10)
+
+The last plan item was replacing the two per-layer `slice_update` calls with in-place writes. A
+probe (`examples/kv_update_probe.rs`-style timing, then removed) measured the raw cost of 56
+`slice_update`s per token on a `[1, 8, capacity, 128]` cache:
+
+| capacity | time per token | effective |
+|---|---:|---:|
+| 256 | 8.5 ms (first pass, warm-up skewed) | 3.5 GB/s |
+| 512 | 2.5 ms | 23 GB/s |
+| 1024 | 4.2 ms | 28 GB/s |
+
+Taken alone that looks like the largest remaining item — so it was checked against the model rather
+than trusted. Generating **32 tokens** and **192 tokens** gives 6.72 ms and 6.88 ms per token
+(unfused arm): a 6× longer cache costs **0.16 ms**, not the 1–2 ms the probe implies. MLX evidently
+does not pay the isolated copy cost in the model's graph, where the updated cache is consumed by the
+attention slice immediately.
+
+So in-place KV is bounded by ~0.2 ms at best, before counting the buffer-aliasing risk that
+out-of-place MLX arrays make unavoidable. **Investigated and closed without an implementation.**
+
+### Where the decode line ends
+
+Four fusions and one structural change were measured: **two KEEPs** (fused add+norm at both residual
+sites, −7.2 % together) and **four negatives** (q/k/v merge, SiLU merge, compiled W8 block, in-place
+KV). The token is now `≈2.9 ms of quantized-GEMM bandwidth + ≈3.5 ms of dependency-chain latency`,
+and the second term is not reachable by removing launches one at a time — every remaining option
+changes the algorithm (speculative decoding, batched verify) rather than the kernel graph.
