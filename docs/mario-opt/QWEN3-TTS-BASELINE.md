@@ -112,3 +112,27 @@ cache writes or an oversized per-step pass), not dispatch.
 That is the next thing to open up: instrument the predictor's own layers/cache for one frame, and if
 the per-step cost is dominated by cache materialization, the fix is the same class as the Qwen3 KV
 finding — but here it would actually pay, because it happens 15× per frame instead of once per token.
+
+## Correction: the predictor is bandwidth-bound, not dispatch-bound
+
+The dispatch reading above does not survive its own arithmetic. 150 launches at 6.7 µs is ~1 ms, and
+the predictor costs 37 ms, so launches cannot be the cost. Counting bytes settles it:
+
+| quantity | value |
+|---|---:|
+| predictor parameters (5 layers, hidden 1024, MLP 3072) | 68.2 M |
+| BF16 weights per group pass | 136.3 MB |
+| passes per frame (15 groups, strictly sequential) | 15 |
+| **bytes read per frame** | **2.04 GB** |
+| implied bandwidth at the measured 37 ms | **≈55 GB/s** |
+| at this machine's ~120 GB/s | 17.0 ms |
+
+The predictor re-reads its whole weight set once per codebook group — 15 times per frame — at ~55 GB/s,
+i.e. **bandwidth-bound at ≈46 % of what the machine can do**. The lever is bytes, not launches: a W8
+predictor copy halves 2.04 GB to ~1.02 GB, a potential **~17 ms of the ~61 ms frame (−28 %)** if the
+quantized kernels keep their bandwidth (the caveat `doc/optimization-transfer-rules.md` records — on
+MiniCPM5-2B they did not).
+
+The 15 passes cannot be collapsed: group *g* consumes group *g−1*'s sampled code, so there is no
+batching escape, only fewer bytes per pass. This also supersedes the "fusions below budget" conclusion
+of the previous section — the fusions were correctly costed at ~1.6 %, but they were the wrong lever.
