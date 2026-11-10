@@ -70,7 +70,17 @@ fn admit(options: &LoadOptions) -> Result<Variant> {
 }
 
 fn use_predictor_fusion(variant: Variant, architecture: &str) -> bool {
-    variant == Variant::Auto && architecture == "applegpu_g16g"
+    if variant != Variant::Auto {
+        return false;
+    }
+    // `APXINF_TTS_PREDICTOR_FUSION=1` opts a chip whose architecture has not
+    // been through the measurement gate into the fused predictor; `=0` forces
+    // the reference path everywhere.
+    match std::env::var("APXINF_TTS_PREDICTOR_FUSION").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => architecture == "applegpu_g16g",
+    }
 }
 
 pub fn load(

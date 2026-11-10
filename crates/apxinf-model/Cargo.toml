@@ -139,3 +139,8 @@ required-features = ["mlx"]
 [[example]]
 name = "rms_norm_add_check"
 path = "examples/rms_norm_add_check.rs"
+
+[[example]]
+name = "qwen3_tts_probe"
+path = "examples/qwen3_tts_probe.rs"
+required-features = ["mlx"]
