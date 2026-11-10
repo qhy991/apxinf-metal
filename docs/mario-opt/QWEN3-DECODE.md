@@ -243,3 +243,39 @@ it does not fuse `quantized_matmul` with its neighbours.
 be attacked with fewer GPU kernels (fused quantized GEMV + norm + activation, or a lower dispatch
 count per token), not with graph compilation. The code was not kept: it is a rejected direction and
 the repository does not carry dead paths.
+
+## Where the remaining gap lives, and the W4 experiment (2026-11-10)
+
+Two measurements before touching kernels.
+
+**A bandwidth probe** (`examples/qw3_gemv_probe.rs`) times MLX's `quantized_matmul` at the six
+Qwen3-0.6B decode shapes. Two modes:
+
+| mode | one layer (16.7 MB) | full token (28 layers, 468 MB) |
+|---|---:|---:|
+| each call synchronized | 0.20–0.23 ms (~9 GB/s) | — |
+| 168 calls pipelined, one eval | — | **3.13 / 3.78 / 4.94 ms → 149 / 124 / 95 GB/s** |
+
+The pipelined sweep reaches **149 GB/s, i.e. the ≈3.1 ms W8 floor**, while the real decode runs at
+6.7 ms. The difference is not kernel efficiency: the decode chain is **serially dependent** (each
+layer consumes the previous one), so every one of the ~628 kernels per token exposes its launch
+latency instead of overlapping. That is also why compiling the block did not help (previous
+section): `Compiled` collapses host graph construction, not device kernels.
+
+**W4 decode weights** halve the bytes at the same kernel count. `APXINF_QWEN3_W8_BITS=4` selects
+the width (8 default, 6 also accepted), one env for the whole decode lane:
+
+| arm | TPOT (32 tokens) | TPOT (192 tokens) |
+|---|---:|---:|
+| W8 (default) | 6.72 / 6.69 ms | 6.91 ms |
+| **W4** | **5.56 / 5.57 ms** | **5.74 ms** |
+| delta | **−17 %** | **−17 %** |
+
+Quality: the 32-token answer is textually identical; the 192-token answer shares a 24-token prefix
+and then differs in wording while staying coherent and on-topic — the expected shape of 4-bit
+noise. W4 stays **opt-in**: a lossy width does not become the default without a teacher-forced
+consistency campaign on the same bar the W8 flip used.
+
+**Remaining plan**: with bytes halved the dependency-length part is now the majority of the token
+(~4 ms of 5.6 ms), so the next lever is fewer kernels (fused norm+QKV, o+residual, gate/up+SiLU),
+not another width change.
