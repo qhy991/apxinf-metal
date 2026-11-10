@@ -316,10 +316,23 @@ impl Model {
         let mask = (l > 1)
             .then(|| self.ops.causal_mask(l, x.dtype()))
             .transpose()?;
+        let staged = std::env::var("APXINF_TTS_PREDICTOR_STAGES").map_or(false, |v| v == "1");
+        if staged {
+            x.eval()?;
+            eprintln!("{{\"pred_stage\":{{\"group\":{group},\"to_mtp_ms\":0.0}}}}");
+        }
         let mut x = x;
         for (i, (layer, cache)) in p.layers.iter().zip(cache.iter_mut()).enumerate() {
+            let layer_started = std::time::Instant::now();
             let fused = self.predictor_mlp.as_ref().map(|(k, w)| (k, &w[i]));
             x = self.layer(layer, &x, &cos, &sin, mask.as_ref(), cache, fused)?;
+            if staged {
+                x.eval()?;
+                eprintln!(
+                    "{{\"pred_layer\":{{\"group\":{group},\"layer\":{i},\"ms\":{:.3}}}}}",
+                    layer_started.elapsed().as_secs_f64() * 1e3
+                );
+            }
         }
         p.heads[group].apply(&x.fast_rms_norm(&p.norm, EPS)?)
     }

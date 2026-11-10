@@ -62,6 +62,31 @@ launch-bound shape this repository's rules describe — not a host or Python ove
 Next: measure one group's isolated GPU time (evaluate after each step instead of once per frame) to
 separate per-step dispatch from per-step work, then decide whether fusing the predictor's
 norm/add chain is worth a kernel. No kernel is proposed before that measurement.
+
+## Inside the predictor (`APXINF_TTS_PREDICTOR_STAGES=1`)
+
+Evaluating after each predictor layer, over 39 frames × 15 groups:
+
+| step | median |
+|---|---:|
+| predictor layer (each of 5) | **0.648–0.675 ms** |
+| predictor call (5 layers) | ~3.2 ms |
+| × 15 groups per frame | ~49 ms |
+
+That reproduces the frame-level 37–38 ms within the noise of the eager-evaluation mode (the first
+group of each frame also carries the talker's pending pass, so the first group reads much higher).
+
+**0.65 ms for one layer of a five-layer model on a 16-row cache is dispatch, not arithmetic.** A layer
+here is attention over ≤16 positions plus a `SwigluMlpGemv`-fused MLP, so the kernels are tiny and
+numerous. This is the launch-bound shape again — but the budget is what matters: fusing the two
+add+norm edges per layer would remove ~2 launches × 5 layers × 15 groups = **150 launches per frame**,
+i.e. ~1 ms of a ~61 ms frame (≈1.6 %). The 15-group chain is inherently sequential (group g consumes
+group g-1's code), so the launches cannot be collapsed into one another.
+
+**Conclusion: the TTS predictor is dispatch-bound but the individual fusions are not worth their
+budget.** The remaining lever with real upside is the frame's structure — pipelining the talker's next
+step against the current frame's predictor — not more kernels. That is where the next attempt should
+go if this line is picked up again.
 ## Per-step dispatch versus per-step work (`APXINF_TTS_GROUP_EVAL=1`)
 
 Synchronizing after every predictor group instead of once per frame:
