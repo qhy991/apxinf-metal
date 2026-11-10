@@ -135,3 +135,5 @@ required-features = ["mlx"]
 [[example]]
 name = "qwen_image_loop"
 required-features = ["mlx"]
+name = "rms_norm_add_check"
+path = "examples/rms_norm_add_check.rs"

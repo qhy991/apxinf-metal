@@ -169,6 +169,9 @@ pub struct Qwen3Model {
     weights: Weights,
     seams: Option<Seams>,
     qk_fusion: Option<QkNormRope>,
+    /// Fused `norm(x + residual)` for the post-attention site
+    /// (`APXINF_QWEN3_FUSED_NORM=0` falls back to add + norm).
+    rms_norm_add: Option<apxinf_mlx::RmsNormAdd>,
     activation: Compiled,
     initial_kv: Vec<KvState>,
     kv: Vec<KvState>,
@@ -220,6 +223,11 @@ impl Qwen3Model {
         } else {
             None
         };
+        let rms_norm_add = if std::env::var("APXINF_QWEN3_FUSED_NORM").map_or(true, |v| v != "0") {
+            Some(apxinf_mlx::RmsNormAdd::new(backend.stream(), config.hidden_size)?)
+        } else {
+            None
+        };
         let qk_fusion = if variant == Variant::MixedW8 {
             Some(QkNormRope::new(backend.stream())?)
         } else {
@@ -240,6 +248,7 @@ impl Qwen3Model {
             backend,
             weights,
             seams,
+            rms_norm_add,
             qk_fusion,
             activation,
             initial_kv: Vec::new(),
@@ -529,8 +538,14 @@ impl Qwen3Model {
             .transpose(&[0, 2, 1, 3])?
             .reshape(&[1, len, c.num_attention_heads * c.head_dim])?;
         let y = layer.o.call(&y)?;
-        let hidden = x.add(&y)?;
-        let n = self.normalized(&hidden, &layer.post_norm)?;
+        let (hidden, n) = match self.rms_norm_add.as_ref() {
+            Some(kernel) => kernel.call(x, &y, &layer.post_norm, c.rms_norm_eps)?,
+            None => {
+                let hidden = x.add(&y)?;
+                let n = self.normalized(&hidden, &layer.post_norm)?;
+                (hidden, n)
+            }
+        };
         let (gate, up) = layer.gate_up(&n)?;
         let activated = self.activation.call(&[gate, up])?.remove(0);
         let out = hidden.add(&layer.down.call(&activated)?)?;
