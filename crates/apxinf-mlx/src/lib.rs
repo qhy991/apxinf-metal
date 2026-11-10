@@ -47,7 +47,9 @@ mod mpp_f16_gemm;
 mod q4_f16;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod qk_norm_rope;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod rms_norm_add;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use rms_norm_add::RmsNormAdd;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub mod qmm_bm64;
