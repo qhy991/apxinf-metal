@@ -62,3 +62,22 @@ launch-bound shape this repository's rules describe — not a host or Python ove
 Next: measure one group's isolated GPU time (evaluate after each step instead of once per frame) to
 separate per-step dispatch from per-step work, then decide whether fusing the predictor's
 norm/add chain is worth a kernel. No kernel is proposed before that measurement.
+## Per-step dispatch versus per-step work (`APXINF_TTS_GROUP_EVAL=1`)
+
+Synchronizing after every predictor group instead of once per frame:
+
+| mode | RTF | wall | per-step |
+|---|---:|---:|---:|
+| one eval per frame (baseline) | **0.953** | 2.97 s | ~2.5 ms amortized |
+| eval after every group | **1.606** | 5.01 s | **4.497 ms median** |
+
+Two conclusions. First, batching the 15 groups into one evaluation is already worth ~1.8× over
+synchronizing each — so the frame-level structure is right and must not be replaced by per-step
+evaluation. Second, and more important: **2.5 ms of device work per predictor step is far too much for
+a small model step**. The predictor is 15 sequential forwards of a few layers; a step of that size
+should be tens of microseconds of arithmetic. Whatever costs 2.5 ms per step is structural (per-step
+cache writes or an oversized per-step pass), not dispatch.
+
+That is the next thing to open up: instrument the predictor's own layers/cache for one frame, and if
+the per-step cost is dominated by cache materialization, the fix is the same class as the Qwen3 KV
+finding — but here it would actually pay, because it happens 15× per frame instead of once per token.
