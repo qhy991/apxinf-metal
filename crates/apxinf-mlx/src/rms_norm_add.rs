@@ -11,9 +11,9 @@ pub struct RmsNormAdd {
 impl RmsNormAdd {
     /// `hidden` is the row width (Qwen3-0.6B: 1024).
     pub fn new(stream: &Stream, hidden: usize) -> Result<Self> {
-        if !matches!(hidden, 1024) {
+        if hidden == 0 || hidden % 4 != 0 {
             return Err(Error::Contract(
-                "rms_norm_add is compiled for one row width".into(),
+                "rms_norm_add needs a row width that is a multiple of four".into(),
             ));
         }
         Ok(Self {
@@ -40,10 +40,10 @@ impl RmsNormAdd {
             || x.dtype() != MlxDType::BF16
             || y.dtype() != MlxDType::BF16
             || weight.shape() != [self.hidden]
-            || weight.dtype() != MlxDType::F32
+            || !matches!(weight.dtype(), MlxDType::F32 | MlxDType::BF16)
         {
             return Err(Error::Contract(
-                "rms_norm_add requires BF16 [1, rows, hidden] operands and an F32 weight".into(),
+                "rms_norm_add requires BF16 [1, rows, hidden] operands and an F32/BF16 weight".into(),
             ));
         }
         let rows = shape[1];

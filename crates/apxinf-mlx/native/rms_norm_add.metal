@@ -11,7 +11,7 @@ const uint WIDTH = static_cast<uint>(H);
 const uint ROW_OFFSET = row * H;
 
 threadgroup float partials[32];
-threadgroup float row_values[1024];
+threadgroup float row_values[H];
 float total = 0.0f;
 
 for (uint column = lid * 4u; column < WIDTH; column += 256u * 4u) {
@@ -48,7 +48,7 @@ for (uint column = lid * 4u; column < WIDTH; column += 256u * 4u) {
     for (uint j = 0; j < 4u; ++j) {
         uint index = column + j;
         if (index < H) {
-            float normalized = row_values[index] * scale * weight_input[index];
+            float normalized = row_values[index] * scale * static_cast<float>(weight_input[index]);
             normed_output[ROW_OFFSET + index] = static_cast<bfloat16_t>(normalized);
         }
     }
