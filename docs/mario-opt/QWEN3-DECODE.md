@@ -338,6 +338,31 @@ on by default for the Qwen3 decode path; `APXINF_QWEN3_FUSED_NORM=0` restores th
 Next items of the plan (`o`/`down` residual epilogues, in-place KV, SiLU epilogue) each remove
 another ~28 kernels, i.e. ~0.19 ms at the measured 6.7 µs dispatch cost.
 
+## Deferred MLP residual: the second KEEP (2026-11-10)
+
+The fusion ledger above left one structural candidate shaped like the fusion that worked: move the
+`down` residual off the critical path. Instead of `out = hidden + down(x)` at the end of a layer and
+then `norm(out)` at the start of the next, the layer now returns `(hidden, down)` and the **next
+layer's input norm** consumes the pair through the same `RmsNormAdd` kernel. One fewer `add` launch
+per layer, on the same edge that made the first fusion pay.
+
+| arm (mixed-w8, 192-token generation, 3 alternating rounds) | TPOT |
+|---|---:|
+| `add` + `fast_rms_norm` (fused kernels off) | 6.85–6.88 ms |
+| **deferred residual + fused norm** | **6.37–6.40 ms** |
+| delta | **−7.1…−7.3 %** |
+
+Parity: **192/192 tokens identical** across the two arms.
+
+Combined with the earlier items this is the token's current shape:
+
+```
+9.81 ms  baseline (bf16-compiled, host-sampled decode)
+6.70 ms  W8 weights + device greedy
+6.39 ms  + fused add/norm at both residual sites
+(5.56 ms with the opt-in W4 width, minus the same fusion saving)
+```
+
 ## Fusion ledger: one KEEP, three measured negatives (2026-11-10)
 
 The dispatch measurements in the previous section suggested each removed launch was worth ~6.7 µs,

@@ -492,16 +492,16 @@ impl Qwen3Model {
     fn eager_layer(
         &self,
         x: &Array,
+        n: &Array,
         layer: &LayerWeights,
         kv: &KvState,
         index: &Array,
         cos: &Array,
         sin: &Array,
         end: usize,
-    ) -> Result<(Array, KvState)> {
+    ) -> Result<(Array, Array, KvState)> {
         let c = &self.config;
         let len = x.shape()[1];
-        let n = self.normalized(x, &layer.input_norm)?;
         let q = layer
             .q
             .call(&n)?
@@ -548,8 +548,8 @@ impl Qwen3Model {
         };
         let (gate, up) = layer.gate_up(&n)?;
         let activated = self.activation.call(&[gate, up])?.remove(0);
-        let out = hidden.add(&layer.down.call(&activated)?)?;
-        Ok((out, KvState { keys, values }))
+        let down = layer.down.call(&activated)?;
+        Ok((hidden, down, KvState { keys, values }))
     }
 
     fn run(
@@ -614,13 +614,38 @@ impl Qwen3Model {
             .slice_axis(2, self.position, end)?;
         let mut pending = Vec::with_capacity(self.kv.len());
         let previous = std::mem::take(&mut self.kv);
+        // The MLP residual is deferred: the next layer's input norm consumes
+        // `hidden + down_out` through the fused add+norm kernel instead of a
+        // separate `add` launch. `None` means the value is already summed (the
+        // compiled BF16 block returns a complete layer output).
+        let mut carry: Option<(Array, Option<Array>)> = None;
         for (layer, kv) in self.weights.layers.iter().zip(previous) {
             // The inherited block replacement applies only after prefill has
             // established request KV. A fresh single-token prompt keeps the
             // public attention boundary, just like a source KVCache with no keys.
+            let (layer_input, layer_normed) = match carry.take() {
+                None => {
+                    let normed = self.normalized(&x, &layer.input_norm)?;
+                    (x.clone(), normed)
+                }
+                Some((hidden, None)) => {
+                    let normed = self.normalized(&hidden, &layer.input_norm)?;
+                    (hidden, normed)
+                }
+                Some((hidden, Some(down))) => match self.rms_norm_add.as_ref() {
+                    Some(kernel) => {
+                        kernel.call(&hidden, &down, &layer.input_norm, self.config.rms_norm_eps)?
+                    }
+                    None => {
+                        let summed = hidden.add(&down)?;
+                        let normed = self.normalized(&summed, &layer.input_norm)?;
+                        (summed, normed)
+                    }
+                },
+            };
             if len == 1 && self.position > 0 && self.variant == Variant::Bf16Compiled {
                 let mut args = vec![
-                    x,
+                    layer_input.clone(),
                     kv.keys.clone(),
                     kv.values.clone(),
                     index.clone(),
@@ -638,17 +663,24 @@ impl Qwen3Model {
                     .unwrap()
                     .call(&args)?
                     .into_iter();
-                x = values.next().unwrap();
+                let out = values.next().unwrap();
+                carry = Some((out, None));
                 pending.push(KvState {
                     keys: values.next().unwrap(),
                     values: values.next().unwrap(),
                 });
             } else {
-                let result = self.eager_layer(&x, layer, &kv, &index, &cos, &sin, end)?;
-                x = result.0;
-                pending.push(result.1);
+                let (hidden, down, state) =
+                    self.eager_layer(&layer_input, &layer_normed, layer, &kv, &index, &cos, &sin, end)?;
+                carry = Some((hidden, Some(down)));
+                pending.push(state);
             }
         }
+        let x = match carry.take() {
+            None => x,
+            Some((hidden, None)) => hidden,
+            Some((hidden, Some(down))) => hidden.add(&down)?,
+        };
         let output = if emit_logits {
             let logits = self
                 .weights
