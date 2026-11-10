@@ -130,6 +130,173 @@ matches it in three ways:
 The tests use recorded coremltools packages. The packages themselves are not
 committed, because they contain checkpoint-derived weights.
 
+## Weight encodings
+
+The encoding a program stores its weights in decides whether its `conv` reaches the
+Neural Engine at all. The operation list above admits
+`constexpr_blockwise_shift_scale`, but its granularity is not free to choose.
+
+Measured by compiling one projection per encoding and reading
+`MLComputePlan.get_compute_device_usage_for_mlprogram_operation`, with no
+prediction (M4 Mac16,10, macOS 27.0.1, coremltools 9.0, 2026-11-10,
+`layers.12.mlp.gate_proj` [6144, 2048] at T = 512, conv layout):
+
+| encoding | MIL lowering | placement |
+| --- | --- | --- |
+| FP16 | `const` | Neural Engine |
+| int8 per-channel | `constexpr_blockwise_shift_scale` | Neural Engine |
+| LUT4, LUT6 per grouped channel | `constexpr_lut_to_dense` | Neural Engine |
+| int8 per-block 32 | `constexpr_blockwise_shift_scale` | CPU |
+| int8 per-block 64 | `constexpr_blockwise_shift_scale` | CPU |
+| uint4 per-block 32 | `constexpr_blockwise_shift_scale` | CPU |
+
+A per-block encoding sends the whole `conv`, and the `identity` after it, to
+`MLCPUComputeDevice`. The same shape then runs at 0.77 TF/s against 7.63 on the
+Neural Engine (M2, T = 512, Clef layer 0 [12288, 4096], per-block 64). The owner's
+M1 Pro measurement of 2026-10-16 recorded the same fallback for per-block int8 and
+uint4, so this is Core ML compiler behaviour on three generations rather than one
+device's quirk.
+
+### The axis, not the group count, decides placement
+
+Every row of that table follows one rule: scales or palettes may vary along the
+output axis, and may not vary along the input axis. Tested directly by building
+`constexpr_lut_to_dense` with the LUT grouped along each axis in turn, on a
+[3072, 1024] conv:
+
+| palettes along output | palettes along input | total | placement |
+| ---: | ---: | ---: | --- |
+| 1 (per tensor) | 1 | 1 | Neural Engine |
+| 192 (per 16 rows) | 1 | 192 | Neural Engine |
+| 3072 (per row) | 1 | 3072 | Neural Engine |
+| 1 | 16 (per 64 inputs) | 16 | CPU |
+| 3072 | 16 | 49152 | CPU |
+
+Three thousand palettes along the output axis are accepted and sixteen along the
+input axis are not, so the group count is not the variable. `palettize_weights`
+and `linear_quantize_weights` only expose output-axis grouping as `per_channel`
+and `per_grouped_channel`; the raw op accepts either, and the compiler does not.
+
+This closes the sub-8-bit question. A 4-bit palette holds 16 entries, and a Clef
+Q4 weight row holds 544 distinct values where one of its 64-input groups holds 14.
+Four bits are therefore only enough over a narrow group, a narrow group means
+grouping along the input axis, and that is the grouping the Neural Engine refuses.
+The two consequences are worth stating plainly:
+
+- No re-encoding of a block-wise checkpoint can be both exact and Neural Engine
+  resident. An exact LUT4 built per (row, 64 inputs) was measured at 1.12 TF/s on
+  the CPU against FP16's 5.46 on the Neural Engine.
+- Palette granularity cannot rescue 4-bit accuracy within the permitted axis.
+  Per-row LUT4 is 1.01e-01 where per-16-row LUT4 is 9.95e-02, against a 2.47e-03
+  budget: 16x more palettes changes nothing, because each row is individually too
+  wide for 16 centroids.
+
+The usable design space on the Neural Engine is therefore two encodings, FP16 at
+2.0 bytes per weight and exact against the checkpoint, and per-row int8 at 1.0
+bytes per weight and 8.8e-03. The composition's int8-plus-FP16 neuron split is
+already the whole space, not a point within it.
+
+Published 4-bit checkpoints are block-wise by construction: MLX affine carries one
+scale and bias per 64 inputs, GPTQ and AWQ one per 128, GGUF k-quants one per block
+of 32 or 256. Whichever of those a family ships, it cannot be handed to the Neural
+Engine in its published form. The composition's per-row int8 is the re-encoding that
+avoids this constraint, not a free choice, and a port must keep that property.
+
+An encoding that stays on the Neural Engine does keep its compression in resident
+memory. Host wired delta across load and three predictions, seven fresh processes
+per encoding, median, same M4 cell under the host's Metal lock:
+
+| encoding | package | wired | wired vs FP16 | relative RMSE |
+| --- | ---: | ---: | ---: | ---: |
+| FP16 | 25.2 MB | 35.9 MB | 1.00x | 4.98e-04 |
+| int8 per-channel | 12.6 MB | 23.5 MB | 1.53x | 8.66e-03 |
+| LUT6 grouped-channel 16 | 9.5 MB | 20.2 MB | 1.78x | 2.59e-02 |
+| LUT4 grouped-channel 16 | 6.3 MB | 17.1 MB | 2.10x | 1.10e-01 |
+| int8 per-block 32 | 13.4 MB | 0.2 MB | n/a, on CPU | 8.15e-03 |
+| int8 per-block 64 | 13.0 MB | 0.1 MB | n/a, on CPU | 8.55e-03 |
+| uint4 per-block 32 | 7.3 MB | 0.1 MB | n/a, on CPU | 6.12e-02 |
+
+The three CPU rows wire nothing, which is the check that this measures Neural
+Engine residency and not process overhead. Compression is realised about half way:
+LUT4's package is 4.0x smaller than FP16's and its wired set only 2.1x, because the
+compiled program carries a fixed cost that does not shrink with the encoding.
+
+Accuracy is where the grouped-channel LUTs fail. Against a budget of 1.77e-03,
+LUT4 is 1.10e-01, worse than the affine Q4 checkpoint it was re-encoded from, and
+LUT6 is 2.59e-02. Neither is usable at this palette granularity, which matches the
+owner's M1 Pro numbers and the `stk012` arm that failed quality in 11 of 12 cases.
+
+`constexpr_lut_to_dense` is the only sub-8-bit encoding the Neural Engine accepts.
+It does not follow that a LUT buys residency for free. A palette holds 16 FP16
+entries however few weights it covers, so its granularity sets the cost:
+
+| encoding | bytes per weight | [6144, 2048] | vs FP16 |
+| --- | ---: | ---: | ---: |
+| FP16 | 2.000 | 25.17 MB | 1.00x |
+| affine Q4 group-64 (as published) | 0.562 | 7.08 MB | 3.56x |
+| int8 per-channel | 1.001 | 12.60 MB | 2.00x |
+| LUT4, one palette per 16 output rows | 0.501 | 6.30 MB | 3.99x |
+| LUT4, one palette per (row, 64 inputs) | 1.000 | 12.58 MB | 2.00x |
+
+Only the last row reproduces affine Q4 group-64 exactly. Within one group every
+weight is `q * scale + bias` with `q` in 0..15, so 16 palette entries hold every
+value the group can take; the largest number of distinct values in a 64-group of the
+Clef checkpoint is 16, as that bound requires. Exactness costs 0.5 byte per weight of
+palette on top of the 0.5 byte index, which is what int8 per-channel already costs.
+An exact LUT4 re-encoding therefore adds no residency headroom over the
+composition's existing int8, and is 1.78x larger than the checkpoint it reproduces.
+The 3.99x row is a different encoding that shares one palette across 16 output rows
+and does not reproduce the checkpoint; it is the 1.10e-01 row of the table above.
+
+Building that exact encoding by hand confirms the axis rule rather than beating
+it: one palette per (row, 64 inputs) reproduces the checkpoint, and runs at 1.12
+TF/s on the CPU against FP16's 5.46 on the Neural Engine, wiring 3.1 MB because
+nothing is resident there.
+
+Speed does not separate the encodings either, once both arms are tuned. Splitting
+`conv` along K helps FP16 and does not help int8, so an unsplit comparison overstates
+int8 by roughly the split's own gain. Best against best at the same token count:
+
+| host | shape | FP16 | int8 | unsplit would say |
+| --- | --- | ---: | ---: | ---: |
+| M4 | `down_proj` [2048, 6144], T 1408 | 1.264 ms/512tok | 1.198 | 2.032x |
+| M4 | `gate_proj` [6144, 2048], T 512 | 1.132 ms/512tok | 1.106 | 1.201x |
+| M2 | [12288, 4096], T 512 | 6.409 ms | 5.783 | 1.571x |
+
+That is 1.02x to 1.11x for int8, against 1.20x to 2.03x read off unsplit arms. Select
+an encoding on placement, accuracy and residency, and tune the K split separately.
+
+### Two accuracy increments the int8 share can have for free
+
+The axis rule forbids an input-axis *encoding*, not an input-axis *graph*. The K
+split already cuts one `conv` into parts along K and sums them, and each part is a
+separate `conv` with its own weight tensor, so per-row scales on a K/parts slice
+are one scale per (row, K/parts inputs). That granularity comes from the graph,
+which the compiler allows.
+
+Second, `constexpr_blockwise_shift_scale` carries a shift as well as a scale.
+The composition quantizes symmetrically, and an affine Q4 group's values sit around
+a nonzero offset, so a symmetric quantizer spends range covering that offset.
+Asymmetric per-channel is `mode='linear'` with `uint8`, and it lands on the Neural
+Engine at the same package size as the symmetric form.
+
+Relative RMSE of the Clef layer 0 gate against a float64 oracle on its own Q4
+weights, 1024 sampled rows, budget 2.47e-03:
+
+| K parts | each scale covers | symmetric | asymmetric |
+| ---: | ---: | ---: | ---: |
+| 1 (as deployed) | 4096 inputs | 8.79e-03 | 8.15e-03 |
+| 4 (`k_chunk` 1024) | 1024 inputs | 7.78e-03 | 7.22e-03 |
+| 16 | 256 inputs | 6.83e-03 | 6.08e-03 |
+| 64 (the checkpoint's own) | 64 inputs | 5.95e-03 | 3.52e-03 |
+
+At `k_chunk` 1024, which is the K split the M2 sweep already picks for speed, the
+pair is 1.22x better than the deployed arm at identical bytes, identical placement
+and a split that is already there. None of these reach the budget, so this does not
+make an all-int8 share admissible. What it would change is the neuron split: the
+FP16 neurons exist because int8's error is too large for them, and a smaller int8
+error moves that line. How many neurons move has not been measured.
+
 ## Runtime
 
 - **Compile.** Core ML compiles a package with `MLModel compileModelAtURL:`.
