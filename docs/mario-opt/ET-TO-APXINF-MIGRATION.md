@@ -442,3 +442,18 @@ after, `contaminated: false` in all three blocks):
    native side and a paging artifact on the ET side; neither survives a clean window.
 4. d3-lite has no ANE path, so this is a pure GPU/CPU comparison; the M4's advantage comes
    from its newer GPU rather than from its Neural Engine.
+
+## `fused_prep` is now the default for d3-lite text (2026-11-10)
+
+The knob was opt-in; two chips and three paired campaigns later it is the default for the text path,
+with the image path kept on `separate` through a new `APXINF_D3_GDN_BLOCK_IMAGE` (default
+`separate`) because the image parity budget is much tighter (its headroom was 0.0046).
+
+| arm (eight-case timing, M1 Pro) | total |
+|---|---:|
+| **default (`fused_prep`)** | **3 310.8 / 3 314.7 ms** |
+| explicit `separate` | 3 386.3 ms |
+| delta | **−2.2 %** |
+
+End-to-end semantic check on the 48-case gate: **48/48 decisions identical**, `max|Δp| 0.032931`
+against the 0.035 bound — the same parity numbers the opt-in arm produced, now as the default.
