@@ -66,10 +66,16 @@ norm/add chain is worth a kernel. No kernel is proposed before that measurement.
 
 Synchronizing after every predictor group instead of once per frame:
 
-| mode | RTF | wall | per-step |
+| mode | RTF (run 1) | RTF (run 2) | per-step |
 |---|---:|---:|---:|
-| one eval per frame (baseline) | **0.953** | 2.97 s | ~2.5 ms amortized |
-| eval after every group | **1.606** | 5.01 s | **4.497 ms median** |
+| one eval per frame (baseline) | 0.953 | 1.466 | — |
+| eval after every group | 1.606 | 1.073 | 2.295–4.497 ms |
+
+**Run-to-run variance on this host is large**: the same configuration read RTF 0.83–1.47 across the
+day, and the root causes (thermal state, background agents) are not under the benchmark's control. The
+*ordering* held in both runs of every paired comparison, but any single absolute RTF should be treated
+as ±30 % until the host is quiet. The per-frame attribution below came from a single quiet window and
+should be re-taken with paired arms before it is used to size an optimization.
 
 Two conclusions. First, batching the 15 groups into one evaluation is already worth ~1.8× over
 synchronizing each — so the frame-level structure is right and must not be replaced by per-step

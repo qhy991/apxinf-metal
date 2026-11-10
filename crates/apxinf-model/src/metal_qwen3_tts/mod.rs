@@ -279,21 +279,12 @@ impl QwenTts {
                     &codes[group],
                 )?
             };
-            let forward_started = std::time::Instant::now();
-            let logits = self.model.predictor(&inputs, group, &mut cache)?;
-            let forward_ms = forward_started.elapsed().as_secs_f64() * 1e3;
-            let sample_started = std::time::Instant::now();
-            let code = self.sampler.sample(&logits, None, &[])?;
-            let sample_ms = sample_started.elapsed().as_secs_f64() * 1e3;
-            if std::env::var("APXINF_TTS_STAGES").map_or(false, |v| v == "1") {
-                eprintln!("{{\"tts_group\":{{\"group\":{group},\"forward_ms\":{forward_ms:.3},\"sample_ms\":{sample_ms:.3}}}}}");
             let step_started = std::time::Instant::now();
             let logits = self.model.predictor(&inputs, group, &mut cache)?;
             let code = self.sampler.sample(&logits, None, &[])?;
-            // `APXINF_TTS_GROUP_EVAL=1` synchronizes after every group so the
-            // per-step device cost can be separated from the frame's batched
-            // evaluation.
             if std::env::var("APXINF_TTS_GROUP_EVAL").map_or(false, |v| v == "1") {
+                // Synchronize per group to separate per-step device cost from
+                // the frame's batched evaluation.
                 code.eval()?;
                 if std::env::var("APXINF_TTS_STAGES").map_or(false, |v| v == "1") {
                     eprintln!(
