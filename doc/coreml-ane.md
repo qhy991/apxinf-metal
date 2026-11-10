@@ -130,6 +130,74 @@ matches it in three ways:
 The tests use recorded coremltools packages. The packages themselves are not
 committed, because they contain checkpoint-derived weights.
 
+## Weight encodings
+
+The encoding a program stores its weights in decides whether its `conv` reaches the
+Neural Engine at all. The operation list above admits
+`constexpr_blockwise_shift_scale`, but its granularity is not free to choose.
+
+Measured by compiling one projection per encoding and reading
+`MLComputePlan.get_compute_device_usage_for_mlprogram_operation`, with no
+prediction (M4 Mac16,10, macOS 27.0.1, coremltools 9.0, 2026-11-10,
+`layers.12.mlp.gate_proj` [6144, 2048] at T = 512, conv layout):
+
+| encoding | MIL lowering | placement |
+| --- | --- | --- |
+| FP16 | `const` | Neural Engine |
+| int8 per-channel | `constexpr_blockwise_shift_scale` | Neural Engine |
+| LUT4, LUT6 per grouped channel | `constexpr_lut_to_dense` | Neural Engine |
+| int8 per-block 32 | `constexpr_blockwise_shift_scale` | CPU |
+| int8 per-block 64 | `constexpr_blockwise_shift_scale` | CPU |
+| uint4 per-block 32 | `constexpr_blockwise_shift_scale` | CPU |
+
+A per-block encoding sends the whole `conv`, and the `identity` after it, to
+`MLCPUComputeDevice`. The same shape then runs at 0.77 TF/s against 7.63 on the
+Neural Engine (M2, T = 512, Clef layer 0 [12288, 4096], per-block 64). The owner's
+M1 Pro measurement of 2026-10-16 recorded the same fallback for per-block int8 and
+uint4, so this is Core ML compiler behaviour on three generations rather than one
+device's quirk.
+
+Published 4-bit checkpoints are block-wise by construction: MLX affine carries one
+scale and bias per 64 inputs, GPTQ and AWQ one per 128, GGUF k-quants one per block
+of 32 or 256. Whichever of those a family ships, it cannot be handed to the Neural
+Engine in its published form. The composition's per-row int8 is the re-encoding that
+avoids this constraint, not a free choice, and a port must keep that property.
+
+`constexpr_lut_to_dense` is the only sub-8-bit encoding the Neural Engine accepts.
+It does not follow that a LUT buys residency. A palette holds 16 FP16 entries
+however few weights it covers, so its granularity sets the cost:
+
+| encoding | bytes per weight | [6144, 2048] | vs FP16 |
+| --- | ---: | ---: | ---: |
+| FP16 | 2.000 | 25.17 MB | 1.00x |
+| affine Q4 group-64 (as published) | 0.562 | 7.08 MB | 3.56x |
+| int8 per-channel | 1.001 | 12.60 MB | 2.00x |
+| LUT4, one palette per 16 output rows | 0.501 | 6.30 MB | 3.99x |
+| LUT4, one palette per (row, 64 inputs) | 1.000 | 12.58 MB | 2.00x |
+
+Only the last row reproduces affine Q4 group-64 exactly. Within one group every
+weight is `q * scale + bias` with `q` in 0..15, so 16 palette entries hold every
+value the group can take; the largest number of distinct values in a 64-group of the
+Clef checkpoint is 16, as that bound requires. Exactness costs 0.5 byte per weight of
+palette on top of the 0.5 byte index, which is what int8 per-channel already costs.
+An exact LUT4 re-encoding therefore adds no residency headroom over the
+composition's existing int8, and is 1.78x larger than the checkpoint it reproduces.
+The 3.99x row is a different encoding that shares one palette across 16 output rows
+and does not reproduce the checkpoint.
+
+Speed does not separate the encodings either, once both arms are tuned. Splitting
+`conv` along K helps FP16 and does not help int8, so an unsplit comparison overstates
+int8 by roughly the split's own gain. Best against best at the same token count:
+
+| host | shape | FP16 | int8 | unsplit would say |
+| --- | --- | ---: | ---: | ---: |
+| M4 | `down_proj` [2048, 6144], T 1408 | 1.264 ms/512tok | 1.198 | 2.032x |
+| M4 | `gate_proj` [6144, 2048], T 512 | 1.132 ms/512tok | 1.106 | 1.201x |
+| M2 | [12288, 4096], T 512 | 6.409 ms | 5.783 | 1.571x |
+
+That is 1.02x to 1.11x for int8, against 1.20x to 2.03x read off unsplit arms. Select
+an encoding on placement, accuracy and residency, and tune the K split separately.
+
 ## Runtime
 
 - **Compile.** Core ML compiles a package with `MLModel compileModelAtURL:`.
