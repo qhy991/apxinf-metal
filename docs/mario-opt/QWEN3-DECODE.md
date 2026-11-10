@@ -279,3 +279,39 @@ consistency campaign on the same bar the W8 flip used.
 **Remaining plan**: with bytes halved the dependency-length part is now the majority of the token
 (~4 ms of 5.6 ms), so the next lever is fewer kernels (fused norm+QKV, o+residual, gate/up+SiLU),
 not another width change.
+
+## The dispatch bill: where the last 3.8 ms goes (2026-11-10)
+
+`qw3_gemv_probe` grew two modes that separate bandwidth from dispatch:
+
+| probe | work | result |
+|---|---|---:|
+| chained | 168 `quantized_matmul` back to back, each consuming the previous output | **2.9–4.6 ms** |
+| skeleton | 168 × (`rms_norm` + add + SiLU + `slice_update`) on small tensors (~84 MB) | **4.54 ms** |
+| sweep | 168 independent `quantized_matmul` (468 MB) | 3.1–4.2 ms (110–149 GB/s) |
+| real decode (W8) | — | **6.7 ms** |
+
+The chained probe rules out a dependency tax: a strictly serial chain of the same projections runs
+at the bandwidth floor. The skeleton is the finding — those elementwise ops move ~84 MB, which is
+~0.4 ms of bandwidth, yet cost **4.54 ms**: about **6.7 µs of fixed dispatch per kernel**, times the
+~672 tiny kernels a token issues.
+
+That consistency check also explains the earlier negative results: fusing q/k/v removed 56
+*bandwidth* kernels and changed nothing, and compiling the block cannot reduce the device kernel
+count at all. The 6.7 ms is roughly 2.9 ms of quantized-matmul bandwidth plus **~3.1 ms of small-op
+dispatch**.
+
+So the lever is fusing the *elementwise* work into the projections, by kernel count:
+
+| fusion | kernels | expected saving |
+|---|---|---:|
+| `add + rms_norm` → one kernel (twice per layer) | 56 → 28 | ~0.19 ms |
+| SiLU·mul into the gate/up epilogue | 28 → 0 | ~0.19 ms |
+| residual add into the o epilogue | 28 → 0 | ~0.19 ms |
+| residual add into the down epilogue | 28 → 0 | ~0.19 ms |
+| KV `slice_update` → in-place write | 56 → 28 | ~0.19 ms |
+| total | ~460 → ~200 | **~1.7 ms** |
+
+On top of the W4 width (−1.1 ms) that projects to **5.56 → ~2.6–3.0 ms** per token. The order that
+keeps each step independently verifiable is: `rms_norm_add`, then the residual epilogues, then
+in-place KV, then the SiLU epilogue.

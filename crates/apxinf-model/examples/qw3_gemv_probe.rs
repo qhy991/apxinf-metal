@@ -139,6 +139,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             w.numel() as u64 * 4 + s.numel() as u64 * 2 + b.numel() as u64 * 2
         })
         .sum();
+    // The same 168 projections, but chained: each takes the previous output as
+    // its input, like a real decode. This isolates the dependency tax from the
+    // bandwidth floor measured above.
+    let chain_weight = {
+        let count = 1024 * 2048;
+        let data: Vec<f32> = (0..count).map(|i| ((i % 17) as f32 - 8.0) / 64.0).collect();
+        let canonical = Array::from_f32(&stream, &[1024, 2048], &data)?.cast(MlxDType::BF16)?;
+        let packed = canonical.transpose(&[1, 0])?;
+        let [w, s, b] = packed.quantize(64, 8)?;
+        stream.eval(&[w.clone(), s.clone(), b.clone()])?;
+        (w, s, b)
+    };
+    let mut state = x.clone();
+    let started = Instant::now();
+    for _ in 0..168 {
+        let y = state.quantized_matmul(&chain_weight.0, &chain_weight.1, &chain_weight.2, true, 64, 8)?;
+        state = y.slice_axis(1, 0, 1024)?;
+    }
+    stream.eval(&[state])?;
+    // Non-matmul skeleton: the same count of the small elementwise ops a decode
+    // token issues (norm, residual adds, SiLU, KV-style slice_update), chained.
+    let weight = Array::from_f32(&stream, &[1024], &vec![1.0f32; 1024])?.cast(MlxDType::BF16)?;
+    let cache = Array::zeros(&stream, &[1, 8, 256, 128], MlxDType::BF16)?;
+    let row = Array::zeros(&stream, &[1, 8, 1, 128], MlxDType::BF16)?;
+    let index = Array::from_i32(&stream, &[1], &[0])?;
+    let mut state = x.clone();
+    let started = Instant::now();
+    for _ in 0..168 {
+        let n = state.fast_rms_norm(&weight, 1e-6)?;
+        state = state.add(&n)?;
+        state = state.mul(&state.sigmoid()?)?;
+        let _ = cache.slice_update(&row, &index, &[2])?;
+    }
+    stream.eval(&[state])?;
+    println!(
+        "skeleton (168 norm+add+silu+slice_update): {:.3} ms",
+        started.elapsed().as_secs_f64() * 1e3
+    );
+
+    println!(
+        "chained 168 projections:   {:.3} ms  (same weight, strictly serial)",
+        started.elapsed().as_secs_f64() * 1e3
+    );
+
     println!(
         "full token sweep (28 layers): {:.3} ms, {:.1} MB -> {:.1} GB/s",
         seconds * 1e3,
