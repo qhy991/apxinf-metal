@@ -337,3 +337,26 @@ on by default for the Qwen3 decode path; `APXINF_QWEN3_FUSED_NORM=0` restores th
 
 Next items of the plan (`o`/`down` residual epilogues, in-place KV, SiLU epilogue) each remove
 another ~28 kernels, i.e. ~0.19 ms at the measured 6.7 µs dispatch cost.
+
+## Fusion ledger: one KEEP, three measured negatives (2026-11-10)
+
+The dispatch measurements in the previous section suggested each removed launch was worth ~6.7 µs,
+so four fusions were attempted. Only one moved the wall:
+
+| fusion | kernels removed / token | measured TPOT | verdict |
+|---|---|---|---|
+| **residual add + RMS norm** (post-attention) | 28 | 6.88 → **6.52 ms** | **KEEP** |
+| q / k / v projection → one quantized GEMM | 56 | 6.82 → 6.80 ms | **NOT-WORTH** (no change) |
+| SiLU(gate) · up from the fused gate/up output | 56–84 | 6.51 → 6.47/6.55 ms | **NOT-WORTH** (no change) |
+| KV `slice_update` → in-place write | 28 | not attempted | — |
+
+The pattern: the fusion that helped sat **on the dependency chain between attention and the MLP**,
+where its two kernels each had to finish before the next projection could start. The two that did
+nothing sit next to kernels that already dominate (the quantized projections), so the removed
+launches simply hid behind work that was going to happen anyway. The skeleton probe's 6.7 µs per
+kernel is therefore an **upper bound on isolated launches**, not a per-kernel budget in the model.
+
+Consequence for the plan: fusing more small kernels is not where the remaining ~3 ms is. The two
+untried structural options keep the same shape as the one that worked — (a) defer the `down`
+residual so the *next* layer's input norm consumes it through `RmsNormAdd` (moves one more kernel
+off the chain), and (b) in-place KV writes. Both are worth trying; neither is a sure thing.
