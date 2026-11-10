@@ -315,3 +315,25 @@ So the lever is fusing the *elementwise* work into the projections, by kernel co
 On top of the W4 width (−1.1 ms) that projects to **5.56 → ~2.6–3.0 ms** per token. The order that
 keeps each step independently verifiable is: `rms_norm_add`, then the residual epilogues, then
 in-place KV, then the SiLU epilogue.
+
+## Fused residual-add + RMS-norm kernel — KEEP (2026-11-10)
+
+First item of the fusion plan: the post-attention site computes `hidden = x + y` and then
+`norm(hidden)`. `apxinf_mlx::RmsNormAdd` does both in one launch (one threadgroup per row,
+BF16 add rounded before the statistics, F32 weight), and returns the sum as well so the
+residual path is unchanged.
+
+| arm (mixed-w8, 192-token generation) | TPOT |
+|---|---:|
+| add + `fast_rms_norm` (unfused) | 6.88 ms |
+| **fused `rms_norm_add`** | **6.52–6.55 ms** |
+| delta | **−4.8…−5.0 %** |
+
+Parity: the fused **sum is bit-identical** (`hidden: 0/3072` differ on the unit check), and the
+normalized row differs by **one BF16 ULP** at most (`max |delta| 7.6e-3`, 3069/3072 elements) —
+the reduction order of the mean differs from MLX's. Over a 192-token generation the outputs are
+**192/192 identical**, so the rounding difference does not move a token here. `RmsNormAdd` is
+on by default for the Qwen3 decode path; `APXINF_QWEN3_FUSED_NORM=0` restores the two-op path.
+
+Next items of the plan (`o`/`down` residual epilogues, in-place KV, SiLU epilogue) each remove
+another ~28 kernels, i.e. ~0.19 ms at the measured 6.7 µs dispatch cost.
