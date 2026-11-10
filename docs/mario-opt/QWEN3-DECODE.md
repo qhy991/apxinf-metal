@@ -414,3 +414,56 @@ sites, −7.2 % together) and **four negatives** (q/k/v merge, SiLU merge, compi
 KV). The token is now `≈2.9 ms of quantized-GEMM bandwidth + ≈3.5 ms of dependency-chain latency`,
 and the second term is not reachable by removing launches one at a time — every remaining option
 changes the algorithm (speculative decoding, batched verify) rather than the kernel graph.
+## Migration check: the fusion pays only where a graph is launch-bound (2026-11-10)
+
+The add+norm kernel was ported to d3-lite (`metal_d3_lite`, hidden 1024, pure GPU) and measured on
+its own eight-case timing set with the `fused_prep` GDN block:
+
+| arm | eight-case total |
+|---|---:|
+| fused `rms_norm_add` | 3 270.6 / 3 286.9 ms |
+| unfused | 3 276.0 ms |
+| delta | **none** (inside window noise) |
+
+The reason is the workload shape, not the kernel: d3-lite evaluates **one graph per request** (no
+decode, no KV cache), so its 28 layers are ~224 launches inside a ~400 ms graph — about 1.6 ms of
+dispatch out of 3 270. The same fusion paid −5 % on Qwen3 only because Qwen3's decode graph is 628
+launches inside 6.7 ms.
+
+**Rule of thumb this establishes**: a per-launch fusion is worth attempting when
+`kernels × 6.7 µs` is a visible fraction of the graph's wall time — i.e. in token-by-token decode
+loops and small per-step graphs, not in single-shot forwards. Measured ratios:
+
+| model path | kernels / graph | wall / graph | dispatch share | verdict |
+|---|---:|---:|---:|---|
+| Qwen3-0.6B decode | 628 | 6.7 ms | ~63 % | fusion pays (−5 %) |
+| d3-lite single request | ~224 | ~409 ms | ~0.05 % | fusion not worth it |
+
+The port was reverted (no measured benefit, and the repository does not carry unmeasured paths). The
+kernel itself keeps its generalised width and BF16/F32 weight so the decode models can use it
+directly.
+
+## Migration verdict across the model set (2026-11-10)
+
+The add+norm fusion was ported to every viable target and measured before shipping:
+
+| model path | graph shape | dispatch share | fused norm result |
+|---|---|---:|---|
+| **Qwen3-0.6B decode** | 628 kernels / 6.7 ms | ~63 % | **KEEP**: −5 %, −7.2 % with the deferred residual |
+| MiniCPM5-2B decode | ~320 kernels / 33.5 ms | ~7 % | **no change** (33.56 vs 33.64 ms), identical tokens |
+| d3-lite single request | ~224 kernels / 409 ms | ~0.05 % | **no change** (3 270 vs 3 276 ms) |
+
+So the fusion does not "transfer to other models" as a rule; it transfers to **launch-bound graphs**.
+Qwen3-0.6B qualifies because a 0.6B model's per-token work is small relative to its ~628 launches;
+MiniCPM5-2B already moves 4 GB per token at ~120 GB/s (near the M1 Pro's peak), so a removed launch
+is diluted 10× below noise, and d3-lite has no decode loop at all.
+
+**What does transfer, by contrast, is the quantization lever** — and it transfers in the opposite
+order of model size:
+
+- Qwen3-0.6B: W8 `−31.7 %` (plus device greedy), W4 `−17 %` on top;
+- MiniCPM5-2B: **has no W8 variant** (`mixed-w8` is rejected by `admit`), and its decode is
+  bandwidth-bound at ~120 GB/s, so a W8 decode copy should roughly halve the weight traffic —
+  the largest single opportunity in that module;
+- the engine-side rule generalises: **shave launch count only where dispatch share is visible; shave
+  bytes wherever the graph is bandwidth-bound**.
