@@ -467,3 +467,27 @@ order of model size:
   the largest single opportunity in that module;
 - the engine-side rule generalises: **shave launch count only where dispatch share is visible; shave
   bytes wherever the graph is bandwidth-bound**.
+
+## MiniCPM5 W8 migration: measured, and it does not transfer (2026-11-10)
+
+The migration verdict predicted that MiniCPM5-2B — bandwidth-bound at ~118 GB/s with no W8 variant —
+would be the best place to port Qwen3's W8 decode lane. It was implemented (a `mixed-w8` variant, W8
+copies of all seven layer projections, the one-row `quantized_matmul` lane) and measured:
+
+| variant | TPOT (32-token generation) | tokens |
+|---|---:|---|
+| `bf16-compiled` | 33.83 / 34.00 ms | identical prefix |
+| `mixed-w8` | 34.40 / 34.40 ms | identical prefix |
+
+**W8 is 1.7 % slower**, so the port was reverted. The reason is the same effect the Qwen3 shape probe
+showed: MLX's `quantized_matmul` at one row reaches ~72 GB/s where the BF16 GEMM reaches 100–300 GB/s
+on the same shapes. Halving the bytes only wins when the quantized kernel keeps at least half the
+BF16 bandwidth; on Qwen3-0.6B's shapes it did, on MiniCPM5-2B's it does not.
+
+**The full migration picture, all measured:**
+
+| lever | transfers when | measured |
+|---|---|---|
+| launch fusion | the graph is launch-bound (dispatch ≥ ~50 % of wall) | Qwen3-0.6B −7.2 %; MiniCPM5 0; d3-lite 0 |
+| W8 decode weights | the quantized kernel keeps ≥ half the BF16 bandwidth at M=1 | Qwen3-0.6B −31.7 %; MiniCPM5 +1.7 % (worse) |
+| device greedy + deferred residual | greedy decode loop exists | Qwen3-0.6B −31.7 % partially from this |
