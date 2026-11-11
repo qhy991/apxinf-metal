@@ -144,3 +144,8 @@ path = "examples/rms_norm_add_check.rs"
 name = "qwen3_tts_probe"
 path = "examples/qwen3_tts_probe.rs"
 required-features = ["mlx"]
+
+[[example]]
+name = "qmm_probe"
+path = "examples/qmm_probe.rs"
+required-features = ["mlx"]
