@@ -70,3 +70,25 @@ skeleton's implied dispatch share is below ~10 % of the token, fusion will hide 
    decode; the model's own quality gate for image/audio targets).
 4. Revert when it does not pay. A rejected direction ships as a measurement in the line's document,
    never as dead code on `main`.
+
+## Host noise comes from the desktop session, not from throttling
+
+The TTS line spent a day treating its own variance as thermal: the same configuration read RTF 0.83 to
+1.47 on the M1 Pro. It was not thermal. `ps` on the same machine showed a desktop session holding a core
+continuously:
+
+```
+PID    %CPU  ELAPSED      COMMAND
+441    52.3  05-23:32:54  .../SkyLight.framework/.../WindowServer
+25144  17.5  02-11:03:48  .../Ventura.appex/Contents/MacOS/Ventura
+```
+
+Two system UI processes at ~70 % of one core for days. That is enough to move a 3 s synthesis both ways
+and to make a 6.7 ms decode token read 6.1–6.9 ms.
+
+**Rule.** Record the host state with every measurement — `ps -Ao pid,pcpu,etime,comm | sort -k2 -rn |
+head -5` — and say which session it was taken in. If a system UI process is above ~20 % CPU, absolute
+numbers are good to about ±30 %; paired deltas taken in the same window are still usable, which is why
+the paired-arm discipline matters more than the absolute reading. Laptop measurements taken with a
+logged-in desktop are not comparable to ones taken on a headless or locked machine, and no amount of
+repeating the same arm fixes that.
