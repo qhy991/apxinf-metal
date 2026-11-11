@@ -9,7 +9,9 @@
 //! like any other. A case with a check also reports how far its first
 //! prediction is from an f64 reference.
 //!
-//!   cargo run -q -p apxinf-coreml --release --features native --example aneops
+//!   cargo run -q -p apxinf-coreml --release --features native --example aneops [case ...]
+//!
+//! Naming cases runs only those, plus the cases they require.
 use apxinf_core::{Error, Result};
 use apxinf_coreml::program::GeluMode;
 use apxinf_coreml::{ComputeDeviceKind, ComputeUnits, Operand, Package, ProgramBuilder, ProgramCache, Var};
@@ -27,6 +29,9 @@ struct Program {
     /// Where the authored program differs from the case as specified.
     note: &'static str,
     check: Check,
+    /// Per input, a factor the host folds into it before the program sees it.
+    /// The check is given the values before the fold. Empty means none.
+    input_scales: Vec<f32>,
 }
 
 /// What a case's first output is compared with, in f64.
@@ -129,6 +134,7 @@ fn finish(b: ProgramBuilder, inputs: Vec<Var>, outputs: &[&Var], note: &'static 
         outputs: outputs.iter().map(|&v| v.clone()).collect(),
         note,
         check: Check::None,
+        input_scales: Vec::new(),
     })
 }
 
@@ -218,6 +224,8 @@ const HEAD_DIM: usize = 128;
 
 /// Per head: `S = conv(Q_h, K_h)` is `[1, keys, 1, queries]`, softmax over the
 /// key (channel) axis, then `O_h = conv(P, V_h^T)` is `[1, head_dim, 1, queries]`.
+/// Gated on `softmax_in_block`, the softmax at this block's score size; the
+/// `[1,1,128,1408]` softmax it used to wait on is below the placement threshold.
 fn attention_core_conv() -> Result<Program> {
     let mut b = ProgramBuilder::new();
     let q = b.input("q", &[1, HEADS * HEAD_DIM, 1, SEQ]);
@@ -263,15 +271,36 @@ fn softmax() -> Result<Program> {
     finish(b, vec![x], &[&y], "")
 }
 
+/// `softmax_last_axis` of `x - max(x)`: the same value, but `exp` cannot
+/// overflow FP16, which it does above 11.09.
+fn stable_softmax_last_axis(b: &mut ProgramBuilder, x: &Var) -> Result<Var> {
+    let max = b.reduce_max(x, &[x.shape().len() as i32 - 1], true)?;
+    let neg = b.mul(&max, Operand::Scalar(f16::from_f32(-1.0)), None)?;
+    let shifted = b.add(x, Operand::Var(&neg), None)?;
+    softmax_last_axis(b, &shifted)
+}
+
+/// Unscaled attention with the softmax spelled as elementwise ops, so each one
+/// is a separate pass over the `[1,8,1408,1408]` scores.
 fn attention_core() -> Result<Program> {
+    let (heads, rows, d) = (8, 1408, 256);
     let mut b = ProgramBuilder::new();
-    let scores = b.input("scores", &[1, 8, 1408, 256]);
-    let value = b.input("value", &[1, 8, 256, 1408]);
-    let out_value = b.input("out_value", &[1, 8, 1408, 256]);
+    let scores = b.input("scores", &[1, heads, rows, d]);
+    let value = b.input("value", &[1, heads, d, rows]);
+    let out_value = b.input("out_value", &[1, heads, rows, d]);
     let s = b.matmul(&scores, &value)?;
-    let p = softmax_last_axis(&mut b, &s)?;
+    let p = stable_softmax_last_axis(&mut b, &s)?;
     let y = b.matmul(&p, &out_value)?;
-    finish(b, vec![scores, value, out_value], &[&y], "")
+    Ok(Program {
+        // Without the max subtraction, `exp` of these unscaled scores overflowed.
+        check: attention_check(heads, rows, rows, d, 1.0, KeyLayout::Transposed),
+        ..finish(
+            b,
+            vec![scores, value, out_value],
+            &[&y],
+            "no 1/sqrt(d) scale; softmax is reduce_max, mul -1, add, exp, reduce_sum, real_div",
+        )?
+    })
 }
 
 fn transpose_head() -> Result<Program> {
@@ -290,31 +319,44 @@ fn concat_heads() -> Result<Program> {
     finish(b, heads, &[&y], "")
 }
 
-/// Wide enough that the scores are peaked, so a wrong scale or key axis shows in
-/// the output rather than averaging out to the mean of `v`.
-const ATTENTION_SPAN: f32 = 4.0;
+/// `values` repeats every 200 elements, so a 128-wide row has 25 distinct scores.
+/// At span 4 the top one wins with or without `1/sqrt(d)`, and a block with no
+/// scale passed the check at 1.2e-4. At span 1 a missing scale moves the output
+/// by 0.5 relative, and the scores are still peaked enough not to average out.
+const ATTENTION_SPAN: f32 = 1.0;
 
 /// Query rows of each head that the f64 oracle recomputes.
 fn sampled_rows(rows: usize) -> impl Iterator<Item = usize> {
     (0..rows).step_by(rows.div_ceil(4))
 }
 
-/// `softmax(q k^T / sqrt(d)) v` at four query rows per head, for row-major
-/// `q[1, heads, rows, d]` and `k, v[1, heads, keys, d]`.
-fn attention_check(heads: usize, rows: usize, keys: usize, d: usize) -> Check {
+/// How the `k` input of an attention case is laid out per head.
+#[derive(Clone, Copy)]
+enum KeyLayout {
+    /// `[keys, d]`, row-major.
+    Rows,
+    /// `[d, keys]`, already `k^T`.
+    Transposed,
+}
+
+/// `softmax(scale q k^T) v` at four query rows per head, for row-major
+/// `q[1, heads, rows, d]` and `v[1, heads, keys, d]`, inputs on `[-ATTENTION_SPAN, ATTENTION_SPAN)`.
+fn attention_check(heads: usize, rows: usize, keys: usize, d: usize, scale: f64, layout: KeyLayout) -> Check {
     Check::Sampled {
         span: ATTENTION_SPAN,
         f: Box::new(move |inputs: &[Vec<f16>]| {
             let (q, k, v) = (&inputs[0], &inputs[1], &inputs[2]);
-            let scale = 1.0 / (d as f64).sqrt();
+            let key = |h: usize, j: usize, c: usize| match layout {
+                KeyLayout::Rows => k[(h * keys + j) * d + c],
+                KeyLayout::Transposed => k[(h * d + c) * keys + j],
+            };
             let mut expected = Vec::new();
             for h in 0..heads {
                 for i in sampled_rows(rows) {
                     let qi = &q[(h * rows + i) * d..][..d];
                     let scores: Vec<f64> = (0..keys)
                         .map(|j| {
-                            let kj = &k[(h * keys + j) * d..][..d];
-                            qi.iter().zip(kj).map(|(a, b)| a.to_f64() * b.to_f64()).sum::<f64>() * scale
+                            qi.iter().enumerate().map(|(c, a)| a.to_f64() * key(h, j, c).to_f64()).sum::<f64>() * scale
                         })
                         .collect();
                     let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -331,26 +373,42 @@ fn attention_check(heads: usize, rows: usize, keys: usize, d: usize) -> Check {
     }
 }
 
-/// Decomposed attention as one program: `QK^T` and `AV` as batched matmuls, the
-/// `1/sqrt(d)` scale as a scalar `mul`, and the native `softmax` over the keys.
-fn attention_block_matmul(heads: usize, rows: usize, keys: usize, d: usize) -> Result<Program> {
+/// Where an attention block applies `1/sqrt(d)`.
+#[derive(Clone, Copy)]
+enum ScoreScale {
+    /// A scalar `mul` over the scores, inside the block.
+    Separate,
+    /// Multiplied into `q` on the host, so the block has no `mul`.
+    Folded,
+    /// Nowhere. Numerically wrong; it only prices the `mul`.
+    Omitted,
+}
+
+/// Decomposed attention as one program: `QK^T` and `AV` as batched matmuls and
+/// the native `softmax` over the keys, with the scale where `scale` puts it.
+/// The check is always the correctly scaled attention of `q` before any fold.
+fn attention_block_matmul(heads: usize, rows: usize, keys: usize, d: usize, scale: ScoreScale) -> Result<Program> {
+    let factor = 1.0 / (d as f32).sqrt();
     let mut b = ProgramBuilder::new();
     let q = b.input("q", &[1, heads, rows, d]);
     let k = b.input("k", &[1, heads, keys, d]);
     let v = b.input("v", &[1, heads, keys, d]);
     let kt = b.transpose(&k, &[0, 1, 3, 2])?;
-    let scores = b.matmul(&q, &kt)?;
-    let scaled = b.mul(&scores, Operand::Scalar(f16::from_f32(1.0 / (d as f32).sqrt())), None)?;
-    let p = b.softmax(&scaled, -1)?;
+    let mut scores = b.matmul(&q, &kt)?;
+    if let ScoreScale::Separate = scale {
+        scores = b.mul(&scores, Operand::Scalar(f16::from_f32(factor)), None)?;
+    }
+    let p = b.softmax(&scores, -1)?;
     let y = b.matmul(&p, &v)?;
+    let (note, input_scales) = match scale {
+        ScoreScale::Separate => ("k^T is a transpose op: the builder's matmul always emits transpose_y=false", vec![]),
+        ScoreScale::Folded => ("q is multiplied by 1/sqrt(d) on the host and rounded to FP16 before the program", vec![factor]),
+        ScoreScale::Omitted => ("NUMERICALLY WRONG, a cost floor only: no 1/sqrt(d) anywhere; same program as the folded case", vec![]),
+    };
     Ok(Program {
-        check: attention_check(heads, rows, keys, d),
-        ..finish(
-            b,
-            vec![q, k, v],
-            &[&y],
-            "k^T is a transpose op: the builder's matmul always emits transpose_y=false",
-        )?
+        check: attention_check(heads, rows, keys, d, f64::from(factor), KeyLayout::Rows),
+        input_scales,
+        ..finish(b, vec![q, k, v], &[&y], note)?
     })
 }
 
@@ -361,7 +419,7 @@ fn attention_sdpa_op(heads: usize, seq: usize, d: usize) -> Result<Program> {
     let v = b.input("v", &[1, heads, seq, d]);
     let y = b.sdpa(&q, &k, &v, None)?;
     Ok(Program {
-        check: attention_check(heads, seq, seq, d),
+        check: attention_check(heads, seq, seq, d, 1.0 / (d as f64).sqrt(), KeyLayout::Rows),
         ..finish(
             b,
             vec![q, k, v],
@@ -632,14 +690,6 @@ fn cases() -> Vec<Case> {
             "x[1,256,1,1408] w[128,256,1,1] (input)",
             conv_dynamic_weight,
         ),
-        Case {
-            requires: &["softmax_op", "conv_dynamic_weight"],
-            ..case(
-                "attention_core_conv",
-                "8 heads x seq 1408 x head_dim 128: q[1,1024,1,1408] k[11264,128,1,1] v[1024,1408,1,1]",
-                attention_core_conv,
-            )
-        },
         case(
             "reshape_matmul",
             "x[1,8,1408,256] -> [8,1408,256], matmul with value[8,256,1408]",
@@ -652,22 +702,23 @@ fn cases() -> Vec<Case> {
         author,
         requires: &[],
     };
+    use ScoreScale::{Folded, Omitted, Separate};
+    for (name, shape, (heads, rows, keys), scale) in [
+        ("attention_block_matmul", "q,k,v[1,8,1408,128]", (HEADS, SEQ, SEQ), Separate),
+        ("attention_scale_folded", "q,k,v[1,8,1408,128]", (HEADS, SEQ, SEQ), Folded),
+        ("attention_no_scale", "q,k,v[1,8,1408,128]", (HEADS, SEQ, SEQ), Omitted),
+        ("attention_block_matmul_wide", "q,k,v[1,32,512,128]", (32, 512, 512), Separate),
+        ("attention_scale_folded_wide", "q,k,v[1,32,512,128]", (32, 512, 512), Folded),
+        ("attention_decode_shape", "q[1,8,1,128] k,v[1,8,2048,128], scores [1,8,1,2048]", (HEADS, 1, 2048), Separate),
+        ("attention_fold_decode", "q[1,8,1,128] k,v[1,8,2048,128], scores [1,8,1,2048]", (HEADS, 1, 2048), Folded),
+    ] {
+        cases.push(program(
+            name,
+            shape,
+            Box::new(move || attention_block_matmul(heads, rows, keys, HEAD_DIM, scale)),
+        ));
+    }
     cases.extend([
-        program(
-            "attention_block_matmul",
-            "q,k,v[1,8,1408,128]",
-            Box::new(|| attention_block_matmul(HEADS, SEQ, SEQ, HEAD_DIM)),
-        ),
-        program(
-            "attention_block_matmul_wide",
-            "q,k,v[1,32,512,128]",
-            Box::new(|| attention_block_matmul(32, 512, 512, HEAD_DIM)),
-        ),
-        program(
-            "attention_decode_shape",
-            "q[1,8,1,128] k,v[1,8,2048,128], scores [1,8,1,2048]",
-            Box::new(|| attention_block_matmul(HEADS, 1, 2048, HEAD_DIM)),
-        ),
         program(
             "attention_sdpa_op",
             "q,k,v[1,8,1408,128]",
@@ -679,6 +730,14 @@ fn cases() -> Vec<Case> {
             Box::new(|| attention_sdpa_op(64, 496, 64)),
         ),
         case("softmax_in_block", "x[1,8,1408,1408] axis -1", softmax_in_block),
+        Case {
+            requires: &["softmax_in_block", "conv_dynamic_weight"],
+            ..case(
+                "attention_core_conv",
+                "8 heads x seq 1408 x head_dim 128: q[1,1024,1,1408] k[11264,128,1,1] v[1024,1408,1,1]",
+                attention_core_conv,
+            )
+        },
     ]);
     use Elementwise::*;
     for (name, body) in [
@@ -769,10 +828,18 @@ fn measure(program: &Program, cache: &ProgramCache) -> Result<Measurement> {
                 .collect()
         })
         .collect();
+    let fed: Vec<Vec<f16>> = data
+        .iter()
+        .enumerate()
+        .map(|(i, d)| match program.input_scales.get(i) {
+            Some(&s) => d.iter().map(|x| f16::from_f32(x.to_f32() * s)).collect(),
+            None => d.clone(),
+        })
+        .collect();
     let inputs: Vec<(&str, &[f16], &[usize])> = program
         .inputs
         .iter()
-        .zip(&data)
+        .zip(&fed)
         .map(|(v, d)| (v.name(), &d[..], v.shape()))
         .collect();
     let outputs: Vec<(&str, &[usize])> = program.outputs.iter().map(|v| (v.name(), v.shape())).collect();
@@ -841,12 +908,30 @@ fn sysctl(name: &str) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// The cases named on the command line and the cases they require, or every
+/// case when none is named.
+fn selected(all: Vec<Case>, names: &[String]) -> Result<Vec<Case>> {
+    if let Some(unknown) = names.iter().find(|n| !all.iter().any(|c| c.name == n.as_str())) {
+        return Err(Error::Other(format!("no case named {unknown}")));
+    }
+    let wanted: Vec<&str> = all
+        .iter()
+        .filter(|c| names.iter().any(|n| n == c.name))
+        .flat_map(|c| c.requires.iter().copied().chain([c.name]))
+        .collect();
+    Ok(all
+        .into_iter()
+        .filter(|c| names.is_empty() || wanted.contains(&c.name))
+        .collect())
+}
+
 fn main() -> Result<()> {
+    let names: Vec<String> = std::env::args().skip(1).collect();
     let root = std::env::temp_dir().join(format!("aneops-{}", std::process::id()));
     let (mut measured, mut refused, mut unsupported, mut blocked) = (0, 0, 0, 0);
     let mut all_on_ane: Vec<String> = Vec::new();
     let mut placed: Vec<&str> = Vec::new();
-    for (i, case) in cases().iter().enumerate() {
+    for (i, case) in selected(cases(), &names)?.iter().enumerate() {
         let head = format!("\"case\":\"{}\",\"shape\":\"{}\"", case.name, esc(&case.shape));
         let t0 = Instant::now();
         let missing: Vec<String> = case
