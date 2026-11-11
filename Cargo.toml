@@ -63,3 +63,8 @@ half = "2"
 # and the checkpoint's own preprocessor is bit-exact for PNG.
 base64 = "0.13"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[bin]]
+name = "apxinf-latency-worker"
+path = "src/bin/apxinf-latency-worker.rs"
+required-features = ["mlx"]
