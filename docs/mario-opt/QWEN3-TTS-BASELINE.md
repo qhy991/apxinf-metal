@@ -163,3 +163,32 @@ assumed from this table.
 The remaining work is mechanical: re-add the `apxinf_mlx::Quantized` decode wrapper (it existed on the
 MiniCPM5 branch and was reverted with that negative result), build the five predictor layers' W8 copies
 at load, and use them for the M=1 lane.
+## W8 decode copies: measured, and the split verdict (2026-11-11)
+
+`APXINF_TTS_W8_PREDICTOR=1` / `APXINF_TTS_W8_TALKER=1` (or `=4|6|8`) give the code predictor and the
+1.7B talker affine W8 decode copies. Paired, same text, same seed:
+
+| arm | audio | wall | RTF | complete |
+|---|---:|---:|---:|---|
+| baseline | 3.120 s | 2.70–2.80 s | 0.866–0.897 | yes |
+| **W8 predictor** | **3.120 s** | **2.40–2.42 s** | **0.771–0.777** | yes |
+| W8 talker | 3.120 s | 2.43 s | 0.779 | yes |
+| W8 both | **2.960 s** | **1.90–1.93 s** | **0.641–0.650** | yes |
+
+**Verdict split.**
+
+- **W8 predictor is a clean KEEP candidate**: −11…−14 % wall, and the produced audio is *identical in
+  duration* to the baseline (3.120 s, both complete), i.e. the same frame count and the same EOS.
+- **W8 talker** halves the largest byte stream and reaches RTF 0.78, and **W8 both reaches 0.64**
+  (−31 %), but the combined arm produces **2.960 s instead of 3.120 s** — a different frame count, so
+  the sampled codes changed. The synthesis still terminates normally (`complete: yes`), which is what a
+  different sampling path looks like, but "still terminates" is not "still intelligible".
+
+So the talker/speech-quality question needs the gate this repository does not have natively: an ASR
+round-trip (the Qwen3-ASR checkpoint is present on the machine, but `apxinf-model` has no ASR runtime
+yet). Until then the talker copies stay **opt-in**, and only the predictor copy is proposed for a
+default after the parity-style check on more texts.
+
+The bytes arithmetic that predicts this is in the previous section: the predictor re-reads 2.04 GB per
+frame (15 sequential group passes) and the talker ~3.4 GB (its 1.7B weights), so both respond to
+halving the bytes, and the measured 0.64 RTF combined is close to what the totals allow.
