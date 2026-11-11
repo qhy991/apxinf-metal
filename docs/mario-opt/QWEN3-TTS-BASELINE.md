@@ -136,3 +136,30 @@ MiniCPM5-2B they did not).
 The 15 passes cannot be collapsed: group *g* consumes group *g−1*'s sampled code, so there is no
 batching escape, only fewer bytes per pass. This also supersedes the "fusions below budget" conclusion
 of the previous section — the fusions were correctly costed at ~1.6 %, but they were the wrong lever.
+
+## The W8 predictor gate passes (probe, `examples/qmm_probe.rs`)
+
+Before wiring W8 into the predictor, the precondition from `doc/optimization-transfer-rules.md` was
+tested: *does the quantized lane keep its bandwidth on these shapes?* MiniCPM5-2B failed it. The TTS
+predictor's five projection shapes pass it comfortably (M1 Pro, `[out, in]`, M=1, 200 iterations after
+50 warm-ups):
+
+| shape | BF16 | W8 | speed-up |
+|---|---:|---:|---:|
+| 1024 × 1024 | 0.033 ms (64 GB/s) | 0.023 ms (46 GB/s) | **1.46×** |
+| 1024 × 1024 | 0.025 ms (83 GB/s) | 0.016 ms (65 GB/s) | **1.56×** |
+| 3072 × 1024 | 0.075 ms (84 GB/s) | 0.022 ms (141 GB/s) | **3.36×** |
+| 3072 × 1024 | 0.033 ms (189 GB/s) | 0.027 ms (119 GB/s) | **1.26×** |
+| 1024 × 3072 | 0.046 ms (137 GB/s) | 0.026 ms (120 GB/s) | **1.76×** |
+
+W8 wins on every shape, 1.26–3.36× (≈1.9× mean). Applied to the measured 37 ms predictor pass, that
+projects **≈17–19 ms saved of the ~61 ms frame (−28…−31 %)**, cutting the 2.04 GB per frame to ~1.02 GB.
+
+Two caveats worth keeping: the repeated 1024 × 1024 and 3072 × 1024 rows disagree with themselves by up
+to 2× (host noise, see the discipline section — pair the arms when it matters), and the win is a
+per-shape property, so the predictor's actual end-to-end gain must still be measured rather than
+assumed from this table.
+
+The remaining work is mechanical: re-add the `apxinf_mlx::Quantized` decode wrapper (it existed on the
+MiniCPM5 branch and was reverted with that negative result), build the five predictor layers' W8 copies
+at load, and use them for the M=1 lane.
