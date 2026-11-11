@@ -20,13 +20,17 @@
 //!       --op conv2d --c <in> --n <out> --h <h> --w <w> --kernel <k>
 //!       --op norm   --hidden <c> --tiles <t>
 //!       --op moe    --experts <E> --m <tokens> --n <n> --k <k> [--n-splits <experts per predict>]
+//!       --op attention --heads <h> --d <d> --seq <s> [--kv-heads <h>] [--kv-seq <n>] [--causal]
+//!                   [--spellings folded,separate]
 mod class;
 
 use apxinf_core::{Error, Result};
 use apxinf_coreml::{
     ComputeDeviceKind, ComputeUnits, Operand, Package, ProgramBuilder, ProgramCache, Var,
 };
-use class::{check_flags, check_format, Format, OpClass, Problem, Schedule, Spelling};
+use class::{
+    check_flags, check_format, check_spelling, Format, OpClass, Problem, Schedule, Spelling,
+};
 use half::f16;
 
 /// What happened to one searched cell. A schedule the compiler refused, or
@@ -43,6 +47,8 @@ enum Outcome {
         ms: f64,
         rel_rmse: f64,
         weight_mb: f64,
+        /// The operations of the first program, every one placed on the engine.
+        engine_ops: Vec<String>,
     },
 }
 
@@ -236,6 +242,48 @@ fn norm_program(hidden: usize, tile: usize) -> Result<Package> {
     b.finish(&[&y])
 }
 
+/// One query tile of attention, `softmax(q k^T / sqrt(d) + mask) v`, with the
+/// scale where `s.spelling` puts it: folded leaves it to the host, separate is
+/// a `mul` over the scores. Grouped query heads are reshaped into the query
+/// rows of their K/V head, so one matmul serves the group and K and V are
+/// never repeated.
+fn attention_program(
+    heads: usize,
+    kv_heads: usize,
+    d: usize,
+    kv_seq: usize,
+    causal: bool,
+    s: &Schedule,
+) -> Result<Package> {
+    let (t, group) = (s.tile, heads / kv_heads);
+    let dims = |v: &[usize]| v.iter().map(|&x| x as i32).collect::<Vec<i32>>();
+    let mut b = ProgramBuilder::new();
+    let q = b.input("q", &[1, heads, t, d]);
+    let k = b.input("k", &[1, kv_heads, kv_seq, d]);
+    let v = b.input("v", &[1, kv_heads, kv_seq, d]);
+    let mask = causal.then(|| b.input("mask", &[1, 1, group * t, kv_seq]));
+    let q = match group {
+        1 => q,
+        _ => b.reshape(&q, &dims(&[1, kv_heads, group * t, d]))?,
+    };
+    let kt = b.transpose(&k, &[0, 1, 3, 2])?;
+    let mut scores = b.matmul(&q, &kt)?;
+    if s.spelling == Spelling::ScaleSeparate {
+        let scale = f16::from_f32(1.0 / (d as f32).sqrt());
+        scores = b.mul(&scores, Operand::Scalar(scale), None)?;
+    }
+    if let Some(m) = &mask {
+        scores = b.add(&scores, Operand::Var(m), None)?;
+    }
+    let p = b.softmax(&scores, -1)?;
+    let mut o = b.matmul(&p, &v)?;
+    if group > 1 {
+        o = b.reshape(&o, &dims(&[1, heads, t, d]))?;
+    }
+    let y = b.identity(&o, Some("y"));
+    b.finish(&[&y])
+}
+
 /// The programs one round of schedule `s` runs: one, or one per MoE predict.
 fn build(p: &Problem, w: &[f16], s: Schedule) -> Result<Vec<Package>> {
     p.validate(&s)?;
@@ -258,6 +306,16 @@ fn build(p: &Problem, w: &[f16], s: Schedule) -> Result<Vec<Package>> {
             Ok(vec![one])
         }
         Problem::Norm { hidden } => Ok(vec![norm_program(hidden, t)?]),
+        Problem::Attention {
+            heads,
+            kv_heads,
+            d,
+            kv_seq,
+            causal,
+            ..
+        } => Ok(vec![attention_program(
+            heads, kv_heads, d, kv_seq, causal, &s,
+        )?]),
         // `n_split` experts' [N, K] weights stacked into one [n_split*N, K] conv.
         Problem::Moe { n, k, .. } => w
             .chunks_exact(s.n_split * n * k)
@@ -320,7 +378,8 @@ fn evaluate(
     // gate 2: placement is observed, not commanded. Reject anything the
     // compiler did not put entirely on the engine.
     let mut models = Vec::with_capacity(packages.len());
-    for package in &packages {
+    let mut engine_ops: Vec<String> = Vec::new();
+    for (n, package) in packages.iter().enumerate() {
         let mut off: Vec<String> = Vec::new();
         let model = cache.load_with_placement(
             package,
@@ -332,6 +391,8 @@ fn evaluate(
                         if let Some(d) = op.usage.as_ref().and_then(|u| u.preferred.as_ref()) {
                             if d.kind != ComputeDeviceKind::NeuralEngine {
                                 off.push(format!("{}:{:?}", op.operator, d.kind));
+                            } else if n == 0 {
+                                engine_ops.push(op.operator.clone());
                             }
                         }
                     }
@@ -397,6 +458,7 @@ fn evaluate(
         ms,
         rel_rmse,
         weight_mb,
+        engine_ops,
     }))
 }
 
@@ -467,8 +529,8 @@ fn row_label(class: OpClass, s: &Schedule) -> String {
     let axes = class.axes();
     let dash = |on: bool, v: String| if on { v } else { "-".into() };
     format!(
-        "{:<7} {:<10} {:>6} {:>8} {:>4}",
-        dash(axes.spelling, s.spelling.label().into()),
+        "{:<8} {:<10} {:>6} {:>8} {:>4}",
+        dash(axes.has_spelling(), s.spelling.label().into()),
         s.format.label(),
         s.tile,
         dash(axes.k_chunk.is_some(), s.k_chunk.to_string()),
@@ -480,7 +542,7 @@ fn row_label(class: OpClass, s: &Schedule) -> String {
 fn summary(class: OpClass, s: &Schedule) -> String {
     let axes = class.axes();
     let mut parts = Vec::new();
-    if axes.spelling {
+    if axes.has_spelling() {
         parts.push(s.spelling.label().to_owned());
     }
     parts.push(s.format.label());
@@ -500,7 +562,7 @@ fn schedule_json(class: OpClass, s: &Schedule) -> String {
     let or_null = |on: bool, v: String| if on { v } else { "null".into() };
     format!(
         "\"spelling\": {}, \"format\": \"{}\", \"tile\": {}, \"k_chunk\": {}, \"n_split\": {}",
-        or_null(axes.spelling, format!("\"{}\"", s.spelling.label())),
+        or_null(axes.has_spelling(), format!("\"{}\"", s.spelling.label())),
         esc(&s.format.label()),
         s.tile,
         or_null(axes.k_chunk.is_some(), s.k_chunk.to_string()),
@@ -512,14 +574,17 @@ fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let class = OpClass::parse(&arg("--op").unwrap_or_else(|| "linear".into()))?;
     check_flags(class, &argv)?;
-    let problem = Problem::parse(class, arg)?;
+    let problem = Problem::parse(class, arg, |f| argv.iter().any(|a| a == f))?;
     let axes = class.axes();
 
     let tiles = counts(&problem, "--tiles")?;
     let chunks = counts(&problem, "--chunks")?;
     let spellings: Vec<Spelling> = list(&problem, "--spellings")
         .iter()
-        .map(|v| Spelling::parse(v))
+        .map(|v| {
+            let s = Spelling::parse(v)?;
+            check_spelling(class, s).map(|()| s)
+        })
         .collect::<Result<_>>()?;
     let n_splits = counts(&problem, "--n-splits")?;
     let formats: Vec<Format> = list(&problem, "--formats")
@@ -620,7 +685,7 @@ fn main() -> Result<()> {
         }
     }
     let mut sizes = Vec::new();
-    if axes.spelling {
+    if axes.has_spelling() {
         sizes.push(format!("{} spellings", spellings.len()));
     }
     sizes.push(format!("{} tiles", tiles.len()));
@@ -649,7 +714,7 @@ fn main() -> Result<()> {
         candidates.len()
     );
     println!(
-        "  {:<7} {:<10} {:>6} {:>8} {:>4} {:>10} {:>11} {:>10} {:>9}  {}",
+        "  {:<8} {:<10} {:>6} {:>8} {:>4} {:>10} {:>11} {:>10} {:>9}  {}",
         "spell",
         "format",
         "tile",
@@ -699,6 +764,7 @@ fn main() -> Result<()> {
                 ms,
                 rel_rmse,
                 weight_mb,
+                ..
             } => {
                 let rel = *base.get_or_insert(ms) / ms;
                 let calls = match problem.predicts(&s) {
@@ -750,15 +816,21 @@ fn main() -> Result<()> {
         j.push_str(&format!("  \"note\": \"{}\",\n", problem.note()));
         j.push_str("  \"cells\": [\n");
         for (i, c) in cells.iter().enumerate() {
-            let (ms, rmse) = match c.outcome {
-                Outcome::Ok { ms, rel_rmse, .. } => (Some(ms), Some(rel_rmse)),
-                _ => (None, None),
+            let (ms, rmse, ops) = match &c.outcome {
+                Outcome::Ok {
+                    ms,
+                    rel_rmse,
+                    engine_ops,
+                    ..
+                } => (Some(*ms), Some(*rel_rmse), &engine_ops[..]),
+                _ => (None, None, &[][..]),
             };
+            let ops: Vec<String> = ops.iter().map(|o| format!("\"{}\"", esc(o))).collect();
             j.push_str(&format!(
-                "    {{{}, \"verdict\": \"{}\", \"detail\": \"{}\", \"ms_per_128tok\": {}, \"rel_rmse\": {}, \"weight_mb\": {:.3}, \"resident_gb\": {:.3}, \"build_s\": {:.2}, \"ms_per_unit\": {}}}{}\n",
+                "    {{{}, \"verdict\": \"{}\", \"detail\": \"{}\", \"ms_per_128tok\": {}, \"rel_rmse\": {}, \"weight_mb\": {:.3}, \"resident_gb\": {:.3}, \"build_s\": {:.2}, \"ms_per_unit\": {}, \"engine_ops\": [{}]}}{}\n",
                 schedule_json(class, &c.schedule), c.outcome.verdict(), esc(c.outcome.detail()),
                 num(per_128(ms)), num(rmse), c.outcome.weight_mb(),
-                c.outcome.weight_mb() * copies as f64 / 1e3, c.build_s, num(ms),
+                c.outcome.weight_mb() * copies as f64 / 1e3, c.build_s, num(ms), ops.join(", "),
                 if i + 1 == cells.len() { "" } else { "," }
             ));
         }
