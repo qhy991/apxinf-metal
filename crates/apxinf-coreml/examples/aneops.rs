@@ -36,8 +36,11 @@ enum Check {
     /// `[-span, span)` so the function leaves its linear range.
     Elementwise { span: f32, f: Box<dyn Fn(f64) -> f64> },
     /// `(flat output index, expected value)` at a sample of the first output,
-    /// computed from the first input.
-    Sampled(Box<dyn Fn(&[f16]) -> Vec<(usize, f64)>>),
+    /// computed from the inputs, which are spread over `[-span, span)`.
+    Sampled {
+        span: f32,
+        f: Box<dyn Fn(&[Vec<f16>]) -> Vec<(usize, f64)>>,
+    },
 }
 
 struct Case {
@@ -287,6 +290,114 @@ fn concat_heads() -> Result<Program> {
     finish(b, heads, &[&y], "")
 }
 
+/// Wide enough that the scores are peaked, so a wrong scale or key axis shows in
+/// the output rather than averaging out to the mean of `v`.
+const ATTENTION_SPAN: f32 = 4.0;
+
+/// Query rows of each head that the f64 oracle recomputes.
+fn sampled_rows(rows: usize) -> impl Iterator<Item = usize> {
+    (0..rows).step_by(rows.div_ceil(4))
+}
+
+/// `softmax(q k^T / sqrt(d)) v` at four query rows per head, for row-major
+/// `q[1, heads, rows, d]` and `k, v[1, heads, keys, d]`.
+fn attention_check(heads: usize, rows: usize, keys: usize, d: usize) -> Check {
+    Check::Sampled {
+        span: ATTENTION_SPAN,
+        f: Box::new(move |inputs: &[Vec<f16>]| {
+            let (q, k, v) = (&inputs[0], &inputs[1], &inputs[2]);
+            let scale = 1.0 / (d as f64).sqrt();
+            let mut expected = Vec::new();
+            for h in 0..heads {
+                for i in sampled_rows(rows) {
+                    let qi = &q[(h * rows + i) * d..][..d];
+                    let scores: Vec<f64> = (0..keys)
+                        .map(|j| {
+                            let kj = &k[(h * keys + j) * d..][..d];
+                            qi.iter().zip(kj).map(|(a, b)| a.to_f64() * b.to_f64()).sum::<f64>() * scale
+                        })
+                        .collect();
+                    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+                    let total: f64 = weights.iter().sum();
+                    for c in 0..d {
+                        let o: f64 = (0..keys).map(|j| weights[j] * v[(h * keys + j) * d + c].to_f64()).sum();
+                        expected.push(((h * rows + i) * d + c, o / total));
+                    }
+                }
+            }
+            expected
+        }),
+    }
+}
+
+/// Decomposed attention as one program: `QK^T` and `AV` as batched matmuls, the
+/// `1/sqrt(d)` scale as a scalar `mul`, and the native `softmax` over the keys.
+fn attention_block_matmul(heads: usize, rows: usize, keys: usize, d: usize) -> Result<Program> {
+    let mut b = ProgramBuilder::new();
+    let q = b.input("q", &[1, heads, rows, d]);
+    let k = b.input("k", &[1, heads, keys, d]);
+    let v = b.input("v", &[1, heads, keys, d]);
+    let kt = b.transpose(&k, &[0, 1, 3, 2])?;
+    let scores = b.matmul(&q, &kt)?;
+    let scaled = b.mul(&scores, Operand::Scalar(f16::from_f32(1.0 / (d as f32).sqrt())), None)?;
+    let p = b.softmax(&scaled, -1)?;
+    let y = b.matmul(&p, &v)?;
+    Ok(Program {
+        check: attention_check(heads, rows, keys, d),
+        ..finish(
+            b,
+            vec![q, k, v],
+            &[&y],
+            "k^T is a transpose op: the builder's matmul always emits transpose_y=false",
+        )?
+    })
+}
+
+fn attention_sdpa_op(heads: usize, seq: usize, d: usize) -> Result<Program> {
+    let mut b = ProgramBuilder::new();
+    let q = b.input("q", &[1, heads, seq, d]);
+    let k = b.input("k", &[1, heads, seq, d]);
+    let v = b.input("v", &[1, heads, seq, d]);
+    let y = b.sdpa(&q, &k, &v, None)?;
+    Ok(Program {
+        check: attention_check(heads, seq, seq, d),
+        ..finish(
+            b,
+            vec![q, k, v],
+            &[&y],
+            "no scale or causal input exists in the CoreML8 opset; the op applies 1/sqrt(d) itself",
+        )?
+    })
+}
+
+fn softmax_in_block() -> Result<Program> {
+    let (heads, rows, keys) = (HEADS, SEQ, SEQ);
+    let mut b = ProgramBuilder::new();
+    let x = b.input("x", &[1, heads, rows, keys]);
+    let y = b.softmax(&x, -1)?;
+    let check = Check::Sampled {
+        span: ATTENTION_SPAN,
+        f: Box::new(move |inputs: &[Vec<f16>]| {
+            let mut expected = Vec::new();
+            for h in 0..heads {
+                for i in sampled_rows(rows) {
+                    let at = (h * rows + i) * keys;
+                    let row: Vec<f64> = inputs[0][at..][..keys].iter().map(|v| v.to_f64()).collect();
+                    let max = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let total: f64 = row.iter().map(|s| (s - max).exp()).sum();
+                    expected.extend(row.iter().enumerate().map(|(j, s)| (at + j, (s - max).exp() / total)));
+                }
+            }
+            expected
+        }),
+    };
+    Ok(Program {
+        check,
+        ..finish(b, vec![x], &[&y], "")?
+    })
+}
+
 const MLP_HIDDEN: usize = 2048;
 const MLP_WIDTH: usize = 6144;
 const MLP_TILE: usize = 1408;
@@ -447,7 +558,8 @@ fn mlp(body: Elementwise) -> Result<Program> {
     let down = split_k_conv(&mut b, &hidden, &wd, h, n)?;
     let y = b.identity(&down, Some("y"));
     let f = body.reference();
-    let check = Check::Sampled(Box::new(move |x: &[f16]| {
+    let check = Check::Sampled { span: 1.0, f: Box::new(move |inputs: &[Vec<f16>]| {
+        let x = &inputs[0];
         let dot = |row: &[f16], v: &[f64]| row.iter().zip(v).map(|(w, v)| w.to_f64() * v).sum::<f64>();
         (0..MLP_TILE)
             .step_by(88)
@@ -464,7 +576,7 @@ fn mlp(body: Elementwise) -> Result<Program> {
                     .collect::<Vec<_>>()
             })
             .collect()
-    }));
+    }) };
     let note = match body {
         Elementwise::SiluHalfTanh => "Wg pre-scaled by 0.5",
         Elementwise::GeluTanh => "gelu replaces silu; the oracle computes gelu",
@@ -533,6 +645,40 @@ fn cases() -> Vec<Case> {
             "x[1,8,1408,256] -> [8,1408,256], matmul with value[8,256,1408]",
             reshape_matmul,
         ),
+    ]);
+    let program = |name: &'static str, shape: &str, author: Box<dyn Fn() -> Result<Program>>| Case {
+        name,
+        shape: shape.to_owned(),
+        author,
+        requires: &[],
+    };
+    cases.extend([
+        program(
+            "attention_block_matmul",
+            "q,k,v[1,8,1408,128]",
+            Box::new(|| attention_block_matmul(HEADS, SEQ, SEQ, HEAD_DIM)),
+        ),
+        program(
+            "attention_block_matmul_wide",
+            "q,k,v[1,32,512,128]",
+            Box::new(|| attention_block_matmul(32, 512, 512, HEAD_DIM)),
+        ),
+        program(
+            "attention_decode_shape",
+            "q[1,8,1,128] k,v[1,8,2048,128], scores [1,8,1,2048]",
+            Box::new(|| attention_block_matmul(HEADS, 1, 2048, HEAD_DIM)),
+        ),
+        program(
+            "attention_sdpa_op",
+            "q,k,v[1,8,1408,128]",
+            Box::new(|| attention_sdpa_op(HEADS, SEQ, HEAD_DIM)),
+        ),
+        program(
+            "attention_sdpa_op_64h",
+            "q,k,v[1,64,496,64]",
+            Box::new(|| attention_sdpa_op(64, 496, 64)),
+        ),
+        case("softmax_in_block", "x[1,8,1408,1408] axis -1", softmax_in_block),
     ]);
     use Elementwise::*;
     for (name, body) in [
@@ -609,8 +755,8 @@ fn measure(program: &Program, cache: &ProgramCache) -> Result<Measurement> {
         },
     )?;
     let span = match &program.check {
-        Check::Elementwise { span, .. } => *span,
-        _ => 1.0,
+        Check::Elementwise { span, .. } | Check::Sampled { span, .. } => *span,
+        Check::None => 1.0,
     };
     let data: Vec<Vec<f16>> = program
         .inputs
@@ -650,8 +796,8 @@ fn measure(program: &Program, cache: &ProgramCache) -> Result<Measurement> {
         Check::Elementwise { f, .. } => Some(deviation(
             first.iter().zip(&data[0]).map(|(g, x)| (g.to_f64(), f(x.to_f64()))),
         )),
-        Check::Sampled(expect) => Some(deviation(
-            expect(&data[0]).into_iter().map(|(i, want)| (first[i].to_f64(), want)),
+        Check::Sampled { f, .. } => Some(deviation(
+            f(&data).into_iter().map(|(i, want)| (first[i].to_f64(), want)),
         )),
     };
     Ok(Measurement {

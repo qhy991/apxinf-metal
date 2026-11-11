@@ -137,6 +137,20 @@ fn broadcast(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
         .collect()
 }
 
+/// Numpy-style broadcast of two static shapes of any rank, aligned at the last axis.
+fn broadcast_aligned(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
+    let rank = a.len().max(b.len());
+    let dim = |s: &[usize], i: usize| (i + s.len()).checked_sub(rank).map_or(1, |j| s[j]);
+    (0..rank)
+        .map(|i| match (dim(a, i), dim(b, i)) {
+            (x, y) if x == y => Some(x),
+            (1, y) => Some(y),
+            (x, 1) => Some(x),
+            _ => None,
+        })
+        .collect()
+}
+
 impl ProgramBuilder {
     pub fn new() -> Self {
         Self {
@@ -400,13 +414,23 @@ impl ProgramBuilder {
     /// placed on the Neural Engine. At batch 1 it measured entirely on the CPU
     /// while an equivalent 1x1 convolution reached the engine, so the spelling is
     /// a placement decision, not a style choice.
+    ///
+    /// Batched as MIL defines it: the last two axes multiply as `[M, N] x [N, P]`
+    /// and the axes before them broadcast numpy-style, so `[1, 8, M, N]` times
+    /// `[N, P]` is `[1, 8, M, P]`.
     pub fn matmul(&mut self, x: &Var, y: &Var) -> Result<Var> {
-        let (&[xm, xk], &[yk, yn]) = (&x.shape[..], &y.shape[..]) else {
-            return Err(contract("matmul needs two rank-2 operands"));
+        let (Some((x_batch, &[xm, xk])), Some((y_batch, &[yk, yn]))) =
+            (x.shape.split_last_chunk::<2>(), y.shape.split_last_chunk::<2>())
+        else {
+            return Err(contract("matmul needs operands of rank 2 or more"));
         };
         if xk != yk {
             return Err(contract("matmul inner dimensions must match"));
         }
+        let Some(mut shape) = broadcast_aligned(x_batch, y_batch) else {
+            return Err(contract("matmul batch dimensions do not broadcast"));
+        };
+        shape.extend([xm, yn]);
         let name = self.op_name("matmul", None);
         let flag = |b: &mut Self, param: &'static str| -> Var {
             let v = immediate(
@@ -423,13 +447,73 @@ impl ProgramBuilder {
         let out = Var {
             name: name.clone(),
             dtype: data_type::FLOAT16,
-            shape: vec![xm, yn],
+            shape,
         };
         let inputs = [("x", x), ("y", y), ("transpose_x", &tx), ("transpose_y", &ty)]
             .into_iter()
             .map(|(k, v)| (k.to_owned(), by_name(v)))
             .collect();
         self.push("matmul", &name, inputs, std::slice::from_ref(&out));
+        Ok(out)
+    }
+
+    /// MIL `scaled_dot_product_attention`, `softmax(q k^T / sqrt(E) + attn_mask) v`
+    /// over the last two axes of rank >= 3 operands that share their batch axes.
+    ///
+    /// The `CoreML8` opset defines only `query`, `key`, `value` and `attn_mask`:
+    /// the scale is fixed at `1/sqrt(E)` and there is no causal flag, so a causal
+    /// or rescaled attention has to arrive through `attn_mask` or the inputs. An
+    /// FP16 mask is added to the scores; a bool mask keeps the `true` positions.
+    pub fn sdpa(&mut self, q: &Var, k: &Var, v: &Var, attn_mask: Option<&Var>) -> Result<Var> {
+        let rank = q.shape.len();
+        if k.shape.len() != rank || v.shape.len() != rank {
+            return Err(contract("sdpa query, key and value must share a rank"));
+        }
+        if rank < 3 {
+            return Err(contract("sdpa needs rank 3 or more for batch, sequence and embedding"));
+        }
+        let batch = &q.shape[..rank - 2];
+        if k.shape[..rank - 2] != *batch || v.shape[..rank - 2] != *batch {
+            return Err(contract("sdpa query, key and value must share their batch axes"));
+        }
+        if q.shape[rank - 1] != k.shape[rank - 1] {
+            return Err(contract("sdpa query and key must share an embedding size"));
+        }
+        let keys = k.shape[rank - 2];
+        if v.shape[rank - 2] != keys {
+            return Err(contract("sdpa key and value must share a sequence length"));
+        }
+        if let Some(mask) = attn_mask {
+            if mask.dtype != data_type::FLOAT16 && mask.dtype != data_type::BOOL {
+                return Err(contract("sdpa attn_mask must be FP16 or bool"));
+            }
+            let mask_rows = match mask.shape.split_last() {
+                Some((&last, rows)) if last == keys => rows,
+                _ => return Err(contract("sdpa attn_mask must end in the key sequence length")),
+            };
+            if broadcast_aligned(&q.shape[..rank - 1], mask_rows).is_none() {
+                return Err(contract("sdpa attn_mask must broadcast to the scores"));
+            }
+        }
+        let name = self.op_name("scaled_dot_product_attention", None);
+        let mut shape = q.shape[..rank - 1].to_vec();
+        shape.push(v.shape[rank - 1]);
+        let out = Var {
+            name: name.clone(),
+            dtype: q.dtype,
+            shape,
+        };
+        let inputs = [("query", q), ("key", k), ("value", v)]
+            .into_iter()
+            .chain(attn_mask.map(|m| ("attn_mask", m)))
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push(
+            "scaled_dot_product_attention",
+            &name,
+            inputs,
+            std::slice::from_ref(&out),
+        );
         Ok(out)
     }
 
@@ -1302,12 +1386,6 @@ mod tests {
 
     #[test]
     fn math_and_layout_ops_refuse_invalid_arguments() {
-        fn refused(r: Result<Var>, why: &str) {
-            match r {
-                Err(Error::Contract(m)) => assert!(m.contains(why), "{m:?} is not about {why:?}"),
-                other => panic!("expected a refusal about {why:?}, got {other:?}"),
-            }
-        }
         let mut b = ProgramBuilder::new();
         let x = b.input("x", &[1, 8, 16, 4]);
         let before = b.operations.len();
@@ -1366,12 +1444,6 @@ mod tests {
 
     #[test]
     fn softmax_and_reshape_refuse_invalid_arguments() {
-        fn refused(r: Result<Var>, why: &str) {
-            match r {
-                Err(Error::Contract(m)) => assert!(m.contains(why), "{m:?} is not about {why:?}"),
-                other => panic!("expected a refusal about {why:?}, got {other:?}"),
-            }
-        }
         let mut b = ProgramBuilder::new();
         let x = b.input("x", &[1, 8, 16, 4]);
         let before = b.operations.len();
@@ -1443,12 +1515,6 @@ mod tests {
 
     #[test]
     fn activation_ops_refuse_invalid_arguments() {
-        fn refused(r: Result<Var>, why: &str) {
-            match r {
-                Err(Error::Contract(m)) => assert!(m.contains(why), "{m:?} is not about {why:?}"),
-                other => panic!("expected a refusal about {why:?}, got {other:?}"),
-            }
-        }
         let mut b = ProgramBuilder::new();
         let x = b.input("x", &[1, 8, 16, 4]);
         let before = b.operations.len();
@@ -1458,6 +1524,143 @@ mod tests {
         refused(b.clamp(&x, lo, lo), "min < max");
         refused(b.clamp(&x, f16::NAN, hi), "min < max");
         refused(b.clamp(&bool_var(&[1, 8, 16, 4]), lo, hi), "FP16 input");
+
+        assert_eq!(b.operations.len(), before, "a refused call emitted an operation");
+    }
+
+    fn refused(r: Result<Var>, why: &str) {
+        match r {
+            Err(Error::Contract(m)) => assert!(m.contains(why), "{m:?} is not about {why:?}"),
+            other => panic!("expected a refusal about {why:?}, got {other:?}"),
+        }
+    }
+
+    fn bool_const(b: &ProgramBuilder, op: &proto::Operation, param: &str) -> Vec<bool> {
+        match immediate_of(b, op, param) {
+            tensor_value::Value::Bools(v) => v.values.clone(),
+            other => panic!("{param} is not a bool: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batched_matmul_multiplies_the_last_two_axes_and_broadcasts_the_rest() {
+        let mut b = ProgramBuilder::new();
+        let q = b.input("q", &[1, 8, 1408, 128]);
+        let kt = b.input("kt", &[1, 8, 128, 1408]);
+        let w = b.input("w", &[128, 64]);
+        let x = b.input("x", &[2, 1, 4, 5]);
+        let y = b.input("y", &[3, 5, 6]);
+        let m = b.input("m", &[4, 5]);
+        let n = b.input("n", &[5, 6]);
+
+        let scores = b.matmul(&q, &kt).unwrap();
+        let projected = b.matmul(&q, &w).unwrap();
+        let mixed = b.matmul(&x, &y).unwrap();
+        let plain = b.matmul(&m, &n).unwrap();
+
+        assert_eq!(scores.shape(), &[1, 8, 1408, 1408]);
+        assert_eq!(projected.shape(), &[1, 8, 1408, 64]);
+        assert_eq!(mixed.shape(), &[2, 3, 4, 6]);
+        assert_eq!(plain.shape(), &[4, 6]);
+        for (out, operands) in [(&scores, ["q", "kt"]), (&projected, ["q", "w"])] {
+            let matmul = op(&b, out);
+            assert_eq!(matmul.r#type, "matmul");
+            assert_eq!([bound(matmul, "x"), bound(matmul, "y")], operands.map(|o| vec![o.to_owned()]));
+            assert_eq!(
+                [bool_const(&b, matmul, "transpose_x"), bool_const(&b, matmul, "transpose_y")],
+                [[false], [false]]
+            );
+        }
+    }
+
+    #[test]
+    fn batched_matmul_refuses_invalid_operands() {
+        let mut b = ProgramBuilder::new();
+        let x = b.input("x", &[1, 8, 1408, 128]);
+        let vector = b.input("vector", &[128]);
+        let w = b.input("w", &[128, 64]);
+        let before = b.operations.len();
+
+        refused(b.matmul(&vector, &w), "rank 2 or more");
+        refused(b.matmul(&x, &vector), "rank 2 or more");
+
+        let off_inner = b.input("off_inner", &[1, 8, 64, 1408]);
+        refused(b.matmul(&x, &off_inner), "inner dimensions");
+        let (m, n) = (b.input("m", &[4, 5]), b.input("n", &[6, 7]));
+        refused(b.matmul(&m, &n), "inner dimensions");
+
+        let four_heads = b.input("four_heads", &[1, 4, 128, 1408]);
+        refused(b.matmul(&x, &four_heads), "batch dimensions");
+        let (two, three) = (b.input("two", &[2, 4, 5]), b.input("three", &[3, 5, 6]));
+        refused(b.matmul(&two, &three), "batch dimensions");
+
+        assert_eq!(b.operations.len(), before, "a refused call emitted an operation");
+    }
+
+    #[test]
+    fn sdpa_emits_the_ios18_op_with_its_parameter_names() {
+        let mut b = ProgramBuilder::new();
+        let q = b.input("q", &[1, 8, 1408, 128]);
+        let k = b.input("k", &[1, 8, 1408, 128]);
+        let v = b.input("v", &[1, 8, 1408, 128]);
+        let mask = b.input("mask", &[1, 1, 1408, 1408]);
+        let dq = b.input("dq", &[1, 8, 1, 128]);
+        let dk = b.input("dk", &[1, 8, 2048, 128]);
+        let dv = b.input("dv", &[1, 8, 2048, 64]);
+
+        let plain = b.sdpa(&q, &k, &v, None).unwrap();
+        let masked = b.sdpa(&q, &k, &v, Some(&mask)).unwrap();
+        let decode = b.sdpa(&dq, &dk, &dv, None).unwrap();
+
+        assert_eq!((plain.shape(), masked.shape()), (q.shape(), q.shape()));
+        assert_eq!(decode.shape(), &[1, 8, 1, 64]);
+        assert_eq!(plain.name(), "scaled_dot_product_attention_0");
+        let plain_op = op(&b, &plain);
+        assert_eq!(plain_op.r#type, "scaled_dot_product_attention");
+        assert_eq!(
+            plain_op.inputs.keys().collect::<Vec<_>>(),
+            ["key", "query", "value"]
+        );
+        let masked_op = op(&b, &masked);
+        assert_eq!(
+            ["query", "key", "value", "attn_mask"].map(|p| bound(masked_op, p)),
+            [["q"], ["k"], ["v"], ["mask"]].map(|n| n.map(str::to_owned).to_vec())
+        );
+    }
+
+    #[test]
+    fn sdpa_refuses_what_the_ios18_op_refuses() {
+        let mut b = ProgramBuilder::new();
+        let q = b.input("q", &[1, 8, 1408, 128]);
+        let k = b.input("k", &[1, 8, 1408, 128]);
+        let v = b.input("v", &[1, 8, 1408, 128]);
+        let before = b.operations.len();
+
+        let rank3 = b.input("rank3", &[8, 1408, 128]);
+        refused(b.sdpa(&q, &rank3, &v, None), "share a rank");
+        refused(b.sdpa(&q, &k, &rank3, None), "share a rank");
+        let (q2, k2) = (b.input("q2", &[1408, 128]), b.input("k2", &[1408, 128]));
+        refused(b.sdpa(&q2, &k2, &k2, None), "rank 3 or more");
+        let four_heads = b.input("four_heads", &[1, 4, 1408, 128]);
+        refused(b.sdpa(&q, &four_heads, &v, None), "batch axes");
+        refused(b.sdpa(&q, &k, &four_heads, None), "batch axes");
+        let narrow = b.input("narrow", &[1, 8, 1408, 64]);
+        refused(b.sdpa(&q, &narrow, &v, None), "embedding size");
+        let short = b.input("short", &[1, 8, 512, 128]);
+        refused(b.sdpa(&q, &k, &short, None), "sequence length");
+
+        let off_keys = b.input("off_keys", &[1, 1, 1408, 512]);
+        refused(b.sdpa(&q, &k, &v, Some(&off_keys)), "end in the key sequence length");
+        let scalar = b.input("scalar", &[]);
+        refused(b.sdpa(&q, &k, &v, Some(&scalar)), "end in the key sequence length");
+        let off_heads = b.input("off_heads", &[1, 4, 1408, 1408]);
+        refused(b.sdpa(&q, &k, &v, Some(&off_heads)), "broadcast to the scores");
+        let ints = Var {
+            name: "ints".to_owned(),
+            dtype: data_type::INT32,
+            shape: vec![1, 1, 1408, 1408],
+        };
+        refused(b.sdpa(&q, &k, &v, Some(&ints)), "FP16 or bool");
 
         assert_eq!(b.operations.len(), before, "a refused call emitted an operation");
     }
