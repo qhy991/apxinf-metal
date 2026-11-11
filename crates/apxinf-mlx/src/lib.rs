@@ -14,6 +14,10 @@ mod bf16_qk_table_rope;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod ffi;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod quantized;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+pub use quantized::Quantized;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use array::{
     clear_cache, load_safetensors, loaded_library_path, memory_stats, reset_peak_memory,
     set_cache_limit, set_memory_limit, Array, Compiled, MemoryStats, MetalKernel, MlxDType,
