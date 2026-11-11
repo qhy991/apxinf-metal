@@ -689,6 +689,58 @@ impl ProgramBuilder {
         Ok(out)
     }
 
+    /// `softmax` of `x` along `axis`, which MIL counts from the end when negative.
+    pub fn softmax(&mut self, x: &Var, axis: i32) -> Result<Var> {
+        let rank = x.shape.len() as i32;
+        if !(-rank..rank).contains(&axis) {
+            return Err(contract("softmax axis must index the input"));
+        }
+        let name = self.op_name("softmax", None);
+        let axis_var = self.ints(&name, "axis", &[axis], true);
+        let out = Var {
+            name: name.clone(),
+            ..x.clone()
+        };
+        let inputs = [("x", x), ("axis", &axis_var)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push("softmax", &name, inputs, std::slice::from_ref(&out));
+        Ok(out)
+    }
+
+    /// `reshape` of `x` to `shape`. One `-1` takes the size the element count leaves.
+    pub fn reshape(&mut self, x: &Var, shape: &[i32]) -> Result<Var> {
+        if shape.iter().filter(|&&d| d == -1).count() > 1 {
+            return Err(contract("reshape allows at most one -1"));
+        }
+        if shape.iter().any(|&d| d == 0 || d < -1) {
+            return Err(contract("reshape dims must be positive or -1"));
+        }
+        let count: usize = x.shape.iter().product();
+        let known: usize = shape.iter().filter(|&&d| d > 0).map(|&d| d as usize).product();
+        let resolved: Vec<usize> = shape
+            .iter()
+            .map(|&d| if d == -1 { count / known } else { d as usize })
+            .collect();
+        if resolved.iter().product::<usize>() != count {
+            return Err(contract("reshape must keep the input's element count"));
+        }
+        let name = self.op_name("reshape", None);
+        let shape_var = self.ints(&name, "shape", shape, false);
+        let out = Var {
+            name: name.clone(),
+            dtype: x.dtype,
+            shape: resolved,
+        };
+        let inputs = [("x", x), ("shape", &shape_var)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push("reshape", &name, inputs, std::slice::from_ref(&out));
+        Ok(out)
+    }
+
     /// `concat` of `values` along a non-negative `axis`.
     pub fn concat(&mut self, values: &[&Var], axis: usize, interleave: bool) -> Result<Var> {
         let Some(first) = values.first() else {
@@ -1212,6 +1264,66 @@ mod tests {
         refused(b.select(&flags, &x, &flags), "share a dtype");
         let wide = b.input("z", &[1, 3, 16, 4]);
         refused(b.select(&flags, &x, &wide), "broadcast");
+
+        assert_eq!(b.operations.len(), before, "a refused call emitted an operation");
+    }
+
+    fn int_const(b: &ProgramBuilder, op: &proto::Operation, param: &str) -> Vec<i32> {
+        let name = &bound(op, param)[0];
+        let constant = b
+            .operations
+            .iter()
+            .find(|c| &c.outputs[0].name == name)
+            .unwrap();
+        match &constant.attributes["val"].value {
+            Some(value::Value::ImmediateValue(v)) => match &v.tensor.as_ref().unwrap().value {
+                Some(tensor_value::Value::Ints(ints)) => ints.values.clone(),
+                other => panic!("{param} is not an int tensor: {other:?}"),
+            },
+            _ => panic!("{param} is not an immediate"),
+        }
+    }
+
+    #[test]
+    fn softmax_and_reshape_emit_their_mil_ops_and_shapes() {
+        let mut b = ProgramBuilder::new();
+        let x = b.input("x", &[1, 8, 1408, 256]);
+        let last = b.softmax(&x, -1).unwrap();
+        let heads = b.softmax(&x, 1).unwrap();
+        let flat = b.reshape(&x, &[8, 1408, 256]).unwrap();
+        let inferred = b.reshape(&x, &[8, -1, 128]).unwrap();
+
+        let emitted = [&last, &heads, &flat, &inferred].map(|v| op(&b, v).r#type.as_str());
+        assert_eq!(emitted, ["softmax", "softmax", "reshape", "reshape"]);
+        assert_eq!((last.shape(), heads.shape()), (x.shape(), x.shape()));
+        assert_eq!(flat.shape(), &[8, 1408, 256]);
+        assert_eq!(inferred.shape(), &[8, 2816, 128]);
+
+        assert_eq!(int_const(&b, op(&b, &heads), "axis"), [1]);
+        assert_eq!(int_const(&b, op(&b, &flat), "shape"), [8, 1408, 256]);
+        assert_eq!(bound(op(&b, &inferred), "x"), ["x"]);
+    }
+
+    #[test]
+    fn softmax_and_reshape_refuse_invalid_arguments() {
+        fn refused(r: Result<Var>, why: &str) {
+            match r {
+                Err(Error::Contract(m)) => assert!(m.contains(why), "{m:?} is not about {why:?}"),
+                other => panic!("expected a refusal about {why:?}, got {other:?}"),
+            }
+        }
+        let mut b = ProgramBuilder::new();
+        let x = b.input("x", &[1, 8, 16, 4]);
+        let before = b.operations.len();
+
+        refused(b.softmax(&x, 4), "axis must index");
+        refused(b.softmax(&x, -5), "axis must index");
+
+        refused(b.reshape(&x, &[-1, -1, 4]), "at most one -1");
+        refused(b.reshape(&x, &[8, 0, 64]), "positive or -1");
+        refused(b.reshape(&x, &[8, -2, 64]), "positive or -1");
+        refused(b.reshape(&x, &[8, 16, 5]), "element count");
+        refused(b.reshape(&x, &[-1, 3]), "element count");
 
         assert_eq!(b.operations.len(), before, "a refused call emitted an operation");
     }

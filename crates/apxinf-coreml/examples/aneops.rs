@@ -30,9 +30,13 @@ struct Case {
     name: &'static str,
     shape: String,
     author: Box<dyn Fn() -> Result<Program>>,
+    /// Cases that must place entirely on the engine before this one is worth building.
+    requires: &'static [&'static str],
 }
 
 enum Outcome {
+    /// A required case did not place entirely on the engine.
+    Blocked(Vec<String>),
     /// The builder refused to author the case.
     Unsupported(String),
     /// Compile, load or prediction failed.
@@ -110,20 +114,85 @@ fn rmsnorm() -> Result<Program> {
 }
 
 /// `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`.
-fn gelu() -> Result<Program> {
+fn tanh_gelu(b: &mut ProgramBuilder, x: &Var) -> Result<Var> {
     let s = |v: f32| Operand::Scalar(f16::from_f32(v));
-    let mut b = ProgramBuilder::new();
-    let x = b.input("x", &[1, 6144, 1, 1408]);
-    let x2 = b.mul(&x, Operand::Var(&x), None)?;
-    let x3 = b.mul(&x2, Operand::Var(&x), None)?;
+    let x2 = b.mul(x, Operand::Var(x), None)?;
+    let x3 = b.mul(&x2, Operand::Var(x), None)?;
     let cubic = b.mul(&x3, s(0.044715), None)?;
-    let inner = b.add(&x, Operand::Var(&cubic), None)?;
+    let inner = b.add(x, Operand::Var(&cubic), None)?;
     let scaled = b.mul(&inner, s((2.0 / std::f32::consts::PI).sqrt()), None)?;
     let t = b.tanh(&scaled);
     let one_plus = b.add(&t, s(1.0), None)?;
-    let half = b.mul(&x, s(0.5), None)?;
-    let y = b.mul(&half, Operand::Var(&one_plus), None)?;
+    let half = b.mul(x, s(0.5), None)?;
+    b.mul(&half, Operand::Var(&one_plus), None)
+}
+
+fn gelu() -> Result<Program> {
+    let mut b = ProgramBuilder::new();
+    let x = b.input("x", &[1, 6144, 1, 1408]);
+    let y = tanh_gelu(&mut b, &x)?;
     finish(b, vec![x], &[&y], "")
+}
+
+fn gemm_plus_gelu() -> Result<Program> {
+    let mut b = ProgramBuilder::new();
+    let x = b.input("x", &[1, 2048, 1, 1408]);
+    let h = b.conv_fp16(&x, &weights(6144 * 2048), &[6144, 2048, 1, 1])?;
+    let y = tanh_gelu(&mut b, &h)?;
+    finish(b, vec![x], &[&y], "")
+}
+
+fn softmax_op() -> Result<Program> {
+    let mut b = ProgramBuilder::new();
+    let x = b.input("x", &[1, 1, 128, 1408]);
+    let y = b.softmax(&x, 3)?;
+    finish(b, vec![x], &[&y], "")
+}
+
+fn conv_dynamic_weight() -> Result<Program> {
+    let mut b = ProgramBuilder::new();
+    let x = b.input("x", &[1, 256, 1, 1408]);
+    let w = b.input("w", &[128, 256, 1, 1]);
+    let y = b.conv(&x, &w)?;
+    finish(b, vec![x, w], &[&y], "")
+}
+
+const HEADS: usize = 8;
+const SEQ: usize = 1408;
+const HEAD_DIM: usize = 128;
+
+/// Per head: `S = conv(Q_h, K_h)` is `[1, keys, 1, queries]`, softmax over the
+/// key (channel) axis, then `O_h = conv(P, V_h^T)` is `[1, head_dim, 1, queries]`.
+fn attention_core_conv() -> Result<Program> {
+    let mut b = ProgramBuilder::new();
+    let q = b.input("q", &[1, HEADS * HEAD_DIM, 1, SEQ]);
+    let k = b.input("k", &[HEADS * SEQ, HEAD_DIM, 1, 1]);
+    let v = b.input("v", &[HEADS * HEAD_DIM, SEQ, 1, 1]);
+    let qs = b.split(&q, &[HEAD_DIM; HEADS], 1)?;
+    let ks = b.split(&k, &[SEQ; HEADS], 0)?;
+    let vs = b.split(&v, &[HEAD_DIM; HEADS], 0)?;
+    let mut heads = Vec::with_capacity(HEADS);
+    for h in 0..HEADS {
+        let scores = b.conv(&qs[h], &ks[h])?;
+        let p = b.softmax(&scores, 1)?;
+        heads.push(b.conv(&p, &vs[h])?);
+    }
+    let y = b.concat(&heads.iter().collect::<Vec<_>>(), 1, false)?;
+    finish(
+        b,
+        vec![q, k, v],
+        &[&y],
+        "one conv pair per head: the builder's conv has groups=1, so 8 heads cannot share one grouped conv; q/k/v arrive in conv layout and are split per head, output [1,1024,1,1408]; no 1/sqrt(d) scale",
+    )
+}
+
+fn reshape_matmul() -> Result<Program> {
+    let mut b = ProgramBuilder::new();
+    let x = b.input("x", &[1, 8, 1408, 256]);
+    let value = b.input("value", &[8, 256, 1408]);
+    let r = b.reshape(&x, &[8, 1408, 256])?;
+    let y = b.matmul(&r, &value)?;
+    finish(b, vec![x, value], &[&y], "")
 }
 
 fn softmax_last_axis(b: &mut ProgramBuilder, x: &Var) -> Result<Var> {
@@ -171,17 +240,20 @@ fn cases() -> Vec<Case> {
         name,
         shape: shape.to_owned(),
         author: Box::new(author),
+        requires: &[],
     };
     let mut cases = vec![Case {
         name: "gemm_baseline",
         shape: "x[1,2048,1,1408] w[6144,2048,1,1]".into(),
         author: Box::new(|| gemm(1408)),
+        requires: &[],
     }];
     for tile in [1, 4, 8, 16, 32, 64, 128, 256, 512] {
         cases.push(Case {
             name: "gemm_small_m",
             shape: format!("x[1,2048,1,{tile}] w[6144,2048,1,1]"),
             author: Box::new(move || gemm(tile)),
+            requires: &[],
         });
     }
     cases.extend([
@@ -196,6 +268,30 @@ fn cases() -> Vec<Case> {
         ),
         case("transpose_head", "x[1,8,1408,256] perm[0,1,3,2]", transpose_head),
         case("concat_heads", "4 x [1,8,1408,64] axis 3", concat_heads),
+        case("softmax_op", "x[1,1,128,1408] axis 3", softmax_op),
+        case(
+            "gemm_plus_gelu",
+            "x[1,2048,1,1408] w[6144,2048,1,1] then tanh gelu",
+            gemm_plus_gelu,
+        ),
+        case(
+            "conv_dynamic_weight",
+            "x[1,256,1,1408] w[128,256,1,1] (input)",
+            conv_dynamic_weight,
+        ),
+        Case {
+            requires: &["softmax_op", "conv_dynamic_weight"],
+            ..case(
+                "attention_core_conv",
+                "8 heads x seq 1408 x head_dim 128: q[1,1024,1,1408] k[11264,128,1,1] v[1024,1408,1,1]",
+                attention_core_conv,
+            )
+        },
+        case(
+            "reshape_matmul",
+            "x[1,8,1408,256] -> [8,1408,256], matmul with value[8,256,1408]",
+            reshape_matmul,
+        ),
     ]);
     cases
 }
@@ -286,26 +382,41 @@ fn sysctl(name: &str) -> String {
 
 fn main() -> Result<()> {
     let root = std::env::temp_dir().join(format!("aneops-{}", std::process::id()));
-    let (mut measured, mut refused, mut unsupported) = (0, 0, 0);
+    let (mut measured, mut refused, mut unsupported, mut blocked) = (0, 0, 0, 0);
     let mut all_on_ane: Vec<String> = Vec::new();
+    let mut placed: Vec<&str> = Vec::new();
     for (i, case) in cases().iter().enumerate() {
         let head = format!("\"case\":\"{}\",\"shape\":\"{}\"", case.name, esc(&case.shape));
         let t0 = Instant::now();
-        let outcome = match (case.author)() {
-            Err(e) => Outcome::Unsupported(e.to_string()),
-            Ok(program) => {
-                let dir = root.join(i.to_string());
-                let _ = std::fs::remove_dir_all(&dir);
-                let result = measure(&program, &ProgramCache::new(&dir));
-                let _ = std::fs::remove_dir_all(&dir);
-                match result {
-                    Ok(m) => Outcome::Measured(m),
-                    Err(e) => Outcome::Refused(e.to_string()),
+        let missing: Vec<String> = case
+            .requires
+            .iter()
+            .filter(|r| !placed.contains(r))
+            .map(|r| r.to_string())
+            .collect();
+        let outcome = if !missing.is_empty() {
+            Outcome::Blocked(missing)
+        } else {
+            match (case.author)() {
+                Err(e) => Outcome::Unsupported(e.to_string()),
+                Ok(program) => {
+                    let dir = root.join(i.to_string());
+                    let _ = std::fs::remove_dir_all(&dir);
+                    let result = measure(&program, &ProgramCache::new(&dir));
+                    let _ = std::fs::remove_dir_all(&dir);
+                    match result {
+                        Ok(m) => Outcome::Measured(m),
+                        Err(e) => Outcome::Refused(e.to_string()),
+                    }
                 }
             }
         };
         let build_s = t0.elapsed().as_secs_f64();
         let line = match outcome {
+            Outcome::Blocked(by) => {
+                blocked += 1;
+                format!("{{{head},\"status\":\"blocked\",\"blocked_by\":{}}}", strings(&by))
+            }
             Outcome::Unsupported(reason) => {
                 unsupported += 1;
                 format!(
@@ -324,6 +435,7 @@ fn main() -> Result<()> {
                 measured += 1;
                 if m.off_ane.is_empty() && !m.on_ane.is_empty() {
                     all_on_ane.push(format!("{} {}", case.name, case.shape));
+                    placed.push(case.name);
                 }
                 format!(
                     "{{{head},\"status\":\"measured\",\"on_ane\":{},\"off_ane\":{},\"on_ane_ops\":{},\"no_device\":{},\"ms\":{:.4},\"ms_min\":{:.4},\"ms_max\":{:.4},\"build_s\":{build_s:.2},\"finite\":{},\"nonzero\":{},\"note\":\"{}\"}}",
@@ -344,10 +456,10 @@ fn main() -> Result<()> {
     }
     let _ = std::fs::remove_dir_all(&root);
     println!(
-        "{{\"summary\":\"aneops\",\"chip\":\"{}\",\"os_build\":\"{}\",\"compute_units\":\"CpuAndNeuralEngine\",\"warmup\":{WARMUP},\"timed\":{TIMED},\"cases\":{},\"measured\":{measured},\"refused\":{refused},\"unsupported\":{unsupported},\"all_on_ane\":{}}}",
+        "{{\"summary\":\"aneops\",\"chip\":\"{}\",\"os_build\":\"{}\",\"compute_units\":\"CpuAndNeuralEngine\",\"warmup\":{WARMUP},\"timed\":{TIMED},\"cases\":{},\"measured\":{measured},\"refused\":{refused},\"unsupported\":{unsupported},\"blocked\":{blocked},\"all_on_ane\":{}}}",
         esc(&sysctl("machdep.cpu.brand_string")),
         esc(&sysctl("kern.osversion")),
-        measured + refused + unsupported,
+        measured + refused + unsupported + blocked,
         strings(&all_on_ane)
     );
     if measured == 0 {
