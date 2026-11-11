@@ -6,10 +6,12 @@
 //! gives every operation's preferred device, and the case is timed with its
 //! declared inputs (median of 20 predictions after 5 warmups). A case the
 //! builder cannot author, or the compiler refuses, is a result and is printed
-//! like any other.
+//! like any other. A case with a check also reports how far its first
+//! prediction is from an f64 reference.
 //!
 //!   cargo run -q -p apxinf-coreml --release --features native --example aneops
 use apxinf_core::{Error, Result};
+use apxinf_coreml::program::GeluMode;
 use apxinf_coreml::{ComputeDeviceKind, ComputeUnits, Operand, Package, ProgramBuilder, ProgramCache, Var};
 use half::f16;
 use std::time::{Duration, Instant};
@@ -24,6 +26,18 @@ struct Program {
     outputs: Vec<Var>,
     /// Where the authored program differs from the case as specified.
     note: &'static str,
+    check: Check,
+}
+
+/// What a case's first output is compared with, in f64.
+enum Check {
+    None,
+    /// `f` of the first input, element by element, with the inputs spread over
+    /// `[-span, span)` so the function leaves its linear range.
+    Elementwise { span: f32, f: Box<dyn Fn(f64) -> f64> },
+    /// `(flat output index, expected value)` at a sample of the first output,
+    /// computed from the first input.
+    Sampled(Box<dyn Fn(&[f16]) -> Vec<(usize, f64)>>),
 }
 
 struct Case {
@@ -54,6 +68,27 @@ struct Measurement {
     finite: bool,
     nonzero: bool,
     note: &'static str,
+    deviation: Option<Deviation>,
+}
+
+struct Deviation {
+    rel_rmse: f64,
+    max_abs: f64,
+}
+
+/// Over `(got, want)` pairs.
+fn deviation(pairs: impl Iterator<Item = (f64, f64)>) -> Deviation {
+    let (mut err2, mut ref2, mut max_abs) = (0.0, 0.0, 0.0f64);
+    for (g, w) in pairs {
+        let d = g - w;
+        err2 += d * d;
+        ref2 += w * w;
+        max_abs = max_abs.max(d.abs());
+    }
+    Deviation {
+        rel_rmse: (err2 / ref2).sqrt(),
+        max_abs,
+    }
 }
 
 fn values(n: usize, seed: usize) -> Vec<f16> {
@@ -68,12 +103,29 @@ fn weights(n: usize) -> Vec<f16> {
         .collect()
 }
 
+/// Uniform on `[-amplitude, amplitude)` from splitmix64. Unlike `weights`, which
+/// repeats every 2000 values, these carry no structure for a long sum to cancel.
+fn random_weights(n: usize, seed: u64, amplitude: f32) -> Vec<f16> {
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            let unit = ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32;
+            f16::from_f32((2.0 * unit - 1.0) * amplitude)
+        })
+        .collect()
+}
+
 fn finish(b: ProgramBuilder, inputs: Vec<Var>, outputs: &[&Var], note: &'static str) -> Result<Program> {
     Ok(Program {
         package: b.finish(outputs)?,
         inputs,
         outputs: outputs.iter().map(|&v| v.clone()).collect(),
         note,
+        check: Check::None,
     })
 }
 
@@ -235,6 +287,195 @@ fn concat_heads() -> Result<Program> {
     finish(b, heads, &[&y], "")
 }
 
+const MLP_HIDDEN: usize = 2048;
+const MLP_WIDTH: usize = 6144;
+const MLP_TILE: usize = 1408;
+const K_CHUNK: usize = 1024;
+
+fn silu_ref(v: f64) -> f64 {
+    v / (1.0 + (-v).exp())
+}
+
+fn tanh_gelu_ref(v: f64) -> f64 {
+    0.5 * v * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (v + 0.044715 * v * v * v)).tanh())
+}
+
+/// One elementwise program body: a single MIL op, or one spelling of an activation.
+#[derive(Clone, Copy)]
+enum Elementwise {
+    Identity,
+    /// `x * 0.5`, the scalar form the SiLU chain uses.
+    Mul,
+    /// `x + 1`, the scalar form the SiLU chain uses.
+    Add,
+    /// `x + x`, which the compiler cannot fold into a neighbour.
+    AddSelf,
+    Tanh,
+    Sigmoid,
+    Silu,
+    /// `clip(x, -1, 1)`.
+    Clamp,
+    GeluTanh,
+    /// Jev's shipped `(0.5 g) (1 + tanh(0.5 g))`.
+    SiluMulAddTanh,
+    /// `g * sigmoid(g)`.
+    SiluSigmoid,
+    /// `h (1 + tanh(h))` of `h = g / 2`, which is `silu(g)` exactly. The halving
+    /// is folded into the gate weights, exact in FP16 above the subnormal range.
+    SiluHalfTanh,
+}
+
+impl Elementwise {
+    /// What the body's input is, as a multiple of the gate it stands for.
+    fn gate_scale(self) -> f32 {
+        match self {
+            Self::SiluHalfTanh => 0.5,
+            _ => 1.0,
+        }
+    }
+
+    /// The body's output as a function of its input.
+    fn reference(self) -> fn(f64) -> f64 {
+        match self {
+            Self::Identity => |v| v,
+            Self::Mul => |v| v * 0.5,
+            Self::Add => |v| v + 1.0,
+            Self::AddSelf => |v| 2.0 * v,
+            Self::Tanh => f64::tanh,
+            Self::Sigmoid => |v| 1.0 / (1.0 + (-v).exp()),
+            Self::Clamp => |v| v.clamp(-1.0, 1.0),
+            Self::GeluTanh => tanh_gelu_ref,
+            Self::Silu | Self::SiluMulAddTanh | Self::SiluSigmoid => silu_ref,
+            Self::SiluHalfTanh => |h| silu_ref(2.0 * h),
+        }
+    }
+
+    fn apply(self, b: &mut ProgramBuilder, x: &Var) -> Result<Var> {
+        let s = |v: f32| Operand::Scalar(f16::from_f32(v));
+        Ok(match self {
+            Self::Identity => b.identity(x, None),
+            Self::Mul => b.mul(x, s(0.5), None)?,
+            Self::Add => b.add(x, s(1.0), None)?,
+            Self::AddSelf => b.add(x, Operand::Var(x), None)?,
+            Self::Tanh => b.tanh(x),
+            Self::Sigmoid => b.sigmoid(x),
+            Self::Silu => b.silu(x),
+            Self::Clamp => b.clamp(x, f16::from_f32(-1.0), f16::from_f32(1.0))?,
+            Self::GeluTanh => b.gelu(x, GeluMode::TanhApproximation),
+            Self::SiluMulAddTanh => {
+                let scaled = b.mul(x, s(0.5), None)?;
+                let half = b.mul(x, s(0.5), None)?;
+                let t = b.tanh(&half);
+                let one_plus = b.add(&t, s(1.0), None)?;
+                b.mul(&scaled, Operand::Var(&one_plus), None)?
+            }
+            Self::SiluSigmoid => {
+                let sig = b.sigmoid(x);
+                b.mul(x, Operand::Var(&sig), None)?
+            }
+            Self::SiluHalfTanh => {
+                let t = b.tanh(x);
+                let one_plus = b.add(&t, s(1.0), None)?;
+                b.mul(x, Operand::Var(&one_plus), None)?
+            }
+        })
+    }
+}
+
+/// `body` at the MLP's gate shape, checked against its f64 reference. With
+/// `anchored`, it reads `AddSelf` of the input instead, which keeps ops the
+/// compiler runs on the CPU when alone on the engine; `op_add_self` is the floor.
+fn elementwise(body: Elementwise, anchored: bool) -> Result<Program> {
+    let mut b = ProgramBuilder::new();
+    let x = b.input("x", &[1, MLP_WIDTH, 1, MLP_TILE]);
+    let input = match anchored {
+        true => Elementwise::AddSelf.apply(&mut b, &x)?,
+        false => x.clone(),
+    };
+    let y = body.apply(&mut b, &input)?;
+    let note = match body {
+        Elementwise::SiluHalfTanh => "input is h = g/2, as the MLP folds the halving into Wg; checked against silu(2h)",
+        _ => "",
+    };
+    let f = body.reference();
+    let lead = if anchored { 2.0 } else { 1.0 };
+    Ok(Program {
+        check: Check::Elementwise { span: 8.0, f: Box::new(move |v| f(lead * v)) },
+        ..finish(b, vec![x], &[&y], note)?
+    })
+}
+
+/// `conv(x, w)` for a row-major `[n, k]` weight with K split into `K_CHUNK`
+/// parts whose partial convs are summed in order, as Jev's `chunked_conv`.
+fn split_k_conv(b: &mut ProgramBuilder, x: &Var, w: &[f16], n: usize, k: usize) -> Result<Var> {
+    let parts = b.split(x, &vec![K_CHUNK; k / K_CHUNK], 1)?;
+    let mut acc: Option<Var> = None;
+    for (i, part) in parts.iter().enumerate() {
+        let chunk: Vec<f16> = w
+            .chunks_exact(k)
+            .flat_map(|row| &row[i * K_CHUNK..(i + 1) * K_CHUNK])
+            .copied()
+            .collect();
+        let y = b.conv_fp16(part, &chunk, &[n, K_CHUNK, 1, 1])?;
+        acc = Some(match acc {
+            None => y,
+            Some(a) => b.add(&a, Operand::Var(&y), None)?,
+        });
+    }
+    Ok(acc.expect("k holds at least one chunk"))
+}
+
+/// Jev's MLP at the wavefront tile: `conv(body(conv(x, Wg)) * conv(x, Wu), Wd)`,
+/// every matrix split-K at `K_CHUNK`, returned through `identity` named `y`.
+fn mlp(body: Elementwise) -> Result<Program> {
+    let (h, n) = (MLP_HIDDEN, MLP_WIDTH);
+    // With x on [-1, 1), an amplitude of 0.05 puts the gate's standard deviation
+    // near 1.3, where SiLU is no longer close to linear.
+    let scale = body.gate_scale();
+    let wg: Vec<f16> = random_weights(n * h, 1, 0.05)
+        .into_iter()
+        .map(|v| f16::from_f32(v.to_f32() * scale))
+        .collect();
+    let wu = random_weights(n * h, 2, 0.05);
+    let wd = random_weights(h * n, 3, 0.05);
+    let mut b = ProgramBuilder::new();
+    let x = b.input("x", &[1, h, 1, MLP_TILE]);
+    let gate = split_k_conv(&mut b, &x, &wg, n, h)?;
+    let up = split_k_conv(&mut b, &x, &wu, n, h)?;
+    let act = body.apply(&mut b, &gate)?;
+    let hidden = b.mul(&act, Operand::Var(&up), None)?;
+    let down = split_k_conv(&mut b, &hidden, &wd, h, n)?;
+    let y = b.identity(&down, Some("y"));
+    let f = body.reference();
+    let check = Check::Sampled(Box::new(move |x: &[f16]| {
+        let dot = |row: &[f16], v: &[f64]| row.iter().zip(v).map(|(w, v)| w.to_f64() * v).sum::<f64>();
+        (0..MLP_TILE)
+            .step_by(88)
+            .flat_map(|t| {
+                let xt: Vec<f64> = (0..h).map(|c| x[c * MLP_TILE + t].to_f64()).collect();
+                let hidden: Vec<f64> = wg
+                    .chunks_exact(h)
+                    .zip(wu.chunks_exact(h))
+                    .map(|(g, u)| f(dot(g, &xt)) * dot(u, &xt))
+                    .collect();
+                wd.chunks_exact(n)
+                    .enumerate()
+                    .map(|(c, row)| (c * MLP_TILE + t, dot(row, &hidden)))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }));
+    let note = match body {
+        Elementwise::SiluHalfTanh => "Wg pre-scaled by 0.5",
+        Elementwise::GeluTanh => "gelu replaces silu; the oracle computes gelu",
+        _ => "",
+    };
+    Ok(Program {
+        check,
+        ..finish(b, vec![x], &[&y], note)?
+    })
+}
+
 fn cases() -> Vec<Case> {
     let case = |name: &'static str, shape: &str, author: fn() -> Result<Program>| Case {
         name,
@@ -293,6 +534,60 @@ fn cases() -> Vec<Case> {
             reshape_matmul,
         ),
     ]);
+    use Elementwise::*;
+    for (name, body) in [
+        ("op_identity", Identity),
+        ("op_mul", Mul),
+        ("op_add", Add),
+        ("op_add_self", AddSelf),
+        ("op_tanh", Tanh),
+        ("op_sigmoid", Sigmoid),
+        ("op_silu", Silu),
+        ("op_clamp", Clamp),
+        ("op_gelu", GeluTanh),
+        ("act_silu_mul_add_tanh", SiluMulAddTanh),
+        ("act_silu_sigmoid", SiluSigmoid),
+        ("act_silu_half_tanh", SiluHalfTanh),
+    ] {
+        cases.push(Case {
+            name,
+            shape: format!("x[1,{MLP_WIDTH},1,{MLP_TILE}]"),
+            author: Box::new(move || elementwise(body, false)),
+            requires: &[],
+        });
+    }
+    for (name, body) in [
+        ("anchored_tanh", Tanh),
+        ("anchored_sigmoid", Sigmoid),
+        ("anchored_silu", Silu),
+        ("anchored_clamp", Clamp),
+        ("anchored_gelu", GeluTanh),
+    ] {
+        cases.push(Case {
+            name,
+            shape: format!("x[1,{MLP_WIDTH},1,{MLP_TILE}], op of x + x"),
+            author: Box::new(move || elementwise(body, true)),
+            requires: &[],
+        });
+    }
+    // The control runs first and again last, so drift across the MLP cases shows.
+    for (name, body) in [
+        ("mlp_silu_mul_add_tanh", SiluMulAddTanh),
+        ("mlp_silu_native", Silu),
+        ("mlp_silu_sigmoid", SiluSigmoid),
+        ("mlp_silu_half_tanh", SiluHalfTanh),
+        ("mlp_gelu_native", GeluTanh),
+        ("mlp_control_repeat", SiluMulAddTanh),
+    ] {
+        cases.push(Case {
+            name,
+            shape: format!(
+                "x[1,{MLP_HIDDEN},1,{MLP_TILE}] Wg,Wu[{MLP_WIDTH},{MLP_HIDDEN}] Wd[{MLP_HIDDEN},{MLP_WIDTH}] split-K {K_CHUNK}"
+            ),
+            author: Box::new(move || mlp(body)),
+            requires: &[],
+        });
+    }
     cases
 }
 
@@ -313,11 +608,20 @@ fn measure(program: &Program, cache: &ProgramCache) -> Result<Measurement> {
             Ok(())
         },
     )?;
+    let span = match &program.check {
+        Check::Elementwise { span, .. } => *span,
+        _ => 1.0,
+    };
     let data: Vec<Vec<f16>> = program
         .inputs
         .iter()
         .enumerate()
-        .map(|(i, v)| values(v.shape().iter().product(), i * 7919))
+        .map(|(i, v)| {
+            values(v.shape().iter().product(), i * 7919)
+                .into_iter()
+                .map(|x| f16::from_f32(x.to_f32() * span))
+                .collect()
+        })
         .collect();
     let inputs: Vec<(&str, &[f16], &[usize])> = program
         .inputs
@@ -327,9 +631,10 @@ fn measure(program: &Program, cache: &ProgramCache) -> Result<Measurement> {
         .collect();
     let outputs: Vec<(&str, &[usize])> = program.outputs.iter().map(|v| (v.name(), v.shape())).collect();
 
-    let got = model.predict(&inputs, &outputs)?;
+    let mut got = model.predict(&inputs, &outputs)?;
     let finite = got.iter().flatten().all(|v| v.is_finite());
     let nonzero = got.iter().flatten().any(|v| v.to_f32() != 0.0);
+    let first = got.swap_remove(0);
     for _ in 0..WARMUP {
         model.predict(&inputs, &outputs)?;
     }
@@ -340,6 +645,15 @@ fn measure(program: &Program, cache: &ProgramCache) -> Result<Measurement> {
         })
         .collect::<Result<_>>()?;
     ts.sort_by(f64::total_cmp);
+    let deviation = match &program.check {
+        Check::None => None,
+        Check::Elementwise { f, .. } => Some(deviation(
+            first.iter().zip(&data[0]).map(|(g, x)| (g.to_f64(), f(x.to_f64()))),
+        )),
+        Check::Sampled(expect) => Some(deviation(
+            expect(&data[0]).into_iter().map(|(i, want)| (first[i].to_f64(), want)),
+        )),
+    };
     Ok(Measurement {
         on_ane,
         off_ane,
@@ -350,6 +664,7 @@ fn measure(program: &Program, cache: &ProgramCache) -> Result<Measurement> {
         finite,
         nonzero,
         note: program.note,
+        deviation,
     })
 }
 
@@ -433,12 +748,16 @@ fn main() -> Result<()> {
             }
             Outcome::Measured(m) => {
                 measured += 1;
+                let deviation = match &m.deviation {
+                    Some(d) => format!("{{\"rel_rmse\":{:.3e},\"max_abs\":{:.3e}}}", d.rel_rmse, d.max_abs),
+                    None => "null".into(),
+                };
                 if m.off_ane.is_empty() && !m.on_ane.is_empty() {
                     all_on_ane.push(format!("{} {}", case.name, case.shape));
                     placed.push(case.name);
                 }
                 format!(
-                    "{{{head},\"status\":\"measured\",\"on_ane\":{},\"off_ane\":{},\"on_ane_ops\":{},\"no_device\":{},\"ms\":{:.4},\"ms_min\":{:.4},\"ms_max\":{:.4},\"build_s\":{build_s:.2},\"finite\":{},\"nonzero\":{},\"note\":\"{}\"}}",
+                    "{{{head},\"status\":\"measured\",\"on_ane\":{},\"off_ane\":{},\"on_ane_ops\":{},\"no_device\":{},\"ms\":{:.4},\"ms_min\":{:.4},\"ms_max\":{:.4},\"build_s\":{build_s:.2},\"finite\":{},\"nonzero\":{},\"deviation\":{deviation},\"note\":\"{}\"}}",
                     m.on_ane.len(),
                     strings(&m.off_ane),
                     strings(&m.on_ane),

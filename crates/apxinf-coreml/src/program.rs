@@ -36,6 +36,25 @@ pub enum Operand<'a> {
     Scalar(f16),
 }
 
+/// The formula MIL `gelu` evaluates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeluMode {
+    /// `0.5 x (1 + erf(x / sqrt 2))`.
+    Exact,
+    /// `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`, which MIL spells
+    /// `TANH_APPROXIMATION`, not `TANH`.
+    TanhApproximation,
+}
+
+impl GeluMode {
+    fn mil(self) -> &'static str {
+        match self {
+            Self::Exact => "EXACT",
+            Self::TanhApproximation => "TANH_APPROXIMATION",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ProgramBuilder {
     inputs: Vec<Var>,
@@ -611,6 +630,56 @@ impl ProgramBuilder {
     }
     pub fn identity(&mut self, x: &Var, name: Option<&str>) -> Var {
         self.unary("identity", x, name)
+    }
+    pub fn sigmoid(&mut self, x: &Var) -> Var {
+        self.unary("sigmoid", x, None)
+    }
+    /// `x * sigmoid(x)` as one op.
+    pub fn silu(&mut self, x: &Var) -> Var {
+        self.unary("silu", x, None)
+    }
+    /// `log(1 + exp(x))`.
+    pub fn softplus(&mut self, x: &Var) -> Var {
+        self.unary("softplus", x, None)
+    }
+
+    pub fn gelu(&mut self, x: &Var, mode: GeluMode) -> Var {
+        let name = self.op_name("gelu", None);
+        let mode = self.constant(&name, "mode", string_value(mode.mil()), data_type::STRING, &[]);
+        let out = Var {
+            name: name.clone(),
+            ..x.clone()
+        };
+        let inputs = [("x", x), ("mode", &mode)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push("gelu", &name, inputs, std::slice::from_ref(&out));
+        out
+    }
+
+    /// MIL `clip` with `alpha = min` and `beta = max`. The bounds share the
+    /// input's type, and from the iOS17 opset on MIL refuses `min >= max`.
+    pub fn clamp(&mut self, x: &Var, min: f16, max: f16) -> Result<Var> {
+        if x.dtype != data_type::FLOAT16 {
+            return Err(contract("clamp needs an FP16 input, the type of its bounds"));
+        }
+        if !(min < max) {
+            return Err(contract("clamp needs min < max"));
+        }
+        let name = self.op_name("clip", None);
+        let alpha = self.fp16_scalar(&name, "alpha", min);
+        let beta = self.fp16_scalar(&name, "beta", max);
+        let out = Var {
+            name: name.clone(),
+            ..x.clone()
+        };
+        let inputs = [("x", x), ("alpha", &alpha), ("beta", &beta)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push("clip", &name, inputs, std::slice::from_ref(&out));
+        Ok(out)
     }
 
     /// `reduce_max` over `axes` (non-negative).
@@ -1269,18 +1338,9 @@ mod tests {
     }
 
     fn int_const(b: &ProgramBuilder, op: &proto::Operation, param: &str) -> Vec<i32> {
-        let name = &bound(op, param)[0];
-        let constant = b
-            .operations
-            .iter()
-            .find(|c| &c.outputs[0].name == name)
-            .unwrap();
-        match &constant.attributes["val"].value {
-            Some(value::Value::ImmediateValue(v)) => match &v.tensor.as_ref().unwrap().value {
-                Some(tensor_value::Value::Ints(ints)) => ints.values.clone(),
-                other => panic!("{param} is not an int tensor: {other:?}"),
-            },
-            _ => panic!("{param} is not an immediate"),
+        match immediate_of(b, op, param) {
+            tensor_value::Value::Ints(ints) => ints.values.clone(),
+            other => panic!("{param} is not an int tensor: {other:?}"),
         }
     }
 
@@ -1324,6 +1384,80 @@ mod tests {
         refused(b.reshape(&x, &[8, -2, 64]), "positive or -1");
         refused(b.reshape(&x, &[8, 16, 5]), "element count");
         refused(b.reshape(&x, &[-1, 3]), "element count");
+
+        assert_eq!(b.operations.len(), before, "a refused call emitted an operation");
+    }
+
+    fn immediate_of<'a>(b: &'a ProgramBuilder, op: &proto::Operation, param: &str) -> &'a tensor_value::Value {
+        let name = &bound(op, param)[0];
+        let constant = b
+            .operations
+            .iter()
+            .find(|c| &c.outputs[0].name == name)
+            .unwrap();
+        match &constant.attributes["val"].value {
+            Some(value::Value::ImmediateValue(v)) => v.tensor.as_ref().unwrap().value.as_ref().unwrap(),
+            _ => panic!("{param} is not an immediate"),
+        }
+    }
+
+    #[test]
+    fn activation_ops_emit_their_mil_ops_and_shapes() {
+        let mut b = ProgramBuilder::new();
+        let x = b.input("x", &[1, 6144, 1, 1408]);
+        let sig = b.sigmoid(&x);
+        let silu = b.silu(&x);
+        let soft = b.softplus(&x);
+        let exact = b.gelu(&x, GeluMode::Exact);
+        let tanh = b.gelu(&x, GeluMode::TanhApproximation);
+        let clip = b
+            .clamp(&x, f16::from_f32(-1.5), f16::from_f32(2.0))
+            .unwrap();
+
+        let outs = [&sig, &silu, &soft, &exact, &tanh, &clip];
+        assert_eq!(
+            outs.map(|v| op(&b, v).r#type.as_str()),
+            ["sigmoid", "silu", "softplus", "gelu", "gelu", "clip"]
+        );
+        assert!(outs.iter().all(|v| v.shape() == x.shape()));
+        assert!(outs.iter().all(|v| bound(op(&b, v), "x") == ["x"]));
+
+        let mode = |v: &Var| match immediate_of(&b, op(&b, v), "mode") {
+            tensor_value::Value::Strings(s) => s.values.clone(),
+            other => panic!("mode is not a string: {other:?}"),
+        };
+        assert_eq!(mode(&exact), ["EXACT"]);
+        assert_eq!(mode(&tanh), ["TANH_APPROXIMATION"]);
+
+        let clip_op = op(&b, &clip);
+        assert_eq!(
+            (bound(clip_op, "alpha"), bound(clip_op, "beta")),
+            (vec!["clip_0_alpha_0".to_owned()], vec!["clip_0_beta_0".to_owned()])
+        );
+        let bound_value = |param: &str| match immediate_of(&b, clip_op, param) {
+            tensor_value::Value::Bytes(v) => f16::from_le_bytes([v.values[0], v.values[1]]).to_f32(),
+            other => panic!("{param} is not an FP16 scalar: {other:?}"),
+        };
+        assert_eq!((bound_value("alpha"), bound_value("beta")), (-1.5, 2.0));
+    }
+
+    #[test]
+    fn activation_ops_refuse_invalid_arguments() {
+        fn refused(r: Result<Var>, why: &str) {
+            match r {
+                Err(Error::Contract(m)) => assert!(m.contains(why), "{m:?} is not about {why:?}"),
+                other => panic!("expected a refusal about {why:?}, got {other:?}"),
+            }
+        }
+        let mut b = ProgramBuilder::new();
+        let x = b.input("x", &[1, 8, 16, 4]);
+        let before = b.operations.len();
+
+        let (lo, hi) = (f16::from_f32(-1.0), f16::from_f32(1.0));
+        refused(b.clamp(&x, hi, lo), "min < max");
+        refused(b.clamp(&x, lo, lo), "min < max");
+        refused(b.clamp(&x, f16::NAN, hi), "min < max");
+        refused(b.clamp(&bool_var(&[1, 8, 16, 4]), lo, hi), "FP16 input");
 
         assert_eq!(b.operations.len(), before, "a refused call emitted an operation");
     }
