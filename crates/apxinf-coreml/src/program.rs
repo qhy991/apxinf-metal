@@ -215,6 +215,28 @@ impl ProgramBuilder {
         self.constant(op, param, value, data_type::INT32, shape)
     }
 
+    fn fp16_scalar(&mut self, op: &str, param: &str, value: f16) -> Var {
+        let value = immediate(
+            data_type::FLOAT16,
+            &[],
+            tensor_value::Value::Bytes(proto::RepeatedBytes {
+                values: value.to_le_bytes().to_vec(),
+            }),
+        );
+        self.constant(op, param, value, data_type::FLOAT16, &[])
+    }
+
+    fn flag(&mut self, op: &str, param: &str, value: bool) -> Var {
+        let value = immediate(
+            data_type::BOOL,
+            &[],
+            tensor_value::Value::Bools(proto::RepeatedBools {
+                values: vec![value],
+            }),
+        );
+        self.constant(op, param, value, data_type::BOOL, &[])
+    }
+
     fn blob_value(
         &mut self,
         dtype: i32,
@@ -281,6 +303,114 @@ impl ProgramBuilder {
             inputs,
             std::slice::from_ref(&out),
         );
+        Ok(out)
+    }
+
+    /// `constexpr_lut_to_dense(indices, lut)`: `bits`-wide palette indices into a
+    /// per-group FP16 lookup table, materialized at load. `lut` holds one table of
+    /// `1 << bits` entries per group of `shape[0] / groups` rows; `indices` is packed
+    /// least-significant-first with no padding between rows.
+    ///
+    /// Core ML keeps per-block INT8/INT4 (`constexpr_blockwise_shift_scale` with a
+    /// sub-row block) off the Neural Engine, but places this one on it, which is what
+    /// makes sub-8-bit ANE weights reachable at all.
+    pub fn constexpr_lut_to_dense(
+        &mut self,
+        indices: &[u8],
+        shape: &[usize],
+        lut: &[f16],
+        groups: usize,
+        bits: u32,
+    ) -> Result<Var> {
+        let count: usize = shape.iter().product();
+        let entries = 1usize << bits;
+        if !matches!(bits, 4 | 6) {
+            return Err(contract("lut_to_dense supports 4- and 6-bit palettes"));
+        }
+        if indices.len() != count || lut.len() != groups * entries {
+            return Err(contract("lut_to_dense needs one index per weight and one table per group"));
+        }
+        if groups == 0 || shape.is_empty() || shape[0] % groups != 0 {
+            return Err(contract("lut_to_dense groups must divide the first dimension"));
+        }
+        if indices.iter().any(|&i| usize::from(i) >= entries) {
+            return Err(contract("lut_to_dense index outside the palette"));
+        }
+        let name = self.op_name("constexpr_lut_to_dense", None);
+        let (mil_dtype, blob_dtype) = match bits {
+            4 => (data_type::UINT4, BlobDataType::UInt4),
+            _ => (data_type::UINT6, BlobDataType::UInt6),
+        };
+        let packed = pack_indices(indices, bits);
+        let indices = self.blob_value(mil_dtype, shape, blob_dtype, &packed);
+        // Core ML's layout: one table per group, then the palette, then the vector axis.
+        let mut lut_shape = vec![groups];
+        lut_shape.extend(std::iter::repeat(1).take(shape.len() - 1));
+        lut_shape.push(entries);
+        lut_shape.push(1);
+        let bytes: Vec<u8> = lut.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let lut = self.blob_value(data_type::FLOAT16, &lut_shape, BlobDataType::Float16, &bytes);
+        let arg = |v: proto::Value| proto::Argument {
+            arguments: vec![proto::Binding {
+                binding: Some(binding::Binding::Value(v)),
+            }],
+        };
+        let out = Var {
+            name: name.clone(),
+            dtype: data_type::FLOAT16,
+            shape: shape.to_vec(),
+        };
+        let inputs = [
+            ("indices".to_owned(), arg(indices)),
+            ("lut".to_owned(), arg(lut)),
+        ]
+        .into();
+        self.push(
+            "constexpr_lut_to_dense",
+            &name,
+            inputs,
+            std::slice::from_ref(&out),
+        );
+        Ok(out)
+    }
+
+    /// `matmul(x, y)` with both operands already in place, no transpose.
+    ///
+    /// This exists so a schedule search can ask the compiler the one question the
+    /// conv path cannot: whether the same arithmetic spelled as a matmul is still
+    /// placed on the Neural Engine. At batch 1 it measured entirely on the CPU
+    /// while an equivalent 1x1 convolution reached the engine, so the spelling is
+    /// a placement decision, not a style choice.
+    pub fn matmul(&mut self, x: &Var, y: &Var) -> Result<Var> {
+        let (&[xm, xk], &[yk, yn]) = (&x.shape[..], &y.shape[..]) else {
+            return Err(contract("matmul needs two rank-2 operands"));
+        };
+        if xk != yk {
+            return Err(contract("matmul inner dimensions must match"));
+        }
+        let name = self.op_name("matmul", None);
+        let flag = |b: &mut Self, param: &'static str| -> Var {
+            let v = immediate(
+                data_type::BOOL,
+                &[],
+                tensor_value::Value::Bools(proto::RepeatedBools {
+                    values: vec![false],
+                }),
+            );
+            b.constant(&name, param, v, data_type::BOOL, &[])
+        };
+        let tx = flag(self, "transpose_x");
+        let ty = flag(self, "transpose_y");
+        let out = Var {
+            name: name.clone(),
+            dtype: data_type::FLOAT16,
+            shape: vec![xm, yn],
+        };
+        let inputs = [("x", x), ("y", y), ("transpose_x", &tx), ("transpose_y", &ty)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push("matmul", &name, inputs, std::slice::from_ref(&out));
         Ok(out)
     }
 
@@ -414,16 +544,7 @@ impl ProgramBuilder {
         let name = self.op_name(kind, name);
         let y = match y {
             Operand::Var(v) => v.clone(),
-            Operand::Scalar(s) => {
-                let value = immediate(
-                    data_type::FLOAT16,
-                    &[],
-                    tensor_value::Value::Bytes(proto::RepeatedBytes {
-                        values: s.to_le_bytes().to_vec(),
-                    }),
-                );
-                self.constant(&name, "y", value, data_type::FLOAT16, &[])
-            }
+            Operand::Scalar(s) => self.fp16_scalar(&name, "y", s),
         };
         let out = Var {
             name: name.clone(),
@@ -469,28 +590,54 @@ impl ProgramBuilder {
     pub fn abs(&mut self, x: &Var) -> Var {
         self.unary("abs", x, None)
     }
+    pub fn exp(&mut self, x: &Var) -> Var {
+        self.unary("exp", x, None)
+    }
+    /// `rsqrt(x)` with MIL's default `epsilon` of 1e-12, which is zero in FP16.
+    /// The ML Program parser refuses an `rsqrt` that omits it.
+    pub fn rsqrt(&mut self, x: &Var) -> Var {
+        let name = self.op_name("rsqrt", None);
+        let epsilon = self.fp16_scalar(&name, "epsilon", f16::from_f32(1e-12));
+        let out = Var {
+            name: name.clone(),
+            ..x.clone()
+        };
+        let inputs = [("x", x), ("epsilon", &epsilon)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push("rsqrt", &name, inputs, std::slice::from_ref(&out));
+        out
+    }
     pub fn identity(&mut self, x: &Var, name: Option<&str>) -> Var {
         self.unary("identity", x, name)
     }
 
     /// `reduce_max` over `axes` (non-negative).
     pub fn reduce_max(&mut self, x: &Var, axes: &[i32], keep_dims: bool) -> Result<Var> {
+        self.reduce("reduce_max", x, axes, keep_dims)
+    }
+    /// `reduce_sum` over `axes` (non-negative).
+    pub fn reduce_sum(&mut self, x: &Var, axes: &[i32], keep_dims: bool) -> Result<Var> {
+        self.reduce("reduce_sum", x, axes, keep_dims)
+    }
+
+    fn reduce(
+        &mut self,
+        kind: &'static str,
+        x: &Var,
+        axes: &[i32],
+        keep_dims: bool,
+    ) -> Result<Var> {
         if axes
             .iter()
             .any(|&a| usize::try_from(a).map_or(true, |a| a >= x.shape.len()))
         {
-            return Err(contract("reduce_max axes must index the input"));
+            return Err(contract("reduce axes must index the input"));
         }
-        let name = self.op_name("reduce_max", None);
+        let name = self.op_name(kind, None);
         let axes_var = self.ints(&name, "axes", axes, false);
-        let keep = immediate(
-            data_type::BOOL,
-            &[],
-            tensor_value::Value::Bools(proto::RepeatedBools {
-                values: vec![keep_dims],
-            }),
-        );
-        let keep = self.constant(&name, "keep_dims", keep, data_type::BOOL, &[]);
+        let keep = self.flag(&name, "keep_dims", keep_dims);
         let shape = x
             .shape
             .iter()
@@ -510,7 +657,105 @@ impl ProgramBuilder {
             .into_iter()
             .map(|(k, v)| (k.to_owned(), by_name(v)))
             .collect();
-        self.push("reduce_max", &name, inputs, std::slice::from_ref(&out));
+        self.push(kind, &name, inputs, std::slice::from_ref(&out));
+        Ok(out)
+    }
+
+    /// `transpose` of `x`: output axis `i` is input axis `perm[i]`.
+    pub fn transpose(&mut self, x: &Var, perm: &[i32]) -> Result<Var> {
+        let Some(axes) = perm
+            .iter()
+            .map(|&p| usize::try_from(p).ok().filter(|&p| p < x.shape.len()))
+            .collect::<Option<Vec<usize>>>()
+        else {
+            return Err(contract("transpose perm must index the input"));
+        };
+        if axes.len() != x.shape.len() || axes.iter().collect::<BTreeSet<_>>().len() != axes.len()
+        {
+            return Err(contract("transpose perm must be a permutation of the input axes"));
+        }
+        let name = self.op_name("transpose", None);
+        let perm_var = self.ints(&name, "perm", perm, false);
+        let out = Var {
+            name: name.clone(),
+            dtype: x.dtype,
+            shape: axes.iter().map(|&a| x.shape[a]).collect(),
+        };
+        let inputs = [("x", x), ("perm", &perm_var)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push("transpose", &name, inputs, std::slice::from_ref(&out));
+        Ok(out)
+    }
+
+    /// `concat` of `values` along a non-negative `axis`.
+    pub fn concat(&mut self, values: &[&Var], axis: usize, interleave: bool) -> Result<Var> {
+        let Some(first) = values.first() else {
+            return Err(contract("concat needs at least one value"));
+        };
+        if axis >= first.shape.len() {
+            return Err(contract("concat axis must index the values"));
+        }
+        if values.iter().any(|v| v.dtype != first.dtype) {
+            return Err(contract("concat values must share a dtype"));
+        }
+        let agrees = |v: &Var| {
+            v.shape.len() == first.shape.len()
+                && v.shape
+                    .iter()
+                    .zip(&first.shape)
+                    .enumerate()
+                    .all(|(i, (a, b))| i == axis || a == b)
+        };
+        if !values.iter().all(|v| agrees(v)) {
+            return Err(contract(
+                "concat values must agree on every axis except the concat axis",
+            ));
+        }
+        let name = self.op_name("concat", None);
+        let axis_var = self.ints(&name, "axis", &[axis as i32], true);
+        let interleave = self.flag(&name, "interleave", interleave);
+        let mut shape = first.shape.clone();
+        shape[axis] = values.iter().map(|v| v.shape[axis]).sum();
+        let out = Var {
+            name: name.clone(),
+            dtype: first.dtype,
+            shape,
+        };
+        let list = proto::Argument {
+            arguments: values.iter().flat_map(|v| by_name(v).arguments).collect(),
+        };
+        let inputs = [
+            ("values".to_owned(), list),
+            ("axis".to_owned(), by_name(&axis_var)),
+            ("interleave".to_owned(), by_name(&interleave)),
+        ]
+        .into();
+        self.push("concat", &name, inputs, std::slice::from_ref(&out));
+        Ok(out)
+    }
+
+    /// MIL `select`, numpy's `where`: `a` where the bool `cond` holds, else `b`.
+    pub fn select(&mut self, cond: &Var, a: &Var, b: &Var) -> Result<Var> {
+        if cond.dtype != data_type::BOOL {
+            return Err(contract("select cond must be a bool value"));
+        }
+        if a.dtype != b.dtype {
+            return Err(contract("select branches must share a dtype"));
+        }
+        let shape = broadcast(&broadcast(&cond.shape, &a.shape)?, &b.shape)?;
+        let name = self.op_name("select", None);
+        let out = Var {
+            name: name.clone(),
+            dtype: a.dtype,
+            shape,
+        };
+        let inputs = [("cond", cond), ("a", a), ("b", b)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push("select", &name, inputs, std::slice::from_ref(&out));
         Ok(out)
     }
 
@@ -654,6 +899,81 @@ impl Package {
 
 #[cfg(test)]
 mod tests {
+    /// The spelling axis, at a production shape: does the same arithmetic written
+    /// as `matmul` still reach the Neural Engine?
+    ///
+    /// At batch 1 a 4096x4096 GEMV measured ANE 0/3 as `matmul` and `linear` but
+    /// ANE 3/3 as a 1x1 convolution, which is why every ANE-friendly layout
+    /// converts projections to convolutions. This asserts the same question at a
+    /// tile the engine is actually given, so a schedule search can trust the axis.
+    ///
+    ///   cargo test -p apxinf-coreml --release --features native \
+    ///     spelling_placement -- --ignored --nocapture
+    #[test]
+    #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+    #[ignore = "needs the native compiler and the host Metal lock"]
+    fn spelling_placement() {
+        use crate::{ComputeDeviceKind, ComputeUnits, ProgramCache};
+        const N: usize = 1024;
+        const K: usize = 1024;
+        let w: Vec<f16> = (0..N * K)
+            .map(|i| f16::from_f32((((i * 2654435761) % 1000) as f32 / 500.0 - 1.0) * 0.02))
+            .collect();
+
+        for tile in [1usize, 128, 512] {
+            for spelling in ["conv1x1", "matmul"] {
+                let mut b = ProgramBuilder::new();
+                let y = if spelling == "matmul" {
+                    let x = b.input("x", &[tile, K]);
+                    let mut t = vec![f16::ZERO; N * K];
+                    for r in 0..N {
+                        for c in 0..K {
+                            t[c * N + r] = w[r * K + c];
+                        }
+                    }
+                    let wv = b.fp16_blob("w", "value", &t, &[K, N]).unwrap();
+                    let m = b.matmul(&x, &wv).unwrap();
+                    b.identity(&m, Some("y"))
+                } else {
+                    let x = b.input("x", &[1, K, 1, tile]);
+                    let c = b.conv_fp16(&x, &w, &[N, K, 1, 1]).unwrap();
+                    b.identity(&c, Some("y"))
+                };
+                let pkg = b.finish(&[&y]).unwrap();
+                let dir = std::env::temp_dir().join(format!("spelling-{spelling}-{tile}"));
+                let _ = std::fs::remove_dir_all(&dir);
+                let cache = ProgramCache::new(&dir);
+                let mut devices: Vec<String> = Vec::new();
+                let loaded = cache.load_with_placement(
+                    &pkg,
+                    ComputeUnits::CpuAndNeuralEngine,
+                    std::time::Duration::from_secs(120),
+                    |facts| {
+                        for f in &facts.functions {
+                            for op in &f.operations {
+                                if let Some(d) = op.usage.as_ref().and_then(|u| u.preferred.as_ref())
+                                {
+                                    devices.push(format!("{}:{:?}", op.operator, d.kind));
+                                }
+                            }
+                        }
+                        Ok(())
+                    },
+                );
+                let ane = devices
+                    .iter()
+                    .filter(|d| d.ends_with("NeuralEngine"))
+                    .count();
+                println!(
+                    "  tile={tile:<4} {spelling:<8} -> {}  ANE {ane}/{}  {devices:?}",
+                    if loaded.is_ok() { "loaded" } else { "FAILED" },
+                    devices.len()
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -782,6 +1102,120 @@ mod tests {
         assert_eq!(halves(offsets[2]), [3.0; 8]);
     }
 
+    fn op<'a>(b: &'a ProgramBuilder, out: &Var) -> &'a proto::Operation {
+        b.operations
+            .iter()
+            .find(|op| op.outputs.iter().any(|o| o.name == out.name))
+            .unwrap()
+    }
+
+    fn bound(op: &proto::Operation, param: &str) -> Vec<String> {
+        op.inputs[param]
+            .arguments
+            .iter()
+            .map(|a| match &a.binding {
+                Some(binding::Binding::Name(n)) => n.clone(),
+                _ => panic!("{param} is not bound by name"),
+            })
+            .collect()
+    }
+
+    fn bool_var(shape: &[usize]) -> Var {
+        Var {
+            name: "cond".to_owned(),
+            dtype: data_type::BOOL,
+            shape: shape.to_vec(),
+        }
+    }
+
+    #[test]
+    fn math_and_layout_ops_emit_their_mil_ops_and_shapes() {
+        let mut b = ProgramBuilder::new();
+        let x = b.input("x", &[1, 8, 16, 4]);
+        let e = b.exp(&x);
+        let r = b.rsqrt(&e);
+        let kept = b.reduce_sum(&r, &[1, 3], true).unwrap();
+        let dropped = b.reduce_sum(&r, &[3], false).unwrap();
+        let t = b.transpose(&x, &[2, 0, 3, 1]).unwrap();
+        let y = b.input("y", &[1, 8, 16, 2]);
+        let c = b.concat(&[&x, &y, &e], 3, false).unwrap();
+        let cond = bool_var(&[1, 8, 16, 1]);
+        let s = b.select(&cond, &x, &e).unwrap();
+
+        let emitted = [&e, &r, &kept, &dropped, &t, &c, &s].map(|v| op(&b, v).r#type.as_str());
+        assert_eq!(
+            emitted,
+            ["exp", "rsqrt", "reduce_sum", "reduce_sum", "transpose", "concat", "select"]
+        );
+        assert_eq!((e.shape(), r.shape()), (&[1, 8, 16, 4][..], &[1, 8, 16, 4][..]));
+        assert_eq!(kept.shape(), &[1, 1, 16, 1]);
+        assert_eq!(dropped.shape(), &[1, 8, 16]);
+        // perm [2, 0, 3, 1] applied, not its inverse (which would give [8, 4, 1, 16]).
+        assert_eq!(t.shape(), &[16, 1, 4, 8]);
+        assert_eq!(c.shape(), &[1, 8, 16, 10]);
+        assert_eq!(s.shape(), &[1, 8, 16, 4]);
+
+        let perm = bound(op(&b, &t), "perm");
+        let perm_const = b
+            .operations
+            .iter()
+            .find(|op| op.outputs[0].name == perm[0])
+            .unwrap();
+        match &perm_const.attributes["val"].value {
+            Some(value::Value::ImmediateValue(v)) => assert_eq!(
+                v.tensor.as_ref().unwrap().value,
+                Some(tensor_value::Value::Ints(proto::RepeatedInts {
+                    values: vec![2, 0, 3, 1]
+                }))
+            ),
+            _ => panic!("perm is not an immediate"),
+        }
+        assert_eq!(bound(op(&b, &c), "values"), ["x", "y", e.name()]);
+        assert_eq!(bound(op(&b, &r), "epsilon"), ["rsqrt_0_epsilon_0"]);
+        let select = op(&b, &s);
+        assert_eq!(
+            ["cond", "a", "b"].map(|p| bound(select, p)),
+            [["cond"], ["x"], [e.name()]].map(|n| n.map(str::to_owned).to_vec())
+        );
+    }
+
+    #[test]
+    fn math_and_layout_ops_refuse_invalid_arguments() {
+        fn refused(r: Result<Var>, why: &str) {
+            match r {
+                Err(Error::Contract(m)) => assert!(m.contains(why), "{m:?} is not about {why:?}"),
+                other => panic!("expected a refusal about {why:?}, got {other:?}"),
+            }
+        }
+        let mut b = ProgramBuilder::new();
+        let x = b.input("x", &[1, 8, 16, 4]);
+        let before = b.operations.len();
+
+        refused(b.reduce_sum(&x, &[4], true), "axes must index");
+        refused(b.reduce_sum(&x, &[-1], true), "axes must index");
+
+        refused(b.transpose(&x, &[0, 1, 2, 4]), "perm must index");
+        refused(b.transpose(&x, &[0, 1, -2, 3]), "perm must index");
+        refused(b.transpose(&x, &[0, 1, 2]), "permutation");
+        refused(b.transpose(&x, &[0, 1, 1, 3]), "permutation");
+
+        refused(b.concat(&[], 0, false), "at least one value");
+        refused(b.concat(&[&x, &x], 4, false), "axis must index");
+        let off_axis = b.input("w", &[1, 8, 8, 4]);
+        refused(b.concat(&[&x, &off_axis], 3, false), "every axis except");
+        let low_rank = b.input("v", &[1, 8, 16]);
+        refused(b.concat(&[&x, &low_rank], 1, false), "every axis except");
+        let flags = bool_var(&[1, 8, 16, 4]);
+        refused(b.concat(&[&x, &flags], 3, false), "share a dtype");
+
+        refused(b.select(&x, &x, &x), "bool");
+        refused(b.select(&flags, &x, &flags), "share a dtype");
+        let wide = b.input("z", &[1, 3, 16, 4]);
+        refused(b.select(&flags, &x, &wide), "broadcast");
+
+        assert_eq!(b.operations.len(), before, "a refused call emitted an operation");
+    }
+
     #[test]
     fn invalid_programs_are_rejected() {
         let mut b = ProgramBuilder::new();
@@ -798,4 +1232,21 @@ mod tests {
         let wide = b.input("z", &[1, 3, 1, 8]);
         assert!(b.mul(&x, Operand::Var(&wide), None).is_err());
     }
+}
+
+/// Packs `bits`-wide indices least-significant-first into whole bytes, the layout
+/// Core ML's blob reader expects for `UInt4` / `UInt6` (no padding between rows).
+fn pack_indices(indices: &[u8], bits: u32) -> Vec<u8> {
+    let total_bits = indices.len() * bits as usize;
+    let mut out = vec![0u8; total_bits.div_ceil(8)];
+    for (i, &v) in indices.iter().enumerate() {
+        let start = i * bits as usize;
+        for b in 0..bits as usize {
+            if v >> b & 1 == 1 {
+                let bit = start + b;
+                out[bit / 8] |= 1 << (bit % 8);
+            }
+        }
+    }
+    out
 }

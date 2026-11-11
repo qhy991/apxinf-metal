@@ -110,6 +110,140 @@ fn int8_per_row(w: &[f16], cols: usize) -> (Vec<i8>, Vec<f16>) {
     (q, scales)
 }
 
+/// Which encoding the Neural Engine share uses for its gate/up/down weights.
+///
+/// INT8 is the qualified default. The LUT forms exist because Core ML keeps
+/// per-block sub-8-bit INT off the Neural Engine while it places
+/// `constexpr_lut_to_dense` on it, so a palette is the only way to spend fewer
+/// than 8 bits per ANE weight — which buys residency, and residency is what
+/// gates the neuron share.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AneFormat {
+    Int8,
+    Lut { bits: u32 },
+}
+
+/// `APXINF_CLEF_ANE_FORMAT=int8|lut6|lut4`; unset keeps INT8 bit for bit.
+pub fn ane_format() -> AneFormat {
+    match std::env::var("APXINF_CLEF_ANE_FORMAT").ok().as_deref() {
+        Some("lut6") => AneFormat::Lut { bits: 6 },
+        Some("lut4") => AneFormat::Lut { bits: 4 },
+        _ => AneFormat::Int8,
+    }
+}
+
+/// `APXINF_CLEF_NEURON_SHARE=<percent>` of the intermediate width on the Neural
+/// Engine, keeping the qualified INT8:FP16 ratio. The geometry constraints are
+/// the admission ones: a 32-multiple total, an INT8 share whose down parts
+/// divide into 64-multiple widths, and a positive FP16 share. Unset reproduces
+/// the qualified split exactly.
+pub fn neuron_counts() -> (usize, usize) {
+    let Some(pct) = std::env::var("APXINF_CLEF_NEURON_SHARE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    else {
+        return (NEURON_INT8, NEURON_FP16);
+    };
+    let total = (INTERMEDIATE * pct.clamp(1, 99) / 100) / 32 * 32;
+    // The INT8 share must split into `parts` equal down parts of a 64-multiple
+    // width, so walk down from the ratio's value to the first size that does.
+    let mut int8 = (total * NEURON_INT8 / (NEURON_INT8 + NEURON_FP16)) / 128 * 128;
+    while int8 > 0 {
+        let parts = int8.div_ceil(DOWN_PART);
+        if int8 % parts == 0 && (int8 / parts) % 64 == 0 && total > int8 {
+            break;
+        }
+        int8 -= 128;
+    }
+    let fp16 = total.saturating_sub(int8);
+    if int8 == 0 || fp16 == 0 {
+        return (NEURON_INT8, NEURON_FP16);
+    }
+    (int8, fp16)
+}
+
+/// One encoded weight matrix: the INT8 pair, or palette indices plus one
+/// FP16 table per row.
+enum Encoded {
+    Int8 { q: Vec<i8>, scale: Vec<f16> },
+    Lut { idx: Vec<u8>, lut: Vec<f16>, bits: u32 },
+}
+
+impl Encoded {
+    /// Encodes `[rows, cols]` row-major `w`. The palette is the same per-row
+    /// symmetric grid INT8 uses, just with fewer levels, so the dequantized
+    /// values stay a subset of what the INT8 path already produces.
+    fn encode(w: &[f16], cols: usize, format: AneFormat) -> Self {
+        match format {
+            AneFormat::Int8 => {
+                let (q, scale) = int8_per_row(w, cols);
+                Self::Int8 { q, scale }
+            }
+            AneFormat::Lut { bits } => {
+                let levels = f32::from((1u32 << (bits - 1)) as u16) - 1.0;
+                let entries = 1usize << bits;
+                let rows = w.len() / cols;
+                let mut idx = Vec::with_capacity(w.len());
+                let mut lut = Vec::with_capacity(rows * entries);
+                for row in w.chunks_exact(cols) {
+                    let peak = row
+                        .iter()
+                        .fold(0f32, |m, v| m.max(v.to_f32().abs()))
+                        .max(f32::MIN_POSITIVE);
+                    let scale = peak / levels;
+                    // Index `levels` is exactly zero, so an all-zero row stays zero.
+                    for j in 0..entries {
+                        lut.push(f16::from_f32((j as f32 - levels) * scale));
+                    }
+                    for v in row {
+                        let q = (v.to_f32() / scale).round().clamp(-levels, levels);
+                        idx.push((q + levels) as u8);
+                    }
+                }
+                Self::Lut { idx, lut, bits }
+            }
+        }
+    }
+
+    /// The constexpr weight var for a `[rows, cols, 1, 1]` convolution kernel.
+    fn weight(&self, b: &mut ProgramBuilder, rows: usize, cols: usize) -> Result<Var> {
+        match self {
+            Self::Int8 { q, scale } => {
+                b.constexpr_blockwise_shift_scale(q, &[rows, cols, 1, 1], scale, &[rows, 1, 1, 1])
+            }
+            Self::Lut { idx, lut, bits } => {
+                b.constexpr_lut_to_dense(idx, &[rows, cols, 1, 1], lut, rows, *bits)
+            }
+        }
+    }
+
+    /// Per row, the sum of the dequantized magnitudes — the quantity the FP16
+    /// overflow bound needs. It is a property of the dequantized weights, so it
+    /// is the same question for either encoding.
+    fn row_abs_sums(&self, rows: usize, cols: usize) -> Vec<f64> {
+        (0..rows)
+            .map(|r| match self {
+                Self::Int8 { q, scale } => {
+                    let abs: Vec<f64> = q[r * cols..(r + 1) * cols]
+                        .iter()
+                        .map(|&v| f64::from(v).abs())
+                        .collect();
+                    f64::from(scale[r].to_f32()) * pairwise_sum(&abs)
+                }
+                Self::Lut { idx, lut, bits } => {
+                    let entries = 1usize << bits;
+                    let table = &lut[r * entries..(r + 1) * entries];
+                    let abs: Vec<f64> = idx[r * cols..(r + 1) * cols]
+                        .iter()
+                        .map(|&i| f64::from(table[usize::from(i)].to_f32()).abs())
+                        .collect();
+                    pairwise_sum(&abs)
+                }
+            })
+            .collect()
+    }
+}
+
 /// Columns `[start, start + width)` of a row-major `[rows, cols]` matrix.
 fn columns(w: &[f16], cols: usize, start: usize, width: usize) -> Vec<f16> {
     w.chunks_exact(cols)
@@ -362,6 +496,7 @@ impl DenseMlp {
     }
 
     pub fn split(&self) -> NeuronSplit {
+        let (n8, n16) = neuron_counts();
         let (ng, eg) = row_stats(&self.gate, HIDDEN);
         let (nu, eu) = row_stats(&self.up, HIDDEN);
         let (nd, ed) = column_stats(&self.down, INTERMEDIATE);
@@ -376,9 +511,9 @@ impl DenseMlp {
             v
         };
         NeuronSplit {
-            int8: sorted(&order[..NEURON_INT8]),
-            fp16: sorted(&order[NEURON_INT8..NEURON_INT8 + NEURON_FP16]),
-            gpu: sorted(&order[NEURON_INT8 + NEURON_FP16..]),
+            int8: sorted(&order[..n8]),
+            fp16: sorted(&order[n8..n8 + n16]),
+            gpu: sorted(&order[n8 + n16..]),
         }
     }
 
@@ -403,26 +538,26 @@ impl DenseMlp {
     /// fused into one conv with a zero bias.
     pub fn program(&self, split: &NeuronSplit) -> Result<Package> {
         let (n, nf) = (split.int8.len(), split.fp16.len());
-        let (qg, sg) = int8_per_row(&Self::rows(&self.gate, &split.int8), HIDDEN);
-        let (qu, su) = int8_per_row(&Self::rows(&self.up, &split.int8), HIDDEN);
+        let format = ane_format();
+        let eg = Encoded::encode(&Self::rows(&self.gate, &split.int8), HIDDEN, format);
+        let eu = Encoded::encode(&Self::rows(&self.up, &split.int8), HIDDEN, format);
         let fg = Self::rows(&self.gate, &split.fp16);
         let fu = Self::rows(&self.up, &split.fp16);
         let fd = self.down_columns(&split.fp16);
         let wd = self.down_columns(&split.int8);
         let parts = n.div_ceil(DOWN_PART);
         let width = n / parts;
-        let down: Vec<(Vec<i8>, Vec<f16>)> = (0..parts)
-            .map(|p| int8_per_row(&columns(&wd, n, p * width, width), width))
+        let down: Vec<Encoded> = (0..parts)
+            .map(|p| Encoded::encode(&columns(&wd, n, p * width, width), width, format))
             .collect();
         // Bound the dot products of the int8 and FP16 weights the Neural Engine uses.
         let mut row_sums = vec![0f64; HIDDEN];
-        for (qd, sd) in &down {
-            for (r, sum) in row_sums.iter_mut().enumerate() {
-                let abs: Vec<f64> = qd[r * width..(r + 1) * width]
-                    .iter()
-                    .map(|&v| f64::from(v).abs())
-                    .collect();
-                *sum += f64::from(sd[r].to_f32()) * pairwise_sum(&abs);
+        for part in &down {
+            for (sum, v) in row_sums
+                .iter_mut()
+                .zip(part.row_abs_sums(HIDDEN, width))
+            {
+                *sum += v;
             }
         }
         for (r, sum) in row_sums.iter_mut().enumerate() {
@@ -448,9 +583,9 @@ impl DenseMlp {
         let half = Operand::Scalar(f16::from_f32(0.5));
         let mut b = ProgramBuilder::new();
         let x = b.input("x", &[1, HIDDEN, 1, NEURON_TILE]);
-        let wg = b.constexpr_blockwise_shift_scale(&qg, &[n, HIDDEN, 1, 1], &sg, &[n, 1, 1, 1])?;
+        let wg = eg.weight(&mut b, n, HIDDEN)?;
         let g = b.conv(&x, &wg)?;
-        let wu = b.constexpr_blockwise_shift_scale(&qu, &[n, HIDDEN, 1, 1], &su, &[n, 1, 1, 1])?;
+        let wu = eu.weight(&mut b, n, HIDDEN)?;
         let u = b.conv(&x, &wu)?;
         // swish(gf)'s `* 0.5` is the program's third mul (after swish(g)'s two).
         let gf_half =
@@ -504,13 +639,8 @@ impl DenseMlp {
             vec![a]
         };
         let mut ys = Vec::with_capacity(parts + 1);
-        for (xi, (qd, sd)) in xs.iter().zip(&down) {
-            let wd = b.constexpr_blockwise_shift_scale(
-                qd,
-                &[HIDDEN, width, 1, 1],
-                sd,
-                &[HIDDEN, 1, 1, 1],
-            )?;
+        for (xi, part) in xs.iter().zip(&down) {
+            let wd = part.weight(&mut b, HIDDEN, width)?;
             ys.push(b.conv(xi, &wd)?);
         }
         ys.push(b.conv_fp16(&af, &fd, &[HIDDEN, nf, 1, 1])?);
@@ -1145,6 +1275,406 @@ mod tests {
     /// coremltools 9.0 reference build compiled (in the directory
     /// `recorded_env` names): the same weight file bytes and the same decoded
     /// program (writer metadata and `buildInfo` excluded).
+    /// All 32 layers resident at one share, with the host's paging counters
+    /// around the measured window.
+    ///
+    /// The share campaign found 70% is the latency optimum (-13.4%) but left the
+    /// default at 56% because 70%'s ANE weights thrashed a 16 GB host. This asks
+    /// that question directly on this host: load every layer's program, run them
+    /// in sequence like a forward pass does, and report both the per-pass cost and
+    /// the swap the window caused. A share is only usable if its pass is faster
+    /// AND it did not page.
+    ///
+    ///   APXINF_CLEF_SHARES=56,70 APXINF_CLEF_CHECKPOINT=<dir> cargo test \
+    ///     -p apxinf-model --release --features coreml ane_full_stack_share \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs APXINF_CLEF_CHECKPOINT and the Metal lock; loads every layer"]
+    fn ane_full_stack_share() {
+        fn swapouts() -> u64 {
+            let out = std::process::Command::new("vm_stat").output().unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find(|l| l.starts_with("Swapouts"))
+                .and_then(|l| l.rsplit(' ').next())
+                .map(|v| v.trim_end_matches('.').parse().unwrap_or(0))
+                .unwrap_or(0)
+        }
+
+        let checkpoint = std::path::PathBuf::from(
+            std::env::var("APXINF_CLEF_CHECKPOINT").expect("set APXINF_CLEF_CHECKPOINT"),
+        );
+        let shares = std::env::var("APXINF_CLEF_SHARES").unwrap_or_else(|_| "56,70".to_owned());
+        let read = |n: &str| std::fs::read_to_string(checkpoint.join(n)).unwrap();
+        let config =
+            super::super::Config::from_json(&read("config.json"), &read("joint_head_config.json"))
+                .unwrap();
+        let stream = Stream::metal(0).unwrap();
+        let backbone =
+            super::super::weights::Backbone::load(&config, &stream, &checkpoint).unwrap();
+        let layers = backbone.layers.len();
+        println!("\n  {layers} layers, all resident, {NEURON_TILE}-token tile\n");
+        println!(
+            "  {:>6} {:>7} {:>9} {:>11} {:>10} {:>10} {:>12}",
+            "share", "int8", "cache GB", "build s", "pass ms", "vs base", "swapouts"
+        );
+        let mut base = 0f64;
+        for share in shares.split(',') {
+            std::env::set_var("APXINF_CLEF_ANE_FORMAT", "int8");
+            std::env::set_var("APXINF_CLEF_NEURON_SHARE", share);
+            let (n8, _) = neuron_counts();
+            let dir = std::env::temp_dir().join(format!("clef-full-{share}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            let cache = apxinf_coreml::ProgramCache::new(&dir);
+            let before = swapouts();
+            let t0 = std::time::Instant::now();
+            let mut models = Vec::with_capacity(layers);
+            let mut bytes = 0u64;
+            for layer in &backbone.layers {
+                let dense = DenseMlp::new(&layer.mlp).unwrap();
+                let package = dense.program(&dense.split()).unwrap();
+                bytes += package.weights.len() as u64;
+                models.push(
+                    cache
+                        .load(&package, apxinf_coreml::ComputeUnits::CpuAndNeuralEngine)
+                        .unwrap(),
+                );
+            }
+            let build = t0.elapsed().as_secs_f64();
+            let x = vec![f16::ZERO; HIDDEN * NEURON_TILE];
+            let inputs = [("x", &x[..], &[1, HIDDEN, 1, NEURON_TILE][..])];
+            let outs = [
+                ("y", &[1, HIDDEN, 1, NEURON_TILE][..]),
+                ("gate_scale", &[1, 1, 1, NEURON_TILE][..]),
+                ("up_scale", &[1, 1, 1, NEURON_TILE][..]),
+            ];
+            // one warm pass over every layer, then measured passes
+            for m in &models {
+                m.predict(&inputs, &outs).unwrap();
+            }
+            let mid = swapouts();
+            let mut passes = Vec::new();
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                for m in &models {
+                    m.predict(&inputs, &outs).unwrap();
+                }
+                passes.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            passes.sort_by(f64::total_cmp);
+            let ms = passes[passes.len() / 2];
+            if base == 0.0 {
+                base = ms;
+            }
+            let after = swapouts();
+            println!(
+                "  {share:>5}% {n8:>7} {:>9.2} {build:>11.0} {ms:>10.1} {:>9.2}x {:>12}  (load {}, measure {})",
+                bytes as f64 / 1e9,
+                base / ms,
+                after - before,
+                mid - before,
+                after - mid,
+            );
+            println!(
+                "         passes ms: {:?}",
+                passes.iter().map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>()
+            );
+            drop(models);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        std::env::remove_var("APXINF_CLEF_ANE_FORMAT");
+        std::env::remove_var("APXINF_CLEF_NEURON_SHARE");
+    }
+
+    /// Why is the LUT fast as a bare conv (probe: 3.07 ms vs INT8's 3.17) but 4x
+    /// slower inside the real program? Builds the two programs the full one is made
+    /// of, one at a time, in both formats: gate+up (one conv over [n, HIDDEN]) and
+    /// the down parts. The ANE places both either way, so the cost is in how the
+    /// op interacts with the rest of the graph, not in placement.
+    #[test]
+    #[ignore = "needs APXINF_CLEF_CHECKPOINT and the Metal lock"]
+    fn ane_lut_cost_isolation() {
+        let checkpoint = std::path::PathBuf::from(
+            std::env::var("APXINF_CLEF_CHECKPOINT").expect("set APXINF_CLEF_CHECKPOINT"),
+        );
+        let read = |n: &str| std::fs::read_to_string(checkpoint.join(n)).unwrap();
+        let config =
+            super::super::Config::from_json(&read("config.json"), &read("joint_head_config.json"))
+                .unwrap();
+        let stream = Stream::metal(0).unwrap();
+        let backbone =
+            super::super::weights::Backbone::load(&config, &stream, &checkpoint).unwrap();
+        let dense = DenseMlp::new(&backbone.layers[12].mlp).unwrap();
+        std::env::set_var("APXINF_CLEF_NEURON_SHARE", "56");
+        let split = dense.split();
+        let n = split.int8.len();
+        let gate_rows = DenseMlp::rows(&dense.gate, &split.int8);
+
+        let time = |label: &str, pkg: &apxinf_coreml::Package, out_rows: usize| {
+            let dir = std::env::temp_dir().join(format!("clef-iso-{label}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            let cache = apxinf_coreml::ProgramCache::new(&dir);
+            let model = cache
+                .load(pkg, apxinf_coreml::ComputeUnits::CpuAndNeuralEngine)
+                .unwrap();
+            let x = vec![f16::ZERO; HIDDEN * NEURON_TILE];
+            let inputs = [("x", &x[..], &[1, HIDDEN, 1, NEURON_TILE][..])];
+            let outs = [("y", &[1, out_rows, 1, NEURON_TILE][..])];
+            for _ in 0..5 {
+                model.predict(&inputs, &outs).unwrap();
+            }
+            let mut ts = Vec::new();
+            for _ in 0..30 {
+                let t = std::time::Instant::now();
+                model.predict(&inputs, &outs).unwrap();
+                ts.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            ts.sort_by(f64::total_cmp);
+            drop(model);
+            let _ = std::fs::remove_dir_all(&dir);
+            ts[ts.len() / 2]
+        };
+
+        println!("\n  one gate conv, [{n}, {HIDDEN}] over a {NEURON_TILE}-token tile:");
+        for (label, format) in [("int8", AneFormat::Int8), ("lut6", AneFormat::Lut { bits: 6 })] {
+            let e = Encoded::encode(&gate_rows, HIDDEN, format);
+            let mut b = ProgramBuilder::new();
+            let x = b.input("x", &[1, HIDDEN, 1, NEURON_TILE]);
+            let w = e.weight(&mut b, n, HIDDEN).unwrap();
+            let y = b.conv(&x, &w).unwrap();
+            let y = b.identity(&y, Some("y"));
+            let pkg = b.finish(&[&y]).unwrap();
+            println!("    {label:<5} {:>8.3} ms   [pkg {:.0} MB]",
+                     time(&format!("gate-{label}"), &pkg, n),
+                     pkg.weights.len() as f64 / 1e6);
+        }
+
+        println!("\n  the same conv across tile widths (NEURON_TILE is 128):");
+        println!("    {:>6} {:>10} {:>10} {:>8}", "tile", "int8 ms", "lut6 ms", "lut6/int8");
+        for tile in [128usize, 256, 512, 1024] {
+            let mut row = [0f64; 2];
+            for (i, format) in [AneFormat::Int8, AneFormat::Lut { bits: 6 }].into_iter().enumerate() {
+                let e = Encoded::encode(&gate_rows, HIDDEN, format);
+                let mut b = ProgramBuilder::new();
+                let x = b.input("x", &[1, HIDDEN, 1, tile]);
+                let w = e.weight(&mut b, n, HIDDEN).unwrap();
+                let c = b.conv(&x, &w).unwrap();
+                let y = b.identity(&c, Some("y"));
+                let pkg = b.finish(&[&y]).unwrap();
+                let dir = std::env::temp_dir().join(format!("clef-tile-{tile}-{i}"));
+                let _ = std::fs::remove_dir_all(&dir);
+                let cache = apxinf_coreml::ProgramCache::new(&dir);
+                let model = cache
+                    .load(&pkg, apxinf_coreml::ComputeUnits::CpuAndNeuralEngine)
+                    .unwrap();
+                let x = vec![f16::ZERO; HIDDEN * tile];
+                let inputs = [("x", &x[..], &[1, HIDDEN, 1, tile][..])];
+                let outs = [("y", &[1, n, 1, tile][..])];
+                for _ in 0..5 {
+                    model.predict(&inputs, &outs).unwrap();
+                }
+                let mut ts = Vec::new();
+                for _ in 0..20 {
+                    let t = std::time::Instant::now();
+                    model.predict(&inputs, &outs).unwrap();
+                    ts.push(t.elapsed().as_secs_f64() * 1e3);
+                }
+                ts.sort_by(f64::total_cmp);
+                row[i] = ts[ts.len() / 2];
+                drop(model);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            // normalize to a 128-token tile so the columns are comparable
+            let k = 128.0 / tile as f64;
+            println!("    {tile:>6} {:>10.3} {:>10.3} {:>8.2}x", row[0] * k, row[1] * k, row[1] / row[0]);
+        }
+
+        println!("\n  the same conv followed by one elementwise op (tanh):");
+        for (label, format) in [("int8", AneFormat::Int8), ("lut6", AneFormat::Lut { bits: 6 })] {
+            let e = Encoded::encode(&gate_rows, HIDDEN, format);
+            let mut b = ProgramBuilder::new();
+            let x = b.input("x", &[1, HIDDEN, 1, NEURON_TILE]);
+            let w = e.weight(&mut b, n, HIDDEN).unwrap();
+            let c = b.conv(&x, &w).unwrap();
+            let t = b.tanh(&c);
+            let y = b.identity(&t, Some("y"));
+            let pkg = b.finish(&[&y]).unwrap();
+            println!("    {label:<5} {:>8.3} ms", time(&format!("tanh-{label}"), &pkg, n));
+        }
+        std::env::remove_var("APXINF_CLEF_NEURON_SHARE");
+    }
+
+    /// Per-call latency and placement of the Neural Engine program at each
+    /// (format, share), on the real checkpoint.
+    ///
+    /// Residency only gates which share is admissible; the payoff is the share
+    /// itself (70% measured -13.4% end to end). This measures what one layer's
+    /// ANE share costs per call, so a share is only worth admitting if its
+    /// per-call cost does not eat the share's own benefit.
+    ///
+    ///   APXINF_CLEF_CHECKPOINT=<dir> cargo test -p apxinf-model --release \
+    ///     --features coreml ane_latency_by_format -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs APXINF_CLEF_CHECKPOINT and the Metal lock"]
+    fn ane_latency_by_format() {
+        let checkpoint = std::path::PathBuf::from(
+            std::env::var("APXINF_CLEF_CHECKPOINT").expect("set APXINF_CLEF_CHECKPOINT"),
+        );
+        let read = |n: &str| std::fs::read_to_string(checkpoint.join(n)).unwrap();
+        let config =
+            super::super::Config::from_json(&read("config.json"), &read("joint_head_config.json"))
+                .unwrap();
+        let stream = Stream::metal(0).unwrap();
+        let backbone =
+            super::super::weights::Backbone::load(&config, &stream, &checkpoint).unwrap();
+        let mlp = &backbone.layers[12].mlp;
+        println!("\n  {:<6} {:>6} {:>10} {:>10} {:>8}  placement",
+                 "format", "share", "median ms", "vs base", "ANE ops");
+        let mut base = 0f64;
+        for (fmt, share) in [
+            ("int8", "56"), ("int8", "70"),
+            ("lut6", "56"), ("lut6", "70"), ("lut6", "84"),
+            ("lut4", "84"),
+        ] {
+            std::env::set_var("APXINF_CLEF_ANE_FORMAT", fmt);
+            std::env::set_var("APXINF_CLEF_NEURON_SHARE", share);
+            let dense = DenseMlp::new(mlp).unwrap();
+            let package = dense.program(&dense.split()).unwrap();
+            let dir = std::env::temp_dir().join(format!("clef-lat-{fmt}-{share}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            let cache = apxinf_coreml::ProgramCache::new(&dir);
+            let mut off = Vec::new();
+            let model = cache
+                .load_with_placement(
+                    &package,
+                    apxinf_coreml::ComputeUnits::CpuAndNeuralEngine,
+                    std::time::Duration::from_secs(180),
+                    |facts| {
+                        for f in &facts.functions {
+                            for op in &f.operations {
+                                if let Some(d) = op.usage.as_ref().and_then(|u| u.preferred.as_ref())
+                                {
+                                    if d.kind != apxinf_coreml::ComputeDeviceKind::NeuralEngine {
+                                        off.push(format!("{}:{:?}", op.operator, d.kind));
+                                    }
+                                }
+                            }
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            let x = vec![f16::ZERO; HIDDEN * NEURON_TILE];
+            let inputs = [("x", &x[..], &[1, HIDDEN, 1, NEURON_TILE][..])];
+            let outs = [
+                ("y", &[1, HIDDEN, 1, NEURON_TILE][..]),
+                ("gate_scale", &[1, 1, 1, NEURON_TILE][..]),
+                ("up_scale", &[1, 1, 1, NEURON_TILE][..]),
+            ];
+            for _ in 0..5 {
+                model.predict(&inputs, &outs).unwrap();
+            }
+            let mut ts = Vec::new();
+            for _ in 0..30 {
+                let t = std::time::Instant::now();
+                model.predict(&inputs, &outs).unwrap();
+                ts.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            ts.sort_by(f64::total_cmp);
+            let ms = ts[ts.len() / 2];
+            if base == 0.0 {
+                base = ms;
+            }
+            println!(
+                "  {fmt:<6} {share:>5}% {ms:>10.3} {:>9.2}x {:>8}  {}",
+                base / ms,
+                if off.is_empty() { "all" } else { "PARTIAL" },
+                if off.is_empty() { "all on ANE".to_owned() } else { format!("{off:?}") }
+            );
+            drop(model);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        std::env::remove_var("APXINF_CLEF_ANE_FORMAT");
+        std::env::remove_var("APXINF_CLEF_NEURON_SHARE");
+    }
+
+    /// Weight residency of the Neural Engine program at each (format, share).
+    ///
+    /// Residency is what gates the neuron share: 70% is the measured latency optimum
+    /// (-13.4%) but its ANE weights thrash a 16 GB host, so the qualified default
+    /// stays at 56%. A 6-bit palette spends 25% fewer weight bytes at the same speed.
+    ///
+    ///   APXINF_CLEF_CHECKPOINT=<dir> cargo test -p apxinf-model --release \
+    ///     --features coreml ane_residency_by_format -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs APXINF_CLEF_CHECKPOINT"]
+    fn ane_residency_by_format() {
+        let checkpoint = std::path::PathBuf::from(
+            std::env::var("APXINF_CLEF_CHECKPOINT").expect("set APXINF_CLEF_CHECKPOINT"),
+        );
+        let read = |n: &str| std::fs::read_to_string(checkpoint.join(n)).unwrap();
+        let config =
+            super::super::Config::from_json(&read("config.json"), &read("joint_head_config.json"))
+                .unwrap();
+        let stream = Stream::metal(0).unwrap();
+        let backbone =
+            super::super::weights::Backbone::load(&config, &stream, &checkpoint).unwrap();
+        let layers = backbone.layers.len();
+        let mlp = &backbone.layers[12].mlp;
+        println!("\n{layers} layers, probing layer 12\n");
+        println!(
+            "  {:<6} {:>6} {:>7} {:>7} {:>12} {:>15}",
+            "format", "share", "int8", "fp16", "cache MB", "x layers GB"
+        );
+        let mut base = 0f64;
+        for (fmt, share) in [
+            ("int8", "56"),
+            ("int8", "70"),
+            ("int8", "84"),
+            ("lut6", "56"),
+            ("lut6", "70"),
+            ("lut6", "84"),
+            ("lut4", "84"),
+        ] {
+            std::env::set_var("APXINF_CLEF_ANE_FORMAT", fmt);
+            std::env::set_var("APXINF_CLEF_NEURON_SHARE", share);
+            let (n8, n16) = neuron_counts();
+            let dense = DenseMlp::new(mlp).unwrap();
+            let package = dense.program(&dense.split()).unwrap();
+            let mb = package.weights.len() as f64 / 1e6;
+            // The compiled cache is what the host actually holds resident, and what
+            // the share campaign's GB anchors were read from.
+            let dir = std::env::temp_dir().join(format!("clef-res-{fmt}-{share}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            let cache = apxinf_coreml::ProgramCache::new(&dir);
+            let compiled = cache.compiled(&package).unwrap();
+            let mut cmb = 0u64;
+            let mut stack = vec![compiled.clone()];
+            while let Some(p) = stack.pop() {
+                for e in std::fs::read_dir(&p).into_iter().flatten().flatten() {
+                    let m = e.metadata().unwrap();
+                    if m.is_dir() {
+                        stack.push(e.path());
+                    } else {
+                        cmb += m.len();
+                    }
+                }
+            }
+            let cmb = cmb as f64 / 1e6;
+            let _ = std::fs::remove_dir_all(&dir);
+            let gb = cmb * layers as f64 / 1e3;
+            if base == 0.0 {
+                base = gb;
+            }
+            println!(
+                "  {fmt:<6} {share:>5}% {n8:>7} {n16:>7} {cmb:>12.1} {gb:>15.2}  ({:.2}x)  [pkg {mb:.0} MB]",
+                gb / base
+            );
+        }
+        std::env::remove_var("APXINF_CLEF_ANE_FORMAT");
+        std::env::remove_var("APXINF_CLEF_NEURON_SHARE");
+    }
+
     fn layer_programs_match_recorded(
         recorded_env: &str,
         split: &str,
