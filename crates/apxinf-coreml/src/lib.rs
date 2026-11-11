@@ -5,6 +5,12 @@ pub mod blob;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod placement;
 pub mod program;
+// anesched's class registry is pure host code; compiling it here puts its
+// schedule checks under `cargo test --lib`, which never builds examples.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../examples/anesched/class.rs"]
+mod anesched_class;
 pub mod proto;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod runtime;
