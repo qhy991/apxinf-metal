@@ -175,19 +175,28 @@ at load, and use them for the M=1 lane.
 | W8 talker | 3.120 s | 2.43 s | 0.779 | yes |
 | W8 both | **2.960 s** | **1.90–1.93 s** | **0.641–0.650** | yes |
 
-**Verdict split.**
+**Verdict correction (same day, after a build fix).** The first reading of this experiment was wrong
+because the measurement binary had been built from a checkout that did **not** contain the W8 code: the
+`APXINF_TTS_W8_*` variables were no-ops and the arms compared BF16 against itself (100 % code agreement,
+which is how the error was caught). Rebuilt from the merged commit, the codec codes say something quite
+different:
 
-- **W8 predictor is a clean KEEP candidate**: −11…−14 % wall, and the produced audio is *identical in
-  duration* to the baseline (3.120 s, both complete), i.e. the same frame count and the same EOS.
-- **W8 talker** halves the largest byte stream and reaches RTF 0.78, and **W8 both reaches 0.64**
-  (−31 %), but the combined arm produces **2.960 s instead of 3.120 s** — a different frame count, so
-  the sampled codes changed. The synthesis still terminates normally (`complete: yes`), which is what a
-  different sampling path looks like, but "still terminates" is not "still intelligible".
+| comparison | frames | code agreement | identical frames |
+|---|---|---:|---:|
+| BF16 vs **W8 both** | 39 vs 37 | **7.9 %** | 1/37 |
+| BF16 vs **W8 predictor** | 39 vs 39 | **9.9 %** | 1/39 |
+| BF16 vs **W8 talker** | 39 vs 39 | **7.2 %** | 1/39 |
 
-So the talker/speech-quality question needs the gate this repository does not have natively: an ASR
-round-trip (the Qwen3-ASR checkpoint is present on the machine, but `apxinf-model` has no ASR runtime
-yet). Until then the talker copies stay **opt-in**, and only the predictor copy is proposed for a
-default after the parity-style check on more texts.
+So the quantized copies **do change the generated speech**, by a lot in token terms: at temperature 0.9 a
+small logit perturbation sends the sampler down a different path within a frame or two. The frame count
+staying at 39 in the predictor and talker arms means duration and termination are preserved, but
+**"same length" is not "same speech"**, and neither is evidence of quality either way.
+
+**Consequence**: W8 stays **opt-in** on both paths — it already is, nothing was flipped — and the
+quality question needs an ASR round-trip. `apxinf-model` has no ASR runtime and there are no Whisper
+weights on this machine, so that gate needs `apxinf-audio-serve` plus a model manifest first. The speed
+numbers in the table above remain valid measurements of the two lanes; what is retracted is the claim
+that the predictor lane is semantically safe to default.
 
 The bytes arithmetic that predicts this is in the previous section: the predictor re-reads 2.04 GB per
 frame (15 sequential group passes) and the talker ~3.4 GB (its 1.7B weights), so both respond to
