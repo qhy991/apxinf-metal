@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resumable LIBERO evaluation — dual transport, multi-suite, self-contained.
+"""Resumable LIBERO evaluation — dual transport and multi-suite.
 
 One evaluator for every way of reaching the model and every LIBERO suite:
 
@@ -10,26 +10,33 @@ One evaluator for every way of reaching the model and every LIBERO suite:
   no socket, no server, no subprocess.
 
 Both transports drive the *same* rollout loop through a small :class:`Backend`
-abstraction, so the LIBERO harness (rollout constants, resize-with-pad, the
-resumable fsync'd JSONL ledger, timing split) is shared verbatim. The harness
-used to live in ``scripts/libero_harness.py``; it is inlined here so the script
-is a single self-contained file with no implicit-cwd import.
+abstraction, so the LIBERO harness (rollout constants, the resumable fsync'd
+JSONL ledger, timing split) is shared verbatim. Native observation conversion
+lives in ``scripts/libero_observation.py`` so evaluation and calibration cannot
+silently diverge on camera orientation or robot-state layout. Model-specific
+resize remains inside the selected policy.
 
 ``--suite`` selects one LIBERO task suite (``libero_10`` / ``libero_90`` /
 ``libero_spatial`` / ``libero_object`` / ``libero_goal``) or ``all``. The ledger
 key is ``(suite, task_id, trial_id)`` so multiple suites share one resumable
 account without ``task_id=0`` colliding across suites.
 
-Adding a new model needs no change here: register a policy in ``apxinf.policies``
-(``@register_policy("<name>")``) and run ``--backend in-process --model-type
-<name> --model-dir <ckpt>`` (or serve it and use ``--backend websocket``).
+Model loading remains registry-driven. Dataset/model-specific state or action
+conventions are explicit adapters in ``scripts/libero_observation.py`` rather
+than being hidden in the shared rollout loop.
+
+This script exists so a kernel change, an FP8 recalibration or a tactic bump can
+be regressed end-to-end against ApxInf's own published LIBERO numbers. The
+observation conversion it uses is mirrored elsewhere; see
+``scripts/libero_observation.py`` on keeping the two in step.
 
     # websocket (server already running)
     python scripts/eval_libero.py --backend websocket --precision bf16 \
         --suite libero_10 --results-jsonl r.jsonl --summary-json s.json
 
-    # in-process (no server)
+    # in-process GR00T (no server)
     python scripts/eval_libero.py --backend in-process --model-dir /path/ckpt \
+        --backbone /path/to/Cosmos-Reason2-2B \
         --precision bf16 --action-dim 7 --suite libero_10 \
         --results-jsonl r.jsonl --summary-json s.json
 """
@@ -39,23 +46,49 @@ from __future__ import annotations
 import argparse
 import collections
 import json
-import math
 import os
 import pathlib
 import sys
 import time
 import traceback
-from typing import Optional, Protocol, Tuple
+from typing import Any, NamedTuple, Optional, Protocol, Tuple
 
 import numpy as np
-from PIL import Image
+
+if __package__:
+    from .libero_observation import (
+        libero_gr00t_action,
+        libero_gr00t_state,
+        libero_images,
+        libero_state,
+        load_libero_init_states,
+        make_env,
+    )
+else:
+    from libero_observation import (
+        libero_gr00t_action,
+        libero_gr00t_state,
+        libero_images,
+        libero_state,
+        load_libero_init_states,
+        make_env,
+    )
 
 # --- rollout protocol constants (OpenPI's public PI0.5 LIBERO configuration) ---
 LIBERO_ACTION_DIM = 7
+
+#: LIBERO's wire dialect, mirroring openpi's ``LiberoInputs``. Stated here rather
+#: than looked up: this file *is* the LIBERO evaluator, and LIBERO's keys are
+#: fixed by the published benchmark, so naming them is not a second source of
+#: truth for anything that varies. ``--image-keys`` / ``--state-key`` override
+#: them so a checkpoint trained under other keys can still be scored on the suite.
+LIBERO_IMAGE_KEYS = ("observation/image", "observation/wrist_image")
+LIBERO_STATE_KEY = "observation/state"
+LIBERO_PROMPT_KEY = "prompt"
+
 MAX_STEPS = 520
 WAIT_STEPS = 10
 REPLAN_STEPS = 5
-IMAGE_SIZE = 224
 
 #: The five LIBERO task suites ``--suite all`` expands to, in a stable order.
 ALL_SUITES = (
@@ -69,44 +102,55 @@ ALL_SUITES = (
 LedgerKey = Tuple[str, int, int]  # (suite, task_id, trial_id)
 
 
+class WireKeys(NamedTuple):
+    """What this evaluator puts on the wire, resolved once from the arguments."""
+
+    image_keys: Tuple[str, str]
+    state_key: str
+    prompt_key: str
+
+
+def _two_image_keys(value: str) -> Tuple[str, str]:
+    """Parse ``--image-keys base,wrist``.
+
+    Rejects any other count here rather than in the policy: LIBERO renders exactly
+    two cameras, and a third name would silently address a view the simulator
+    never fills.
+    """
+    keys = tuple(part.strip() for part in value.split(",") if part.strip())
+    if len(keys) != 2:
+        raise argparse.ArgumentTypeError(
+            f"expected two comma-separated keys (base,wrist), got {len(keys)}: {value!r}"
+        )
+    return keys
+
+
+def resolve_wire_keys(args: argparse.Namespace) -> WireKeys:
+    image_keys = getattr(args, "image_keys", None) or LIBERO_IMAGE_KEYS
+    return WireKeys(
+        image_keys=(image_keys[0], image_keys[1]),
+        state_key=getattr(args, "state_key", None) or LIBERO_STATE_KEY,
+        prompt_key=getattr(args, "prompt_key", None) or LIBERO_PROMPT_KEY,
+    )
+
+
+def _add_apxinf_to_path() -> None:
+    """Make ``import apxinf`` work from a source checkout, idempotently."""
+    package_dir = pathlib.Path(__file__).resolve().parents[1] / "python" / "apxinf"
+    if package_dir.is_dir() and str(package_dir) not in sys.path:
+        sys.path.insert(0, str(package_dir))
+
+
 # --- LIBERO harness (inlined; was scripts/libero_harness.py) ------------------
 
 
-def quat_to_axis_angle(quat: np.ndarray) -> np.ndarray:
-    quat = np.asarray(quat, dtype=np.float64).copy()
-    quat[3] = np.clip(quat[3], -1.0, 1.0)
-    denominator = math.sqrt(max(0.0, 1.0 - quat[3] * quat[3]))
-    if math.isclose(denominator, 0.0):
-        return np.zeros(3, dtype=np.float32)
-    return (quat[:3] * 2.0 * math.acos(quat[3]) / denominator).astype(np.float32)
-
-
-def resize_images(base: np.ndarray, wrist: np.ndarray) -> np.ndarray:
-    # LIBERO camera arrays are upside down relative to the training convention.
-    def resize_with_pad(image: np.ndarray) -> np.ndarray:
-        image = np.ascontiguousarray(image[::-1, ::-1])
-        height, width = image.shape[:2]
-        ratio = max(width / IMAGE_SIZE, height / IMAGE_SIZE)
-        resized_height = int(height / ratio)
-        resized_width = int(width / ratio)
-        resized = np.asarray(
-            Image.fromarray(image).resize(
-                (resized_width, resized_height), resample=Image.Resampling.BILINEAR
-            )
-        )
-        canvas = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
-        offset_y = (IMAGE_SIZE - resized_height) // 2
-        offset_x = (IMAGE_SIZE - resized_width) // 2
-        canvas[
-            offset_y : offset_y + resized_height,
-            offset_x : offset_x + resized_width,
-        ] = resized
-        return canvas
-
-    return np.stack([resize_with_pad(base), resize_with_pad(wrist)], axis=0)
-
-
-def completed_runs(path: pathlib.Path, precision: str) -> dict[LedgerKey, dict]:
+def completed_runs(
+    path: pathlib.Path,
+    precision: str,
+    *,
+    max_steps: Optional[int] = None,
+    replan_steps: Optional[int] = None,
+) -> dict[LedgerKey, dict]:
     """Load the ``status == "completed"`` rows from a resumable ledger.
 
     Keyed by ``(suite, task_id, trial_id)`` so one ledger can hold several suites
@@ -127,6 +171,22 @@ def completed_runs(path: pathlib.Path, precision: str) -> dict[LedgerKey, dict]:
                 f"at line {line_number}"
             )
         if item.get("status") == "completed":
+            # Rows written before rollout-protocol fields were added used the
+            # evaluator's historical OpenPI defaults (520/5). Preserve their
+            # resumability while still rejecting an attempt to reuse them for
+            # an explicitly different protocol such as GR00T's 720/8.
+            item_max_steps = item.get("max_steps", MAX_STEPS)
+            item_replan_steps = item.get("replan_steps", REPLAN_STEPS)
+            if max_steps is not None and item_max_steps != max_steps:
+                raise ValueError(
+                    f"ledger max_steps is {item_max_steps!r}, requested "
+                    f"{max_steps!r} at line {line_number}"
+                )
+            if replan_steps is not None and item_replan_steps != replan_steps:
+                raise ValueError(
+                    f"ledger replan_steps is {item_replan_steps!r}, requested "
+                    f"{replan_steps!r} at line {line_number}"
+                )
             key: LedgerKey = (
                 str(item["suite"]),
                 int(item["task_id"]),
@@ -152,6 +212,9 @@ def write_summary(
     expected_keys: set[LedgerKey],
     precision: str,
     transport: str,
+    *,
+    max_steps: int = MAX_STEPS,
+    replan_steps: int = REPLAN_STEPS,
 ) -> None:
     """Write the aggregate summary, grouped per-suite then per-task."""
     per_suite: dict[str, dict] = {}
@@ -185,6 +248,11 @@ def write_summary(
         "suites": sorted({key[0] for key in expected_keys}),
         "transport": transport,
         "precision": precision,
+        "rollout_protocol": {
+            "max_steps": max_steps,
+            "replan_steps": replan_steps,
+            "wait_steps": WAIT_STEPS,
+        },
         "expected_runs": len(expected_keys),
         "completed_runs": len(rows),
         "missing_runs": [
@@ -246,20 +314,6 @@ def _aggregate_timing(rows: list[dict]) -> dict:
     }
 
 
-def make_env(task, seed: int):
-    from libero.libero import get_libero_path
-    from libero.libero.envs import OffScreenRenderEnv
-
-    bddl = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    env = OffScreenRenderEnv(
-        bddl_file_name=str(bddl),
-        camera_heights=256,
-        camera_widths=256,
-    )
-    env.seed(seed)
-    return env
-
-
 # --- transport backends -------------------------------------------------------
 
 
@@ -275,31 +329,67 @@ class Backend(Protocol):
     #: Static description sent by / read from the underlying policy.
     metadata: dict
 
+    def state_from_observation(self, observation) -> Any:
+        """Return the state representation expected by the selected policy."""
+        ...
+
     def infer(
-        self, base: np.ndarray, wrist: np.ndarray, state: np.ndarray, prompt: str
-    ) -> Tuple[np.ndarray, dict]:
-        """Return ``(actions, {"model_seconds", "server_processor_seconds"})``."""
+        self,
+        base: np.ndarray,
+        wrist: np.ndarray,
+        state: Any,
+        prompt: str,
+        noise: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], dict]:
+        """Return ``(actions, normalized_actions, timing)``."""
         ...
 
     def close(self) -> None:
         ...
 
 
-def _observation(base, wrist, state, prompt) -> dict:
+def state_finger_joints(metadata: Mapping) -> int:
+    """How many of LIBERO's mirrored finger joints the checkpoint's state carries.
+
+    LIBERO reports two mirrored finger joints and LeRobot's own env keeps both
+    (8-dim state), while this harness collapsed them into one gripper coordinate
+    (7-dim) for PI0.5. The width is a checkpoint property — it is the width of
+    its normalization statistics — so a policy publishes it as
+    ``metadata["state_dim"]`` and the harness builds exactly that vector instead
+    of guessing. ``None`` (a policy that publishes no width) keeps the
+    historical collapsed vector.
+    """
+    width = metadata.get("state_dim")
+    if width is None:
+        return 1
+    if int(width) == 7:
+        return 1
+    if int(width) == 8:
+        return 2
+    raise ValueError(
+        f"the loaded policy declares state_dim={width}, but this harness can only "
+        "build LIBERO's 7-dim (collapsed gripper) or 8-dim (both finger joints) state"
+    )
+
+
+def _observation(base, wrist, state: Any, prompt, keys: WireKeys) -> dict:
     """The OpenPI LIBERO observation both backends consume, identical on the wire
-    and in-process."""
+    and in-process. The keys are resolved once per run, so what the evaluator
+    sends and what the policy is built to read cannot drift apart mid-rollout."""
     return {
-        "observation/image": base,
-        "observation/wrist_image": wrist,
-        "observation/state": state,
-        "prompt": prompt,
+        keys.image_keys[0]: base,
+        keys.image_keys[1]: wrist,
+        keys.state_key: state,
+        keys.prompt_key: prompt,
     }
 
 
 class WebsocketBackend:
     """Reach an OpenPI-compatible server through the unmodified ``openpi_client``."""
 
-    def __init__(self, host: str, port: int, expected_precision: str) -> None:
+    def __init__(
+        self, host: str, port: int, expected_precision: str, keys: WireKeys
+    ) -> None:
         from openpi_client import websocket_client_policy
 
         # WebsocketClientPolicy honours the ambient proxy; exempt the target host
@@ -312,15 +402,50 @@ class WebsocketBackend:
             os.environ[variable] = ",".join(entries)
         self._client = websocket_client_policy.WebsocketClientPolicy(host, port)
         self.metadata = self._client.get_server_metadata()
+        self._keys = keys
         actual_precision = self.metadata.get("precision")
+        if "model_variant" in self.metadata:
+            actual_precision = {"bf16": "bf16", "fp8_static": "fp8", "int8_dynamic": "int8"}.get(self.metadata["model_variant"])
+
         if actual_precision != expected_precision:
             self.close()
             raise RuntimeError(
                 f"server precision is {actual_precision!r}, expected {expected_precision!r}"
             )
+        self._assert_server_speaks_the_same_dialect()
 
-    def infer(self, base, wrist, state, prompt) -> Tuple[np.ndarray, dict]:
-        response = self._client.infer(_observation(base, wrist, state, prompt))
+    def _assert_server_speaks_the_same_dialect(self) -> None:
+        """Fail at connect rather than score a run on ignored observations.
+
+        The server publishes the keys it will actually read. Sending different
+        ones does not raise for the *state* key — it is simply absent, the policy
+        proceeds without proprioception, and the run finishes with a plausible,
+        wrong success rate. Compare what the metadata reports, when it reports it.
+        """
+        served_images = self.metadata.get("image_keys")
+        if served_images is not None and tuple(served_images) != self._keys.image_keys:
+            self.close()
+            raise RuntimeError(
+                f"server serves image_keys={list(served_images)} but this run sends "
+                f"{list(self._keys.image_keys)}; pass --image-keys to match it"
+            )
+        if "state_key" in self.metadata:
+            served_state = self.metadata["state_key"]
+            if served_state is not None and served_state != self._keys.state_key:
+                self.close()
+                raise RuntimeError(
+                    f"server serves state_key={served_state!r} but this run sends "
+                    f"{self._keys.state_key!r}; pass --state-key to match it"
+                )
+
+    def infer(
+        self, base, wrist, state, prompt, noise=None
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], dict]:
+        if noise is not None:
+            raise RuntimeError("warm-start noise requires --backend in-process")
+        response = self._client.infer(
+            _observation(base, wrist, state, prompt, self._keys)
+        )
         actions = np.asarray(response["actions"], dtype=np.float32)
         # Only OpenPI-contract keys ride the wire; ``policy_timing`` /
         # ``server_timing`` are the server's tolerated diagnostic namespaces.
@@ -333,12 +458,17 @@ class WebsocketBackend:
         model_ms = float(policy_timing.get("infer_ms", 0.0))
         server_total_ms = float(policy_timing.get("policy_ms", model_ms))
         server_compute_ms = float(server_timing.get("infer_ms", server_total_ms))
-        return actions, {
+        return actions, None, {
             "model_seconds": model_ms / 1000.0,
             # Server compute the client can see beyond the pure model = the
             # server-side processor pipeline (event-loop wall clock minus model).
             "server_processor_seconds": max(0.0, server_compute_ms - model_ms) / 1000.0,
         }
+
+    def state_from_observation(self, observation) -> np.ndarray:
+        # Preserve the established OpenPI wire contract. A GR00T websocket
+        # server can expose its own adapter without changing this evaluator.
+        return libero_state(observation)
 
     def close(self) -> None:
         connection = getattr(self._client, "_ws", None)
@@ -354,40 +484,74 @@ class InProcessBackend:
     so a future ``GrootPolicy`` runs here with no change to this file.
     """
 
-    def __init__(self, args: argparse.Namespace) -> None:
-        # Lazy: importing apxinf pulls in the CUDA binding; websocket-only users
+    def __init__(self, args: argparse.Namespace, keys: WireKeys) -> None:
+        # Lazy: importing apxinf pulls in the policy stack; websocket-only users
         # never pay for it. Make ``import apxinf`` work from a source checkout.
-        repo_root = pathlib.Path(__file__).resolve().parents[1]
-        package_dir = repo_root / "python" / "apxinf"
-        if package_dir.is_dir() and str(package_dir) not in sys.path:
-            sys.path.insert(0, str(package_dir))
+        _add_apxinf_to_path()
         from apxinf import AutoPolicy
 
+        self._keys = keys
+        options = {
+            "backbone": args.backbone,
+            "checkpoint": args.checkpoint,
+            "calibration": args.calibration,
+            "tactics": args.tactics,
+            "tokenizer_path": args.tokenizer,
+            "norm_stats": args.norm_stats,
+            "norm_key": args.norm_key,
+            "action_horizon": args.action_horizon,
+            "num_views": args.num_views,
+            "num_flow_steps": args.num_flow_steps,
+            "flow_start_time": args.flow_start_time,
+            "discrete_state": args.discrete_state,
+            "seed": args.model_seed if args.model_seed is not None else args.seed,
+        }
+        from apxinf.policies.auto import _read_model_type
+        model_type = args.model_type or _read_model_type(pathlib.Path(args.model_dir))
+        # Campaign precision is a numerical comparison category in the ledger.
+        # PI0.5 loading uses a model-local implementation ID instead.
+        selector = (
+            {"model_variant": {"bf16": "bf16", "fp8": "fp8_static", "int8": "int8_dynamic"}[args.precision]}
+            if model_type == "pi05" else {"precision": args.precision}
+        )
         self._policy = AutoPolicy.from_pretrained(
             args.model_dir,
             model_type=args.model_type,
-            checkpoint=args.checkpoint,
             device=args.device,
-            precision=args.precision,
-            calibration=args.calibration,
-            tactics=args.tactics,
-            tokenizer_path=args.tokenizer,
-            norm_key=args.norm_key,
+            **selector,
             action_dim=(args.action_dim or None),
-            action_horizon=args.action_horizon,
-            seed=args.seed,
-            discrete_state=args.discrete_state,
+            # The same keys the websocket backend puts on the wire, so the two
+            # backends are comparable by construction: the policy layer holds no
+            # dataset's keys as a default, and a run that scored one dialect
+            # in-process and another over the wire would be meaningless.
+            image_keys=keys.image_keys,
+            state_key=keys.state_key,
+            prompt_key=keys.prompt_key,
             metadata={"precision": args.precision, "policy": "libero"},
+            **{name: value for name, value in options.items() if value is not None},
         )
         self.metadata = dict(getattr(self._policy, "metadata", {}))
+        self._is_gr00t = self.metadata.get("model_type") == "gr00t"
 
-    def infer(self, base, wrist, state, prompt) -> Tuple[np.ndarray, dict]:
-        result = self._policy.infer(_observation(base, wrist, state, prompt))
+    def state_from_observation(self, observation):
+        if self._is_gr00t:
+            return libero_gr00t_state(observation)
+        return libero_state(observation)
+
+    def infer(
+        self, base, wrist, state, prompt, noise=None
+    ) -> Tuple[np.ndarray, np.ndarray, dict]:
+        result = self._policy.infer(
+            _observation(base, wrist, state, prompt, self._keys), noise=noise
+        )
         actions = np.asarray(result["actions"], dtype=np.float32)
+        if self._is_gr00t:
+            actions = libero_gr00t_action(actions)
+        normalized = np.asarray(result["normalized_actions"], dtype=np.float32)
         timing = result.get("timing", {}) or {}
         model_ms = float(timing.get("model_ms", 0.0))
         total_ms = float(timing.get("total_ms", model_ms))
-        return actions, {
+        return actions, normalized, {
             "model_seconds": model_ms / 1000.0,
             "server_processor_seconds": max(0.0, total_ms - model_ms) / 1000.0,
         }
@@ -399,9 +563,10 @@ class InProcessBackend:
 
 
 def build_backend(args: argparse.Namespace) -> Backend:
+    keys = resolve_wire_keys(args)
     if args.backend == "websocket":
-        return WebsocketBackend(args.host, args.port, args.precision)
-    return InProcessBackend(args)
+        return WebsocketBackend(args.host, args.port, args.precision, keys)
+    return InProcessBackend(args, keys)
 
 
 # --- rollout ------------------------------------------------------------------
@@ -417,11 +582,17 @@ def run_episode(
     backend: Backend,
     transport: str,
     seed: int,
+    warm_start: bool,
+    warm_start_alpha: float,
+    replan_steps: int = REPLAN_STEPS,
+    settle_gripper: float = -1.0,
+    finger_joints: int = 1,
+    max_steps: int = MAX_STEPS,
 ) -> dict:
     episode_started = time.perf_counter()
     env.reset()
     observation = env.set_init_state(initial_state)
-    dummy_action = [0.0] * 6 + [-1.0]
+    dummy_action = [0.0] * 6 + [settle_gripper]
     for _ in range(WAIT_STEPS):
         observation, _, _, _ = env.step(dummy_action)
 
@@ -431,7 +602,7 @@ def run_episode(
     replans = 0
     # Timing is split into four non-overlapping segments so the delivery report
     # can attribute latency:
-    #   preprocess  = client-side camera resize + state assembly (this process)
+    #   preprocess  = client-side camera orientation + state assembly (this process)
     #   model       = pure bare-model infer_rgb (backend timing)
     #   server_proc = server/policy pre/post processor pipeline (backend timing)
     #   transport   = round_trip - server compute (~0 for in-process)
@@ -443,25 +614,41 @@ def run_episode(
     server_processor_seconds = 0.0
     transport_seconds = 0.0
     first_action_checksum = None
+    previous_normalized_chunk = None
+    warm_start_replans = 0
+    warm_noise_checksum = None
+    rng = np.random.default_rng(seed + 1_000_003 * task_id + 10_007 * trial_id)
 
-    while action_steps < MAX_STEPS:
+    while action_steps < max_steps:
         if not action_plan:
             preprocess_started = time.perf_counter()
-            images = resize_images(
+            images = libero_images(
                 observation["agentview_image"],
                 observation["robot0_eye_in_hand_image"],
             )
-            state = np.concatenate(
-                (
-                    observation["robot0_eef_pos"],
-                    quat_to_axis_angle(observation["robot0_eef_quat"]),
-                    observation["robot0_gripper_qpos"],
-                )
-            ).astype(np.float32, copy=False)
+            state = libero_state(observation, finger_joints=finger_joints)
             preprocess_seconds += time.perf_counter() - preprocess_started
 
+            noise = None
+            if warm_start and previous_normalized_chunk is not None:
+                shift = np.empty_like(previous_normalized_chunk)
+                replan = min(replan_steps, shift.shape[0])
+                if replan < shift.shape[0]:
+                    shift[: shift.shape[0] - replan] = previous_normalized_chunk[replan:]
+                shift[shift.shape[0] - replan :] = previous_normalized_chunk[-1]
+                epsilon = rng.standard_normal(previous_normalized_chunk.shape).astype(np.float32)
+                noise = np.ascontiguousarray(
+                    warm_start_alpha * shift + (1.0 - warm_start_alpha) * epsilon,
+                    dtype=np.float32,
+                )
+                warm_start_replans += 1
+                if warm_noise_checksum is None:
+                    warm_noise_checksum = float(np.abs(noise).sum())
+
             request_started = time.perf_counter()
-            actions, timing = backend.infer(images[0], images[1], state, prompt)
+            actions, normalized_actions, timing = backend.infer(
+                images[0], images[1], state, prompt, noise=noise
+            )
             round_trip_seconds = time.perf_counter() - request_started
             inference_seconds += round_trip_seconds
             # The action horizon is a checkpoint property (metadata ``action_horizon``),
@@ -472,14 +659,26 @@ def run_episode(
             if (
                 actions.ndim != 2
                 or actions.shape[1] != LIBERO_ACTION_DIM
-                or actions.shape[0] < REPLAN_STEPS
+                or actions.shape[0] < replan_steps
             ):
                 raise ValueError(
-                    f"expected actions (>= {REPLAN_STEPS}, {LIBERO_ACTION_DIM}), "
+                    f"expected actions (>= {replan_steps}, {LIBERO_ACTION_DIM}), "
                     f"got {actions.shape}"
                 )
             if not np.isfinite(actions).all():
                 raise FloatingPointError("backend returned non-finite actions")
+            if warm_start:
+                if normalized_actions is None:
+                    raise RuntimeError("warm-start requires backend normalized_actions")
+                if normalized_actions.ndim != 2:
+                    raise ValueError(
+                        f"expected normalized actions [H, D], got {normalized_actions.shape}"
+                    )
+                if not np.isfinite(normalized_actions).all():
+                    raise FloatingPointError("backend returned non-finite normalized actions")
+                previous_normalized_chunk = np.ascontiguousarray(
+                    normalized_actions, dtype=np.float32
+                )
 
             segment_model = float(timing.get("model_seconds", 0.0))
             segment_processor = float(timing.get("server_processor_seconds", 0.0))
@@ -490,7 +689,7 @@ def run_episode(
             )
             if first_action_checksum is None:
                 first_action_checksum = float(np.abs(actions).sum())
-            action_plan.extend(actions[:REPLAN_STEPS])
+            action_plan.extend(actions[:replan_steps])
             replans += 1
 
         action = action_plan.popleft()
@@ -516,9 +715,15 @@ def run_episode(
         "websocket_transport_seconds": transport_seconds,
         "elapsed_seconds": time.perf_counter() - episode_started,
         "first_action_abs_checksum": first_action_checksum,
+        "warm_start": warm_start,
+        "warm_start_alpha": warm_start_alpha if warm_start else None,
+        "warm_start_replans": warm_start_replans,
+        "first_warm_noise_abs_checksum": warm_noise_checksum,
         "transport": transport,
         "image_input": "openpi_uint8_hwc",
         "seed": seed,
+        "max_steps": max_steps,
+        "replan_steps": replan_steps,
     }
 
 
@@ -539,9 +744,47 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trials-per-task", type=int, default=10)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--model-seed",
+        type=int,
+        help="in-process model sampling seed (default: reuse --seed)",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=MAX_STEPS,
+        help=f"maximum simulator action steps per episode (default: {MAX_STEPS})",
+    )
+    parser.add_argument(
+        "--replan-steps",
+        type=int,
+        default=REPLAN_STEPS,
+        help=f"actions executed from each predicted chunk (default: {REPLAN_STEPS})",
+    )
+    parser.add_argument(
+        "--settle-gripper",
+        type=float,
+        default=-1.0,
+        help="seventh action used during the initial settle steps (default: -1)",
+    )
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--results-jsonl", required=True, type=pathlib.Path)
     parser.add_argument("--summary-json", required=True, type=pathlib.Path)
+
+    wire = parser.add_argument_group(
+        "wire keys",
+        "Override the names this evaluator sends observations under. The defaults "
+        "are LIBERO's own; change them only to score a checkpoint that was trained "
+        "against a differently named recording of the same suite.",
+    )
+    wire.add_argument(
+        "--image-keys",
+        type=_two_image_keys,
+        metavar="BASE,WRIST",
+        help=f"default: {','.join(LIBERO_IMAGE_KEYS)}",
+    )
+    wire.add_argument("--state-key", help=f"default: {LIBERO_STATE_KEY}")
+    wire.add_argument("--prompt-key", help=f"default: {LIBERO_PROMPT_KEY}")
 
     websocket = parser.add_argument_group("websocket backend")
     websocket.add_argument("--host", default="127.0.0.1")
@@ -550,13 +793,44 @@ def parse_args() -> argparse.Namespace:
     in_process = parser.add_argument_group("in-process backend")
     in_process.add_argument("--model-dir", type=pathlib.Path)
     in_process.add_argument("--model-type", default=None, help="override config.json model type")
+    in_process.add_argument(
+        "--backbone",
+        type=pathlib.Path,
+        help="named backbone asset required by models such as GR00T N1.7",
+    )
     in_process.add_argument("--checkpoint", type=pathlib.Path)
     in_process.add_argument("--device", default="cuda:0")
     in_process.add_argument("--calibration", type=pathlib.Path)
-    in_process.add_argument("--tactics", type=pathlib.Path)
+    in_process.add_argument("--tactics", type=pathlib.Path, help=argparse.SUPPRESS)
     in_process.add_argument("--tokenizer", type=pathlib.Path)
-    in_process.add_argument("--norm-key", default="actions")
+    in_process.add_argument(
+        "--norm-stats", type=pathlib.Path,
+        help="explicit OpenPI-style norm_stats.json; overrides checkpoint normalization",
+    )
+    in_process.add_argument("--norm-key")
     in_process.add_argument("--action-dim", type=int, default=7, help="0 keeps the full vector")
+    in_process.add_argument(
+        "--num-views",
+        type=int,
+        default=None,
+        help="load fewer camera views than the checkpoint declares; LIBERO uses 2",
+    )
+    in_process.add_argument(
+        "--num-flow-steps",
+        type=int,
+        default=None,
+        help="override the checkpoint's diffusion/flow inference steps",
+    )
+    in_process.add_argument(
+        "--flow-start-time",
+        type=float,
+        default=None,
+        help=(
+            "override reverse-flow start time; with --warm-start this defaults to "
+            "1-alpha, and without --warm-start values below 1.0 run partial flow "
+            "from pure noise"
+        ),
+    )
     in_process.add_argument(
         "--action-horizon",
         type=int,
@@ -564,11 +838,58 @@ def parse_args() -> argparse.Namespace:
         help="override the checkpoint's chunk length (default: its config.json "
         f"value; must be >= the {REPLAN_STEPS}-step replan stride)",
     )
-    in_process.add_argument("--discrete-state", action="store_true")
+    in_process.add_argument("--discrete-state", action="store_true", default=None)
+
+    warm = parser.add_argument_group("warm start")
+    warm.add_argument(
+        "--warm-start",
+        action="store_true",
+        help="enable shifted action cache + tail repeat + alpha noise blend + partial flow",
+    )
+    warm.add_argument(
+        "--warm-start-alpha",
+        type=float,
+        default=0.5,
+        help=(
+            "cache/noise blend coefficient used only with --warm-start; partial "
+            "flow starts at 1-alpha"
+        ),
+    )
 
     args = parser.parse_args()
     if args.backend == "in-process" and args.model_dir is None:
         parser.error("--backend in-process requires --model-dir")
+    if args.norm_stats is not None:
+        if args.backend == "websocket":
+            parser.error(
+                "--norm-stats applies to --backend in-process; for the websocket "
+                "backend pass it to pi05_openpi_websocket_server.py instead"
+            )
+        if not args.norm_stats.is_file():
+            parser.error("--norm-stats must name an existing file")
+    if not (0.0 <= args.warm_start_alpha <= 1.0):
+        parser.error("--warm-start-alpha must be in [0, 1]")
+    if args.warm_start and args.warm_start_alpha >= 1.0:
+        parser.error(
+            "--warm-start-alpha must be < 1.0 when --warm-start is enabled "
+            "(otherwise the default flow_start_time would be 0)"
+        )
+    if args.warm_start:
+        if args.backend != "in-process":
+            parser.error("--warm-start requires --backend in-process")
+        if args.num_flow_steps is None:
+            args.num_flow_steps = 1
+        if args.flow_start_time is None:
+            args.flow_start_time = 1.0 - args.warm_start_alpha
+        if args.flow_start_time <= 0.0 or args.flow_start_time > 1.0:
+            parser.error("--flow-start-time must be in (0, 1]")
+    elif args.flow_start_time is not None and args.flow_start_time < 1.0:
+        print(
+            "warning: --flow-start-time < 1.0 without --warm-start runs partial "
+            "flow from pure noise",
+            file=sys.stderr,
+            flush=True,
+        )
     if args.action_horizon is not None:
         # The websocket backend gets its horizon from whatever the server loaded,
         # so accepting the flag here would silently do nothing.
@@ -577,11 +898,15 @@ def parse_args() -> argparse.Namespace:
                 "--action-horizon applies to --backend in-process; for the websocket "
                 "backend pass it to pi05_openpi_websocket_server.py instead"
             )
-        if args.action_horizon < REPLAN_STEPS:
+        if args.action_horizon < args.replan_steps:
             parser.error(
-                f"--action-horizon must be >= {REPLAN_STEPS} (the rollout consumes "
-                f"{REPLAN_STEPS} actions per chunk)"
+                f"--action-horizon must be >= {args.replan_steps} (the rollout consumes "
+                f"{args.replan_steps} actions per chunk)"
             )
+    if args.replan_steps <= 0:
+        parser.error("--replan-steps must be positive")
+    if args.max_steps <= 0:
+        parser.error("--max-steps must be positive")
     if args.trials_per_task <= 0 or args.trials_per_task > 50:
         parser.error("--trials-per-task must be in 1..=50")
     return args
@@ -631,16 +956,30 @@ def main() -> None:
         for task_id in task_ids
         for trial_id in range(args.trials_per_task)
     }
-    ledger = completed_runs(args.results_jsonl, args.precision)
+    ledger = completed_runs(
+        args.results_jsonl,
+        args.precision,
+        max_steps=args.max_steps,
+        replan_steps=args.replan_steps,
+    )
     unexpected = set(ledger) - expected_keys
     if unexpected:
         raise ValueError(
             f"ledger contains runs outside requested scope: {sorted(unexpected)}"
         )
-    write_summary(args.summary_json, ledger, expected_keys, args.precision, transport)
+    write_summary(
+        args.summary_json,
+        ledger,
+        expected_keys,
+        args.precision,
+        transport,
+        max_steps=args.max_steps,
+        replan_steps=args.replan_steps,
+    )
 
     backend = build_backend(args)
     print(f"backend={args.backend} metadata={backend.metadata}", flush=True)
+    finger_joints = state_finger_joints(getattr(backend, "metadata", {}) or {})
     try:
         for name, suite in suites.items():
             for task_id in task_ids_by_suite[name]:
@@ -655,7 +994,7 @@ def main() -> None:
                     print(f"{name} task {task_id}: already complete", flush=True)
                     continue
                 print(f"{name} task {task_id}: pending trials {pending}", flush=True)
-                initial_states = suite.get_task_init_states(task_id)
+                initial_states = load_libero_init_states(suite, task_id)
                 env = make_env(task, args.seed)
                 try:
                     for trial_id in pending:
@@ -671,6 +1010,12 @@ def main() -> None:
                                     backend,
                                     transport,
                                     args.seed,
+                                    args.warm_start,
+                                    args.warm_start_alpha,
+                                    args.replan_steps,
+                                    args.settle_gripper,
+                                    finger_joints,
+                                    args.max_steps,
                                 )
                                 record["attempt"] = attempt
                                 record["precision"] = args.precision
@@ -679,6 +1024,8 @@ def main() -> None:
                                 write_summary(
                                     args.summary_json, ledger, expected_keys,
                                     args.precision, transport,
+                                    max_steps=args.max_steps,
+                                    replan_steps=args.replan_steps,
                                 )
                                 print(
                                     f"{name} task={task_id} trial={trial_id} "
@@ -715,7 +1062,15 @@ def main() -> None:
     finally:
         backend.close()
 
-    write_summary(args.summary_json, ledger, expected_keys, args.precision, transport)
+    write_summary(
+        args.summary_json,
+        ledger,
+        expected_keys,
+        args.precision,
+        transport,
+        max_steps=args.max_steps,
+        replan_steps=args.replan_steps,
+    )
     missing = expected_keys - set(ledger)
     if missing:
         raise RuntimeError(f"evaluation incomplete; missing {sorted(missing)}")

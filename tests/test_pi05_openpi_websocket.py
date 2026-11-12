@@ -27,12 +27,15 @@ from apxinf.serving.websocket import health_check  # noqa: E402
 HORIZON = 10
 MODEL_DIM = 32
 LIBERO_DIM = 7
+# The wire keys a LIBERO client puts on the socket. The model layer no longer
+# guesses them, so the test has to name them the way a real deployment does.
+LIBERO_IMAGE_KEYS = ("observation/image", "observation/wrist_image")
 IMAGE_SIZE = 224
 NUM_VIEWS = 2
 
 
 class MockModel:
-    """In-process ``BareModel`` stand-in: normalized action is all-zeros.
+    """In-process ``ModelRunnerProtocol`` stand-in: normalized action is all-zeros.
 
     Replaces the old subprocess ``FakeEngine``; the server now calls the model
     in-process through ``Pi05Policy`` instead of over a stdio pipe.
@@ -46,10 +49,14 @@ class MockModel:
         self.max_token_len = 200
         self.images: list[np.ndarray] = []
         self.noises: list[np.ndarray] = []
+        self.sampling_draw = 0
 
-    def infer_rgb(self, rgb_u8, layout, token_ids, noise):
+    def infer_rgb(self, rgb_u8, layout, token_ids, noise=None):
         assert layout == "nhwc"
         self.images.append(np.asarray(rgb_u8).copy())
+        if noise is None:
+            noise = np.full((HORIZON, MODEL_DIM), self.sampling_draw, dtype=np.float32)
+            self.sampling_draw += 1
         self.noises.append(np.asarray(noise).copy())
         return np.zeros((HORIZON, MODEL_DIM), dtype=np.float32)
 
@@ -75,13 +82,17 @@ def build_policy() -> Pi05Policy:
     q99 = q01 + 2
     model = MockModel()
     input_pipeline, output_pipeline = Pi05Policy.default_pipelines(
-        model, tokenizer=ConstTokenizer(), unnormalizer=Unnormalizer(q01=q01, q99=q99)
+        model,
+        tokenizer=ConstTokenizer(),
+        unnormalizer=Unnormalizer(q01=q01, q99=q99),
+        image_keys=LIBERO_IMAGE_KEYS,
     )
     return Pi05Policy(
         model,
         input_pipeline=input_pipeline,
         output_pipeline=output_pipeline,
-        metadata={"precision": "int8", "protocol": "openpi.websocket_policy"},
+        image_keys=LIBERO_IMAGE_KEYS,
+        metadata={"model_variant": "int8_dynamic", "protocol": "openpi.websocket_policy"},
     )
 
 
@@ -146,7 +157,7 @@ class WebsocketServerCompatibilityTest(unittest.TestCase):
         )
         metadata = client.get_server_metadata()
         # Policy metadata (model_type, shapes) merged with the server-injected tags.
-        self.assertEqual(metadata["precision"], "int8")
+        self.assertEqual(metadata["model_variant"], "int8_dynamic")
         self.assertEqual(metadata["model_type"], "pi05")
         observation = {
             "observation/image": np.full((3, 224, 224), 0.5, dtype=np.float32),
@@ -175,15 +186,15 @@ class WebsocketServerCompatibilityTest(unittest.TestCase):
         self.assertNotIn("prev_total_ms", first["server_timing"])
         self.assertIn("prev_total_ms", second["server_timing"])
 
-        # The in-process model saw two NHWC calls, stacked + padded to num_views.
-        self.assertEqual(len(self.policy.model.images), 2)
-        self.assertEqual(self.policy.model.images[0].shape, (NUM_VIEWS, 224, 224, 3))
-        self.assertEqual(self.policy.model.images[0].dtype, np.dtype("uint8"))
+        # The in-process model saw two NHWC calls, one row per configured camera.
+        self.assertEqual(len(self.policy.model_runner.images), 2)
+        self.assertEqual(self.policy.model_runner.images[0].shape, (NUM_VIEWS, 224, 224, 3))
+        self.assertEqual(self.policy.model_runner.images[0].dtype, np.dtype("uint8"))
         # The float 0.5 base image was parsed to uint8 127.
-        self.assertTrue(np.all(self.policy.model.images[0][0] == 127))
+        self.assertTrue(np.all(self.policy.model_runner.images[0][0] == 127))
         # Seeded noise advances between calls, so the two draws differ.
         self.assertFalse(
-            np.array_equal(self.policy.model.noises[0], self.policy.model.noises[1])
+            np.array_equal(self.policy.model_runner.noises[0], self.policy.model_runner.noises[1])
         )
 
 

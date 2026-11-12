@@ -61,6 +61,7 @@ pub struct Pi05Config {
     pub action_horizon: usize,
     pub max_token_len: usize,
     pub num_flow_steps: usize,
+    pub flow_start_time: f32,
     pub num_views: usize,
     pub image_size: usize,
     pub patch_size: usize,
@@ -87,6 +88,7 @@ impl Default for Pi05Config {
             action_horizon: 50,
             max_token_len: 200,
             num_flow_steps: 10,
+            flow_start_time: 1.0,
             num_views: 3,
             image_size: 224,
             patch_size: 14,
@@ -155,6 +157,7 @@ impl Pi05Config {
             &["num_inference_steps", "num_flow_steps"],
             cfg.num_flow_steps,
         );
+        cfg.flow_start_time = f32_field(&v, "flow_start_time", cfg.flow_start_time);
         cfg.num_views = resolve_num_views(&v, cfg.num_views);
         cfg.discrete_state_input = v
             .get("discrete_state_input")
@@ -187,7 +190,7 @@ impl Pi05Config {
     /// The current graph intentionally gives every intermediate a stable
     /// address. A later liveness planner can reuse slots and reduce this
     /// reservation without changing the captured execution contract.
-    pub fn cuda_graph_workspace_bytes(&self, token_count: usize) -> Result<usize> {
+    pub fn cuda_graph_workspace_bytes_fp8_static(&self, token_count: usize) -> Result<usize> {
         if token_count == 0 || token_count > self.max_token_len {
             return Err(Error::Other(format!(
                 "pi05 token count must be in 1..={}, got {token_count}",
@@ -205,7 +208,7 @@ impl Pi05Config {
         let patches = self.num_views * self.patches_per_view();
         let patch_width = 3 * self.patch_size * self.patch_size;
         let vision = self.vision_width;
-        allocate(patches * patch_width);
+        allocate(patches * patch_width * 2);
         allocate(patches * vision * 2);
         allocate(patches * vision * 2);
         for _ in 0..self.vision_depth {
@@ -218,13 +221,17 @@ impl Pi05Config {
             allocate(patches * vision);
             allocate(patches * vision * 2);
             allocate(patches * vision * 2);
+            allocate(patches * vision * 2);
+            allocate(patches * vision * 2);
             allocate(patches * vision);
+            allocate(patches * self.vision_mlp_dim * 2);
             allocate(patches * self.vision_mlp_dim * 2);
             allocate(patches * self.vision_mlp_dim);
             allocate(patches * vision * 2);
             allocate(patches * vision * 2);
         }
         allocate(patches * vision);
+        allocate(patches * vision * 2);
         allocate(patches * self.language.width * 2);
         allocate(patches * self.language.width * 2);
 
@@ -240,10 +247,12 @@ impl Pi05Config {
             allocate(prefix * language_q * 2);
             allocate(prefix * language_kv * 2);
             allocate(prefix * language_kv * 2);
+            allocate(prefix * self.language.width * 2);
             if layer_index + 1 < self.language.depth {
                 allocate(prefix * language_q * 2);
                 allocate(prefix * self.language.num_heads * std::mem::size_of::<f32>());
                 allocate(prefix * language_q);
+                allocate(prefix * self.language.width * 2);
                 allocate(prefix * self.language.width * 2);
                 allocate(prefix * self.language.width * 2);
                 allocate(prefix * self.language.width);
@@ -265,12 +274,15 @@ impl Pi05Config {
             allocate(horizon * self.action_dim);
             allocate(horizon * action * 2);
             allocate(horizon * action * 2);
+            allocate(horizon * action * 2);
             for _ in 0..self.action_expert.depth {
                 allocate(horizon * action);
                 allocate(horizon * action_qkv * 2);
                 allocate(horizon * action_q * 2);
                 allocate(horizon * action_q * 2);
                 allocate(horizon * action_q);
+                allocate(horizon * action * 2);
+                allocate(horizon * action * 2);
                 allocate(horizon * action * 2);
                 allocate(horizon * action * 2);
                 allocate(horizon * action);
@@ -403,7 +415,7 @@ impl Pi05Config {
     /// doubling the validated FP8 bound is therefore safe while keeping the
     /// shape calculation in one place.
     pub fn cuda_graph_workspace_bytes_bf16(&self, token_count: usize) -> Result<usize> {
-        self.cuda_graph_workspace_bytes(token_count)?
+        self.cuda_graph_workspace_bytes_fp8_static(token_count)?
             .checked_mul(2)
             .ok_or_else(|| Error::Other("pi05 BF16 CUDA workspace exceeds address space".into()))
     }
@@ -415,7 +427,7 @@ impl Pi05Config {
     /// unaligned patch projection additionally stores one INT32 accumulator.
     /// Twice the BF16 arena remains a simple conservative upper bound and also
     /// leaves room for the optional dual-backend correctness verifier.
-    pub fn cuda_graph_workspace_bytes_int8(&self, token_count: usize) -> Result<usize> {
+    pub fn cuda_graph_workspace_bytes_int8_dynamic(&self, token_count: usize) -> Result<usize> {
         self.cuda_graph_workspace_bytes_bf16(token_count)?
             .checked_mul(2)
             .ok_or_else(|| Error::Other("pi05 INT8 CUDA workspace exceeds address space".into()))
@@ -436,6 +448,15 @@ impl Pi05Config {
         }
         if self.num_flow_steps == 0 {
             return Err(Error::Other("pi05 num_flow_steps must be non-zero".into()));
+        }
+        if !(self.flow_start_time.is_finite()
+            && self.flow_start_time > 0.0
+            && self.flow_start_time <= 1.0)
+        {
+            return Err(Error::Other(format!(
+                "pi05 flow_start_time must be in (0, 1], got {}",
+                self.flow_start_time
+            )));
         }
         if self.language.depth != self.action_expert.depth
             || self.language.num_heads != self.action_expert.num_heads
@@ -502,6 +523,7 @@ mod tests {
             "chunk_size": 10,
             "tokenizer_max_length": 200,
             "num_inference_steps": 10,
+            "flow_start_time": 0.5,
             "num_views": 2,
             "image_resolution": [224, 224],
             "discrete_state_input": false
@@ -512,6 +534,7 @@ mod tests {
             cfg,
             Pi05Config {
                 discrete_state_input: false,
+                flow_start_time: 0.5,
                 ..Pi05Config::thor_two_view()
             }
         );
@@ -567,12 +590,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_config_json_synthesised_from_an_openpi_metadata_pt() {
+        // Shape emitted by `apxinf.checkpoints.train_config_facts`.
+        let cfg = Pi05Config::from_json_str(
+            r#"{"action_dim": 32, "action_horizon": 50, "discrete_state_input": true,
+                "max_token_len": 200, "num_views": 3}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.action_dim, 32);
+        assert_eq!(cfg.action_horizon, 50);
+        assert_eq!(cfg.max_token_len, 200);
+        assert_eq!(cfg.num_views, 3);
+        assert!(cfg.discrete_state_input);
+    }
+
+    #[test]
     fn thor_graph_workspace_is_bounded() {
         let bytes = Pi05Config::thor_two_view()
-            .cuda_graph_workspace_bytes(200)
+            .cuda_graph_workspace_bytes_fp8_static(200)
             .unwrap();
         assert!(bytes > 1_800_000_000);
         assert!(bytes < 2_500_000_000);
+    }
+
+    #[test]
+    fn thor_three_view_fp8_workspace_covers_t10_and_t21() {
+        let config = Pi05Config::thor_three_view();
+        assert_eq!(
+            config.cuda_graph_workspace_bytes_fp8_static(10).unwrap(),
+            2_954_794_880
+        );
+        assert_eq!(
+            config.cuda_graph_workspace_bytes_fp8_static(21).unwrap(),
+            2_979_016_832
+        );
     }
 
     #[test]
@@ -585,5 +636,99 @@ mod tests {
         let (max_activation, max_weight) = config.fp8_emulation_scratch_elements(200).unwrap();
         assert_eq!(max_activation, 712 * 16_384);
         assert_eq!(max_weight, weight);
+    }
+}
+
+/// Choice of PI0.5 model implementation, including weight and activation formats.
+/// Values are model-local; the loading field `model_variant` is shared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModelVariantChoice {
+    #[default]
+    Auto,
+    Bf16,
+    Fp8Static,
+    Int8Dynamic,
+}
+impl ModelVariantChoice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Bf16 => "bf16",
+            Self::Fp8Static => "fp8_static",
+            Self::Int8Dynamic => "int8_dynamic",
+        }
+    }
+    pub fn resolve(self, sm: u32, has_fp8_scales: bool) -> Self {
+        match self {
+            Self::Auto if sm >= 100 && has_fp8_scales => Self::Fp8Static,
+            Self::Auto if (80..100).contains(&sm) => Self::Int8Dynamic,
+            Self::Auto => Self::Bf16,
+            explicit => explicit,
+        }
+    }
+
+    /// Reject an explicitly selected implementation before loading or
+    /// quantizing weights when the device cannot execute its full model path.
+    pub fn ensure_supported(self, sm: u32) -> Result<Self> {
+        if self == Self::Fp8Static && sm < 100 {
+            return Err(Error::Other(format!(
+                "PI0.5 model_variant=fp8_static is unsupported on sm_{sm}; it requires sm_100 or newer and will not fall back to bf16"
+            )));
+        }
+        Ok(self)
+    }
+}
+impl std::str::FromStr for ModelVariantChoice {
+    type Err = apxinf_core::Error;
+    fn from_str(value: &str) -> apxinf_core::Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto), "bf16" => Ok(Self::Bf16),
+            "fp8_static" => Ok(Self::Fp8Static), "int8_dynamic" => Ok(Self::Int8Dynamic),
+            _ => Err(apxinf_core::Error::Other(format!("unknown PI0.5 model_variant {value:?}; expected auto, bf16, fp8_static or int8_dynamic"))),
+        }
+    }
+}
+#[cfg(test)]
+mod model_variant_tests {
+    use super::ModelVariantChoice;
+    #[test]
+    fn selection_and_identifiers_are_unambiguous() {
+        for v in [
+            ModelVariantChoice::Auto,
+            ModelVariantChoice::Bf16,
+            ModelVariantChoice::Fp8Static,
+            ModelVariantChoice::Int8Dynamic,
+        ] {
+            assert_eq!(v.as_str().parse::<ModelVariantChoice>().unwrap(), v);
+        }
+        for ambiguous in ["fp8", "int8", "w8a8", "unknown"] {
+            assert!(ambiguous.parse::<ModelVariantChoice>().is_err());
+        }
+        assert_eq!(
+            ModelVariantChoice::Auto.resolve(110, true),
+            ModelVariantChoice::Fp8Static
+        );
+        assert_eq!(
+            ModelVariantChoice::Auto.resolve(110, false),
+            ModelVariantChoice::Bf16
+        );
+        assert_eq!(
+            ModelVariantChoice::Auto.resolve(87, false),
+            ModelVariantChoice::Int8Dynamic
+        );
+        assert_eq!(
+            ModelVariantChoice::Bf16.resolve(110, true),
+            ModelVariantChoice::Bf16
+        );
+        let error = ModelVariantChoice::Fp8Static
+            .ensure_supported(89)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported on sm_89"));
+        assert!(error.contains("will not fall back to bf16"));
+        assert_eq!(
+            ModelVariantChoice::Fp8Static.ensure_supported(110).unwrap(),
+            ModelVariantChoice::Fp8Static
+        );
     }
 }

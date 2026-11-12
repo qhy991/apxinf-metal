@@ -1,0 +1,632 @@
+//! BF16 weights and load-time physical layouts.
+use crate::qwen_drive::backend::RuntimeBackend;
+use std::collections::HashMap;
+
+use apxinf_core::{Backend, Error, Result, Tensor};
+
+use super::super::config::QwenDriveConfig;
+use super::host::{transpose_2d, QwenDriveExpertWeights, QwenDriveVlmWeights};
+
+fn take(map: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
+    map.remove(name)
+        .ok_or_else(|| Error::Other(format!("qwen_drive device weights: missing {name}")))
+}
+
+fn take_transposed(map: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
+    transpose_2d(&take(map, name)?)
+}
+
+/// Exact bf16 -> f32 widening on the host (for fp32-consumed constants).
+fn widen_to_f32(tensor: &Tensor) -> Result<Tensor> {
+    let dims = tensor.shape().dims().to_vec();
+    let values = tensor.to_f32_vec()?;
+    Tensor::from_f32(dims, &values)
+}
+
+// FIX (implement_r3 / synthesis_r3): the bf16-loaded reference holds A_log bf16-rounded
+// and upcasts in-formula (modeling_qwen3_5.py:522); native kept the F32 checkpoint value
+// -- a <=2^-9 decay-rate divergence and a guaranteed exact-match blocker. Permanent: do
+// NOT revert.
+fn bf16_grid_round_f32(tensor: &Tensor) -> Result<Tensor> {
+    let dims = tensor.shape().dims().to_vec();
+    let values: Vec<f32> = tensor
+        .to_f32_vec()?
+        .iter()
+        .map(|&value| half::bf16::from_f32(value).to_f32())
+        .collect();
+    Tensor::from_f32(dims, &values)
+}
+
+/// f32 -> bf16 narrowing on the host (round-to-nearest-even, the reference's
+/// `.to(bfloat16)` cast). The checkpoint stores the GDN gated-RMSNorm weight
+/// (`linear_attn.norm.weight`) in f32; the gated RMS kernel expects bf16.
+fn narrow_to_bf16(tensor: &Tensor) -> Result<Tensor> {
+    let dims = tensor.shape().dims().to_vec();
+    let values = tensor.to_f32_vec()?;
+    let narrowed: Vec<half::bf16> = values
+        .iter()
+        .map(|value| half::bf16::from_f32(*value))
+        .collect();
+    Tensor::from_bf16(dims, &narrowed)
+}
+
+/// Store checkpoint `[out, in]` weights as `[in, out]` for row-major GEMM.
+fn projection(tensor: &Tensor) -> Result<Tensor> {
+    transpose_2d(tensor)
+}
+
+fn concat_rows_bf16(parts: &[&Tensor]) -> Result<Tensor> {
+    let cols = parts
+        .first()
+        .and_then(|t| t.shape().dims().get(1).copied())
+        .ok_or_else(|| Error::Other("qwen_drive: packed projection needs 2D parts".into()))?;
+    let mut rows = 0usize;
+    let mut values: Vec<half::bf16> = Vec::new();
+    for part in parts {
+        let dims = part.shape().dims();
+        if dims.len() != 2 || dims[1] != cols {
+            return Err(Error::Other(format!(
+                "qwen_drive: packed projection expects [out, {cols}], got {dims:?}"
+            )));
+        }
+        rows += dims[0];
+        values.extend(
+            part.to_f32_vec()?
+                .iter()
+                .map(|value| half::bf16::from_f32(*value)),
+        );
+    }
+    Tensor::from_bf16(vec![rows, cols], &values)
+}
+
+fn up(backend: &dyn Backend, tensor: &Tensor) -> Result<Tensor> {
+    backend.to_device(tensor)
+}
+
+fn up_mlp(
+    backend: &dyn Backend,
+    mlp: &super::host::ExpertMlp,
+    checkpoint_layout: bool,
+) -> Result<DeviceMlp> {
+    let fc1 = if checkpoint_layout {
+        transpose_2d(&mlp.fc1_w)?
+    } else {
+        mlp.fc1_w.clone()
+    };
+    let fc2 = if checkpoint_layout {
+        transpose_2d(&mlp.fc2_w)?
+    } else {
+        mlp.fc2_w.clone()
+    };
+    Ok(DeviceMlp {
+        fc1_w: up(backend, &fc1)?,
+        fc1_b: up(backend, &mlp.fc1_b)?,
+        fc2_w: up(backend, &fc2)?,
+        fc2_b: up(backend, &mlp.fc2_b)?,
+        checkpoint_layout,
+    })
+}
+
+/// One Linear -> SiLU -> Linear block on device.
+pub struct DeviceMlp {
+    pub fc1_w: Tensor,
+    pub fc1_b: Tensor,
+    pub fc2_w: Tensor,
+    pub fc2_b: Tensor,
+    /// Both weights retain checkpoint `[out,in]` layout for single-row MLPs.
+    pub checkpoint_layout: bool,
+}
+
+pub struct FullAttentionLayerWeights {
+    pub input_norm: Tensor,
+    /// Packed Q/K/V projection; Q contains q|gate per head.
+    pub qkv_w: Tensor,
+    pub q_norm: Tensor,
+    pub k_norm: Tensor,
+    pub o_w: Tensor,
+    pub post_norm: Tensor,
+    /// Fused `[2*intermediate, hidden]`, gate rows followed by up rows.
+    pub gate_up_w: Tensor,
+    pub down_w: Tensor,
+}
+
+pub struct GdnInputSplitWeights {
+    pub main: Tensor, // [2560,12288], QKV then Z
+    pub ab: Tensor,   // [2560,64], b then a
+}
+
+pub struct GdnLayerWeights {
+    pub input_norm: Tensor,
+    /// The four input projections packed along their output rows, in the order
+    /// qkv, z, b, a -- the layout the on-device pack used to build.
+    pub zba_w: Tensor,
+    pub input_split: Option<GdnInputSplitWeights>,
+    /// `[conv_dim, kernel_size]` (squeezed depthwise conv weight).
+    pub conv_w: Tensor,
+    /// `[num_v_heads]` fp32.
+    pub dt_bias: Tensor,
+    pub dt_bias_bf16: Tensor,
+    /// `[num_v_heads]` fp32.
+    pub a_log: Tensor,
+    /// `[head_v_dim]` gated RMSNorm weight (plain semantics).
+    pub gated_norm: Tensor,
+    pub out_w: Tensor,
+    pub post_norm: Tensor,
+    pub gate_up_w: Tensor,
+    pub down_w: Tensor,
+}
+
+pub enum MixerWeights {
+    FullAttention(FullAttentionLayerWeights),
+    Gdn(GdnLayerWeights),
+}
+
+pub struct VisionBlockWeights {
+    pub norm1_w: Tensor,
+    pub norm1_b: Tensor,
+    pub qkv_w: Tensor,
+    pub qkv_b: Tensor,
+    pub proj_w: Tensor,
+    pub proj_b: Tensor,
+    pub norm2_w: Tensor,
+    pub norm2_b: Tensor,
+    pub fc1_w: Tensor,
+    pub fc1_b: Tensor,
+    pub fc2_w: Tensor,
+    pub fc2_b: Tensor,
+}
+
+pub struct VisionDeviceWeights {
+    /// `[3 * temporal * patch * patch, hidden]` flattened Conv3d, transposed.
+    pub patch_w: Tensor,
+    pub patch_b: Tensor,
+    /// `[num_position_embeddings, hidden]` learned table (bilinear source).
+    pub pos_embed: Tensor,
+    pub blocks: Vec<VisionBlockWeights>,
+    pub merger_norm_w: Tensor,
+    pub merger_norm_b: Tensor,
+    pub merger_fc1_w: Tensor,
+    pub merger_fc1_b: Tensor,
+    pub merger_fc2_w: Tensor,
+    pub merger_fc2_b: Tensor,
+}
+
+pub struct ExpertLayerDeviceWeights {
+    pub input_norm: Tensor,
+    pub qkv_w: Tensor,
+    pub q_norm: Tensor,
+    pub k_norm: Tensor,
+    pub o_w: Tensor,
+    pub post_norm: Tensor,
+    pub gate_up_w: Tensor,
+    pub down_w: Tensor,
+    /// Checkpoint [6*hidden,hidden] layout for the biased matrix-vector product.
+    pub modulation_w: Tensor,
+    pub modulation_b: Tensor,
+}
+
+pub struct ExpertDeviceWeights {
+    pub trajectory_proj_w: Tensor,
+    pub trajectory_proj_b: Tensor,
+    pub fourier: DeviceMlp,
+    pub waypoint_embed: Tensor,
+    pub time_mlp: DeviceMlp,
+    pub nav_mlp: DeviceMlp,
+    pub ego_mlp: DeviceMlp,
+    pub history_encoder: DeviceMlp,
+    pub history_velocity_encoder: DeviceMlp,
+    pub history_acceleration_encoder: DeviceMlp,
+    pub query_fusion: DeviceMlp,
+    pub layers: Vec<ExpertLayerDeviceWeights>,
+    pub final_norm: Tensor,
+    pub out_proj_w: Tensor,
+    pub out_proj_b: Tensor,
+    /// bf16 logspace frequency table (rounding is semantic), built at load.
+    pub fourier_freqs: Tensor,
+}
+
+/// torch.logspace(0, log10(max_frequency), steps, dtype=bf16) rebuilt in the
+/// compute dtype exactly like the reference encoder.
+fn fourier_freq_table(num_features: usize, max_frequency: f32) -> Result<Tensor> {
+    if num_features == 0 || !max_frequency.is_finite() || max_frequency <= 0.0 {
+        return Err(Error::Other(
+            "qwen_drive: invalid Fourier table geometry".into(),
+        ));
+    }
+    // Torch CUDA BF16 logspace rounds the endpoint, step and each arithmetic
+    // operation to BF16, and constructs the second half backwards from the end.
+    // Computing a float logspace and casting only its output changes frequencies.
+    let round = |value: f32| half::bf16::from_f32(value).to_f32();
+    let log_max = round((max_frequency as f64).log10() as f32);
+    let step = if num_features > 1 {
+        round(log_max / round((num_features - 1) as f32))
+    } else {
+        0.0
+    };
+    let values: Vec<half::bf16> = (0..num_features)
+        .map(|i| {
+            let exponent = if num_features == 1 {
+                0.0
+            } else if i < num_features / 2 {
+                round(step * round(i as f32))
+            } else {
+                round(log_max - round(step * round((num_features - i - 1) as f32)))
+            };
+            half::bf16::from_f32(10f32.powf(exponent))
+        })
+        .collect();
+    Tensor::from_bf16(vec![num_features], &values)
+}
+
+#[cfg(test)]
+mod frequency_tests {
+    use super::fourier_freq_table;
+
+    #[test]
+    fn projection_packing_transposes_checkpoint_weights() {
+        let values: Vec<_> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .collect();
+        let weight = apxinf_core::Tensor::from_bf16(vec![2, 3], &values).unwrap();
+        let in_out = super::projection(&weight).unwrap();
+        assert_eq!(in_out.shape().dims(), &[3, 2]);
+        assert_eq!(in_out.to_f32_vec().unwrap(), [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn bf16_logspace_matches_frozen_cuda_reference() {
+        let expected = [
+            1.0, 1.203125, 1.4453125, 1.7421875, 2.09375, 2.515625, 3.015625, 3.65625, 4.375,
+            5.28125, 6.375, 7.625, 9.125, 11.125, 13.3125, 15.9375,
+        ];
+        assert_eq!(
+            fourier_freq_table(16, 16.0).unwrap().to_f32_vec().unwrap(),
+            expected
+        );
+        assert_eq!(
+            fourier_freq_table(1, 16.0).unwrap().to_f32_vec().unwrap(),
+            [1.0]
+        );
+        assert!(fourier_freq_table(0, 16.0).is_err());
+        assert!(fourier_freq_table(16, 0.0).is_err());
+    }
+}
+
+pub struct BackboneDeviceWeights {
+    /// `[vocab, hidden]`; doubles as the tied lm_head via a transposed GEMM.
+    pub embed_tokens: Tensor,
+    pub layers: Vec<MixerWeights>,
+    pub final_norm: Tensor,
+    pub vision: VisionDeviceWeights,
+}
+
+impl BackboneDeviceWeights {
+    pub fn from_maps(
+        config: &QwenDriveConfig,
+        vlm: QwenDriveVlmWeights,
+        backend: &dyn Backend,
+    ) -> Result<Self> {
+        let mut language = vlm.language;
+        let mut visual = vlm.visual;
+        let text = &config.text;
+        let hidden = text.hidden_size;
+        let kv_width = text.n_kv_heads * text.head_dim;
+        let q_width = text.n_heads * 2 * text.head_dim;
+
+        let split_gdn_input = backend
+            .as_any()
+            .downcast_ref::<RuntimeBackend>()
+            .is_some_and(|cuda| {
+                cuda.context().caps().sm == 110 && cuda.context().caps().multiprocessor_count == 20
+            });
+        let mut layers = Vec::with_capacity(text.n_layers);
+        // FIX (implement_r3 / synthesis_r3): confirmation-line accumulators for the A_log
+        // bf16-grid rounding below; max_delta over the PRE-round values proves the fix
+        // load-bearing (>0 expected). Permanent.
+        for index in 0..text.n_layers {
+            let p = format!("model.language_model.layers.{index}");
+            let input_norm = up(
+                backend,
+                &take(&mut language, &format!("{p}.input_layernorm.weight"))?,
+            )?;
+            let post_norm = up(
+                backend,
+                &take(
+                    &mut language,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                )?,
+            )?;
+            let gate = take(&mut language, &format!("{p}.mlp.gate_proj.weight"))?;
+            let up_w = take(&mut language, &format!("{p}.mlp.up_proj.weight"))?;
+            // One checkpoint-row-major representation for the fused gate/up operator.
+            let gate_up_w = up(backend, &concat_rows_bf16(&[&gate, &up_w])?)?;
+            let down_w = up(
+                backend,
+                &projection(&take(&mut language, &format!("{p}.mlp.down_proj.weight"))?)?,
+            )?;
+            if text.is_full_attention(index) {
+                let q = take(&mut language, &format!("{p}.self_attn.q_proj.weight"))?;
+                let k = take(&mut language, &format!("{p}.self_attn.k_proj.weight"))?;
+                let v = take(&mut language, &format!("{p}.self_attn.v_proj.weight"))?;
+                if q.shape().dims() != [q_width, hidden]
+                    || k.shape().dims() != [kv_width, hidden]
+                    || v.shape().dims() != [kv_width, hidden]
+                {
+                    return Err(Error::Other(format!(
+                        "qwen_drive: q/k/v projection shape mismatch at layer {index}"
+                    )));
+                }
+                layers.push(MixerWeights::FullAttention(FullAttentionLayerWeights {
+                    input_norm,
+                    qkv_w: up(backend, &projection(&concat_rows_bf16(&[&q, &k, &v])?)?)?,
+                    q_norm: up(
+                        backend,
+                        &take(&mut language, &format!("{p}.self_attn.q_norm.weight"))?,
+                    )?,
+                    k_norm: up(
+                        backend,
+                        &take(&mut language, &format!("{p}.self_attn.k_norm.weight"))?,
+                    )?,
+                    o_w: up(
+                        backend,
+                        &projection(&take(
+                            &mut language,
+                            &format!("{p}.self_attn.o_proj.weight"),
+                        )?)?,
+                    )?,
+                    post_norm,
+                    gate_up_w,
+                    down_w,
+                }));
+            } else {
+                let in_qkv = take(
+                    &mut language,
+                    &format!("{p}.linear_attn.in_proj_qkv.weight"),
+                )?;
+                let in_z = take(&mut language, &format!("{p}.linear_attn.in_proj_z.weight"))?;
+                let in_b = take(&mut language, &format!("{p}.linear_attn.in_proj_b.weight"))?;
+                let in_a = take(&mut language, &format!("{p}.linear_attn.in_proj_a.weight"))?;
+                let input_split = if split_gdn_input
+                    && in_qkv.shape().dims() == [8192, 2560]
+                    && in_z.shape().dims() == [4096, 2560]
+                    && in_b.shape().dims() == [32, 2560]
+                    && in_a.shape().dims() == [32, 2560]
+                {
+                    Some(GdnInputSplitWeights {
+                        main: up(backend, &projection(&concat_rows_bf16(&[&in_qkv, &in_z])?)?)?,
+                        ab: up(backend, &projection(&concat_rows_bf16(&[&in_b, &in_a])?)?)?,
+                    })
+                } else {
+                    None
+                };
+                let conv = take(&mut language, &format!("{p}.linear_attn.conv1d.weight"))?;
+                let conv_dims = conv.shape().dims().to_vec();
+                let conv_dim = 2 * text.linear_num_key_heads * text.linear_key_head_dim
+                    + text.linear_num_value_heads * text.linear_value_head_dim;
+                let kernel = text.linear_conv_kernel_dim;
+                if conv_dims != [conv_dim, 1, kernel] {
+                    return Err(Error::Other(format!(
+                        "qwen_drive: conv1d weight at layer {index} has shape {conv_dims:?}, expected [{conv_dim}, 1, {kernel}]"
+                    )));
+                }
+                // Round A_log to the BF16 grid at load (see bf16_grid_round_f32).
+                let a_log_raw =
+                    widen_to_f32(&take(&mut language, &format!("{p}.linear_attn.A_log"))?)?;
+                let dt_bias = take(&mut language, &format!("{p}.linear_attn.dt_bias"))?;
+                layers.push(MixerWeights::Gdn(GdnLayerWeights {
+                    input_norm,
+                    zba_w: up(
+                        backend,
+                        &projection(&concat_rows_bf16(&[&in_qkv, &in_z, &in_b, &in_a])?)?,
+                    )?,
+                    input_split,
+                    conv_w: up(backend, &conv.reshape(vec![conv_dim, kernel])?)?,
+                    dt_bias: up(backend, &widen_to_f32(&dt_bias)?)?,
+                    dt_bias_bf16: up(backend, &narrow_to_bf16(&dt_bias)?)?,
+                    a_log: up(backend, &bf16_grid_round_f32(&a_log_raw)?)?,
+                    gated_norm: up(
+                        backend,
+                        &narrow_to_bf16(&take(
+                            &mut language,
+                            &format!("{p}.linear_attn.norm.weight"),
+                        )?)?,
+                    )?,
+                    out_w: up(
+                        backend,
+                        &projection(&take(
+                            &mut language,
+                            &format!("{p}.linear_attn.out_proj.weight"),
+                        )?)?,
+                    )?,
+                    post_norm,
+                    gate_up_w,
+                    down_w,
+                }));
+            }
+        }
+        let embed_tokens = up(
+            backend,
+            &take(&mut language, "model.language_model.embed_tokens.weight")?,
+        )?;
+        let final_norm = up(
+            backend,
+            &take(&mut language, "model.language_model.norm.weight")?,
+        )?;
+        if !language.is_empty() {
+            let mut names: Vec<String> = language.keys().cloned().collect();
+            names.sort_unstable();
+            // MTP/auxiliary tensors are allowed but must be named, not silently
+            // dropped: keep the check informational-strict like the scaffold.
+            let mtp_only = names
+                .iter()
+                .all(|name| name.starts_with("model.language_model.mtp"));
+            if !mtp_only {
+                return Err(Error::Other(format!(
+                    "qwen_drive device weights: {} unconsumed language tensors, first: {}",
+                    names.len(),
+                    names[0]
+                )));
+            }
+        }
+
+        // Vision tower.
+        let vision_cfg = &config.vision;
+        let merge_sq = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size;
+        let patch = take(&mut visual, "model.visual.patch_embed.proj.weight")?;
+        let patch_dims = patch.shape().dims().to_vec();
+        let patch_vec = vision_cfg.in_channels
+            * vision_cfg.temporal_patch_size
+            * vision_cfg.patch_size
+            * vision_cfg.patch_size;
+        if patch_dims.len() != 5
+            || patch_dims[0] != vision_cfg.hidden_size
+            || patch_dims.iter().product::<usize>() != vision_cfg.hidden_size * patch_vec
+        {
+            return Err(Error::Other(format!(
+                "qwen_drive: patch_embed weight has shape {patch_dims:?}"
+            )));
+        }
+        let patch_w = transpose_2d(&patch.reshape(vec![vision_cfg.hidden_size, patch_vec])?)?;
+        let mut blocks = Vec::with_capacity(vision_cfg.depth);
+        for index in 0..vision_cfg.depth {
+            let p = format!("model.visual.blocks.{index}");
+            blocks.push(VisionBlockWeights {
+                norm1_w: up(backend, &take(&mut visual, &format!("{p}.norm1.weight"))?)?,
+                norm1_b: up(backend, &take(&mut visual, &format!("{p}.norm1.bias"))?)?,
+                qkv_w: up(
+                    backend,
+                    &take_transposed(&mut visual, &format!("{p}.attn.qkv.weight"))?,
+                )?,
+                qkv_b: up(backend, &take(&mut visual, &format!("{p}.attn.qkv.bias"))?)?,
+                proj_w: up(
+                    backend,
+                    &take_transposed(&mut visual, &format!("{p}.attn.proj.weight"))?,
+                )?,
+                proj_b: up(backend, &take(&mut visual, &format!("{p}.attn.proj.bias"))?)?,
+                norm2_w: up(backend, &take(&mut visual, &format!("{p}.norm2.weight"))?)?,
+                norm2_b: up(backend, &take(&mut visual, &format!("{p}.norm2.bias"))?)?,
+                fc1_w: up(
+                    backend,
+                    &take_transposed(&mut visual, &format!("{p}.mlp.linear_fc1.weight"))?,
+                )?,
+                fc1_b: up(
+                    backend,
+                    &take(&mut visual, &format!("{p}.mlp.linear_fc1.bias"))?,
+                )?,
+                fc2_w: up(
+                    backend,
+                    &take_transposed(&mut visual, &format!("{p}.mlp.linear_fc2.weight"))?,
+                )?,
+                fc2_b: up(
+                    backend,
+                    &take(&mut visual, &format!("{p}.mlp.linear_fc2.bias"))?,
+                )?,
+            });
+        }
+        let merger_fc1 = take_transposed(&mut visual, "model.visual.merger.linear_fc1.weight")?;
+        let merger_fc2 = take_transposed(&mut visual, "model.visual.merger.linear_fc2.weight")?;
+        let expected_fc1 = vision_cfg.hidden_size * merge_sq;
+        if merger_fc1.shape().dims() != [expected_fc1, expected_fc1] {
+            return Err(Error::Other("qwen_drive: merger fc1 shape mismatch".into()));
+        }
+        let vision = VisionDeviceWeights {
+            patch_w: up(backend, &patch_w)?,
+            patch_b: up(
+                backend,
+                &take(&mut visual, "model.visual.patch_embed.proj.bias")?,
+            )?,
+            pos_embed: up(
+                backend,
+                &take(&mut visual, "model.visual.pos_embed.weight")?,
+            )?,
+            blocks,
+            merger_norm_w: up(
+                backend,
+                &take(&mut visual, "model.visual.merger.norm.weight")?,
+            )?,
+            merger_norm_b: up(
+                backend,
+                &take(&mut visual, "model.visual.merger.norm.bias")?,
+            )?,
+            merger_fc1_w: up(backend, &merger_fc1)?,
+            merger_fc1_b: up(
+                backend,
+                &take(&mut visual, "model.visual.merger.linear_fc1.bias")?,
+            )?,
+            merger_fc2_w: up(backend, &merger_fc2)?,
+            merger_fc2_b: up(
+                backend,
+                &take(&mut visual, "model.visual.merger.linear_fc2.bias")?,
+            )?,
+        };
+        if !visual.is_empty() {
+            let mut names: Vec<String> = visual.keys().cloned().collect();
+            names.sort_unstable();
+            return Err(Error::Other(format!(
+                "qwen_drive device weights: {} unconsumed visual tensors, first: {}",
+                names.len(),
+                names[0]
+            )));
+        }
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            final_norm,
+            vision,
+        })
+    }
+}
+
+impl ExpertDeviceWeights {
+    pub fn from_weights(
+        config: &QwenDriveConfig,
+        weights: QwenDriveExpertWeights,
+        backend: &dyn Backend,
+    ) -> Result<ExpertDeviceWeights> {
+        let mut layers = Vec::with_capacity(weights.layers.len());
+        for layer in &weights.layers {
+            layers.push(ExpertLayerDeviceWeights {
+                input_norm: up(backend, &layer.input_layernorm)?,
+                qkv_w: up(backend, &layer.qkv_w)?,
+                q_norm: up(backend, &layer.q_norm)?,
+                k_norm: up(backend, &layer.k_norm)?,
+                o_w: up(backend, &layer.o_w)?,
+                post_norm: up(backend, &layer.post_attention_layernorm)?,
+                gate_up_w: up(backend, &layer.gate_up_w)?,
+                down_w: up(backend, &layer.down_w)?,
+                modulation_w: up(backend, &transpose_2d(&layer.modulation_w)?)?,
+                modulation_b: up(backend, &layer.modulation_b)?,
+            });
+        }
+        Ok(ExpertDeviceWeights {
+            trajectory_proj_w: up(backend, &weights.trajectory_proj_w)?,
+            trajectory_proj_b: up(backend, &weights.trajectory_proj_b)?,
+            fourier: up_mlp(backend, &weights.fourier_encoder, false)?,
+            waypoint_embed: up(backend, &weights.waypoint_embed)?,
+            time_mlp: up_mlp(backend, &weights.time_mlp, true)?,
+            nav_mlp: up_mlp(backend, &weights.nav_mlp, true)?,
+            ego_mlp: up_mlp(backend, &weights.ego_mlp, true)?,
+            history_encoder: up_mlp(backend, &weights.history_encoder, true)?,
+            history_velocity_encoder: up_mlp(backend, &weights.history_velocity_encoder, true)?,
+            history_acceleration_encoder: up_mlp(
+                backend,
+                &weights.history_acceleration_encoder,
+                true,
+            )?,
+            query_fusion: up_mlp(backend, &weights.query_fusion, false)?,
+            layers,
+            final_norm: up(backend, &weights.final_layernorm)?,
+            out_proj_w: up(backend, &weights.out_proj_w)?,
+            out_proj_b: up(backend, &weights.out_proj_b)?,
+            fourier_freqs: up(
+                backend,
+                &fourier_freq_table(
+                    config.expert.fourier_num_features,
+                    config.expert.fourier_max_frequency,
+                )?,
+            )?,
+        })
+    }
+}

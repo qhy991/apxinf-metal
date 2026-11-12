@@ -1,0 +1,371 @@
+use std::rc::Rc;
+
+use apxinf_core::{DType, Result, Tensor};
+
+use super::contracts::{
+    alignment, dtype_code, invalid, range, required_bytes, tensor_storage, Normalized, Semantic,
+};
+use super::{execution, AttentionMask, AttentionPolicy};
+use crate::ffi::abi::{attention as abi, status};
+use crate::{CudaBuffer, CudaContext, HostMappedBuffer};
+
+/// Fixed-address runtime metadata for CUDA Graph-safe KV-cache decoding.
+///
+/// Allocate one instance with the model and reuse it for every decode step.
+/// The mapped device words contain `[valid_key_tokens, query_start]` and may
+/// be updated between graph replays without changing the captured pointer.
+#[derive(Clone)]
+pub struct KvCacheDecodeMeta {
+    storage: Rc<HostMappedBuffer>,
+    key_capacity: usize,
+}
+
+impl KvCacheDecodeMeta {
+    pub fn new(device: usize, key_capacity: usize) -> Result<Self> {
+        if key_capacity == 0 || key_capacity > i32::MAX as usize {
+            return Err(invalid(
+                "decode metadata key_capacity must fit the native Attention limits",
+            ));
+        }
+        Ok(Self {
+            storage: Rc::new(
+                HostMappedBuffer::alloc(2 * std::mem::size_of::<u32>(), device)
+                    .map_err(apxinf_core::Error::Cuda)?,
+            ),
+            key_capacity,
+        })
+    }
+
+    /// Publish the runtime length and query position for a later graph replay.
+    ///
+    /// The caller must ensure that all earlier CUDA work reading this metadata
+    /// has completed before updating it. In particular, synchronize or wait on
+    /// the previous replay before reusing one metadata allocation.
+    pub fn update(&self, valid_key_tokens: usize, query_start: usize) -> Result<()> {
+        if valid_key_tokens == 0 || query_start >= valid_key_tokens {
+            return Err(invalid(
+                "decode metadata requires 0 <= query_start < valid_key_tokens",
+            ));
+        }
+        if valid_key_tokens > self.key_capacity {
+            return Err(invalid(format!(
+                "valid_key_tokens {valid_key_tokens} exceeds decode metadata capacity {}",
+                self.key_capacity
+            )));
+        }
+        let valid_key_tokens = u32::try_from(valid_key_tokens)
+            .map_err(|_| invalid("valid_key_tokens exceeds decode metadata limits"))?;
+        let query_start = u32::try_from(query_start)
+            .map_err(|_| invalid("query_start exceeds decode metadata limits"))?;
+        self.storage
+            .write_u32s(&[valid_key_tokens, query_start])
+            .map_err(apxinf_core::Error::Cuda)
+    }
+}
+
+/// Contiguous KV-cache attention.
+///
+/// Q is `[batch, query_tokens, query_heads, head_dim]`; the cache tensors are
+/// `[batch, key_capacity, kv_heads, head_dim]`. Only their leading
+/// `valid_key_tokens` rows participate. For a causal mask, query token `i`
+/// occupies cache position `query_start + i`.
+///
+/// The default is static KV attention, whose exact length and position are
+/// part of the Spec and may select FA2. Call [`Self::with_decode_meta`] for
+/// dynamic graph decode; that mode keys recipes and executions by capacity
+/// while reading the current length and position from fixed-address metadata.
+pub struct KvCacheAttentionArgs<'a> {
+    pub query: &'a Tensor,
+    pub key_cache: &'a Tensor,
+    pub value_cache: &'a Tensor,
+    pub out: &'a mut Tensor,
+    pub decode_meta: Option<KvCacheDecodeMeta>,
+    pub valid_key_tokens: usize,
+    pub query_start: usize,
+    pub mask: AttentionMask,
+    pub scale: f32,
+    pub policy: AttentionPolicy,
+}
+
+impl<'a> KvCacheAttentionArgs<'a> {
+    pub fn new(
+        query: &'a Tensor,
+        key_cache: &'a Tensor,
+        value_cache: &'a Tensor,
+        out: &'a mut Tensor,
+    ) -> Self {
+        let query_shape = query.shape().dims();
+        let head_dim = query_shape.get(3).copied().unwrap_or(1);
+        let query_tokens = query_shape.get(1).copied().unwrap_or(0);
+        let valid_key_tokens = key_cache.shape().dims().get(1).copied().unwrap_or(0);
+        Self {
+            query,
+            key_cache,
+            value_cache,
+            out,
+            decode_meta: None,
+            valid_key_tokens,
+            query_start: valid_key_tokens.saturating_sub(query_tokens),
+            mask: AttentionMask::Causal,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            policy: AttentionPolicy::default(),
+        }
+    }
+
+    /// Use fixed-address runtime metadata for CUDA Graph decode replay.
+    ///
+    /// One prepared execution and captured graph can then cover every valid
+    /// position up to the metadata capacity. Dynamic metadata is intentionally
+    /// limited to causal single-token decode.
+    pub fn with_decode_meta(mut self, decode_meta: &KvCacheDecodeMeta) -> Self {
+        self.decode_meta = Some(decode_meta.clone());
+        self
+    }
+
+    pub fn non_causal(mut self) -> Self {
+        self.mask = AttentionMask::None;
+        self.query_start = 0;
+        self
+    }
+}
+
+fn reject_overlap(
+    output: &CudaBuffer,
+    output_bytes: usize,
+    input: &CudaBuffer,
+    input_bytes: usize,
+    name: &str,
+) -> Result<()> {
+    let output = range(output, output_bytes)?;
+    let input = range(input, input_bytes)?;
+    if output.start < input.end && input.start < output.end {
+        return Err(invalid(format!(
+            "KV-cache Attention output overlaps read-only {name} storage"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn normalize(ctx: &CudaContext, args: KvCacheAttentionArgs<'_>) -> Result<Normalized> {
+    let q_shape = args.query.shape().dims();
+    let k_shape = args.key_cache.shape().dims();
+    let v_shape = args.value_cache.shape().dims();
+    if q_shape.len() != 4 || k_shape.len() != 4 || v_shape.len() != 4 {
+        return Err(invalid("KV-cache Attention requires rank-4 tensors"));
+    }
+    let (batch, query_tokens, query_heads, head_dim) =
+        (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
+    let (key_batch, key_capacity, kv_heads, key_head_dim) =
+        (k_shape[0], k_shape[1], k_shape[2], k_shape[3]);
+    let dynamic_decode = args.decode_meta.is_some();
+    if dynamic_decode && (batch != 1 || query_tokens != 1 || args.mask != AttentionMask::Causal) {
+        return Err(invalid(
+            "dynamic KV-cache decode metadata requires batch-1 causal single-token queries",
+        ));
+    }
+    if [
+        batch,
+        query_tokens,
+        query_heads,
+        head_dim,
+        key_capacity,
+        kv_heads,
+    ]
+    .contains(&0)
+        || batch != key_batch
+        || v_shape != k_shape
+        || head_dim != key_head_dim
+        || query_heads % kv_heads != 0
+        || args.valid_key_tokens == 0
+        || args.valid_key_tokens > key_capacity
+        || args.query_start > args.valid_key_tokens
+        || (args.mask == AttentionMask::Causal
+            && match args.query_start.checked_add(query_tokens) {
+                Some(end) => end > args.valid_key_tokens,
+                None => true,
+            })
+        || args.out.shape().dims() != q_shape
+        || args.query.dtype() != args.key_cache.dtype()
+        || args.query.dtype() != args.value_cache.dtype()
+        || args.query.dtype() != args.out.dtype()
+        || !matches!(args.query.dtype(), DType::F16 | DType::BF16)
+    {
+        return Err(invalid("invalid KV-cache Attention contract"));
+    }
+    if !args.scale.is_finite() || args.scale <= 0.0 {
+        return Err(invalid(
+            "KV-cache Attention scale must be finite and positive",
+        ));
+    }
+    if [
+        batch,
+        query_tokens,
+        args.valid_key_tokens,
+        key_capacity,
+        query_heads,
+        kv_heads,
+        head_dim,
+        args.query_start,
+    ]
+    .iter()
+    .any(|value| *value > i32::MAX as usize)
+    {
+        return Err(invalid(
+            "KV-cache Attention dimension exceeds native limits",
+        ));
+    }
+
+    let dtype = args.query.dtype();
+    let q = tensor_storage(ctx, args.query, dtype, q_shape)?;
+    let k = tensor_storage(ctx, args.key_cache, dtype, k_shape)?;
+    let v = tensor_storage(ctx, args.value_cache, dtype, v_shape)?;
+    let out = tensor_storage(ctx, args.out, dtype, q_shape)?;
+    let output_bytes = required_bytes(dtype, q_shape)?;
+    for (name, input, shape) in [
+        ("query", &q, q_shape),
+        ("key cache", &k, k_shape),
+        ("value cache", &v, v_shape),
+    ] {
+        reject_overlap(
+            &out,
+            output_bytes,
+            input,
+            required_bytes(dtype, shape)?,
+            name,
+        )?;
+    }
+
+    let default_scale = 1.0 / (head_dim as f32).sqrt();
+    let mut resources: Vec<Rc<dyn std::any::Any>> = Vec::new();
+    let decode_meta = if let Some(meta) = args.decode_meta.as_ref() {
+        if meta.key_capacity != key_capacity {
+            return Err(invalid(format!(
+                "decode metadata capacity {} does not match KV-cache capacity {key_capacity}",
+                meta.key_capacity
+            )));
+        }
+        // Validate everything before `update`: mutating the mapped words on an
+        // error path could corrupt a replay in flight on the correct device.
+        let address = meta.storage.address();
+        if address.device() != ctx.device_id() {
+            return Err(invalid(format!(
+                "KV-cache decode metadata is on CUDA {}, but Attention targets CUDA {}",
+                address.device(),
+                ctx.device_id()
+            )));
+        }
+        meta.update(args.valid_key_tokens, args.query_start)?;
+        resources.push(meta.storage.clone());
+        address.ptr().cast_const().cast()
+    } else {
+        std::ptr::null()
+    };
+    let bindings = abi::Bindings {
+        query: q.ptr(),
+        key: k.ptr(),
+        value: v.ptr(),
+        offsets: std::ptr::null(),
+        decode_meta,
+        output: out.ptr(),
+        stream: ctx.stream().handle(),
+        scale: args.scale,
+        output_scale: 1.0,
+    };
+    Ok(Normalized {
+        spec: abi::Spec {
+            version: abi::SPEC_VERSION,
+            semantic: Semantic::KvCache.abi_value(),
+            dtype: dtype_code(dtype)?,
+            output_dtype: dtype_code(dtype)?,
+            mask: args.mask as u32,
+            q_alignment: alignment(bindings.query),
+            k_alignment: alignment(bindings.key),
+            v_alignment: alignment(bindings.value),
+            output_alignment: alignment(bindings.output.cast_const()),
+            offsets_alignment: 0,
+            batch: batch as i64,
+            query_tokens: query_tokens as i64,
+            key_tokens: if dynamic_decode {
+                key_capacity as i64
+            } else {
+                args.valid_key_tokens as i64
+            },
+            key_capacity: key_capacity as i64,
+            query_heads: query_heads as i64,
+            kv_heads: kv_heads as i64,
+            head_dim: head_dim as i64,
+            query_start: if dynamic_decode {
+                0
+            } else {
+                args.query_start as i64
+            },
+            segments: 0,
+            max_segment_tokens: 0,
+            offsets_hash: 0,
+            scale_is_default: u32::from(args.scale == default_scale),
+            dynamic_decode: u32::from(dynamic_decode),
+        },
+        policy: args.policy,
+        bindings,
+        storage: vec![q, k, v, out],
+        resources,
+    })
+}
+
+pub fn kv_cache_attention(ctx: &CudaContext, args: KvCacheAttentionArgs<'_>) -> Result<()> {
+    execution::execute(ctx, normalize(ctx, args)?)
+}
+
+/// Workspace required by the allocation-free Qwen3.8 FA2 decode path.
+pub fn decode_attention_workspace_bytes() -> usize {
+    usize::try_from(unsafe { abi::apxinf_decode_attention_workspace_bytes() })
+        .expect("FA2 decode workspace size must fit usize")
+}
+
+/// Enqueue the fixed Qwen3.8 single-token FA2 kernel using caller-owned
+/// workspace. This path is deliberately narrow: `[1,1,24,256]` queries and
+/// `[1,capacity,4,256]` BF16 caches.
+pub fn decode_attention(
+    ctx: &CudaContext,
+    query: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    output: &Tensor,
+    workspace: &Tensor,
+    key_tokens: usize,
+    scale: f32,
+) -> Result<()> {
+    let q_shape = [1, 1, 24, 256];
+    let q = tensor_storage(ctx, query, DType::BF16, &q_shape)?;
+    let out = tensor_storage(ctx, output, DType::BF16, &q_shape)?;
+    let k_shape = key_cache.shape().dims();
+    if k_shape.len() != 4 || k_shape[0] != 1 || k_shape[2] != 4 || k_shape[3] != 256 {
+        return Err(invalid("FA2 decode key cache must be [1, capacity, 4, 256]"));
+    }
+    if value_cache.shape().dims() != k_shape || key_tokens < 128 || key_tokens > k_shape[1] {
+        return Err(invalid("FA2 decode requires matching caches and 128 <= key_tokens <= capacity"));
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(invalid("FA2 decode scale must be finite and positive"));
+    }
+    let key = tensor_storage(ctx, key_cache, DType::BF16, k_shape)?;
+    let value = tensor_storage(ctx, value_cache, DType::BF16, k_shape)?;
+    let workspace_shape = workspace.shape().dims();
+    let workspace_buffer = tensor_storage(ctx, workspace, DType::F32, workspace_shape)?;
+    let workspace_bytes = workspace_shape.iter().try_fold(4usize, |bytes, dim| {
+        bytes.checked_mul(*dim)
+            .ok_or_else(|| invalid("FA2 decode workspace size overflow"))
+    })?;
+    let required = decode_attention_workspace_bytes();
+    if workspace_bytes < required {
+        return Err(invalid(format!(
+            "FA2 decode workspace has {workspace_bytes} bytes, need {required}"
+        )));
+    }
+    unsafe {
+        status::check(abi::apxinf_decode_attention(
+            ctx.runtime(), q.ptr(), key.ptr(), value.ptr(), out.ptr(), workspace_buffer.ptr(),
+            workspace_bytes as i64, key_tokens as i64, scale, ctx.stream().handle(),
+        ))
+    }
+}
