@@ -72,6 +72,19 @@ fn literal(value: &proto::Value, weights: &[u8]) -> Result<()> {
         });
     let elements = elements.ok_or(Error::Contract("Clef Core ML literal extent overflows"))?;
     let byte_count = |width: usize| elements.checked_mul(width);
+    // UINT4/UINT6 payloads are bit-packed (`pack_indices`: least-significant
+    // first, no padding between rows), so their exact extent is
+    // `ceil(elements * bits / 8)` bytes. FLOAT16/INT8 keep the byte-width form:
+    // it is the same number for whole-byte elements and preserves their
+    // pre-existing decisions exactly.
+    let packed_byte_count = |bits: usize| elements.checked_mul(bits).map(|bits| bits.div_ceil(8));
+    let expected_bytes = match tensor.data_type {
+        data_type::FLOAT16 => byte_count(2),
+        data_type::INT8 => byte_count(1),
+        data_type::UINT4 => packed_byte_count(4),
+        data_type::UINT6 => packed_byte_count(6),
+        _ => None,
+    };
     let valid = match &value.value {
         Some(value::Value::ImmediateValue(immediate)) => {
             match immediate
@@ -89,20 +102,17 @@ fn literal(value: &proto::Value, weights: &[u8]) -> Result<()> {
                     tensor.data_type == data_type::STRING && values.values.len() == elements
                 }
                 Some(tensor_value::Value::Bytes(values)) => {
-                    let width = match tensor.data_type {
-                        data_type::FLOAT16 => Some(2),
-                        data_type::INT8 => Some(1),
-                        _ => None,
-                    };
-                    width.and_then(byte_count) == Some(values.values.len())
+                    expected_bytes == Some(values.values.len())
                 }
                 None => false,
             }
         }
         Some(value::Value::BlobFileValue(reference)) => {
-            let expected = match tensor.data_type {
-                data_type::FLOAT16 => Some((1, 2)),
-                data_type::INT8 => Some((4, 1)),
+            let wanted = match tensor.data_type {
+                data_type::FLOAT16 => Some(blob::BlobDataType::Float16 as u32),
+                data_type::INT8 => Some(blob::BlobDataType::Int8 as u32),
+                data_type::UINT4 => Some(blob::BlobDataType::UInt4 as u32),
+                data_type::UINT6 => Some(blob::BlobDataType::UInt6 as u32),
                 _ => None,
             };
             reference.file_name == "@model_path/weights/weight.bin"
@@ -110,9 +120,9 @@ fn literal(value: &proto::Value, weights: &[u8]) -> Result<()> {
                 && reference.offset.is_multiple_of(64)
                 && weights.get(4..8) == Some(2u32.to_le_bytes().as_slice())
                 && blob::read(weights, reference.offset)
-                    .zip(expected)
-                    .is_some_and(|((dtype, bytes), (wanted, width))| {
-                        dtype == wanted && byte_count(width) == Some(bytes.len())
+                    .zip(wanted)
+                    .is_some_and(|((dtype, bytes), wanted)| {
+                        dtype == wanted && expected_bytes == Some(bytes.len())
                     })
         }
         None => false,
@@ -417,6 +427,33 @@ mod tests {
         builder.finish(&[&output, &gate, &up]).unwrap()
     }
 
+    /// The same graph with the gate/up/down weight written as an 8-index
+    /// `constexpr_lut_to_dense` palette, i.e. the weight form
+    /// `Mlp::program` emits for `APXINF_CLEF_ANE_FORMAT=lut6|lut4`.
+    fn lut_package(bits: u32) -> Package {
+        let mut builder = ProgramBuilder::new();
+        let input = builder.input("x", &[1, 8, 1, 16]);
+        let entries = 1usize << bits;
+        let indices = vec![0u8; 8];
+        let palette = vec![f16::ONE; entries];
+        let weight = builder
+            .constexpr_lut_to_dense(&indices, &[1, 8, 1, 1], &palette, 1, bits)
+            .unwrap();
+        let convolution = builder.conv(&input, &weight).unwrap();
+        let activation = builder.tanh(&convolution);
+        let gate = builder.identity(&activation, Some("gate_scale"));
+        let magnitude = builder.abs(&convolution);
+        let up = builder.identity(&magnitude, Some("up_scale"));
+        let maximum = builder.reduce_max(&input, &[1], true).unwrap();
+        let scaled = builder
+            .mul(&input, apxinf_coreml::Operand::Var(&gate), None)
+            .unwrap();
+        let output = builder
+            .mul(&scaled, apxinf_coreml::Operand::Var(&maximum), Some("y"))
+            .unwrap();
+        builder.finish(&[&output, &gate, &up]).unwrap()
+    }
+
     fn device(kind: ComputeDeviceKind) -> ComputeDevice {
         ComputeDevice {
             kind,
@@ -651,6 +688,85 @@ mod tests {
                 literal(&value, &weights).is_err(),
                 "literal variant {variant}"
             );
+        }
+    }
+
+    fn immediate_uint_literal(dtype: i32, bytes: usize) -> proto::Value {
+        let dimensions = [1u64, 8, 1, 1]
+            .into_iter()
+            .map(|size| proto::Dimension {
+                constant: Some(proto::ConstantDimension { size }),
+            })
+            .collect();
+        proto::Value {
+            doc_string: String::new(),
+            r#type: Some(proto::ValueType {
+                tensor_type: Some(proto::TensorType {
+                    data_type: dtype,
+                    rank: 4,
+                    dimensions,
+                }),
+            }),
+            value: Some(value::Value::ImmediateValue(proto::ImmediateValue {
+                tensor: Some(proto::TensorValue {
+                    value: Some(tensor_value::Value::Bytes(proto::RepeatedBytes {
+                        values: vec![0; bytes],
+                    })),
+                }),
+            })),
+        }
+    }
+
+    #[test]
+    fn lut4_and_lut6_gate_accepts_exact_packed_palettes_and_rejects_short_blobs() {
+        for bits in [4u32, 6] {
+            let package = lut_package(bits);
+            Admission::new(&package, [1, 8, 1, 16]).unwrap();
+            let offset = {
+                let operations = &package.model.ml_program.as_ref().unwrap().functions["main"]
+                    .block_specializations["CoreML8"]
+                    .operations;
+                let palette = operations
+                    .iter()
+                    .find(|operation| operation.r#type == "constexpr_lut_to_dense")
+                    .unwrap()
+                    .inputs["indices"]
+                    .arguments[0]
+                    .binding
+                    .as_ref()
+                    .unwrap();
+                let binding::Binding::Value(value) = palette else {
+                    panic!("the lut palette must be a literal")
+                };
+                let Some(value::Value::BlobFileValue(reference)) = &value.value else {
+                    panic!("the lut palette must be a blob")
+                };
+                reference.offset as usize
+            };
+            // Eight indices pack into `bits` whole bytes; record one byte less.
+            let exact = bits as usize;
+            let mut truncated = package;
+            truncated.weights[offset + 8..offset + 16]
+                .copy_from_slice(&(exact as u64 - 1).to_le_bytes());
+            let error = Admission::new(&truncated, [1, 8, 1, 16])
+                .err()
+                .expect("a truncated palette must be rejected")
+                .to_string();
+            assert!(error.contains("literal payload"), "bits {bits}: {error}");
+        }
+    }
+
+    #[test]
+    fn uint4_and_uint6_immediate_literals_require_the_packed_extent() {
+        // Eight 4-/6-bit indices pack into 4/6 bytes, not one byte per element.
+        for (dtype, exact) in [(data_type::UINT4, 4usize), (data_type::UINT6, 6)] {
+            literal(&immediate_uint_literal(dtype, exact), &[]).unwrap();
+            for wrong in [0, exact - 1, exact + 1] {
+                assert!(
+                    literal(&immediate_uint_literal(dtype, wrong), &[]).is_err(),
+                    "dtype {dtype}: {wrong} bytes"
+                );
+            }
         }
     }
 
