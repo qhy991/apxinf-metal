@@ -3,6 +3,34 @@ use apxinf_coreml::proto::{self, binding, data_type, tensor_value, value};
 use apxinf_coreml::{blob, ComputeDeviceKind, ComputeUnits, ExpectedPlacement, Package};
 use std::collections::BTreeSet;
 
+/// A weight-materialization operation: exactly the named operands, each one
+/// literal blob of an allowed dtype, and one output.
+fn static_weights(operation: &proto::Operation, operands: &[(&str, &[i32])]) -> Result<()> {
+    check(
+        operation.inputs.len() == operands.len() && operation.outputs.len() == 1,
+        "unexpected static weight operands",
+    )?;
+    for (name, dtypes) in operands {
+        let argument = operation
+            .inputs
+            .get(*name)
+            .ok_or(Error::Contract("Clef weight operand is absent"))?;
+        check(
+            argument.arguments.len() == 1,
+            "ambiguous static weight operand",
+        )?;
+        let Some(binding::Binding::Value(value)) = &argument.arguments[0].binding else {
+            return Err(Error::Contract("Clef static weights must be literal blobs"));
+        };
+        check(
+            matches!(value.value, Some(value::Value::BlobFileValue(_)))
+                && dtypes.contains(&tensor(value.r#type.as_ref().unwrap())?.data_type),
+            "static weight dtype or storage mismatch",
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum RowKind {
     Literal,
@@ -254,32 +282,26 @@ impl<'a> Admission<'a> {
                     RowKind::Literal
                 }
                 "constexpr_blockwise_shift_scale" => {
-                    check(
-                        operation.inputs.len() == 2 && operation.outputs.len() == 1,
-                        "unexpected static weight operands",
+                    static_weights(
+                        operation,
+                        &[
+                            ("data", &[data_type::INT8]),
+                            ("scale", &[data_type::FLOAT16]),
+                        ],
                     )?;
-                    for (name, dtype) in [("data", data_type::INT8), ("scale", data_type::FLOAT16)]
-                    {
-                        let argument = operation
-                            .inputs
-                            .get(name)
-                            .ok_or(Error::Contract("Clef weight operand is absent"))?;
-                        check(
-                            argument.arguments.len() == 1,
-                            "ambiguous static weight operand",
-                        )?;
-                        let Some(binding::Binding::Value(value)) = &argument.arguments[0].binding
-                        else {
-                            return Err(Error::Contract(
-                                "Clef static weights must be literal blobs",
-                            ));
-                        };
-                        check(
-                            matches!(value.value, Some(value::Value::BlobFileValue(_)))
-                                && tensor(value.r#type.as_ref().unwrap())?.data_type == dtype,
-                            "static weight dtype or storage mismatch",
-                        )?;
-                    }
+                    RowKind::WeightMaterialization
+                }
+                // `APXINF_CLEF_ANE_FORMAT=lut6|lut4`: Core ML folds the palette
+                // into the weights at compile time, so like the blockwise form
+                // it has no runtime placement (`usage` is `None`).
+                "constexpr_lut_to_dense" => {
+                    static_weights(
+                        operation,
+                        &[
+                            ("indices", &[data_type::UINT4, data_type::UINT6]),
+                            ("lut", &[data_type::FLOAT16]),
+                        ],
+                    )?;
                     RowKind::WeightMaterialization
                 }
                 _ => RowKind::Runtime,
@@ -505,7 +527,9 @@ mod tests {
                 child_operation_counts: vec![],
                 usage: if matches!(
                     operation.r#type.as_str(),
-                    "const" | "constexpr_blockwise_shift_scale"
+                    // Core ML reports no placement for weight materialization
+                    // (`native_lut_weights_have_no_placement_and_pass_admission`).
+                    "const" | "constexpr_blockwise_shift_scale" | "constexpr_lut_to_dense"
                 ) {
                     None
                 } else {
@@ -721,7 +745,10 @@ mod tests {
     fn lut4_and_lut6_gate_accepts_exact_packed_palettes_and_rejects_short_blobs() {
         for bits in [4u32, 6] {
             let package = lut_package(bits);
-            Admission::new(&package, [1, 8, 1, 16]).unwrap();
+            Admission::new(&package, [1, 8, 1, 16])
+                .unwrap()
+                .check(&facts(&package))
+                .unwrap();
             let offset = {
                 let operations = &package.model.ml_program.as_ref().unwrap().functions["main"]
                     .block_specializations["CoreML8"]
@@ -861,6 +888,62 @@ mod tests {
                 "source variant {variant}"
             );
         }
+    }
+
+    /// The load failure this guards against: `constexpr_lut_to_dense` was
+    /// classified as a runtime operation, Core ML reports no `usage` for it,
+    /// and every lut6 Clef layer died with `Clef runtime placement is unknown`.
+    /// This 8-channel fixture is CPU-preferred, so admission may still refuse
+    /// a later runtime row; it must never refuse the lut row.
+    #[test]
+    #[ignore = "requires native Core ML metadata"]
+    fn native_lut_weights_have_no_placement_and_pass_admission() -> Result<()> {
+        for bits in [4u32, 6] {
+            let package = lut_package(bits);
+            let admission = Admission::new(&package, [1, 8, 1, 16])?;
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../devlocal/clef-coreml-admission-tests")
+                .join(format!("lut{bits}-{}-{nonce}", std::process::id()));
+            let cache = apxinf_coreml::ProgramCache::new(&root);
+            let lut_usage = std::cell::Cell::new(None);
+            let result = cache.load_with_placement(
+                &package,
+                ComputeUnits::CpuAndNeuralEngine,
+                std::time::Duration::from_secs(60),
+                |facts| {
+                    lut_usage.set(Some(
+                        facts
+                            .functions
+                            .iter()
+                            .flat_map(|function| &function.operations)
+                            .filter(|operation| {
+                                operation.operator.ends_with("constexpr_lut_to_dense")
+                            })
+                            .map(|operation| operation.usage.is_some())
+                            .collect::<Vec<_>>(),
+                    ));
+                    admission.check(facts)
+                },
+            );
+            std::fs::remove_dir_all(root)?;
+            assert_eq!(
+                lut_usage.take(),
+                Some(vec![false]),
+                "lut{bits} placement facts"
+            );
+            if let Err(error) = result {
+                let error = error.to_string();
+                assert!(
+                    !error.contains("placement is unknown"),
+                    "lut{bits} admission refused the lut row: {error}"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
