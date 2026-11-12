@@ -12,6 +12,10 @@ const SENTINEL: u32 = 0xDEAD_BEEF;
 pub enum BlobDataType {
     Float16 = 1,
     Int8 = 4,
+    /// Packed 4-bit indices, two per byte, low nibble first.
+    UInt4 = 11,
+    /// Packed 6-bit indices, four per three bytes, least-significant first.
+    UInt6 = 13,
 }
 
 #[derive(Default)]
