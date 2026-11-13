@@ -92,3 +92,22 @@ numbers are good to about ±30 %; paired deltas taken in the same window are sti
 the paired-arm discipline matters more than the absolute reading. Laptop measurements taken with a
 logged-in desktop are not comparable to ones taken on a headless or locked machine, and no amount of
 repeating the same arm fixes that.
+
+## Check whether the lever was already taken (Clef, 2026-11-13)
+
+Before porting W8 to another model, read its projection code. Clef had already spent this lever:
+
+- the backbone is an affine **Q4 group-64** checkpoint (`weights.rs`: `Q4 { weight, scales, biases }`);
+- its GPU path calls `quantized_matmul` **directly on those arrays** (`metal_clef/model.rs`), so there is
+  no dequantize-then-matmul copy to remove;
+- its ANE path re-encodes to **int8 per row** (`metal_clef/ane.rs::int8_per_row`), which is the
+  output-axis grouping the Neural Engine accepts — the same rule the ANE weight-format work established.
+
+So "port W8 to Clef" has nothing to port: a W8 copy would *increase* bytes over the Q4 checkpoint it
+already holds. The lesson generalises to the rest of the porting checklist: **the first question is not
+"will this optimisation help here" but "is it already here"**, and the answer is in the projection code,
+not in a benchmark.
+
+The other side of the same coin: MiniCPM5-2B was the *opposite* case — no quantized variant at all — and
+it still did not pay, because its shapes broke the bandwidth precondition. Both directions are recorded
+so the next port starts from the code and the gate rather than from the model's pedigree.
