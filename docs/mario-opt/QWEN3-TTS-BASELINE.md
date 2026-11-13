@@ -201,3 +201,38 @@ that the predictor lane is semantically safe to default.
 The bytes arithmetic that predicts this is in the previous section: the predictor re-reads 2.04 GB per
 frame (15 sequential group passes) and the talker ~3.4 GB (its 1.7B weights), so both respond to
 halving the bytes, and the measured 0.64 RTF combined is close to what the totals allow.
+
+## ASR gate: the W8 lanes are semantically clean (2026-11-13)
+
+The gate the earlier sections said was missing has now been run, with whisper.cpp (`ggml-small`,
+Chinese/English per sample) on the synthesized WAVs. Metric is character error rate against the input
+text, lower is better.
+
+**Ten texts (five zh, five en) x three arms:**
+
+| arm | mean CER | median CER |
+|---|---:|---:|
+| BF16 | 0.132 | 0.050 |
+| W8 predictor | 0.122 | 0.000 |
+| **W8 both** | **0.092** | 0.000 |
+
+**Three voices (`serena`, `ryan`, `aiden`) on one sentence, BF16 vs W8-both: CER 0.000 in every cell** —
+both arms transcribe back to the input text exactly.
+
+So the quantization does **not** degrade intelligibility; if anything the W8 arms scored marginally
+better, which is sampling noise, not an improvement. The earlier per-code agreement of 7–10 % was a red
+herring: different codec codes produced *different but equally intelligible* speech.
+
+**Why it is still not the default.** Quantizing 231 projections (35 predictor + 196 talker) at load costs
+seconds — a one-shot CLI invocation goes from ~6 s to ~17 s and up on a loaded host. That is a real
+regression for the CLI shape and the right answer is not a default flip but one of:
+
+1. pre-quantize once and cache the copies as an artifact next to the checkpoint, or
+2. enable by default only in the resident/server shape where the cost is paid once.
+
+Until then `APXINF_TTS_W8_PREDICTOR=1 APXINF_TTS_W8_TALKER=1` stays the explicit opt-in, and the speed it
+buys remains what was measured: **RTF 0.90 → 0.77 (predictor) and → 0.64 (both)**.
+
+Note on measurement hygiene: the load-time comparison above was taken while another measurement campaign
+held the machine, so its absolute seconds are indicative only; the direction (seconds of one-time load
+cost) is what matters and is structural, not noise.

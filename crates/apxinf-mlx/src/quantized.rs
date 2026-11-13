@@ -20,9 +20,6 @@ impl Quantized {
     pub fn new(hf_weight: &Array, bits: i32) -> Result<Self> {
         let shape = hf_weight.shape().to_vec();
         let [packed, scales, biases] = hf_weight.quantize(GROUP, bits)?;
-        hf_weight
-            .stream()
-            .eval(&[packed.clone(), scales.clone(), biases.clone()])?;
         Ok(Self {
             packed,
             scales,
