@@ -132,9 +132,16 @@ pub fn load(
     // `APXINF_TTS_W8_PREDICTOR=1` (or 4/6/8 for the width) gives the code
     // predictor's five layers quantized decode copies: it re-reads its 136 MB of
     // weights once per codebook group, 15 times per frame.
-    if let Ok(value) = std::env::var("APXINF_TTS_W8_PREDICTOR") {
-        if value != "0" {
-            let bits = value.parse::<i32>().ok().filter(|b| matches!(b, 4 | 6 | 8)).unwrap_or(8);
+    // Opt-in: the decode copies are semantically clean (see the ASR gate in
+    // docs/mario-opt/QWEN3-TTS-BASELINE.md) but quantizing 231 projections at
+    // load costs seconds, which a one-shot CLI would feel on every invocation.
+    if std::env::var("APXINF_TTS_W8_PREDICTOR").map_or(false, |value| value != "0") {
+        {
+            let bits = std::env::var("APXINF_TTS_W8_PREDICTOR")
+                .ok()
+                .and_then(|value| value.parse::<i32>().ok())
+                .filter(|b| matches!(b, 4 | 6 | 8))
+                .unwrap_or(8);
             let mut count = 0usize;
             for layer in predictor.layers.iter_mut() {
                 for linear in [
@@ -153,11 +160,18 @@ pub fn load(
             eprintln!("Qwen3-TTS: W{bits} decode copies on {count} predictor projections");
         }
     }
-    // Same treatment for the 1.7B talker (`APXINF_TTS_W8_TALKER=1`): it reads
-    // ~3.4 GB per frame, so the bytes lever applies there too.
-    if let Ok(value) = std::env::var("APXINF_TTS_W8_TALKER") {
-        if value != "0" {
-            let bits = value.parse::<i32>().ok().filter(|b| matches!(b, 4 | 6 | 8)).unwrap_or(8);
+    // Same treatment for the 1.7B talker: it reads ~3.4 GB per frame, so the
+    // bytes lever applies there too.
+    // Opt-in: the decode copies are semantically clean (see the ASR gate in
+    // docs/mario-opt/QWEN3-TTS-BASELINE.md) but quantizing 231 projections at
+    // load costs seconds, which a one-shot CLI would feel on every invocation.
+    if std::env::var("APXINF_TTS_W8_TALKER").map_or(false, |value| value != "0") {
+        {
+            let bits = std::env::var("APXINF_TTS_W8_TALKER")
+                .ok()
+                .and_then(|value| value.parse::<i32>().ok())
+                .filter(|b| matches!(b, 4 | 6 | 8))
+                .unwrap_or(8);
             let mut count = 0usize;
             for layer in talker.layers.iter_mut() {
                 for linear in [
@@ -175,6 +189,29 @@ pub fn load(
             }
             eprintln!("Qwen3-TTS: W{bits} decode copies on {count} talker projections");
         }
+    }
+    // One evaluation for every decode copy: quantizing a matrix is lazy, and
+    // evaluating each projection on its own made loading cost tens of seconds.
+    let copies: Vec<apxinf_mlx::Array> = predictor
+        .layers
+        .iter()
+        .flat_map(|layer| {
+            [
+                &layer.attention.q, &layer.attention.k, &layer.attention.v, &layer.attention.o,
+                &layer.mlp.gate, &layer.mlp.up, &layer.mlp.down,
+            ]
+        })
+        .chain(talker.layers.iter().flat_map(|layer| {
+            [
+                &layer.attention.q, &layer.attention.k, &layer.attention.v, &layer.attention.o,
+                &layer.mlp.gate, &layer.mlp.up, &layer.mlp.down,
+            ]
+        }))
+        .filter_map(|linear| linear.w8.as_ref())
+        .flat_map(|copy| copy.arrays())
+        .collect();
+    if !copies.is_empty() {
+        stream.eval(&copies)?;
     }
     let model = Model::new(talker, predictor, &ops, fused)?;
     let decoder = codec::Decoder::new(weights::Codec::load(&stream, path)?, &ops)?;
