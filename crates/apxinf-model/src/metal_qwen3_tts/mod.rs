@@ -132,10 +132,10 @@ pub fn load(
     // `APXINF_TTS_W8_PREDICTOR=1` (or 4/6/8 for the width) gives the code
     // predictor's five layers quantized decode copies: it re-reads its 136 MB of
     // weights once per codebook group, 15 times per frame.
-    // Opt-in: the decode copies are semantically clean (see the ASR gate in
-    // docs/mario-opt/QWEN3-TTS-BASELINE.md) but quantizing 231 projections at
-    // load costs seconds, which a one-shot CLI would feel on every invocation.
-    if std::env::var("APXINF_TTS_W8_PREDICTOR").map_or(false, |value| value != "0") {
+    // On by default: the ASR gate found no intelligibility loss (CER 0.122 vs 0.132 BF16) and the
+    // audio keeps its duration; 35 projections also cost far less to quantize than the talker's 196.
+    // `APXINF_TTS_W8_PREDICTOR=0` restores BF16.
+    if std::env::var("APXINF_TTS_W8_PREDICTOR").map_or(true, |value| value != "0") {
         {
             let bits = std::env::var("APXINF_TTS_W8_PREDICTOR")
                 .ok()
