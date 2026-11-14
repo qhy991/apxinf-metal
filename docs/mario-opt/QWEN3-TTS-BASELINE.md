@@ -236,3 +236,25 @@ buys remains what was measured: **RTF 0.90 → 0.77 (predictor) and → 0.64 (bo
 Note on measurement hygiene: the load-time comparison above was taken while another measurement campaign
 held the machine, so its absolute seconds are indicative only; the direction (seconds of one-time load
 cost) is what matters and is structural, not noise.
+
+## Predictor W8 is the default (2026-11-14)
+
+The ASR gate above cleared the predictor lane on both counts that mattered — no intelligibility loss
+(CER 0.122 vs 0.132 for BF16) and unchanged audio duration — so it is now on by default with
+`APXINF_TTS_W8_PREDICTOR=0` as the opt-out. The talker lane stays opt-in.
+
+**The load-cost objection from the previous section did not survive a quiet host.** The 17 s figure was
+taken while another campaign held the machine; paired on an idle machine, load+run totals were 4.07–5.37 s
+for BF16 against 4.64–4.90 s for both lanes, and the run phase is consistently faster. The predictor
+quantizes 35 projections rather than 231, so its share of the load cost is a fraction of the talker's.
+
+Verified after the flip: `W8 decode copies on 35 predictor projections`, audio **3.12 s** (unchanged),
+RTF **0.774** against BF16's 1.081 in the same window.
+
+| lane | default | opt-out | measured |
+|---|---|---|---|
+| code predictor (35 projections) | **W8 on** | `APXINF_TTS_W8_PREDICTOR=0` | RTF 0.774 vs 1.081 paired |
+| talker (196 projections) | BF16 | `APXINF_TTS_W8_TALKER=1` | RTF 0.64 with both lanes |
+
+The talker lane waits on a cached pre-quantized artifact: its quantization cost is paid on every one-shot
+CLI invocation while its benefit accrues per frame.
