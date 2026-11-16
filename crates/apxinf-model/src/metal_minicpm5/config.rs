@@ -93,6 +93,191 @@ impl AneMlpPlan {
     }
 }
 
+/// `APXINF_MINICPM5_ANE_OVERLAP`: run the reference two-chunk wavefront
+/// prefill instead of the serial one when `APXINF_MINICPM5_ANE_MLP` selects
+/// layers. Only `1` enables it; unset, `0` and every other value keep the
+/// qualified serial schedule, like `APXINF_MINICPM5_EXACT_ATTN`.
+#[cfg(feature = "coreml")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OverlapKnob {
+    On,
+    Off,
+}
+
+#[cfg(feature = "coreml")]
+impl OverlapKnob {
+    pub(super) const ENV: &'static str = "APXINF_MINICPM5_ANE_OVERLAP";
+
+    pub(super) fn from_override(value: Option<&std::ffi::OsStr>) -> Self {
+        match value {
+            Some(value) if value == "1" => Self::On,
+            _ => Self::Off,
+        }
+    }
+
+    pub(super) fn from_env() -> Self {
+        Self::from_override(std::env::var_os(Self::ENV).as_deref())
+    }
+
+    pub(super) fn is_on(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+/// The token chunk a wavefront step is working on: `First` is `c0` (the first
+/// half of the prefill tokens), `Second` is `c1`.
+#[cfg(feature = "coreml")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum WavefrontSegment {
+    First,
+    Second,
+}
+
+/// One step of the K=2 wavefront: a GPU attention leg and the MLP leg issued
+/// while it retires. Exactly one leg is always the `First` chunk and the other
+/// the `Second`, so a step never has an intra-chunk dependency between its two
+/// legs.
+#[cfg(feature = "coreml")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WavefrontStep {
+    /// Attention to build and submit on the GPU for this step, if any.
+    pub(super) attention: Option<(WavefrontSegment, usize)>,
+    /// MLP to issue (Neural Engine program or GPU) while that attention runs.
+    pub(super) mlp: Option<(WavefrontSegment, usize)>,
+}
+
+/// Why a request cannot use the two-chunk wavefront and must keep the serial
+/// schedule. Recorded so a fallback is explicit rather than a mixed schedule.
+#[cfg(feature = "coreml")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SerialReason {
+    /// `APXINF_MINICPM5_ANE_OVERLAP` is not `1`.
+    KnobOff,
+    /// The variant's prefill is not the qualified compiled-chunk one.
+    Variant(Variant),
+    /// `APXINF_MINICPM5_ANE_MLP` selected no layer.
+    NoAneLayers,
+    /// The prompt spans more than one prefill chunk.
+    MultipleChunks,
+    /// Fewer than two prompt tokens: there is no second chunk.
+    TooShort,
+}
+
+#[cfg(feature = "coreml")]
+impl SerialReason {
+    pub(super) fn describe(self) -> &'static str {
+        match self {
+            Self::KnobOff => "overlap knob off",
+            Self::Variant(Variant::Public) => "bf16-public variant",
+            Self::Variant(Variant::DSpark) => "dspark variant",
+            Self::Variant(Variant::Compiled) => "non-compiled variant",
+            Self::NoAneLayers => "no Neural Engine MLP layer selected",
+            Self::MultipleChunks => "prompt spans more than one prefill chunk",
+            Self::TooShort => "prompt is shorter than two chunks",
+        }
+    }
+}
+
+/// The two token chunks of the reference's K=2 wavefront prefill: `c0` is the
+/// first half of the prefill tokens, `c1` the second half.
+#[cfg(feature = "coreml")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WavefrontPlan {
+    pub(super) half0: usize,
+    pub(super) half1: usize,
+}
+
+#[cfg(feature = "coreml")]
+impl WavefrontPlan {
+    /// Admits the wavefront for one prepared prefill request, or names the
+    /// reason the serial schedule must be kept.
+    ///
+    /// `chunk` is the request's only prefill chunk; `None` means the prompt is
+    /// split across several chunks, where two half-prompt chunks would be
+    /// larger than the chunked schedule ever builds and the reference's
+    /// two-chunk shape would no longer hold.
+    pub(super) fn for_request(
+        overlap: bool,
+        variant: Variant,
+        ane_layers: usize,
+        chunk: Option<std::ops::Range<usize>>,
+    ) -> std::result::Result<Self, SerialReason> {
+        if !overlap {
+            return Err(SerialReason::KnobOff);
+        }
+        if variant != Variant::Compiled {
+            return Err(SerialReason::Variant(variant));
+        }
+        if ane_layers == 0 {
+            return Err(SerialReason::NoAneLayers);
+        }
+        let Some(chunk) = chunk else {
+            return Err(SerialReason::MultipleChunks);
+        };
+        let tokens = chunk.len();
+        if tokens < 2 {
+            return Err(SerialReason::TooShort);
+        }
+        Ok(Self {
+            half0: tokens / 2,
+            half1: tokens - tokens / 2,
+        })
+    }
+
+    pub(super) fn tokens(self) -> usize {
+        self.half0 + self.half1
+    }
+
+    /// The reference's layer walk (`wavefront.py:528-604`) over `layers`
+    /// layers, as an explicit step list.
+    ///
+    /// A sequential prefill gives layer `L`'s cache the rows `c0` then `c1`, so
+    /// the `First` attention of a layer always precedes its `Second` attention
+    /// here. Each step overlaps a `First` leg with a `Second` leg, so the GPU
+    /// attention of one chunk retires under the Neural Engine MLP of the other
+    /// and both streams always have a ready input.
+    ///
+    /// `c0`'s MLP of the last layer is not scheduled: no output consumes it,
+    /// so issuing it would only add one exposed prediction. That is the
+    /// reference's measured 83-predict count (2 per layer for `c1`, 1 fewer for
+    /// `c0`), not its nominal 84.
+    pub(super) fn steps(self, layers: usize) -> Vec<WavefrontStep> {
+        if layers == 0 {
+            return Vec::new();
+        }
+        let mut steps = Vec::with_capacity(2 * layers + 1);
+        // Prologue: the first chunk's attention at layer 0, whose output is the
+        // first Neural Engine MLP input.
+        steps.push(WavefrontStep {
+            attention: Some((WavefrontSegment::First, 0)),
+            mlp: None,
+        });
+        for layer in 0..layers {
+            // The second chunk's attention at this layer, under the first
+            // chunk's MLP of the same layer.
+            steps.push(WavefrontStep {
+                attention: Some((WavefrontSegment::Second, layer)),
+                mlp: (layer + 1 < layers).then_some((WavefrontSegment::First, layer)),
+            });
+            // The first chunk's attention at the next layer, under the second
+            // chunk's MLP of this layer.
+            if layer + 1 < layers {
+                steps.push(WavefrontStep {
+                    attention: Some((WavefrontSegment::First, layer + 1)),
+                    mlp: Some((WavefrontSegment::Second, layer)),
+                });
+            }
+        }
+        // The last layer's remaining MLP, which has no other chunk's attention
+        // left to hide under.
+        steps.push(WavefrontStep {
+            attention: None,
+            mlp: Some((WavefrontSegment::Second, layers - 1)),
+        });
+        steps
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct PrefillPlan {
     pub(super) prompt: usize,
@@ -360,5 +545,176 @@ mod tests {
         assert_eq!(attention_width(Variant::Compiled, 65536, 65792), 65536);
         assert_eq!(attention_width(Variant::Compiled, 65537, 65792), 65792);
         assert_eq!(attention_width(Variant::DSpark, 1, 4096), 4096);
+    }
+
+    #[cfg(feature = "coreml")]
+    #[test]
+    fn overlap_knob_is_strictly_one() {
+        use std::ffi::OsStr;
+        let on = |value: Option<&OsStr>| OverlapKnob::from_override(value).is_on();
+        assert!(on(Some(OsStr::new("1"))));
+        assert!(!on(None));
+        for value in ["0", "", "true", "on", "01", "2", " 1"] {
+            assert!(!on(Some(OsStr::new(value))), "{value:?} must not enable overlap");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(!on(Some(OsStr::from_bytes(&[0xff]))));
+        }
+    }
+
+    #[cfg(feature = "coreml")]
+    #[test]
+    fn wavefront_admits_only_single_compiled_chunk_with_ane_layers() {
+        use SerialReason::{MultipleChunks, NoAneLayers, TooShort};
+        let split = |overlap, variant, ane_layers, chunk| {
+            WavefrontPlan::for_request(overlap, variant, ane_layers, chunk)
+        };
+        let prompt = || Some(0..2048usize);
+        assert_eq!(
+            split(false, Variant::Compiled, 4, prompt()),
+            Err(SerialReason::KnobOff)
+        );
+        assert_eq!(
+            split(true, Variant::DSpark, 4, prompt()),
+            Err(SerialReason::Variant(Variant::DSpark))
+        );
+        assert_eq!(
+            split(true, Variant::Public, 4, prompt()),
+            Err(SerialReason::Variant(Variant::Public))
+        );
+        assert_eq!(split(true, Variant::Compiled, 0, prompt()), Err(NoAneLayers));
+        assert_eq!(
+            split(true, Variant::Compiled, 4, None),
+            Err(MultipleChunks)
+        );
+        for tokens in [0usize, 1] {
+            assert_eq!(
+                split(true, Variant::Compiled, 4, Some(0..tokens)),
+                Err(TooShort)
+            );
+        }
+        // The measured 2048-token prompt: the reference's own 1024/1024 split.
+        assert_eq!(
+            split(true, Variant::Compiled, 4, prompt()),
+            Ok(WavefrontPlan {
+                half0: 1024,
+                half1: 1024
+            })
+        );
+        // Every admitted split covers the chunk exactly with two nonempty
+        // halves, so no token is dropped or prefilled twice.
+        for tokens in 2..=4096usize {
+            let plan = split(true, Variant::Compiled, 4, Some(0..tokens)).unwrap();
+            assert!(plan.half0 >= 1 && plan.half1 >= 1, "{tokens} tokens");
+            assert_eq!(plan.tokens(), tokens);
+            assert!(plan.half1 >= plan.half0);
+            assert!(plan.half1 - plan.half0 <= 1);
+        }
+    }
+
+    #[cfg(feature = "coreml")]
+    #[test]
+    fn wavefront_schedule_mirrors_the_reference_layer_walk() {
+        use WavefrontSegment::{First, Second};
+        let plan = WavefrontPlan {
+            half0: 1024,
+            half1: 1024,
+        };
+        // spec-et.md §1: prologue `c0` attention; per layer `c1` attention
+        // under `c0`'s MLP, then the next layer's `c0` attention under `c1`'s
+        // MLP; the last layer keeps one exposed `c1` MLP.
+        let step = |attention, mlp| WavefrontStep { attention, mlp };
+        assert_eq!(
+            plan.steps(3),
+            vec![
+                step(Some((First, 0)), None),
+                step(Some((Second, 0)), Some((First, 0))),
+                step(Some((First, 1)), Some((Second, 0))),
+                step(Some((Second, 1)), Some((First, 1))),
+                step(Some((First, 2)), Some((Second, 1))),
+                step(Some((Second, 2)), None),
+                step(None, Some((Second, 2))),
+            ]
+        );
+    }
+
+    #[cfg(feature = "coreml")]
+    #[test]
+    fn wavefront_schedule_keeps_every_layer_cache_sequential() {
+        use WavefrontSegment::{First, Second};
+        let plan = WavefrontPlan {
+            half0: 1024,
+            half1: 1024,
+        };
+        let layers = 42;
+        let steps = plan.steps(layers);
+        assert_eq!(steps.len(), 2 * layers + 1);
+        for layer in 0..layers {
+            let first = steps
+                .iter()
+                .position(|s| s.attention == Some((First, layer)))
+                .unwrap_or_else(|| panic!("no first-chunk attention at layer {layer}"));
+            let second = steps
+                .iter()
+                .position(|s| s.attention == Some((Second, layer)))
+                .unwrap_or_else(|| panic!("no second-chunk attention at layer {layer}"));
+            assert!(
+                first < second,
+                "layer {layer} must write its first-chunk KV rows before its second-chunk rows"
+            );
+            // Both attention legs must be issued before either chunk's MLP of
+            // the next layer can run, and each layer has exactly one of each.
+            assert_eq!(
+                steps
+                    .iter()
+                    .filter(|s| s.attention == Some((First, layer)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                steps
+                    .iter()
+                    .filter(|s| s.attention == Some((Second, layer)))
+                    .count(),
+                1
+            );
+        }
+        // The MLP of a chunk at layer L is issued after that chunk's own
+        // attention at L, so its input always exists.
+        let mut issued = Vec::new();
+        for (index, step) in steps.iter().enumerate() {
+            if let Some((segment, layer)) = step.mlp {
+                issued.push((segment, layer));
+                let attention = steps[..index]
+                    .iter()
+                    .position(|s| s.attention == Some((segment, layer)))
+                    .unwrap_or_else(|| {
+                        panic!("{segment:?} MLP at layer {layer} runs before its attention")
+                    });
+                assert!(attention < index);
+            }
+        }
+        issued.sort();
+        assert_eq!(issued.len(), 2 * layers - 1);
+        let mut expected: Vec<(WavefrontSegment, usize)> = (0..layers)
+            .map(|layer| (Second, layer))
+            .chain((0..layers - 1).map(|layer| (First, layer)))
+            .collect();
+        expected.sort();
+        assert_eq!(issued, expected);
+        // Every step except the last issues its MLP under the other chunk's
+        // attention, which is the overlap the reference claims.
+        for step in &steps {
+            if let (Some((attention, _)), Some((mlp, _))) = (step.attention, step.mlp) {
+                assert_ne!(attention, mlp, "a step cannot overlap a chunk with itself");
+            }
+        }
+        // The prediction count: two legs per layer minus the dead last-layer
+        // first-chunk MLP.
+        let predicts = steps.iter().filter(|s| s.mlp.is_some()).count();
+        assert_eq!(predicts, 2 * layers - 1);
+        assert_eq!(plan.steps(0), Vec::new());
     }
 }

@@ -31,8 +31,9 @@ from EngineTailor (MIT), Copyright 2026 Haiyan Qin.
 
 The MiniCPM5 ANE MLP prefill program (per-layer FP16 gate/up/SiLU/down Core ML
 program with row-max normalization, K-split down convolution and FP16 overflow
-bound) is adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin, source
-target 9ae7feda2c9c0d5e0d4c6b6f0c2a3b1b9f5e6d7a.
+bound) and its two-chunk GPU-attention/Neural-Engine-MLP overlap schedule are
+adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin, source target
+9ae7feda2c9c0d5e0d4c6b6f0c2a3b1b9f5e6d7a.
 
 The d3-lite GDN operand-chain fused preparation kernel (causal convolution,
 SiLU, q/k/v split and q/k l2norm in one launch) is adapted from EngineTailor

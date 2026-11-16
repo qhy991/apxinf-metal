@@ -5,6 +5,8 @@ use super::{
     math,
     weights::Weights,
 };
+#[cfg(feature = "coreml")]
+use super::config::{SerialReason, WavefrontPlan, WavefrontSegment};
 use crate::{
     GenerationBoundary, LlmInput, LlmTrait, TextCompilationScope, TextPreparationState, TextPreparationStatus,
 };
@@ -76,6 +78,89 @@ impl DecodeAttentionPolicy {
     }
 }
 
+#[cfg(all(test, feature = "coreml"))]
+mod wavefront_mask_tests {
+    use super::*;
+
+    /// Reads a `[1, 1, rows, read]` boolean mask on the CPU stream.
+    fn mask(stream: &apxinf_mlx::Stream, position: usize, rows: usize, read: usize) -> Vec<bool> {
+        let mask = segment_mask(stream, position, rows, read)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        mask.into_iter().map(|byte| byte != 0).collect()
+    }
+
+    #[test]
+    fn first_chunk_mask_is_causal_over_its_own_rows() {
+        let stream = apxinf_mlx::Stream::cpu().unwrap();
+        let (rows, read) = (5, 5);
+        let visible = mask(&stream, 0, rows, read);
+        for row in 0..rows {
+            for column in 0..read {
+                assert_eq!(
+                    visible[row * read + column],
+                    column <= row,
+                    "first chunk row {row} column {column}"
+                );
+            }
+        }
+    }
+
+    /// The property the whole schedule rests on: every second-chunk query sees
+    /// all first-chunk keys, plus its own causal prefix. If this mask were
+    /// causal over the full key window instead, the wavefront would silently
+    /// drop the first half of the prompt from the second half's attention.
+    #[test]
+    fn second_chunk_mask_sees_every_first_chunk_key() {
+        let stream = apxinf_mlx::Stream::cpu().unwrap();
+        let (half0, half1) = (4, 3);
+        let prompt = half0 + half1;
+        let visible = mask(&stream, half0, half1, prompt);
+        for row in 0..half1 {
+            let query = half0 + row;
+            for column in 0..prompt {
+                assert_eq!(
+                    visible[row * prompt + column],
+                    column <= query,
+                    "second chunk row {row} column {column}"
+                );
+            }
+            // The first chunk's rows are all strictly before this query.
+            assert!(visible[row * prompt..row * prompt + half0]
+                .iter()
+                .all(|&v| v));
+        }
+    }
+
+    /// The second chunk's first query can only read its own row, not the rest
+    /// of the second chunk, so no future token leaks in either.
+    #[test]
+    fn second_chunk_mask_hides_its_own_future_rows() {
+        let stream = apxinf_mlx::Stream::cpu().unwrap();
+        let (half0, half1) = (2, 6);
+        let prompt = half0 + half1;
+        let visible = mask(&stream, half0, half1, prompt);
+        for row in 0..half1 {
+            for column in half0..prompt {
+                assert_eq!(
+                    visible[row * prompt + column],
+                    column - half0 <= row,
+                    "second chunk local row {row} column {column}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mask_rejects_queries_outside_the_read_window() {
+        let stream = apxinf_mlx::Stream::cpu().unwrap();
+        assert!(segment_mask(&stream, 4, 3, 4).is_err());
+        assert!(segment_mask(&stream, 0, 0, 4).is_err());
+        assert!(segment_mask(&stream, 0, 4, 4).is_ok());
+    }
+}
+
 #[cfg(test)]
 mod attention_policy_tests {
     use super::*;
@@ -125,6 +210,10 @@ struct PreparedRequest {
     output: usize,
     attention: DecodeAttention,
     positions: HashMap<usize, Array>,
+    /// Two-chunk overlap schedule for this request, or `None` when the prepared
+    /// request must keep the serial prefill path.
+    #[cfg(feature = "coreml")]
+    wavefront: Option<WavefrontPlan>,
 }
 
 pub struct MiniCpm5 {
@@ -151,6 +240,10 @@ pub struct MiniCpm5 {
     /// Neural Engine. Empty unless `APXINF_MINICPM5_ANE_MLP` selects layers.
     #[cfg(feature = "coreml")]
     ane: Vec<Option<super::ane::AneMlp>>,
+    /// `APXINF_MINICPM5_ANE_OVERLAP`: run the two-chunk wavefront prefill on
+    /// requests that admit it instead of the serial chunked schedule.
+    #[cfg(feature = "coreml")]
+    overlap: bool,
 }
 
 /// Builds the per-layer Neural Engine programs named by
@@ -224,6 +317,38 @@ pub(super) fn ane_cache_dir() -> std::path::PathBuf {
         .join("Library/Caches/apxinf/coreml/minicpm5")
 }
 
+/// The explicit causal mask of one wavefront token chunk: query row `r` (at
+/// absolute position `position + r`) may read key rows `0..=position + r`, and
+/// the visible window is the first `read` rows of the layer's cache.
+///
+/// For the first chunk `read == rows`, so this is a plain causal mask. For the
+/// second chunk `read` is the whole prompt, so every one of its queries sees
+/// all first-chunk keys; that is what keeps the wavefront equal to a
+/// sequential prefill of `[c0 | c1]`.
+#[cfg(feature = "coreml")]
+fn segment_mask(
+    stream: &apxinf_mlx::Stream,
+    position: usize,
+    rows: usize,
+    read: usize,
+) -> Result<Array> {
+    if rows == 0 || read < position + rows {
+        return Err(Error::Contract(
+            "MiniCPM5 wavefront mask needs every query row inside the read window",
+        ));
+    }
+    let keys = Array::arange(stream, 0., read as f32, 1., MlxDType::I32)?.reshape(&[1, read])?;
+    let queries = Array::arange(
+        stream,
+        position as f32,
+        (position + rows) as f32,
+        1.,
+        MlxDType::I32,
+    )?
+    .reshape(&[rows, 1])?;
+    keys.less_equal(&queries)?.reshape(&[1, 1, rows, read])
+}
+
 impl MiniCpm5 {
     pub(crate) fn supports_dspark(&self) -> bool {
         self.variant == Variant::DSpark
@@ -248,6 +373,8 @@ impl MiniCpm5 {
         );
         #[cfg(feature = "coreml")]
         let ane = ane_programs(stream, &weights.layers)?;
+        #[cfg(feature = "coreml")]
+        let overlap = super::config::OverlapKnob::from_env().is_on();
         Ok(Self {
             backend,
             weights: Rc::new(weights),
@@ -270,6 +397,8 @@ impl MiniCpm5 {
             failure: None,
             #[cfg(feature = "coreml")]
             ane,
+            #[cfg(feature = "coreml")]
+            overlap,
         })
     }
 
@@ -294,9 +423,25 @@ impl MiniCpm5 {
     fn prepare_inner(&mut self, prompt: usize, output: usize) -> Result<()> {
         let capacity = self.config.request_capacity(self.variant, prompt, output)?;
         let attention = self.attention_policy.resolve(self.variant);
+        let prefill = PrefillPlan::new(
+            prompt,
+            self.prefill_chunk
+                .unwrap_or(if self.variant == Variant::Compiled {
+                    PrefillChunk::Tokens1024
+                } else {
+                    PrefillChunk::Tokens512
+                }),
+        )?;
+        #[cfg(feature = "coreml")]
+        let decision = self.wavefront_decision(prefill);
+        #[cfg(feature = "coreml")]
+        let wavefront = decision.ok();
         let same_profile = self.capacity == capacity
             && self.prepared.as_ref().is_some_and(|p| p.prefill.prompt == prompt && p.output == output && p.attention == attention)
             && self.failure.is_none();
+        #[cfg(feature = "coreml")]
+        let same_profile =
+            same_profile && self.prepared.as_ref().is_some_and(|p| p.wavefront == wavefront);
         if same_profile && !self.states.is_empty() { return Ok(()); }
         if self.offset != 0 { return Err(Error::Contract("reset before changing MiniCPM request preparation")); }
         let reuse_bucket = attention == DecodeAttention::Bucketed && self.capacity == capacity
@@ -331,17 +476,17 @@ impl MiniCpm5 {
             self.step = Some(self.compile_step(attention)?);
         }
         // Warm shape-dependent RoPE traces used by prefill. Norm and SwiGLU
-        // are shapeless; changed request values are never captured.
-        let prefill = PrefillPlan::new(
-            prompt,
-            self.prefill_chunk
-                .unwrap_or(if self.variant == Variant::Compiled {
-                    PrefillChunk::Tokens1024
-                } else {
-                    PrefillChunk::Tokens512
-                }),
-        )?;
-        let lengths = prefill.required_rows();
+        // are shapeless; changed request values are never captured. The
+        // wavefront prefill runs each token chunk through the same RoPE seam,
+        // so its two row counts are traced here as well.
+        #[cfg_attr(not(feature = "coreml"), allow(unused_mut))]
+        let mut lengths = prefill.required_rows();
+        #[cfg(feature = "coreml")]
+        if let Some(wavefront) = wavefront {
+            lengths.extend([wavefront.half0, wavefront.half1]);
+            lengths.sort_unstable();
+            lengths.dedup();
+        }
         for &rows in &lengths {
             if let Some(local) = &self.local {
                 let stream = self.backend.stream();
@@ -413,13 +558,49 @@ impl MiniCpm5 {
             }
         }
         self.failure = None;
+        // One line per published profile: the serving/measurement side has no
+        // other way to tell which prefill schedule this request will run, and a
+        // silent fallback would make an overlap measurement meaningless.
+        #[cfg(feature = "coreml")]
+        match decision {
+            Ok(plan) => eprintln!(
+                "apxinf: MiniCPM5 ANE overlap prefill engaged: {} + {} tokens per layer, {} MLP layer(s) on the Neural Engine",
+                plan.half0,
+                plan.half1,
+                self.ane.iter().filter(|program| program.is_some()).count()
+            ),
+            Err(reason) if reason != SerialReason::KnobOff => eprintln!(
+                "apxinf: MiniCPM5 ANE overlap keeps the serial prefill: {}",
+                reason.describe()
+            ),
+            Err(_) => {}
+        }
         self.prepared = Some(PreparedRequest {
             prefill,
             output,
             attention,
             positions,
+            #[cfg(feature = "coreml")]
+            wavefront,
         });
         Ok(())
+    }
+
+    /// Resolves this request's wavefront schedule, or names why the serial
+    /// schedule is kept. A request the wavefront cannot serve falls back whole:
+    /// the two schedules are never mixed inside one prefill.
+    #[cfg(feature = "coreml")]
+    fn wavefront_decision(
+        &self,
+        prefill: PrefillPlan,
+    ) -> std::result::Result<WavefrontPlan, SerialReason> {
+        let mut chunks = prefill.chunks();
+        let chunk = match (chunks.next(), chunks.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
+        };
+        let ane_layers = self.ane.iter().filter(|program| program.is_some()).count();
+        WavefrontPlan::for_request(self.overlap, self.variant, ane_layers, chunk)
     }
 
     fn norm(&self, x: &Array, weight: &Array) -> Result<Array> {
@@ -658,6 +839,238 @@ impl MiniCpm5 {
         Ok(out)
     }
 
+    /// Runs the reference K=2 wavefront over the whole prepared prompt
+    /// (`spec-et.md` §1): per layer the GPU attention of one token chunk
+    /// retires under the Neural Engine MLP of the other, and every layer's KV
+    /// rows are written first-chunk-then-second-chunk so the cache grows
+    /// exactly as a sequential prefill's. Returns the final logits and installs
+    /// the caches at `offset = prompt`.
+    #[cfg(feature = "coreml")]
+    fn prefill_wavefront(&mut self, ids: &[u32], plan: WavefrontPlan) -> Result<Array> {
+        if let Some(failure) = &self.failure {
+            return Err(Error::Other(format!(
+                "MiniCPM state invalid: {failure}; reset and prepare again"
+            )));
+        }
+        // Take the caches like `run_graph` does: a failed wavefront must not
+        // leave half-updated state installed.
+        let previous = std::mem::take(&mut self.states);
+        let result = (|| {
+            let (logits, states) = self.wavefront_graph(ids, plan, previous)?;
+            let mut output = vec![logits];
+            output.extend(states);
+            self.backend.stream().eval(&output)?;
+            Ok::<_, Error>(self.install_output(output, plan.tokens()))
+        })();
+        if let Err(error) = &result {
+            self.failure = Some(error.to_string());
+        }
+        result
+    }
+
+    /// Builds the wavefront graph. Device work is submitted, not waited for,
+    /// except at the two points the schedule cannot avoid: the Neural Engine
+    /// input download and the prediction itself. Everything after the
+    /// prediction keeps building lazily until the next download.
+    #[cfg(feature = "coreml")]
+    fn wavefront_graph(
+        &self,
+        ids: &[u32],
+        plan: WavefrontPlan,
+        previous: Vec<Array>,
+    ) -> Result<(Array, Vec<Array>)> {
+        let stream = self.backend.stream();
+        let prompt = plan.tokens();
+        let layers = self.weights.layers.len();
+        if ids.len() != prompt || prompt != plan.half0 + plan.half1 {
+            return Err(Error::Contract(
+                "MiniCPM5 wavefront covers exactly the prepared prompt",
+            ));
+        }
+        // Per segment: first token position, token count, KV row it writes, and
+        // how many key rows its attention reads. The second chunk reads all
+        // `prompt` rows, which is what makes its attention equal to the
+        // sequential prefill's.
+        let start = [0usize, plan.half0];
+        let rows = [plan.half0, plan.half1];
+        let write = [0usize, plan.half0];
+        let read = [plan.half0, prompt];
+        let mut residual = Vec::with_capacity(2);
+        for segment in 0..2 {
+            let end = start[segment] + rows[segment];
+            let tokens: Vec<i32> = ids[start[segment]..end].iter().map(|&id| id as i32).collect();
+            let tokens = Array::from_i32(stream, &[1, rows[segment]], &tokens)?;
+            residual.push(self.weights.embedding.take(&tokens, 0)?);
+        }
+        let cos = [
+            self.cos.slice_axis(2, 0, plan.half0)?,
+            self.cos.slice_axis(2, plan.half0, prompt)?,
+        ];
+        let sin = [
+            self.sin.slice_axis(2, 0, plan.half0)?,
+            self.sin.slice_axis(2, plan.half0, prompt)?,
+        ];
+        let mask = [
+            segment_mask(stream, 0, plan.half0, plan.half0)?,
+            segment_mask(stream, plan.half0, plan.half1, prompt)?,
+        ];
+        let mut states = previous;
+        if states.len() != 2 * layers {
+            return Err(Error::Contract(
+                "MiniCPM5 wavefront needs one K/V array per layer",
+            ));
+        }
+        // Attention output of each chunk at the layer its MLP is waiting for.
+        let mut attention: [Option<Array>; 2] = [None, None];
+        let index = |segment: WavefrontSegment| match segment {
+            WavefrontSegment::First => 0,
+            WavefrontSegment::Second => 1,
+        };
+        for step in plan.steps(layers) {
+            // 1. Read the MLP input before this step submits anything. The
+            //    order is load-bearing: the device queue is in-order, so a
+            //    download placed after the attention would make the prediction
+            //    start after the attention had already finished, and there would
+            //    be nothing left to overlap. The input itself depends only on
+            //    the previous step, so this wait is short.
+            let feed = match step.mlp {
+                Some((segment, layer)) if self.ane_program(layer).is_some() => {
+                    let h = attention[index(segment)]
+                        .as_ref()
+                        .ok_or(Error::Contract("MiniCPM5 wavefront step has no MLP input"))?;
+                    Some(self.ane_feed(h, layer)?)
+                }
+                _ => None,
+            };
+            // 2. Build this step's GPU attention. It stays lazy until later
+            //    unless the MLP leg is on the Neural Engine, where it is
+            //    submitted so the device retires it under the prediction.
+            let submitted = match step.attention {
+                Some((segment, layer)) => {
+                    let (h, keys, values) = self.wavefront_attention(
+                        &residual[index(segment)],
+                        layer,
+                        &cos[index(segment)],
+                        &sin[index(segment)],
+                        &mask[index(segment)],
+                        &states[2 * layer],
+                        &states[2 * layer + 1],
+                        write[index(segment)],
+                        read[index(segment)],
+                        rows[index(segment)],
+                    )?;
+                    states[2 * layer] = keys;
+                    states[2 * layer + 1] = values;
+                    attention[index(segment)] = Some(h.clone());
+                    Some(h)
+                }
+                None => None,
+            };
+            // 3. Issue the MLP leg. An ANE layer pays the blocking prediction
+            //    here; a GPU layer just extends the lazy graph, and the next
+            //    download or the final evaluation retires it.
+            if let Some((segment, layer)) = step.mlp {
+                let h = attention[index(segment)]
+                    .as_ref()
+                    .ok_or(Error::Contract("MiniCPM5 wavefront step has no MLP input"))?;
+                residual[index(segment)] = match feed {
+                    Some(feed) => {
+                        if let Some(pending) = &submitted {
+                            stream.async_eval(std::slice::from_ref(pending))?;
+                        }
+                        let program = self
+                            .ane_program(layer)
+                            .ok_or(Error::Contract("MiniCPM5 wavefront lost its ANE program"))?;
+                        h.add(&program.predict_feed(stream, &feed)?)?
+                    }
+                    None => self.layer_mlp(h, layer)?,
+                };
+            }
+        }
+        // The last token is the last row of the second chunk.
+        let normalized = self.norm(&residual[1], &self.weights.norm)?;
+        let head_input = normalized.slice_axis(1, plan.half1 - 1, plan.half1)?;
+        Ok((head_input.matmul(&self.weights.head)?, states))
+    }
+
+    /// One attention sub-layer of one wavefront chunk: residual, norm,
+    /// projections, RoPE, the chunk's KV rows and causal attention over
+    /// `0..read`. `write` is the chunk's KV row offset, so each layer's rows
+    /// land first-chunk-then-second-chunk.
+    #[cfg(feature = "coreml")]
+    #[allow(clippy::too_many_arguments)]
+    fn wavefront_attention(
+        &self,
+        x: &Array,
+        layer: usize,
+        cos: &Array,
+        sin: &Array,
+        mask: &Array,
+        keys: &Array,
+        values: &Array,
+        write: usize,
+        read: usize,
+        rows: usize,
+    ) -> Result<(Array, Array, Array)> {
+        let w = &self.weights.layers[layer];
+        let n = self.norm(x, &w.input_norm)?;
+        let q = n
+            .matmul(&w.q)?
+            .reshape(&[1, rows, 16, 128])?
+            .transpose(&[0, 2, 1, 3])?;
+        let k = n
+            .matmul(&w.k)?
+            .reshape(&[1, rows, 2, 128])?
+            .transpose(&[0, 2, 1, 3])?;
+        let v = n
+            .matmul(&w.v)?
+            .reshape(&[1, rows, 2, 128])?
+            .transpose(&[0, 2, 1, 3])?;
+        let q = self.rotate(&q, cos, sin)?;
+        let k = self.rotate(&k, cos, sin)?;
+        let index = Array::from_i32(self.backend.stream(), &[1], &[write as i32])?;
+        let keys = keys.slice_update(&k, &index, &[2])?;
+        let values = values.slice_update(&v, &index, &[2])?;
+        let attention = q
+            .sdpa(
+                &keys.slice_axis(2, 0, read)?,
+                &values.slice_axis(2, 0, read)?,
+                128f32.powf(-0.5),
+                false,
+                Some(mask),
+            )?
+            .transpose(&[0, 2, 1, 3])?
+            .reshape(&[1, rows, 2048])?;
+        Ok((x.add(&attention.matmul(&w.o)?)?, keys, values))
+    }
+
+    /// The whole MLP of one layer on the GPU, as `eager` computes it. Used for
+    /// the layers `APXINF_MINICPM5_ANE_MLP` does not select.
+    #[cfg(feature = "coreml")]
+    fn layer_mlp(&self, h: &Array, layer: usize) -> Result<Array> {
+        let w = &self.weights.layers[layer];
+        let n = self.norm(h, &w.post_norm)?;
+        let gate = n.matmul(&w.gate)?;
+        let up = n.matmul(&w.up)?;
+        let act = self.swiglu.call(&[gate, up])?.remove(0);
+        h.add(&act.matmul(&w.down)?)
+    }
+
+    /// The Neural Engine program of one layer, when it runs there.
+    #[cfg(feature = "coreml")]
+    fn ane_program(&self, layer: usize) -> Option<&super::ane::AneMlp> {
+        self.ane.get(layer).and_then(Option::as_ref)
+    }
+
+    /// The Neural Engine MLP's host input for one chunk: the chunk's post
+    /// attention norm, tiled FP16 channel-first and downloaded. Split from the
+    /// prediction so the other chunk's attention can be queued in between.
+    #[cfg(feature = "coreml")]
+    fn ane_feed(&self, h: &Array, layer: usize) -> Result<super::ane::AneFeed> {
+        let w = &self.weights.layers[layer];
+        super::ane::AneFeed::of(&self.norm(h, &w.post_norm)?)
+    }
+
     pub(crate) fn run_tokens(
         &mut self,
         ids: &[u32],
@@ -891,6 +1304,13 @@ impl LlmTrait for MiniCpm5 {
             }
             lengths.extend(1..=max_rows);
             lengths.extend(self.prepared.as_ref().unwrap().prefill.required_rows());
+            // The overlap schedule precomputes the two token chunks' row counts,
+            // so their presence here is the observable sign that this request
+            // will run the wavefront instead of the serial chunks.
+            #[cfg(feature = "coreml")]
+            if let Some(wavefront) = self.prepared.as_ref().unwrap().wavefront {
+                lengths.extend([wavefront.half0, wavefront.half1]);
+            }
             lengths.sort_unstable();
             lengths.dedup();
         }
@@ -999,6 +1419,20 @@ impl LlmTrait for MiniCpm5 {
         }
         if !boundary(GenerationBoundary::PrefillStart)? { return Ok(None); }
         let plan = self.prepared.as_ref().unwrap().prefill;
+        // A request that admits the wavefront runs the whole prompt in one
+        // two-chunk schedule; every other request keeps the serial chunk loop
+        // untouched, and a request never mixes the two.
+        #[cfg(feature = "coreml")]
+        if let Some(wavefront) = self.prepared.as_ref().unwrap().wavefront {
+            let logits = self.prefill_wavefront(input.token_ids, wavefront)?;
+            if !boundary(GenerationBoundary::PrefillProgress { consumed_tokens: plan.prompt })? {
+                return Ok(None);
+            }
+            return self
+                .backend
+                .from_array(logits.reshape(&[1, self.vocab_size()])?)
+                .map(Some);
+        }
         let mut logits = None;
         for range in plan.chunks() {
             let end = range.end;

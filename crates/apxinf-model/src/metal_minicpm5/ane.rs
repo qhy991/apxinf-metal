@@ -187,7 +187,7 @@ impl AneMlp {
 
     /// BF16 `[1, T, HIDDEN]` as FP16 channel-first tiles `[tiles, HIDDEN, 256]`
     /// (zero-padded past `T`), in one pass. The result is row-contiguous, so
-    /// [`predict`](Self::predict) may read it back without a copy.
+    /// [`AneFeed::of`] may read it back without a copy.
     pub fn tiles(h: &Array) -> Result<Array> {
         let [1, tokens, channels] = *h.shape() else {
             return Err(Error::Contract("MiniCPM5 ANE tiles take BF16 [1, T, 2048]"));
@@ -220,32 +220,34 @@ impl AneMlp {
     /// in FP32, rounded once. Waits for the tiles only, so GPU work queued
     /// after them keeps running.
     pub fn predict(&self, stream: &Stream, packed: &Array, tokens: usize) -> Result<Array> {
-        let [tiles, channels, tile] = *packed.shape() else {
-            return Err(Error::Contract(
-                "MiniCPM5 ANE tiles must be [tiles, 2048, 256]",
-            ));
-        };
-        if channels != HIDDEN || tile != self.tile || tokens == 0 {
+        self.predict_feed(stream, &AneFeed::of_tiles(packed, tokens)?)
+    }
+
+    /// Same prediction on an input whose tiles were already downloaded: the
+    /// caller may therefore submit unrelated device work between the download
+    /// and this blocking call, which is how the wavefront prefill overlaps the
+    /// other chunk's GPU attention.
+    pub fn predict_feed(&self, stream: &Stream, feed: &AneFeed) -> Result<Array> {
+        let tiles = feed.tiles;
+        let tokens = feed.tokens;
+        if tokens == 0 {
             return Err(Error::Contract(
                 "MiniCPM5 ANE tiles must be [tiles, 2048, 256]",
             ));
         }
-        if tiles != tokens.div_ceil(self.tile) {
+        if tiles != tokens.div_ceil(self.tile) || feed.bytes.len() != tiles * HIDDEN * self.tile * 2 {
             return Err(Error::Contract(
                 "MiniCPM5 ANE tiles must be exactly the tokens' tiles",
             ));
         }
-        if packed.dtype() != MlxDType::F16 {
-            return Err(Error::Contract("MiniCPM5 ANE packed tiles must be FP16"));
-        }
-        let bytes = packed.to_bytes_ready()?;
         // SAFETY: every bit pattern is a valid f16; `align_to` returns only the aligned middle.
-        let (head, aligned, tail) = unsafe { bytes.align_to::<f16>() };
+        let (head, aligned, tail) = unsafe { feed.bytes.align_to::<f16>() };
         let copied: Vec<f16>;
         let values: &[f16] = if head.is_empty() && tail.is_empty() {
             aligned
         } else {
-            copied = bytes
+            copied = feed
+                .bytes
                 .chunks_exact(2)
                 .map(|b| f16::from_le_bytes([b[0], b[1]]))
                 .collect();
@@ -294,6 +296,63 @@ impl AneMlp {
             scaled
         };
         scaled.reshape(&[1, tokens, HIDDEN])?.cast(MlxDType::BF16)
+    }
+}
+
+/// One program input, already downloaded from the device: FP16 channel-first
+/// tiles `[tiles, HIDDEN, TILE]` covering `tokens` rows (zero-padded past
+/// them), held as the little-endian bytes the device produced.
+///
+/// The download is a separate step from the prediction so a caller can submit
+/// device work in between. [`AneMlp::predict`](AneMlp::predict) is exactly
+/// [`AneFeed::of`] followed by `predict_feed`, so the serial schedule only
+/// changes where the wait happens and pays no extra copy. The shape checks
+/// live here because they are the only device-free part of a prediction.
+pub struct AneFeed {
+    tiles: usize,
+    tokens: usize,
+    bytes: Vec<u8>,
+}
+
+impl AneFeed {
+    /// BF16 `[1, T, HIDDEN]` post-attention hidden state to a host feed,
+    /// blocking until its tiles have been computed and copied.
+    pub fn of(h: &Array) -> Result<Self> {
+        let [1, tokens, channels] = *h.shape() else {
+            return Err(Error::Contract("MiniCPM5 ANE tiles take BF16 [1, T, 2048]"));
+        };
+        if channels != HIDDEN || tokens == 0 {
+            return Err(Error::Contract("MiniCPM5 ANE tiles take BF16 [1, T, 2048]"));
+        }
+        Self::of_tiles(&AneMlp::tiles(h)?, tokens)
+    }
+
+    /// The same for tiles already packed by [`AneMlp::tiles`].
+    pub fn of_tiles(packed: &Array, tokens: usize) -> Result<Self> {
+        let [tiles, channels, tile] = *packed.shape() else {
+            return Err(Error::Contract(
+                "MiniCPM5 ANE tiles must be [tiles, 2048, 256]",
+            ));
+        };
+        if channels != HIDDEN || tile != TILE || tokens == 0 || tiles != tokens.div_ceil(TILE) {
+            return Err(Error::Contract(
+                "MiniCPM5 ANE tiles must be exactly the tokens' tiles",
+            ));
+        }
+        if packed.dtype() != MlxDType::F16 {
+            return Err(Error::Contract("MiniCPM5 ANE packed tiles must be FP16"));
+        }
+        let bytes = packed.to_bytes_ready()?;
+        if bytes.len() != tiles * HIDDEN * TILE * 2 {
+            return Err(Error::Contract(
+                "MiniCPM5 ANE packed tiles have the wrong extent",
+            ));
+        }
+        Ok(Self {
+            tiles,
+            tokens,
+            bytes,
+        })
     }
 }
 
@@ -358,6 +417,38 @@ mod tests {
         }
         // Every weight the program needs is in its blob file.
         assert!(package.weights.len() > 3 * HIDDEN * INTERMEDIATE);
+        Ok(())
+    }
+
+    /// The feed's geometry checks run before any device work, so the CPU
+    /// stream is enough to pin the rejection the wavefront relies on: a feed
+    /// that does not cover exactly the program's tiles must never predict.
+    #[test]
+    fn feed_rejects_geometry_outside_the_program() -> Result<()> {
+        let stream = Stream::cpu()?;
+        let rejects = |h: &Array| matches!(AneFeed::of(h), Err(Error::Contract(_)));
+        assert!(rejects(&Array::zeros(&stream, &[1, 2, 8], MlxDType::BF16)?));
+        assert!(rejects(&Array::zeros(&stream, &[1, HIDDEN], MlxDType::BF16)?));
+        assert!(rejects(&Array::zeros(&stream, &[1, 0, HIDDEN], MlxDType::BF16)?));
+        let wrong_tiles = Array::zeros(&stream, &[1, 4, HIDDEN], MlxDType::F16)?;
+        assert!(matches!(
+            AneFeed::of_tiles(&wrong_tiles, TILE),
+            Err(Error::Contract(_))
+        ));
+        let one_tile = Array::zeros(&stream, &[1, HIDDEN, TILE], MlxDType::F16)?;
+        // Too many tokens for the supplied tiles, and the zero-token feed.
+        assert!(matches!(
+            AneFeed::of_tiles(&one_tile, TILE + 1),
+            Err(Error::Contract(_))
+        ));
+        assert!(matches!(
+            AneFeed::of_tiles(&one_tile, 0),
+            Err(Error::Contract(_))
+        ));
+        // The matching geometry is accepted; the download of one zero tile is
+        // host work, not a prediction.
+        let feed = AneFeed::of_tiles(&one_tile, TILE)?;
+        assert_eq!(feed.bytes.len(), HIDDEN * TILE * 2);
         Ok(())
     }
 }
