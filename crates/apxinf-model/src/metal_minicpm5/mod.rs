@@ -1,4 +1,6 @@
 //! Native MiniCPM5-2B on Apple Metal, with independent family mathematics.
+#[cfg(feature = "coreml")]
+mod ane;
 mod config;
 mod dspark;
 mod math;

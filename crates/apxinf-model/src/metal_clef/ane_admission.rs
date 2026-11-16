@@ -10,7 +10,7 @@ enum RowKind {
     Runtime,
 }
 
-pub(super) struct Admission<'a> {
+pub(crate) struct Admission<'a> {
     operations: &'a [proto::Operation],
     kinds: Vec<RowKind>,
 }
@@ -19,7 +19,7 @@ fn check(condition: bool, message: &str) -> Result<()> {
     if condition {
         Ok(())
     } else {
-        Err(Error::Other(format!("Clef Core ML admission: {message}")))
+        Err(Error::Other(format!("Core ML ANE admission: {message}")))
     }
 }
 
@@ -121,7 +121,7 @@ fn literal(value: &proto::Value, weights: &[u8]) -> Result<()> {
 }
 
 impl<'a> Admission<'a> {
-    pub(super) fn new(package: &'a Package, shape: [usize; 4]) -> Result<Self> {
+    pub(crate) fn new(package: &'a Package, shape: [usize; 4]) -> Result<Self> {
         check(
             package.model.specification_version == 9 && !package.model.is_updatable,
             "unsupported or mutable source model",
@@ -297,7 +297,7 @@ impl<'a> Admission<'a> {
         })
     }
 
-    pub(super) fn check(&self, facts: &ExpectedPlacement) -> Result<()> {
+    pub(crate) fn check(&self, facts: &ExpectedPlacement) -> Result<()> {
         check(
             facts.compute_units == ComputeUnits::CpuAndNeuralEngine && facts.functions.len() == 1,
             "wrong plan configuration or functions",
