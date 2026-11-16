@@ -245,3 +245,79 @@ fn real_checkpoint_prepared_code_reuses_with_fresh_request_state() -> Result<()>
     assert_eq!(run(&mut model, 1)?, changed, "ordinary capacity change leaked prior state");
     Ok(())
 }
+
+/// The M1 exit criterion for the ANE MLP: on real checkpoint weights, the
+/// Neural Engine program must reproduce the engine's own GPU MLP to the
+/// EngineTailor admission band (`corr >= 0.99`, relative RMSE `<= 0.02`)
+/// before any schedule may use it. Prints both metrics so the receipt can be
+/// recorded even when the assertion passes.
+#[cfg(feature = "coreml")]
+#[test]
+#[ignore = "requires the MiniCPM5 checkpoint, ANE plan inspection, isolated process and shared Metal locks"]
+fn real_checkpoint_ane_mlp_matches_the_gpu_mlp() -> Result<()> {
+    use super::ane::{program, AneMlp, HIDDEN, INTERMEDIATE, TILE};
+    use super::model::{ane_cache_dir, transposed_f16};
+    use apxinf_mlx::{Array, MlxDType};
+
+    let checkpoint = PathBuf::from(
+        env::var_os("APXINF_MINICPM_CHECKPOINT")
+            .ok_or(Error::Contract("set APXINF_MINICPM_CHECKPOINT"))?,
+    );
+    let config = Config::from_json(&std::fs::read_to_string(checkpoint.join("config.json"))?)?;
+    let backend = MlxBackend::new(0)?;
+    let (map, _) =
+        apxinf_loader::safetensors::load_native_path(&checkpoint).map_err(Error::Other)?;
+    let weights = Weights::load(&config, backend.stream(), map)?;
+    let w = &weights.layers[0];
+
+    let mut values = vec![0f32; TILE * HIDDEN];
+    for (index, value) in values.iter_mut().enumerate() {
+        *value = (((index * 37) % 199) as f32 - 99.0) / 99.0;
+    }
+    let x = Array::from_f32(backend.stream(), &[1, TILE, HIDDEN], &values)?
+        .cast(MlxDType::BF16)?;
+    let gate = x.matmul(&w.gate)?;
+    let up = x.matmul(&w.up)?;
+    let reference = super::math::swiglu(&gate, &up)?.matmul(&w.down)?.to_f32_vec()?;
+
+    let gate_h = transposed_f16(&w.gate, HIDDEN, INTERMEDIATE)?;
+    let up_h = transposed_f16(&w.up, HIDDEN, INTERMEDIATE)?;
+    let down_h = transposed_f16(&w.down, INTERMEDIATE, HIDDEN)?;
+    let package = program(&gate_h, &up_h, &down_h)?;
+    let cache = apxinf_coreml::ProgramCache::new(ane_cache_dir());
+    let ane = AneMlp::load_package(&cache, &package)?;
+    ane.warm()?;
+    let packed = AneMlp::tiles(&x)?;
+    let measured = ane
+        .predict(backend.stream(), &packed, TILE)?
+        .to_f32_vec()?;
+
+    let count = reference.len() as f64;
+    let mean_reference = reference.iter().map(|&v| v as f64).sum::<f64>() / count;
+    let mean_measured = measured.iter().map(|&v| v as f64).sum::<f64>() / count;
+    let mut covariance = 0f64;
+    let mut variance_reference = 0f64;
+    let mut variance_measured = 0f64;
+    let mut squared_error = 0f64;
+    let mut squared_reference = 0f64;
+    let mut maximum = 0f64;
+    for (&a, &b) in reference.iter().zip(&measured) {
+        let (a, b) = (a as f64, b as f64);
+        covariance += (a - mean_reference) * (b - mean_measured);
+        variance_reference += (a - mean_reference).powi(2);
+        variance_measured += (b - mean_measured).powi(2);
+        squared_error += (a - b).powi(2);
+        squared_reference += a * a;
+        maximum = maximum.max((a - b).abs());
+    }
+    let correlation = covariance / (variance_reference.sqrt() * variance_measured.sqrt());
+    let relative_rmse = (squared_error / squared_reference).sqrt();
+    println!(
+        "layer 0 ANE vs GPU MLP: corr={correlation:.6} rel_rmse={relative_rmse:.6} max_abs={maximum:.6}"
+    );
+    assert!(
+        correlation >= 0.99 && relative_rmse <= 0.02,
+        "ANE MLP outside the admission band: corr {correlation} rel_rmse {relative_rmse}"
+    );
+    Ok(())
+}

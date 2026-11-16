@@ -33,6 +33,66 @@ impl PrefillChunk {
     }
 }
 
+/// Layers whose MLP runs as one FP16 Core ML program per layer on the Neural
+/// Engine instead of the GPU. Empty is the qualified GPU path.
+///
+/// `APXINF_MINICPM5_ANE_MLP` accepts `N` (first N layers), a list of ranges
+/// (`0-7,32`), or `off`/`0`. The set is resolved before any device work so a
+/// typo cannot silently select a different schedule; the caller still admits
+/// every program numerically before a layer becomes ANE.
+#[cfg(feature = "coreml")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AneMlpPlan {
+    layers: Vec<usize>,
+}
+
+#[cfg(feature = "coreml")]
+impl AneMlpPlan {
+    pub(super) const ENV: &'static str = "APXINF_MINICPM5_ANE_MLP";
+    pub(super) const MAX_LAYERS: usize = 42;
+
+    pub(super) fn from_env() -> Result<Option<Self>> {
+        match std::env::var(Self::ENV) {
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Ok(value) => Self::parse(value.trim()),
+            Err(_) => Err(Error::Contract("APXINF_MINICPM5_ANE_MLP must be UTF-8")),
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Result<Option<Self>> {
+        if value.is_empty() || value.eq_ignore_ascii_case("off") || value == "0" {
+            return Ok(None);
+        }
+        let mut layers = Vec::new();
+        for part in value.split(',') {
+            let part = part.trim();
+            let (start, end) = match part.split_once('-') {
+                Some((start, end)) => (start, end),
+                None => (part, part),
+            };
+            let start: usize = start
+                .parse()
+                .map_err(|_| Error::Contract("APXINF_MINICPM5_ANE_MLP needs layer indices"))?;
+            let end: usize = end
+                .parse()
+                .map_err(|_| Error::Contract("APXINF_MINICPM5_ANE_MLP needs layer indices"))?;
+            if start > end || end >= Self::MAX_LAYERS {
+                return Err(Error::Contract(
+                    "APXINF_MINICPM5_ANE_MLP layers must be within 0..42 and ordered",
+                ));
+            }
+            layers.extend(start..=end);
+        }
+        layers.sort_unstable();
+        layers.dedup();
+        Ok(Some(Self { layers }))
+    }
+
+    pub(super) fn layers(&self) -> &[usize] {
+        &self.layers
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct PrefillPlan {
     pub(super) prompt: usize,
@@ -181,6 +241,21 @@ impl Variant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ane_mlp_plan_accepts_counts_ranges_and_off() {
+        assert_eq!(AneMlpPlan::parse("off").unwrap(), None);
+        assert_eq!(AneMlpPlan::parse("0").unwrap(), None);
+        assert_eq!(
+            AneMlpPlan::parse("0-3,10").unwrap().unwrap().layers(),
+            &[0, 1, 2, 3, 10]
+        );
+        assert_eq!(AneMlpPlan::parse("8").unwrap().unwrap().layers(), &[8]);
+        assert_eq!(AneMlpPlan::parse("0-1,1-2").unwrap().unwrap().layers(), &[0, 1, 2]);
+        assert!(AneMlpPlan::parse("42").is_err());
+        assert!(AneMlpPlan::parse("3-1").is_err());
+        assert!(AneMlpPlan::parse("abc").is_err());
+    }
 
     #[test]
     fn prefill_plan_preserves_short_prompts_and_admits_only_complete_chunks() {

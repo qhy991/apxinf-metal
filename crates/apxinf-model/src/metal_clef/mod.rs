@@ -4,7 +4,7 @@
 #[cfg(feature = "coreml")]
 mod ane;
 #[cfg(feature = "coreml")]
-mod ane_admission;
+pub(crate) mod ane_admission;
 mod config;
 mod encode;
 mod model;

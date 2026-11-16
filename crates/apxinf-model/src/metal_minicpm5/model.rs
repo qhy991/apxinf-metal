@@ -147,6 +147,81 @@ pub struct MiniCpm5 {
     pub(crate) offset: usize,
     pub(crate) last_taps: Option<Array>,
     failure: Option<String>,
+    /// Layers whose MLP runs as one FP16 Core ML program per layer on the
+    /// Neural Engine. Empty unless `APXINF_MINICPM5_ANE_MLP` selects layers.
+    #[cfg(feature = "coreml")]
+    ane: Vec<Option<super::ane::AneMlp>>,
+}
+
+/// Builds the per-layer Neural Engine programs named by
+/// `APXINF_MINICPM5_ANE_MLP`, or an empty vector when the knob is absent.
+///
+/// The canonical weights are `[in, out]`; the program wants the transposed
+/// `[out, in]` FP16 copy, so the host conversion transposes while narrowing
+/// BF16 to FP16. Programs are compiled and cached once, warmed once, and the
+/// set is fail-closed: any load failure aborts model construction rather than
+/// silently mixing a partially ANE schedule.
+#[cfg(feature = "coreml")]
+fn ane_programs(
+    stream: &apxinf_mlx::Stream,
+    layers: &[super::weights::LayerWeights],
+) -> Result<Vec<Option<super::ane::AneMlp>>> {
+    let Some(plan) = super::config::AneMlpPlan::from_env()? else {
+        return Ok((0..layers.len()).map(|_| None).collect());
+    };
+    let selected: Vec<usize> = plan
+        .layers()
+        .iter()
+        .copied()
+        .filter(|&layer| layer < layers.len())
+        .collect();
+    if selected.len() != plan.layers().len() {
+        return Err(Error::Contract(
+            "APXINF_MINICPM5_ANE_MLP names a layer this model does not have",
+        ));
+    }
+    let cache = apxinf_coreml::ProgramCache::new(ane_cache_dir());
+    let mut programs: Vec<Option<super::ane::AneMlp>> = (0..layers.len()).map(|_| None).collect();
+    for &index in &selected {
+        let w = &layers[index];
+        let gate = transposed_f16(&w.gate, 2048, super::ane::INTERMEDIATE)?;
+        let up = transposed_f16(&w.up, 2048, super::ane::INTERMEDIATE)?;
+        let down = transposed_f16(&w.down, super::ane::INTERMEDIATE, 2048)?;
+        let package = super::ane::program(&gate, &up, &down)?;
+        let ane = super::ane::AneMlp::load_package(&cache, &package)?;
+        ane.warm()?;
+        programs[index] = Some(ane);
+    }
+    let _ = stream;
+    Ok(programs)
+}
+
+/// `array` is a canonical `[rows, columns]` BF16 weight; returns the
+/// `[columns, rows]` row-major FP16 copy the program's 1x1 convolution wants.
+#[cfg(feature = "coreml")]
+pub(super) fn transposed_f16(array: &apxinf_mlx::Array, rows: usize, columns: usize) -> Result<Vec<half::f16>> {
+    let values = array.to_f32_vec()?;
+    if values.len() != rows * columns {
+        return Err(Error::Contract(
+            "MiniCPM5 ANE weight does not match its canonical shape",
+        ));
+    }
+    let mut out = vec![half::f16::ZERO; rows * columns];
+    for row in 0..rows {
+        for column in 0..columns {
+            out[column * rows + row] = half::f16::from_f32(values[row * columns + column]);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "coreml")]
+pub(super) fn ane_cache_dir() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("APXINF_MINICPM5_ANE_CACHE") {
+        return std::path::PathBuf::from(path);
+    }
+    std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+        .join("Library/Caches/apxinf/coreml/minicpm5")
 }
 
 impl MiniCpm5 {
@@ -171,6 +246,8 @@ impl MiniCpm5 {
         let attention_policy = DecodeAttentionPolicy::from_override(
             std::env::var_os("APXINF_MINICPM5_EXACT_ATTN").as_deref(),
         );
+        #[cfg(feature = "coreml")]
+        let ane = ane_programs(stream, &weights.layers)?;
         Ok(Self {
             backend,
             weights: Rc::new(weights),
@@ -191,6 +268,8 @@ impl MiniCpm5 {
             offset: 0,
             last_taps: None,
             failure: None,
+            #[cfg(feature = "coreml")]
+            ane,
         })
     }
 
@@ -537,10 +616,29 @@ impl MiniCpm5 {
                 .reshape(&[1, rows, 2048])?;
             x = x.add(&attention.matmul(&w.o)?)?;
             let n = self.norm(&x, &w.post_norm)?;
-            let gate = n.matmul(&w.gate)?;
-            let up = n.matmul(&w.up)?;
-            let act = self.swiglu.call(&[gate, up])?.remove(0);
-            x = x.add(&act.matmul(&w.down)?)?;
+            // Prefill only: a single-token decode stays on the GPU because the
+            // Neural Engine is a batch device and the host round trip dominates.
+            #[cfg(feature = "coreml")]
+            let mlp = match (rows > 1, self.ane.get(i).and_then(Option::as_ref)) {
+                (true, Some(ane)) => {
+                    let packed = super::ane::AneMlp::tiles(&n)?;
+                    ane.predict(self.backend.stream(), &packed, rows)?
+                }
+                _ => {
+                    let gate = n.matmul(&w.gate)?;
+                    let up = n.matmul(&w.up)?;
+                    let act = self.swiglu.call(&[gate, up])?.remove(0);
+                    act.matmul(&w.down)?
+                }
+            };
+            #[cfg(not(feature = "coreml"))]
+            let mlp = {
+                let gate = n.matmul(&w.gate)?;
+                let up = n.matmul(&w.up)?;
+                let act = self.swiglu.call(&[gate, up])?.remove(0);
+                act.matmul(&w.down)?
+            };
+            x = x.add(&mlp)?;
             states.extend([keys, values]);
             if self.variant == Variant::DSpark && [1, 10, 20, 30, 39].contains(&i) {
                 taps.push(x.clone());
