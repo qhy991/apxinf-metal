@@ -9,11 +9,12 @@
 //! and appends one JSON record per request to `records.jsonl` in the job's
 //! output directory. The driver holds the host locks and owns the receipts.
 //!
-//! This copy is trimmed to the `text` and `tts` job tasks. The classification
-//! and image families changed API after 952c49f5 (DecisionOutput fields,
-//! DecisionInput variants, ImageRequest.step_cache_ratio) and the baseline
-//! comparison driver does not use them, so those paths are absent rather than
-//! guessed at.
+//! This copy serves the `text`, `tts`, `classification` (Clef schema decisions)
+//! and `image` (Qwen-Image) job tasks. Clef on this branch is a text-only
+//! `SchemaDecisionRuntime` and exposes no encoded token IDs, so classification
+//! records that carry images or video are rejected instead of measured as
+//! though their media were absent, and `APXINF_CLEF_DEBUG=1` reports the answer
+//! detail the public output carries rather than the MLX baseline's input IDs.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -22,7 +23,8 @@ use std::time::Instant;
 
 use apxinf_core::Device;
 use apxinf_model::{
-    AutoModel, GenerationOptions, LlmInput, LoadOptions, SamplingMode, SpeechRequest,
+    AutoModel, DecisionSchema, GenerationOptions, ImageRequest, LlmInput, LoadOptions,
+    SamplingMode, SpeechRequest,
 };
 use apxinf_tokenizer::{ChatMessage, Tokenizer};
 use serde_json::{json, Map, Value};
@@ -71,6 +73,18 @@ fn check_speech_settings(snapshot: &Path, settings: &Value) -> Fallible<Value> {
         "sampling_source": path.display().to_string(),
         "frame_limit": field(&generation, "max_new_tokens")?,
         "suite_max_tokens": field(settings, "max_tokens")?,
+    }))
+}
+
+/// The MLX baseline takes the suite's `max_context` as Clef's encoder budget.
+/// The native family admits requests up to its own encoded-prompt limit and
+/// never truncates, so the worker can record the suite's budget but cannot make
+/// the family follow it; a workload whose requests stay inside `max_context`
+/// keeps both arms on the same requests.
+fn check_decision_settings(settings: &Value) -> Fallible<Value> {
+    Ok(json!({
+        "suite_max_context": unsigned(settings, "max_context")?,
+        "family_context_policy": "admits its own encoded-prompt limit; rejects, never truncates",
     }))
 }
 
@@ -177,6 +191,71 @@ fn run(
             case,
             settings,
         ),
+        "classification" => {
+            // The clock covers request validation and the family's own prompt
+            // encoding: the MLX baseline worker also builds its schema request
+            // inside the timed region (mlx_baselines.adapters.Clef.run).
+            let started = Instant::now();
+            let record = field(case, "record")?;
+            check_classification_media(record)?;
+            let schema = classification_schema(record)?;
+            let output = model.decide_schema(&schema).map_err(|e| e.to_string())?;
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            let (mut probabilities, mut decisions) = (Map::new(), Map::new());
+            for answer in &output.answers {
+                let id = answer.question_id.clone();
+                let selected = answer.selected().map_err(|e| e.to_string())?;
+                decisions.insert(id.clone(), json!(selected.code));
+                probabilities.insert(
+                    id,
+                    answer
+                        .scores
+                        .iter()
+                        .map(|s| (s.code.clone(), json!(s.probability as f64)))
+                        .collect::<Map<_, _>>()
+                        .into(),
+                );
+            }
+            // The schema runtime encodes the prompt internally and exposes no
+            // token IDs, so the baseline's `input_ids`/`input_tokens` probe has
+            // no equivalent on this build; the per-question answer detail below
+            // is what the public output can add over `payload`.
+            let debug = std::env::var_os("APXINF_CLEF_DEBUG").map(|_| {
+                json!({
+                    "input_ids": Value::Null,
+                    "input_tokens": Value::Null,
+                    "images": 0,
+                    "answers": output
+                        .answers
+                        .iter()
+                        .map(|answer| {
+                            json!({
+                                "question_id": answer.question_id.clone(),
+                                "selected_index": answer.selected_index,
+                                "selected_code": answer
+                                    .scores
+                                    .get(answer.selected_index)
+                                    .map(|score| score.code.clone()),
+                                "scores": answer
+                                    .scores
+                                    .iter()
+                                    .map(|s| (s.code.clone(), json!(s.probability as f64)))
+                                    .collect::<Map<_, _>>(),
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    "probe_note": "Clef's schema path exposes no encoded input IDs; the MLX baseline's input_ids/input_tokens are unavailable here",
+                })
+            });
+            Ok((
+                elapsed,
+                Request {
+                    payload: json!({"probabilities": probabilities, "decisions": decisions}),
+                    arrays: vec![],
+                    debug,
+                },
+            ))
+        }
         "tts" => {
             let request = SpeechRequest {
                 text: text(case, "text")?,
@@ -216,10 +295,123 @@ fn run(
                 },
             ))
         }
+        "image" => {
+            if field(settings, "guidance")?.as_f64() != Some(1.0)
+                || text(settings, "scheduler")? != "linear"
+            {
+                return Err("the family admits only guidance 1 with the linear scheduler".into());
+            }
+            let (width, height) = (
+                unsigned(case, "width")? as usize,
+                unsigned(case, "height")? as usize,
+            );
+            let request = ImageRequest {
+                prompt: text(case, "prompt")?,
+                width,
+                height,
+                seed,
+                steps: unsigned(settings, "steps")? as usize,
+                // `None` keeps the family's TeaCache-style default, which is
+                // also what the MLX baseline adapter asks for
+                // (`step_cache_ratio=None`); a suite that wants to A/B the
+                // cache needs a setting here and the same change upstream.
+                step_cache_ratio: None,
+            };
+            let started = Instant::now();
+            let image = model.generate_image(&request).map_err(|e| e.to_string())?;
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            let payload = json!({"width": image.width, "height": image.height, "seed": seed});
+            Ok((
+                elapsed,
+                Request {
+                    payload,
+                    arrays: vec![(
+                        "image",
+                        "|u1",
+                        vec![image.height, image.width, 3],
+                        image.rgb,
+                    )],
+                    debug: None,
+                },
+            ))
+        }
         other => Err(format!("no ApxInf latency worker for task {other}")),
     }
 }
 
+/// The schema part of a classification record: `state` + `questions`. The
+/// record may also carry `images` and `videos`, which `DecisionSchema` rejects
+/// as unknown fields; the media are checked separately by
+/// [`check_classification_media`].
+fn classification_schema(record: &Value) -> Fallible<DecisionSchema> {
+    let schema = json!({
+        "state": field(record, "state")?,
+        "questions": field(record, "questions")?,
+    });
+    DecisionSchema::from_json(&schema.to_string()).map_err(|e| e.to_string())
+}
+
+/// Images of a classification record, in request order: local PNG paths and
+/// inline `data:image/...;base64,` payloads (the two forms the baseline
+/// accepts). The native Clef family cannot encode them, so the classification
+/// arm uses this only to validate and reject the record precisely.
+fn classification_images(record: &Value) -> Fallible<(Vec<PathBuf>, Vec<Vec<u8>>)> {
+    let Some(value) = record.get("images") else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let Some(items) = value.as_array() else {
+        return Err("record.images must be an array".into());
+    };
+    if items.len() > 4 {
+        return Err("the Clef worker supports at most four images per request".into());
+    }
+    let mut paths = Vec::new();
+    let mut bytes = Vec::new();
+    for item in items {
+        let Some(item) = item.as_str() else {
+            return Err("record.images entries must be strings".into());
+        };
+        if let Some(rest) = item.strip_prefix("data:image/") {
+            let Some((meta, data)) = rest.split_once(',') else {
+                return Err("malformed data URL in record.images".into());
+            };
+            if !meta.ends_with(";base64") {
+                return Err("record.images data URLs must be base64".into());
+            }
+            bytes.push(decode_base64(data)?);
+        } else if item.is_empty() {
+            return Err("record.images entry is empty".into());
+        } else {
+            paths.push(PathBuf::from(item));
+        }
+    }
+    Ok((paths, bytes))
+}
+
+/// Clef on this branch is a text-only `SchemaDecisionRuntime`
+/// (`LlmCapabilities::TEXT_ONLY`; the checkpoint's vision tower is never read),
+/// so a record carrying images or video cannot be measured. Rejecting it here
+/// keeps the arm from measuring a text-only request while the baseline measures
+/// the media-bearing one.
+fn check_classification_media(record: &Value) -> Fallible<()> {
+    if let Some(videos) = record.get("videos") {
+        if videos.as_array().is_some_and(|items| !items.is_empty()) {
+            return Err("the Clef family on this branch does not serve video".into());
+        }
+    }
+    let (paths, images) = classification_images(record)?;
+    let count = paths.len() + images.len();
+    if count > 0 {
+        return Err(format!(
+            "the Clef family on this branch is a text-only schema runtime; \
+             this record carries {count} image(s), which it cannot encode"
+        ));
+    }
+    Ok(())
+}
+
+/// Standard-alphabet padded base64, so the worker needs no image or encoding
+/// dependency to validate the demo's inline PNGs.
 fn decode_base64(text: &str) -> Fallible<Vec<u8>> {
     fn value(byte: u8) -> Fallible<u32> {
         match byte {
@@ -338,10 +530,10 @@ fn main_inner(job_path: &Path) -> Fallible<()> {
     } else {
         None
     };
-    let checks = if task == "tts" {
-        check_speech_settings(&snapshot, &settings)?
-    } else {
-        Value::Null
+    let checks = match task.as_str() {
+        "tts" => check_speech_settings(&snapshot, &settings)?,
+        "classification" => check_decision_settings(&settings)?,
+        _ => Value::Null,
     };
     let model_variant = std::env::var("APXINF_MODEL_VARIANT").ok();
     // MiniCPM5 declares model_type llama, so its family must be named explicitly.
@@ -453,4 +645,29 @@ mod tests {
         assert!(decode_base64("!").is_err());
     }
 
+    #[test]
+    fn classification_records_split_media_and_reject_it() {
+        let record = json!({
+            "state": "s",
+            "images": ["/tmp/a.png", "data:image/png;base64,iVBORw0KGgo="],
+            "questions": {"q": {"type": "noul"}},
+        });
+        let (paths, bytes) = classification_images(&record).unwrap();
+        assert_eq!(paths, vec![PathBuf::from("/tmp/a.png")]);
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes[0][..4], [0x89, 0x50, 0x4e, 0x47]);
+        assert!(check_classification_media(&record).is_err());
+
+        let schema = classification_schema(&record).unwrap();
+        assert_eq!(schema.questions.len(), 1);
+        assert_eq!(schema.state, json!("s"));
+
+        let text_only = json!({"state": "s", "questions": {"q": {"type": "noul"}}});
+        assert!(check_classification_media(&text_only).is_ok());
+        assert!(check_classification_media(&json!({"images": []})).is_ok());
+        assert!(classification_images(&json!({"images": ["data:image/png,abc"]})).is_err());
+        assert!(classification_images(&json!({"images": [1]})).is_err());
+        assert!(classification_images(&json!({"images": ["a", "b", "c", "d", "e"]})).is_err());
+        assert!(check_classification_media(&json!({"videos": ["v.mp4"]})).is_err());
+    }
 }
