@@ -23,6 +23,10 @@ pub fn register_builtin_models() {
     registry::register("metal_d3", crate::metal_d3_lite::load);
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     registry::register("metal_d3_lite", crate::metal_d3_lite::load);
+    // Checkpoint detection reads `model_type: lfm3`, which `metal_registry_name`
+    // maps to `metal_lfm3`; an explicit `--model-name metal_lfm3` resolves too.
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+    registry::register("metal_lfm3", crate::metal_lfm3::load);
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     registry::register("metal_minicpm5", crate::metal_minicpm5::load);
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]

@@ -16,6 +16,17 @@ pub const NATIVE_PROTOCOL: &str = "apxinf-worker/2.1";
 pub const NATIVE_SAMPLED_PROTOCOL: &str = "apxinf-worker/2.2";
 pub const NATIVE_THINKING_PROTOCOL: &str = "apxinf-worker/2.3";
 pub const NATIVE_BOUNDED_THINKING_PROTOCOL: &str = "apxinf-worker/2.4";
+/// Greedy text generation for a native MLX family whose prompt protocol is
+/// rendered by the family itself (`apxinf-worker/2.1`'s frame set, different
+/// model/adaptor identity). MiniCPM5 keeps its own entries above unchanged.
+pub const NATIVE_TEXT_PROTOCOL: &str = "apxinf-worker/2.8";
+/// Adapter revision reported and verified for [`NATIVE_TEXT_PROTOCOL`].
+pub const NATIVE_TEXT_ADAPTER: &str = "apxinf-native-text-v1";
+/// Prompt protocol the family renders for [`NATIVE_TEXT_PROTOCOL`]. `lane-chatml`
+/// is the protocol the LFM3 corpus and gate were frozen with: the assistant
+/// prefix ends after `<|im_start|>assistant\n` and the checkpoint's own
+/// `chat_template.jinja` is never used (it injects the thinking prefix).
+pub const NATIVE_TEXT_PROMPT_PROTOCOL: &str = "lane-chatml";
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_DEPTH: usize = 16;
 pub const MAX_COMMANDS: u64 = 10_000;
@@ -468,6 +479,7 @@ pub fn validate_command_envelope(frame: &Value) -> Result<()> {
             || frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
             || frame["protocol"] == NATIVE_THINKING_PROTOCOL
             || frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL
+            || frame["protocol"] == NATIVE_TEXT_PROTOCOL
             || frame["protocol"] == VISION_PROTOCOL,
         "unsupported protocol",
     )?;
@@ -516,6 +528,7 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
             || frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
             || frame["protocol"] == NATIVE_THINKING_PROTOCOL
             || frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL
+            || frame["protocol"] == NATIVE_TEXT_PROTOCOL
             || frame["protocol"] == VISION_PROTOCOL,
         "unsupported protocol",
     )?;
@@ -524,7 +537,10 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
     let thinking = frame["protocol"] == NATIVE_THINKING_PROTOCOL || bounded;
     let sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL || thinking;
     let prepared = frame["protocol"] == NATIVE_PREPARED_PROTOCOL;
-    let native = frame["protocol"] == NATIVE_PROTOCOL || prepared || sampled;
+    let native = frame["protocol"] == NATIVE_PROTOCOL
+        || frame["protocol"] == NATIVE_TEXT_PROTOCOL
+        || prepared
+        || sampled;
     uuid(&frame["worker_epoch"])?;
     let kind = string(&frame["kind"])?;
     if let Some(id) = frame.get("command_id") {
@@ -605,8 +621,15 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                     ],
                     &[],
                 )?;
+                // The family-parameterized text protocol reports its own runtime
+                // kind; every MiniCPM5 protocol keeps the original one.
+                let expected_kind = if frame["protocol"] == NATIVE_TEXT_PROTOCOL {
+                    "native_text"
+                } else {
+                    "native_minicpm5"
+                };
                 require(
-                    frame["runtime"]["kind"] == "native_minicpm5"
+                    frame["runtime"]["kind"] == expected_kind
                         && frame["runtime"]["apxinf"] == "0.1.0"
                         && matches!(frame["runtime"]["mlx"].as_str(), Some("0.31.2" | "0.32.3")),
                     "unsupported native runtime",

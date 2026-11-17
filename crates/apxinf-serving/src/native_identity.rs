@@ -35,6 +35,33 @@ pub fn runtime(executable: &Path, library: &Path) -> Result<Value, String> {
     )
 }
 
+/// Runtime identity for the family-parameterized native text provider.
+pub fn text_runtime(executable: &Path, library: &Path) -> Result<Value, String> {
+    if library.file_name().and_then(|name| name.to_str()) != Some("libmlx.dylib") {
+        return Err("The native runtime requires libmlx.dylib.".into());
+    }
+    Ok(
+        json!({"kind":"native_text", "apxinf":"0.1.0", "mlx":"0.32.3",
+        "executable_sha256":digest(executable)?.1, "metal_library_sha256":digest(library)?.1}),
+    )
+}
+
+/// Execution identity for the family-parameterized native text provider. The
+/// registry name and variant are part of the identity, so a different family or
+/// precision cannot satisfy a manifest produced by another one.
+pub fn text_execution(
+    context: usize,
+    output: usize,
+    memory: u64,
+    model_name: &str,
+    variant: &str,
+    prompt_protocol: &str,
+) -> Value {
+    json!({"provider":model_name, "precision":"bf16", "variant":variant,
+        "parser":"plain_text", "enable_thinking":false, "prompt_protocol":prompt_protocol,
+        "max_context":context, "max_output_tokens":output, "memory_limit_bytes":memory})
+}
+
 pub fn execution(context: usize, output: usize, memory: u64) -> Value {
     json!({"provider":"metal_minicpm5", "precision":"bf16", "variant":"bf16-compiled",
         "parser":"minicpm5_xml", "enable_thinking":false, "max_context":context,
@@ -98,6 +125,8 @@ pub fn manifest(model: &Path, runtime: Value, execution: Value) -> Result<Value,
         "apxinf-native-minicpm5-thinking-v1"
     } else if execution.get("sampling").is_some() {
         "apxinf-native-minicpm5-sampled-v1"
+    } else if execution.get("prompt_protocol").is_some() {
+        crate::contracts::NATIVE_TEXT_ADAPTER
     } else {
         "apxinf-native-minicpm5-v1"
     };

@@ -18,6 +18,8 @@ pub mod metal_clef;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_d3_lite;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_lfm3;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_minicpm5;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_qwen3;

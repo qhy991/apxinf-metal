@@ -274,6 +274,15 @@ pub enum WorkerRuntime {
         executable: PathBuf,
         metal_library: PathBuf,
     },
+    /// Family-parameterized native text provider: the same worker binary and
+    /// identity mechanism, with the registry name and prompt protocol supplied by
+    /// the launch instead of hard-coded to MiniCPM5.
+    NativeText {
+        executable: PathBuf,
+        metal_library: PathBuf,
+        model_name: Option<String>,
+        model_variant: Option<String>,
+    },
 }
 
 impl WorkerRuntime {
@@ -289,6 +298,7 @@ impl WorkerRuntime {
             Self::NativeMiniCpm5BoundedThinking { .. } => {
                 contracts::NATIVE_BOUNDED_THINKING_PROTOCOL
             }
+            Self::NativeText { .. } => contracts::NATIVE_TEXT_PROTOCOL,
         }
     }
 }
@@ -361,6 +371,16 @@ impl Config {
         {
             return Err(
                 "Native MiniCPM5 requires at most 16384 positions, --prefill-step-size 256 for launch compatibility, and one token per output frame."
+                    .into(),
+            );
+        }
+        if matches!(self.runtime, WorkerRuntime::NativeText { .. })
+            && (self.max_context > 16384
+                || self.output_batch_tokens != 1
+                || self.prefill_step_size != 256)
+        {
+            return Err(
+                "The native text provider requires at most 16384 positions, --prefill-step-size 256 for launch compatibility, and one token per output frame."
                     .into(),
             );
         }
@@ -969,9 +989,8 @@ async fn launch_worker_until(
         | WorkerRuntime::NativeMiniCpm5 { executable, .. }
         | WorkerRuntime::NativeMiniCpm5Sampled { executable, .. }
         | WorkerRuntime::NativeMiniCpm5Thinking { executable, .. }
-        | WorkerRuntime::NativeMiniCpm5BoundedThinking { executable, .. } => {
-            Command::new(executable)
-        }
+        | WorkerRuntime::NativeMiniCpm5BoundedThinking { executable, .. }
+        | WorkerRuntime::NativeText { executable, .. } => Command::new(executable),
     };
     if let WorkerRuntime::PythonClef { loader } = &config.runtime {
         command.arg("--clef-loader").arg(loader);
@@ -993,6 +1012,22 @@ async fn launch_worker_until(
         .arg(config.output_batch_tokens.to_string())
         .arg("--memory-limit-bytes")
         .arg(config.memory_budget.to_string());
+    if let WorkerRuntime::NativeText {
+        model_name,
+        model_variant,
+        ..
+    } = &config.runtime
+    {
+        command
+            .arg("--prompt-protocol")
+            .arg(contracts::NATIVE_TEXT_PROMPT_PROTOCOL);
+        if let Some(name) = model_name {
+            command.arg("--model-name").arg(name);
+        }
+        if let Some(variant) = model_variant {
+            command.arg("--model-variant").arg(variant);
+        }
+    }
     if matches!(config.runtime, WorkerRuntime::Python) {
         if let Some((bits, start)) = python_kv_options(config) {
             if start >= config.max_context as u64 {
@@ -1023,7 +1058,8 @@ async fn launch_worker_until(
     | WorkerRuntime::NativeMiniCpm5 { metal_library, .. }
     | WorkerRuntime::NativeMiniCpm5Sampled { metal_library, .. }
     | WorkerRuntime::NativeMiniCpm5Thinking { metal_library, .. }
-    | WorkerRuntime::NativeMiniCpm5BoundedThinking { metal_library, .. } = &config.runtime
+    | WorkerRuntime::NativeMiniCpm5BoundedThinking { metal_library, .. }
+    | WorkerRuntime::NativeText { metal_library, .. } = &config.runtime
     {
         command.arg("--metal-library").arg(metal_library).env(
             "DYLD_LIBRARY_PATH",
@@ -2248,6 +2284,35 @@ fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
         {
             return Err(format!("The model artifact identity differs: {name}"));
         }
+    }
+    if let WorkerRuntime::NativeText {
+        executable,
+        metal_library,
+        model_name,
+        model_variant,
+    } = &config.runtime
+    {
+        // Same verification path as the other native providers: the worker's
+        // reported runtime, adapter revision and execution identity must equal
+        // what this launch configuration implies. Nothing is skipped.
+        let expected = crate::native_identity::text_runtime(executable, metal_library)?;
+        let execution = crate::native_identity::text_execution(
+            config.max_context,
+            config.max_output,
+            config.memory_budget,
+            model_name.as_deref().unwrap_or("auto"),
+            model_variant.as_deref().unwrap_or("auto"),
+            contracts::NATIVE_TEXT_PROMPT_PROTOCOL,
+        );
+        if manifest["runtime"] != expected
+            || manifest["adapter_revision"] != contracts::NATIVE_TEXT_ADAPTER
+            || manifest["execution"] != execution
+        {
+            return Err(
+                "The native text execution identity differs from the selected configuration.".into(),
+            );
+        }
+        return Ok(());
     }
     if let WorkerRuntime::NativeMiniCpm5Prepared {
         executable,

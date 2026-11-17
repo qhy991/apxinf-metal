@@ -25,8 +25,16 @@ struct Args {
     model: PathBuf,
     #[arg(long, default_value = "apxinf-local")]
     model_id: String,
-    #[arg(long, default_value = "python-mlx-lm", value_parser = ["python-mlx-lm", "mlx-vlm-minicpmv47", "python-clef", "native-minicpm5", "native-minicpm5-prepared", "native-minicpm5-sampled", "native-minicpm5-thinking", "native-minicpm5-thinking-bounded"])]
+    #[arg(long, default_value = "python-mlx-lm", value_parser = ["python-mlx-lm", "mlx-vlm-minicpmv47", "python-clef", "native-minicpm5", "native-minicpm5-prepared", "native-minicpm5-sampled", "native-minicpm5-thinking", "native-minicpm5-thinking-bounded", "native"])]
     provider: String,
+    /// Registry name for `--provider native`; unset lets the checkpoint's own
+    /// metadata select the family (`model_type: lfm3` resolves to `metal_lfm3`).
+    #[arg(long)]
+    model_name: Option<String>,
+    /// Family-local variant for `--provider native`; unset selects the family's
+    /// own default variant.
+    #[arg(long)]
+    model_variant: Option<String>,
     #[arg(long)]
     native_worker: Option<PathBuf>,
     #[arg(long)]
@@ -195,7 +203,23 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.allocator_cache_limit_bytes.is_some() && args.provider != "native-minicpm5-prepared" {
         return Err("Allocator cache limit requires native-minicpm5-prepared.".into());
     }
-    let runtime = if matches!(
+    if args.provider != "native" && (args.model_name.is_some() || args.model_variant.is_some()) {
+        return Err("--model-name and --model-variant require --provider native.".into());
+    }
+    let runtime = if args.provider == "native" {
+        WorkerRuntime::NativeText {
+            executable: std::fs::canonicalize(
+                args.native_worker
+                    .ok_or("Native provider requires --native-worker.")?,
+            )?,
+            metal_library: std::fs::canonicalize(
+                args.metal_library
+                    .ok_or("Native provider requires --metal-library.")?,
+            )?,
+            model_name: args.model_name.clone(),
+            model_variant: args.model_variant.clone(),
+        }
+    } else if matches!(
         args.provider.as_str(),
         "native-minicpm5"
             | "native-minicpm5-prepared"

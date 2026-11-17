@@ -37,6 +37,8 @@ enum NativeProfile {
     Sampled,
     Thinking,
     BoundedThinking,
+    /// Family-parameterized native text generation (`apxinf-worker/2.8`).
+    Text,
 }
 
 impl NativeProfile {
@@ -47,6 +49,7 @@ impl NativeProfile {
             contracts::NATIVE_SAMPLED_PROTOCOL => Some(Self::Sampled),
             contracts::NATIVE_THINKING_PROTOCOL => Some(Self::Thinking),
             contracts::NATIVE_BOUNDED_THINKING_PROTOCOL => Some(Self::BoundedThinking),
+            contracts::NATIVE_TEXT_PROTOCOL => Some(Self::Text),
             _ => None,
         }
     }
@@ -59,6 +62,16 @@ impl NativeProfile {
             Self::BoundedThinking => {
                 native_identity::bounded_thinking_execution(context, output, memory)
             }
+            // The text provider's identity binds the registry name, variant and
+            // prompt protocol, so `run` builds it at the call site.
+            Self::Text => native_identity::text_execution(
+                context,
+                output,
+                memory,
+                "auto",
+                "auto",
+                contracts::NATIVE_TEXT_PROMPT_PROTOCOL,
+            ),
         }
     }
 
@@ -67,14 +80,42 @@ impl NativeProfile {
     }
 
     fn sampling(self) -> bool {
-        !matches!(self, Self::Greedy | Self::Prepared)
+        !matches!(self, Self::Greedy | Self::Prepared | Self::Text)
     }
+
+    /// Prompt protocol rendered by this launch. Only the text provider renders
+    /// its prompt in the family; every MiniCPM5 profile keeps the checkpoint
+    /// chat template.
+    fn prompt_protocol(self) -> PromptProtocol {
+        match self {
+            Self::Text => PromptProtocol::LaneChatml,
+            _ => PromptProtocol::CheckpointTemplate,
+        }
+    }
+}
+
+/// How the prompt text is produced for a `prepare_input` command.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptProtocol {
+    /// The checkpoint's own `chat_template.jinja` (every MiniCPM5 profile).
+    CheckpointTemplate,
+    /// The family's frozen lane ChatML, rendered by the model family itself.
+    LaneChatml,
 }
 
 #[derive(Parser)]
 struct Args {
     #[arg(long)]
     protocol: String,
+    /// Registry name override for the family-parameterized text provider.
+    #[arg(long)]
+    model_name: Option<String>,
+    /// Family-local variant override for the text provider.
+    #[arg(long)]
+    model_variant: Option<String>,
+    /// Prompt protocol label; `lane-chatml` selects family-rendered prompts.
+    #[arg(long)]
+    prompt_protocol: Option<String>,
     #[arg(long)]
     worker_epoch: String,
     #[arg(long)]
@@ -485,15 +526,51 @@ fn run(args: Args) -> Result<()> {
     if loaded_library != std::fs::canonicalize(&args.metal_library)? {
         return Err("Loaded MLX library differs from the selected runtime.".into());
     }
-    let runtime = native_identity::runtime(&std::env::current_exe()?, &loaded_library)?;
-    let manifest = native_identity::manifest(
-        &args.model,
-        runtime.clone(),
-        if prepared {
-            native_identity::prepared_execution(args.max_context, args.max_output_tokens, args.memory_limit_bytes,
-                args.cache_limit_bytes.unwrap(), args.retained_memory_limit_bytes.unwrap())
-        } else { profile.execution(args.max_context, args.max_output_tokens, args.memory_limit_bytes) },
-    )?;
+    let text_mode = profile == NativeProfile::Text;
+    let prompt_protocol = match args.prompt_protocol.as_deref() {
+        None | Some("lane-chatml") if text_mode => PromptProtocol::LaneChatml,
+        None => profile.prompt_protocol(),
+        Some("checkpoint-template") if !text_mode => PromptProtocol::CheckpointTemplate,
+        Some(other) => return Err(format!("Unsupported prompt protocol `{other}`").into()),
+    };
+    let model_name = args
+        .model_name
+        .clone()
+        .unwrap_or_else(|| "auto".to_string());
+    let model_variant = args
+        .model_variant
+        .clone()
+        .unwrap_or_else(|| "auto".to_string());
+    let runtime = if text_mode {
+        native_identity::text_runtime(&std::env::current_exe()?, &loaded_library)?
+    } else {
+        native_identity::runtime(&std::env::current_exe()?, &loaded_library)?
+    };
+    let execution = if prepared {
+        native_identity::prepared_execution(
+            args.max_context,
+            args.max_output_tokens,
+            args.memory_limit_bytes,
+            args.cache_limit_bytes.unwrap(),
+            args.retained_memory_limit_bytes.unwrap(),
+        )
+    } else if text_mode {
+        native_identity::text_execution(
+            args.max_context,
+            args.max_output_tokens,
+            args.memory_limit_bytes,
+            &model_name,
+            &model_variant,
+            contracts::NATIVE_TEXT_PROMPT_PROTOCOL,
+        )
+    } else {
+        profile.execution(
+            args.max_context,
+            args.max_output_tokens,
+            args.memory_limit_bytes,
+        )
+    };
+    let manifest = native_identity::manifest(&args.model, runtime.clone(), execution)?;
     let model_revision =
         contracts::canonical_identity_digest("apxinf-model-identity-v1", &manifest)?;
     let capabilities = json!({"text":true,"image":false,"greedy":true,"sampling":profile.sampling(),"token_events":true,
@@ -501,15 +578,29 @@ fn run(args: Args) -> Result<()> {
         "max_output_tokens":args.max_output_tokens,"exact_append":false,"state_schema":"none"});
     let capability_revision =
         contracts::canonical_identity_digest("apxinf-capability-v1", &capabilities)?;
-    std::env::set_var("APXINF_MINICPM5_PREFILL_CHUNK", "256");
+    if !text_mode {
+        std::env::set_var("APXINF_MINICPM5_PREFILL_CHUNK", "256");
+    }
     apxinf_mlx::set_memory_limit(usize::try_from(args.memory_limit_bytes)?)?;
-    if let Some(limit) = args.cache_limit_bytes { apxinf_mlx::set_cache_limit(usize::try_from(limit)?)?; }
+    if let Some(limit) = args.cache_limit_bytes {
+        apxinf_mlx::set_cache_limit(usize::try_from(limit)?)?;
+    }
+    let load_name = if text_mode {
+        (model_name != "auto").then(|| model_name.clone())
+    } else {
+        Some("metal_minicpm5".to_string())
+    };
+    let load_variant = if text_mode {
+        (model_variant != "auto").then(|| model_variant.clone())
+    } else {
+        Some("bf16-compiled".to_string())
+    };
     let mut model = AutoModel::load_model(
         Device::Metal(0),
         &args.model,
         &LoadOptions {
-            model_name: Some("metal_minicpm5".into()),
-            model_variant: Some("bf16-compiled".into()),
+            model_name: load_name,
+            model_variant: load_variant,
             text_weight_dtype: Some(DType::BF16),
             ..Default::default()
         },
@@ -520,7 +611,11 @@ fn run(args: Args) -> Result<()> {
         .eos_token_ids
         .clone()
         .ok_or("Checkpoint has no EOS IDs")?;
-    if !eos.contains(&1) || !eos.contains(&130073) {
+    if text_mode {
+        if eos.is_empty() {
+            return Err("Checkpoint has no EOS IDs".into());
+        }
+    } else if !eos.contains(&1) || !eos.contains(&130073) {
         return Err("Unexpected MiniCPM EOS identity".into());
     }
     if profile == NativeProfile::BoundedThinking {
@@ -586,12 +681,13 @@ fn run(args: Args) -> Result<()> {
                     continue;
                 }
                 if command["kind"] == "prepare_input" {
-                    let prepared = prepare(
+                    let prepared = prepare_with_prompt(
                         &tokenizer,
                         &command,
                         &model_revision,
                         args.max_context,
                         profile.enable_thinking(),
+                        prompt_protocol,
                     );
                     match prepared {
                         Ok(tokens) => {
@@ -678,12 +774,32 @@ fn reject_invalid(state: &mut State, command: Value) -> Result<()> {
     Ok(())
 }
 
+/// Checkpoint-template prompt path (every MiniCPM5 profile, and the default for
+/// any caller that does not select a family-rendered prompt).
 fn prepare(
     tokenizer: &Tokenizer,
     command: &Value,
     revision: &str,
     limit: usize,
     enable_thinking: bool,
+) -> std::result::Result<Vec<u32>, Value> {
+    prepare_with_prompt(
+        tokenizer,
+        command,
+        revision,
+        limit,
+        enable_thinking,
+        PromptProtocol::CheckpointTemplate,
+    )
+}
+
+fn prepare_with_prompt(
+    tokenizer: &Tokenizer,
+    command: &Value,
+    revision: &str,
+    limit: usize,
+    enable_thinking: bool,
+    prompt_protocol: PromptProtocol,
 ) -> std::result::Result<Vec<u32>, Value> {
     if command["model_revision"] != revision
         || command["template_options"]["enable_thinking"] != enable_thinking
@@ -707,10 +823,19 @@ fn prepare(
             }
         }
     }
-    let options = json!({"enable_thinking":enable_thinking,"tools":command["tools"]});
-    let prompt = tokenizer
-        .apply_rich_chat_template(&messages, options.as_object().unwrap())
-        .map_err(|e| error("invalid_request", &e.to_string()))?;
+    let prompt = match prompt_protocol {
+        // The family renders the frozen lane ChatML. The checkpoint template is
+        // never consulted here: even with `enable_thinking=false` it injects the
+        // `<think>` prefix, which is a different (unvalidated) protocol.
+        PromptProtocol::LaneChatml => apxinf_model::metal_lfm3::lane_chat_prompt(&messages)
+            .map_err(|e| error("invalid_request", &e.to_string()))?,
+        PromptProtocol::CheckpointTemplate => {
+            let options = json!({"enable_thinking":enable_thinking,"tools":command["tools"]});
+            tokenizer
+                .apply_rich_chat_template(&messages, options.as_object().unwrap())
+                .map_err(|e| error("invalid_request", &e.to_string()))?
+        }
+    };
     if enable_thinking && !prompt.ends_with("<think>\n") {
         return Err(error(
             "invalid_request",
