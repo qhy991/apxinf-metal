@@ -67,13 +67,32 @@ A request is exactly three fields, all required, paths absolute:
 - Each acceleration is default-on with an env kill switch
   (`APXINF_JEV_FP16_COMPUTE=0`, `APXINF_JEV_ANE_WAVEFRONT=0`).
 
-## 4. P0 exit check (remaining)
+## 4. P0 exit check — executed 2026-11-17
 
-For all 72 corpus rows: the prompt string from `contract.build_prompt` and the
-token ids from the snapshot tokenizer must match the EngineTailor oracle
-(`enginetailor/models/jev/reference.py`, Transformers FP32 CPU) byte-for-byte.
-Only after that does P1 start, so a later parity failure cannot be blamed on the
-tokenizer.
+Inputs: EngineTailor `oracle-gate.json` (72 gate cases, M1 Pro, source commit
+`872f6315…`, workload sha256 `251aa0ca…`), the public `openbmb/JevOCRBench@a26c4b32`
+rows (file sha256 `7a4546d1…`), the snapshot tokenizer, and EngineTailor's
+stdlib `contract.build_prompt` as the reference.
+
+Result: **71/72 byte-exact.** For every case, the anchor `input_ids` (with
+image-pad runs collapsed) equal the token ids of `build_prompt(ocr_text)`
+tokenized with `add_special_tokens=False`. Per-case prompt sha256, text-token
+count, anchor `input_sha256` and match flag are recorded in
+`minicpm-ocr-jev-p0-parity.json`; the script is
+`scripts/jev_p0_parity.py`.
+
+One anomaly, case 1906: the anchor ids merge the Arabic sequence `ا`+`ً` into a
+single BPE token where the snapshot tokenizer splits it. The decoded text is
+byte-identical, and tokenizers 0.20.3 / 0.21.4 / 0.22.1 / 0.23.3 all reproduce
+the split, so the host-private workload text is the likely source (the workload
+file exists in neither repo). The anchor ids are kept as the authoritative
+fixture; P1's full-input parity (with images and weights) decides whether any
+implementation detail must follow the anchor path.
+
+Consequence: the tokenizer/prompt contract is pinned and P1 can start as soon as
+weights are available. Per the owner decision, the weights are **re-downloaded
+from HF** (`openbmb/MiniCPM-OCR-Jev`, revision `56960237…`) instead of copied
+over the ~40 KB/s cross-machine link.
 
 ## 5. Notes
 
