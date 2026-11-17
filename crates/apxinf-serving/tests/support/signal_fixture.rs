@@ -39,6 +39,8 @@ impl Fixture {
         let config = Config {
             python,
             worker,
+            worker_args: Vec::new(),
+            worker_env: Vec::new(),
             model: root.join("model"),
             model_id: "cpu-signals".into(),
             max_context: 64,

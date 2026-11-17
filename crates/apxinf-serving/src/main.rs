@@ -6,6 +6,7 @@ use apxinf_serving::{
 use clap::Parser;
 use futures_util::FutureExt;
 use std::{
+    ffi::OsString,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     process::ExitCode,
@@ -50,6 +51,12 @@ struct Args {
     sequence_reservation_bytes: u64,
     #[arg(long, value_enum, default_value = "macos")]
     host_pressure_policy: HostPressurePolicy,
+    /// Extra arguments appended to the worker command line (repeatable).
+    #[arg(long = "worker-arg", value_name = "ARG")]
+    worker_arg: Vec<String>,
+    /// Extra KEY=VALUE environment entries for the worker (repeatable).
+    #[arg(long = "worker-env", value_name = "KEY=VALUE")]
+    worker_env: Vec<String>,
 }
 
 #[tokio::main]
@@ -77,6 +84,20 @@ async fn main() -> ExitCode {
     exit
 }
 
+fn parse_worker_env(values: &[String]) -> Result<Vec<(OsString, OsString)>, Box<dyn std::error::Error>> {
+    let mut parsed = Vec::with_capacity(values.len());
+    for value in values {
+        let (key, entry) = value
+            .split_once('=')
+            .ok_or_else(|| format!("worker environment entry is not KEY=VALUE: {value}"))?;
+        if key.is_empty() || key.contains('\0') || entry.contains('\0') {
+            return Err(format!("worker environment entry is invalid: {value}").into());
+        }
+        parsed.push((OsString::from(key), OsString::from(entry)));
+    }
+    Ok(parsed)
+}
+
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     diagnostics::initialize()?;
     let mut shutdown = Box::pin(termination_signal()?);
@@ -98,7 +119,10 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     let service = supervisor::start_with_shutdown(
         Config {
-            python: std::fs::canonicalize(args.python)?,
+            // Keep the declared interpreter path (a venv launcher must keep its
+            // pyvenv.cfg prefix); canonicalize() resolves a venv symlink to the
+            // base interpreter and hides the venv's site-packages from the worker.
+            python: std::path::absolute(args.python)?,
             worker: std::fs::canonicalize(args.worker)?,
             model: std::fs::canonicalize(args.model)?,
             model_id: args.model_id,
@@ -111,6 +135,8 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             memory_budget: args.memory_budget_bytes,
             sequence_reservation: args.sequence_reservation_bytes,
             host_pressure_policy: args.host_pressure_policy,
+            worker_args: args.worker_arg,
+            worker_env: parse_worker_env(&args.worker_env)?,
         },
         shutdown.as_mut(),
     )
