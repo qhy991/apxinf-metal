@@ -327,6 +327,8 @@ pub struct Config {
     pub memory_budget: u64,
     pub sequence_reservation: u64,
     pub host_pressure_policy: HostPressurePolicy,
+    /// Append one JSON line per settled request here (chat and replay).
+    pub request_log: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -572,8 +574,25 @@ pub struct Metrics {
     pub worker_restart_failures: AtomicU64,
 }
 
+/// One forced-decode replay handed to the worker-owning coordinator.
+pub struct ReplayJob {
+    pub prompt: Vec<u32>,
+    pub target: Vec<u32>,
+    pub steps: Option<usize>,
+    pub reply: tokio::sync::oneshot::Sender<Result<Value, ApiError>>,
+}
+
 pub struct Service {
     queue: PendingQueue,
+    /// Replay lane: the coordinator owns the worker, so replays are serialized
+    /// with chat work through this channel instead of a second command writer.
+    replay_tx: tokio::sync::mpsc::Sender<ReplayJob>,
+    replay_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ReplayJob>>>,
+    /// Optional append-only per-request timing log.
+    pub request_log: Option<Arc<crate::request_log::RequestLog>>,
+    /// Declared attention/prefill backend configuration (`off` until ANE prefill
+    /// is implemented for this family).
+    pub ane: String,
     host_pressure: Arc<HostPressure>,
     pub ready: Value,
     ready_state: RwLock<Value>,
@@ -620,6 +639,59 @@ impl Service {
 
     pub(crate) fn image_enabled(&self) -> bool {
         self.ready["protocol"] == contracts::VISION_PROTOCOL
+    }
+
+    /// Run one forced-decode replay and return the worker's result frame.
+    ///
+    /// Replay shares the single worker lane, so it is serialized with chat
+    /// requests; that is what keeps its per-step timings comparable to live
+    /// traffic. The worker resets its request state before and after, so
+    /// consecutive replays cannot inherit state from each other.
+    pub async fn replay(
+        &self,
+        prompt: Vec<u32>,
+        target: Vec<u32>,
+        steps: Option<usize>,
+    ) -> Result<Value, ApiError> {
+        if self.decision_enabled() || self.image_enabled() {
+            return Err(ApiError::new(
+                400,
+                "unsupported_feature",
+                "This provider does not support text replay.",
+            ));
+        }
+        if !self.available.load(Ordering::Acquire) {
+            return Err(ApiError::worker("The model worker is unavailable."));
+        }
+        if let Some(error) = self.rotating.load(Ordering::Acquire).then(|| {
+            ApiError::new(503, "model_unavailable", "The model worker is rotating.")
+        }) {
+            return Err(error);
+        }
+        self.check_host_pressure(false)?;
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.replay_tx
+            .send(ReplayJob {
+                prompt,
+                target,
+                steps,
+                reply,
+            })
+            .await
+            .map_err(|_| ApiError::worker("The replay lane is closed."))?;
+        match tokio::time::timeout(self.timeout, result).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(_)) => Err(ApiError::worker("The replay lane was dropped.")),
+            Err(_) => Err(ApiError::new(
+                504,
+                "timeout",
+                "The replay did not finish within the request timeout.",
+            )),
+        }
+    }
+
+    fn take_replay_lane(&self) -> Option<tokio::sync::mpsc::Receiver<ReplayJob>> {
+        self.replay_rx.lock().ok().and_then(|mut slot| slot.take())
     }
 
     pub fn enqueue(&self, request: Request) -> Result<Ticket, ApiError> {
@@ -1281,7 +1353,16 @@ async fn start_inner(
     let (worker, ready) = launch_worker_until(&config, &pressure, shutdown).await?;
     let (stopped_sender, stopped) = watch::channel(None);
     let (_, peak) = ready_memory_totals(&ready)?;
+    let request_log = match &config.request_log {
+        Some(path) => Some(Arc::new(crate::request_log::RequestLog::open(path)?)),
+        None => None,
+    };
+    let (replay_tx, replay_rx) = tokio::sync::mpsc::channel(1);
     let service = Arc::new(Service {
+        replay_tx,
+        replay_rx: std::sync::Mutex::new(Some(replay_rx)),
+        request_log,
+        ane: "off".to_string(),
         queue: PendingQueue::new(config.queue_capacity),
         host_pressure: pressure.clone(),
         ready_state: RwLock::new(ready.clone()),
@@ -1630,6 +1711,7 @@ where
     Fut: Future<Output = Result<(Worker, Value), E>>,
     E: Into<LaunchError>,
 {
+    let mut replay_rx = shared.take_replay_lane();
     let mut backoff = RestartBackoff::new(shared.restart);
     let mut pending_recovery: Option<Arc<RequestObservation>> = None;
     let mut fault: Option<String> = None;
@@ -1692,6 +1774,12 @@ where
                         }
                     }
                 }
+                continue;
+            }
+            replay = recv_replay(&mut replay_rx) => {
+                let Some(job) = replay else { break; };
+                let result = run_replay(&mut worker, &shared, &job, shared.timeout).await;
+                let _ = job.reply.send(result);
                 continue;
             }
             job = shared.queue.recv(&shared.metrics) => match job {
@@ -2745,6 +2833,36 @@ async fn execute(
         "{}",
         json!({"event":"request_settled","request_id":job.id,"status":public.status,"worker_status":terminal["status"],"consumer_stop":consumer_stop,"input_tokens":input_tokens,"output_tokens":output_tokens,"elapsed_ms":job.ingress.elapsed().as_millis(),"worker_metrics":terminal["metrics"]})
     ));
+    {
+        let metrics = &terminal["metrics"];
+        let ttft_ms = metrics["ttft_ns"].as_u64().unwrap_or(0) as f64 / 1e6;
+        let total_ms = metrics["elapsed_ns"].as_u64().unwrap_or(0) as f64 / 1e6;
+        let decode_ms = (total_ms - ttft_ms).max(0.0);
+        let per_token = if output_tokens > 1 {
+            decode_ms / (output_tokens - 1) as f64
+        } else {
+            0.0
+        };
+        let execution = &service.ready["model_manifest"]["execution"];
+        log_request(
+            service,
+            json!({
+                "request_id": job.id,
+                "kind": "chat",
+                "prefill_ms": ttft_ms,
+                "decode_ms": decode_ms,
+                "decode_ms_per_token": per_token,
+                "ttft_ms": ttft_ms,
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "quant": execution["precision"],
+                "ane": service.ane,
+                "thermal": crate::thermal::state(),
+                "status": public.status,
+                "cause": cause,
+            }),
+        );
+    }
     Ok(())
     }.await;
     result.map_err(|error| {
@@ -2755,6 +2873,98 @@ async fn execute(
             reported: true,
         }
     })
+}
+
+/// Await a replay job, or pend forever when the lane is not owned by this loop.
+async fn recv_replay(
+    lane: &mut Option<tokio::sync::mpsc::Receiver<ReplayJob>>,
+) -> Option<ReplayJob> {
+    match lane.as_mut() {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Send one forced-decode replay to the worker and read its result frame.
+async fn run_replay(
+    worker: &mut Worker,
+    shared: &Arc<Service>,
+    job: &ReplayJob,
+    timeout: Duration,
+) -> Result<Value, ApiError> {
+    let mut command = json!({
+        "protocol": worker.protocol,
+        "kind": "replay",
+        "worker_epoch": worker.epoch,
+        "command_id": uuid::Uuid::new_v4().to_string(),
+        "prompt_token_ids": job.prompt,
+        "target_token_ids": job.target,
+    });
+    if let Some(steps) = job.steps {
+        command["steps"] = json!(steps);
+    }
+    let command_id = command["command_id"].clone();
+    worker.send(&command).await?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ApiError::new(
+                504,
+                "timeout",
+                "The replay did not finish within the request timeout.",
+            ));
+        }
+        let frame = worker.receive(remaining).await?;
+        if frame["command_id"] != command_id {
+            continue;
+        }
+        match frame["kind"].as_str() {
+            Some("replay_result") => {
+                log_request(
+                    shared,
+                    json!({
+                        "request_id": frame["command_id"],
+                        "kind": "replay",
+                        "prefill_ms": frame["prefill_ms"],
+                        "decode_ms": frame["decode_ms_total"],
+                        "decode_ms_per_token": frame["decode_ms_per_token"]["median_ms"],
+                        "ttft_ms": frame["prefill_ms"],
+                        "prompt_tokens": frame["prompt_tokens"],
+                        "completion_tokens": frame["tokens_emitted"],
+                        "quant": frame["config_echo"]["quant"],
+                        "ane": frame["config_echo"]["ane"],
+                        "thermal": frame["thermal"],
+                        "match_rate": frame["match_rate"],
+                    }),
+                );
+                return Ok(frame);
+            }
+            Some("command_result") if frame["status"] == "error" => {
+                return Err(ApiError::new(
+                    500,
+                    "replay_failed",
+                    frame["error"]["message"]
+                        .as_str()
+                        .unwrap_or("the worker rejected the replay"),
+                ));
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// Append one request record to the configured timing log, if any.
+fn log_request(service: &Service, mut record: Value) {
+    let Some(log) = &service.request_log else {
+        return;
+    };
+    if let Some(object) = record.as_object_mut() {
+        object.insert("ts".into(), json!(crate::request_log::now_iso()));
+        object.insert("model".into(), json!(service.model_id));
+        object.insert("ane".into(), json!(service.ane));
+    }
+    log.write(&record);
 }
 
 fn observe_worker_frame(job: &Job, service: &Service, frame: &Value) {
@@ -2933,7 +3143,12 @@ fn gateway_test_service_capabilities(
         protocol,
         PROTOCOL | contracts::VISION_PROTOCOL | contracts::CLEF_PROTOCOL
     );
+    let (replay_tx, replay_rx) = tokio::sync::mpsc::channel(1);
     let service = Arc::new(Service {
+        replay_tx,
+        replay_rx: std::sync::Mutex::new(Some(replay_rx)),
+        request_log: None,
+        ane: "off".to_string(),
         queue: PendingQueue::new(8),
         host_pressure: pressure,
         stopped: watch::channel(None).1,
@@ -2978,7 +3193,12 @@ mod lifecycle_tests {
     const CONTROL: &str = "00000000-0000-4000-8000-000000000002";
 
     fn idle_service() -> Arc<Service> {
+        let (replay_tx, replay_rx) = tokio::sync::mpsc::channel(1);
         Arc::new(Service {
+            replay_tx,
+            replay_rx: std::sync::Mutex::new(Some(replay_rx)),
+            request_log: None,
+            ane: "off".to_string(),
             queue: PendingQueue::new(8),
             host_pressure: Arc::new(HostPressure::new(HostPressurePolicy::Disabled)),
             stopped: watch::channel(None).1,

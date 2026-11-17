@@ -484,7 +484,12 @@ fn read_commands(
             }
             let valid = contracts::validate_frame(&command).is_ok();
             let shutdown = valid && command["kind"] == "shutdown";
-            if !valid || matches!(command["kind"].as_str(), Some("submit" | "prepare_input")) {
+            if !valid
+                || matches!(
+                    command["kind"].as_str(),
+                    Some("submit" | "prepare_input" | "replay")
+                )
+            {
                 commands.try_send(Incoming {
                     value: command,
                     valid,
@@ -570,6 +575,7 @@ fn run(args: Args) -> Result<()> {
             args.memory_limit_bytes,
         )
     };
+    let execution_echo = execution.clone();
     let manifest = native_identity::manifest(&args.model, runtime.clone(), execution)?;
     let model_revision =
         contracts::canonical_identity_digest("apxinf-model-identity-v1", &manifest)?;
@@ -680,7 +686,17 @@ fn run(args: Args) -> Result<()> {
                     reject_invalid(&mut state, command)?;
                     continue;
                 }
-                if command["kind"] == "prepare_input" {
+                if command["kind"] == "replay" {
+                    if let Err(failure) =
+                        replay(&mut state, &mut model, &args, &command, &execution_echo, &eos)
+                    {
+                        state.reply(
+                            &command,
+                            "error",
+                            Some(error("invalid_request", &failure.to_string())),
+                        )?;
+                    }
+                } else if command["kind"] == "prepare_input" {
                     let prepared = prepare_with_prompt(
                         &tokenizer,
                         &command,
@@ -775,7 +791,10 @@ fn reject_invalid(state: &mut State, command: Value) -> Result<()> {
 }
 
 /// Checkpoint-template prompt path (every MiniCPM5 profile, and the default for
-/// any caller that does not select a family-rendered prompt).
+/// any caller that does not select a family-rendered prompt). The installed
+/// worker call site uses `prepare_with_prompt`; the unit tests exercise this
+/// wrapper, so it is test-only in the binary.
+#[cfg(test)]
 fn prepare(
     tokenizer: &Tokenizer,
     command: &Value,
@@ -852,6 +871,140 @@ fn prepare_with_prompt(
         ));
     }
     Ok(tokens)
+}
+
+/// One `replay` command: prefill the given prompt, then feed the caller's tokens
+/// through the engine without sampling and report per-step cost and agreement.
+///
+/// Every replay starts from a clean request state, so consecutive replays in one
+/// worker process cannot contaminate each other.
+fn replay(
+    state: &mut State,
+    model: &mut apxinf_model::LoadedModel,
+    args: &Args,
+    command: &Value,
+    execution: &Value,
+    eos: &[u32],
+) -> Result<()> {
+    let prompt: Vec<u32> = command["prompt_token_ids"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_u64).map(|v| v as u32).collect())
+        .unwrap_or_default();
+    let target: Vec<u32> = command["target_token_ids"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_u64).map(|v| v as u32).collect())
+        .unwrap_or_default();
+    let requested_steps = command.get("steps").and_then(Value::as_u64).map(|v| v as usize);
+    if prompt.is_empty() {
+        return state.reply(
+            command,
+            "error",
+            Some(error("invalid_request", "replay needs at least one prompt token")),
+        );
+    }
+    let steps = requested_steps
+        .unwrap_or_else(|| target.len().saturating_sub(1).max(1))
+        .min(args.max_output_tokens);
+    let text = model.text_mut()?;
+    let backend = text
+        .backend()
+        .as_any()
+        .downcast_ref::<apxinf_mlx::MlxBackend>()
+        .ok_or("replay requires the native MLX backend")?
+        .clone();
+    // Clean slate: drop any state left by a previous request or replay.
+    text.release_request_state()?;
+    text.reset();
+    text.prewarm_decode(prompt.len(), steps + 1);
+    let started = Instant::now();
+    let first = text.prefill(LlmInput::text(&prompt))?;
+    let prefill_ms = started.elapsed().as_secs_f64() * 1e3;
+    let first_argmax = argmax_of(&backend, &first)?;
+    let mut matches = 0usize;
+    let mut comparisons = 0usize;
+    if let Some(expected) = target.first() {
+        comparisons += 1;
+        if first_argmax == *expected {
+            matches += 1;
+        }
+    }
+    let mut position = prompt.len();
+    let mut previous = first_argmax;
+    let mut per_step = Vec::with_capacity(steps);
+    let mut emitted = 0usize;
+    for step in 0..steps {
+        // Teacher forcing: the next input is the caller's token when supplied,
+        // otherwise the engine's own argmax (a plain autoregressive smoke run).
+        let next = target.get(step).copied().unwrap_or(previous);
+        let started = Instant::now();
+        let logits = text.forward(&[next], position as u32)?;
+        let argmax = argmax_of(&backend, &logits)?;
+        per_step.push(started.elapsed().as_secs_f64() * 1e3);
+        position += 1;
+        emitted += 1;
+        if let Some(expected) = target.get(step + 1) {
+            comparisons += 1;
+            if argmax == *expected {
+                matches += 1;
+            }
+        }
+        previous = argmax;
+    }
+    text.release_request_state()?;
+    text.reset();
+    let mut sorted = per_step.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pick = |fraction: f64| -> f64 {
+        if sorted.is_empty() {
+            return 0.0;
+        }
+        let index = ((sorted.len() - 1) as f64 * fraction).round() as usize;
+        sorted[index]
+    };
+    let total: f64 = per_step.iter().sum();
+    let mut frame = state.frame("replay_result");
+    frame.as_object_mut().unwrap().extend(
+        json!({
+            "command_id": command["command_id"],
+            "prompt_tokens": prompt.len(),
+            "target_tokens": target.len(),
+            "tokens_emitted": emitted,
+            "prefill_ms": prefill_ms,
+            "decode_ms_total": total,
+            "decode_ms_per_token": {
+                "per_step_ms": per_step,
+                "mean_ms": if emitted == 0 { 0.0 } else { total / emitted as f64 },
+                "median_ms": pick(0.5),
+                "p10_ms": pick(0.1),
+                "p90_ms": pick(0.9),
+            },
+            "match_rate": if comparisons == 0 { 0.0 } else { matches as f64 / comparisons as f64 },
+            "matches": matches,
+            "comparisons": comparisons,
+            "prefill_argmax": first_argmax,
+            "config_echo": {
+                "quant": execution["precision"],
+                "ane": "off",
+                "prompt_protocol": contracts::NATIVE_TEXT_PROMPT_PROTOCOL,
+                "eos": eos,
+                "provider": execution["provider"],
+                "variant": execution["variant"],
+            },
+            "thermal": apxinf_serving::thermal::state(),
+            "memory": memory()?,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    state.send(frame)
+}
+
+/// Greedy argmax of the last row, read back as one scalar.
+fn argmax_of(backend: &apxinf_mlx::MlxBackend, logits: &Tensor) -> Result<u32> {
+    let array = backend.array(logits)?;
+    let reduced = array.argmax(-1)?;
+    Ok(reduced.to_u32_scalar()?)
 }
 
 struct NativeSampler<'a> {

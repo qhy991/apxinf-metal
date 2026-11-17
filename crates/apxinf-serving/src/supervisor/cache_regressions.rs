@@ -139,6 +139,7 @@ async fn clef_launch_executes_current_source_despite_valid_stale_bytecode() {
         memory_budget: 4096,
         sequence_reservation: 1024,
         host_pressure_policy: HostPressurePolicy::Disabled,
+        request_log: None,
     };
     config.validate_memory().unwrap();
     let pressure = HostPressure::new(HostPressurePolicy::Disabled);

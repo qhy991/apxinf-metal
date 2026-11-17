@@ -55,6 +55,7 @@ impl Fixture {
             memory_budget: 4096,
             sequence_reservation: 1024,
             host_pressure_policy: HostPressurePolicy::Disabled,
+            request_log: None,
         };
         Self { root, config }
     }

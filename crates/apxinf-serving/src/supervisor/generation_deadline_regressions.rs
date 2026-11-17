@@ -152,6 +152,10 @@ while True:
         model_id: "generation-deadline-probe".into(),
         available: AtomicBool::new(true),
         rotating: AtomicBool::new(false),
+        replay_tx: tokio::sync::mpsc::channel(1).0,
+        replay_rx: std::sync::Mutex::new(None),
+        request_log: None,
+        ane: "off".to_string(),
         metrics: Metrics::default(),
         // Held stages only progress after the test releases them, so the
         // deadline is the only thing that ends the first request. The budget

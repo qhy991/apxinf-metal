@@ -23,6 +23,7 @@ pub(super) fn configuration(memory_budget: u64, sequence_reservation: u64) -> Co
         memory_budget,
         sequence_reservation,
         host_pressure_policy: crate::host_pressure::HostPressurePolicy::Disabled,
+        request_log: None,
     }
 }
 

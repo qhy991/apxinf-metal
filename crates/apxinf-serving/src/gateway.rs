@@ -130,6 +130,10 @@ pub fn router_with_gate(gate: Arc<Gate>) -> Router {
         .route("/v1/messages", post(gated_messages))
         .route("/v1/messages/count_tokens", post(gated_count_tokens))
         .route("/v1/chat/completions", post(gated_chat))
+        // Forced-decode replay: run a supplied prompt and feed a recorded token
+        // trajectory through the engine without sampling, for like-for-like
+        // engine comparison. Not part of the OpenAI schema.
+        .route("/v1/replay", post(gated_replay))
         .route("/v1/systemone", post(gated_systemone))
         .route("/metrics", get(gated_metrics))
         .layer(DefaultBodyLimit::max(1_000_000))
@@ -166,6 +170,121 @@ async fn gated_chat(State(gate): State<Arc<Gate>>, headers: HeaderMap, body: Byt
         Some(service) => chat(State(service), headers, body).await,
         None => loading_error(),
     }
+}
+
+async fn gated_replay(State(gate): State<Arc<Gate>>, body: Bytes) -> Response {
+    match gate.service() {
+        Some(service) => replay(State(service), body).await,
+        None => loading_error(),
+    }
+}
+
+/// `POST /v1/replay`
+///
+/// `{prompt_token_ids, target_token_ids, steps?, quant?, ane?}` -> per-step
+/// forced-decode timings and teacher-forced agreement. The declared `quant`/`ane`
+/// are checked against the loaded configuration, so a client cannot label this
+/// process's timings as a different engine.
+async fn replay(State(service): State<Arc<Service>>, body: Bytes) -> Response {
+    match replay_request(service, body).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn replay_request(
+    service: Arc<Service>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let value = crate::contracts::parse_document(&body)
+        .map_err(|e| ApiError::invalid(format!("The request is not valid JSON: {e}")))?;
+    if let Some(model) = value["model"].as_str() {
+        if model != service.model_id {
+            return Err(ApiError::new(
+                404,
+                "model_not_found",
+                "The requested model is not loaded.",
+            ));
+        }
+    }
+    let tokens = |field: &str| -> Result<Vec<u32>, ApiError> {
+        let Some(values) = value.get(field) else {
+            return Ok(Vec::new());
+        };
+        let Some(values) = values.as_array() else {
+            return Err(ApiError::invalid(format!("`{field}` must be an array of ids.")));
+        };
+        values
+            .iter()
+            .map(|token| {
+                token
+                    .as_u64()
+                    .filter(|id| *id <= u32::MAX as u64)
+                    .map(|id| id as u32)
+                    .ok_or_else(|| {
+                        ApiError::invalid(format!("`{field}` must contain token ids only."))
+                    })
+            })
+            .collect()
+    };
+    let prompt = tokens("prompt_token_ids")?;
+    let target = tokens("target_token_ids")?;
+    if prompt.is_empty() {
+        return Err(ApiError::invalid(
+            "`prompt_token_ids` must contain at least one token.",
+        ));
+    }
+    let steps = value
+        .get("steps")
+        .and_then(|steps| steps.as_u64())
+        .map(|steps| steps as usize);
+    // Declared configuration: checked, then echoed from the loaded process.
+    let execution = &service.ready["model_manifest"]["execution"];
+    let quant = execution["precision"].as_str().unwrap_or("unknown");
+    if let Some(requested) = value["quant"].as_str() {
+        if requested != quant {
+            return Err(ApiError::new(
+                400,
+                "unsupported_configuration",
+                format!("This process is serving `{quant}`, not `{requested}`."),
+            ));
+        }
+    }
+    if let Some(requested) = value["ane"].as_str() {
+        if requested != service.ane {
+            return Err(ApiError::new(
+                400,
+                "unsupported_configuration",
+                format!("This process is serving with ANE `{}`, not `{requested}`.", service.ane),
+            ));
+        }
+    }
+    let result = service.replay(prompt, target, steps).await?;
+    let mut headers = HeaderMap::new();
+    if let Some(request_id) = result["command_id"].as_str() {
+        if let Ok(value) = request_id.parse() {
+            headers.insert("x-request-id", value);
+        }
+    }
+    let body = json!({
+        "object": "replay.result",
+        "model": service.model_id,
+        "request_id": result["command_id"],
+        "prompt_tokens": result["prompt_tokens"],
+        "target_tokens": result["target_tokens"],
+        "tokens_emitted": result["tokens_emitted"],
+        "prefill_ms": result["prefill_ms"],
+        "decode_ms_total": result["decode_ms_total"],
+        "decode_ms_per_token": result["decode_ms_per_token"],
+        "match_rate": result["match_rate"],
+        "matches": result["matches"],
+        "comparisons": result["comparisons"],
+        "prefill_argmax": result["prefill_argmax"],
+        "config_echo": result["config_echo"],
+        "thermal": result["thermal"],
+        "memory": result["memory"],
+    });
+    Ok((headers, Json(body)).into_response())
 }
 
 async fn gated_count_tokens(

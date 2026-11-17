@@ -40,6 +40,7 @@ impl Files {
             memory_budget: 4194304,
             sequence_reservation: 1024,
             host_pressure_policy: HostPressurePolicy::Disabled,
+            request_log: None,
         }
     }
 }

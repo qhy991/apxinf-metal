@@ -448,6 +448,13 @@ fn capabilities(value: &Value, native: bool, sampled: bool) -> Result<()> {
     integer(&value["max_output_tokens"], 0, MAX_OUTPUT_TOKENS)?;
     choice(&value["state_schema"], &["none"])
 }
+fn duration(value: &Value) -> Result<()> {
+    require(
+        value.as_f64().is_some_and(|v| v.is_finite() && v >= 0.0),
+        "duration must be a finite nonnegative number",
+    )
+}
+
 fn is_event(kind: &str) -> bool {
     [
         "accepted",
@@ -500,6 +507,13 @@ pub fn validate_command_envelope(frame: &Value) -> Result<()> {
             REQUEST,
             &["cause", "output_token_count", "text_byte_cutoff"],
             &[],
+        )?,
+        // Forced-decode replay command (family-parameterized native text only).
+        "replay" => fields(
+            frame,
+            COMMAND,
+            &["prompt_token_ids", "target_token_ids"],
+            &["steps"],
         )?,
         "query_stats" | "drain" | "shutdown" => fields(frame, COMMAND, &[], &[])?,
         _ => return Err(ContractError("unknown command kind".into())),
@@ -1022,6 +1036,58 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                 leases(&frame["retained_lease_ids"])?.is_empty(),
                 "stateless profile cannot retain leases",
             )?;
+        }
+        "replay" => {
+            fields(
+                frame,
+                COMMAND,
+                &["prompt_token_ids", "target_token_ids"],
+                &["steps"],
+            )?;
+            tokens(&frame["prompt_token_ids"], 1, MAX_PROMPT_TOKENS as usize)?;
+            tokens(&frame["target_token_ids"], 0, MAX_OUTPUT_TOKENS as usize)?;
+            if let Some(steps) = frame.get("steps") {
+                integer(steps, 1, MAX_OUTPUT_TOKENS)?;
+            }
+        }
+        "replay_result" => {
+            fields(
+                frame,
+                COMMAND,
+                &[
+                    "prompt_tokens",
+                    "target_tokens",
+                    "tokens_emitted",
+                    "prefill_ms",
+                    "decode_ms_total",
+                    "decode_ms_per_token",
+                    "match_rate",
+                    "matches",
+                    "comparisons",
+                    "prefill_argmax",
+                    "config_echo",
+                    "thermal",
+                    "memory",
+                ],
+                &[],
+            )?;
+            integer(&frame["prompt_tokens"], 1, MAX_PROMPT_TOKENS)?;
+            integer(&frame["target_tokens"], 0, MAX_OUTPUT_TOKENS)?;
+            integer(&frame["tokens_emitted"], 0, MAX_OUTPUT_TOKENS)?;
+            integer(&frame["matches"], 0, MAX_OUTPUT_TOKENS)?;
+            integer(&frame["comparisons"], 0, MAX_OUTPUT_TOKENS)?;
+            duration(&frame["prefill_ms"])?;
+            duration(&frame["decode_ms_total"])?;
+            object(&frame["decode_ms_per_token"])?;
+            require(
+                frame["match_rate"]
+                    .as_f64()
+                    .is_some_and(|v| (0.0..=1.0).contains(&v)),
+                "replay match_rate must be a fraction",
+            )?;
+            object(&frame["config_echo"])?;
+            object(&frame["thermal"])?;
+            object(&frame["memory"])?;
         }
         "command_result" => {
             fields(frame, COMMAND, &["status"], &["error"])?;

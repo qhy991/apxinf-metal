@@ -85,6 +85,13 @@ struct Args {
     /// Append the diagnostic records to this file in addition to stderr.
     #[arg(long)]
     diagnostics_file: Option<PathBuf>,
+    /// Append one JSON line per settled request (chat and replay) to this file.
+    #[arg(long)]
+    request_log: Option<PathBuf>,
+    /// Prefill backend for the native text provider. Only `off` is implemented
+    /// today; `on` (Neural Engine composed prefill) is a separate task.
+    #[arg(long, default_value = "off", value_parser = ["off", "on"])]
+    ane: String,
 }
 
 #[tokio::main]
@@ -206,6 +213,15 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.provider != "native" && (args.model_name.is_some() || args.model_variant.is_some()) {
         return Err("--model-name and --model-variant require --provider native.".into());
     }
+    if args.ane == "on" && args.provider != "native" {
+        return Err("--ane on requires --provider native.".into());
+    }
+    if args.ane == "on" {
+        return Err(
+            "ANE prefill is not implemented for this family yet; use --ane off (see AG6 Part 2)."
+                .into(),
+        );
+    }
     let runtime = if args.provider == "native" {
         WorkerRuntime::NativeText {
             executable: std::fs::canonicalize(
@@ -310,6 +326,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         memory_budget: args.memory_budget_bytes,
         sequence_reservation: args.sequence_reservation_bytes,
         host_pressure_policy: args.host_pressure_policy,
+        request_log: args.request_log.clone(),
     };
     let shutdown = shutdown.shared();
     // Bind and serve before loading so a client can observe the loading phase

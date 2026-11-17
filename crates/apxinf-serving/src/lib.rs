@@ -8,6 +8,8 @@ pub mod host_pressure;
 mod metrics;
 pub mod native_identity;
 pub mod output;
+pub mod request_log;
+pub mod thermal;
 pub mod owned_media;
 pub mod sampling;
 pub mod supervisor;
