@@ -1058,6 +1058,7 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                     "prompt_tokens",
                     "target_tokens",
                     "tokens_emitted",
+                    "emitted_token_ids",
                     "prefill_ms",
                     "decode_ms_total",
                     "decode_ms_per_token",
@@ -1074,6 +1075,11 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
             integer(&frame["prompt_tokens"], 1, MAX_PROMPT_TOKENS)?;
             integer(&frame["target_tokens"], 0, MAX_OUTPUT_TOKENS)?;
             integer(&frame["tokens_emitted"], 0, MAX_OUTPUT_TOKENS)?;
+            tokens(
+                &frame["emitted_token_ids"],
+                0,
+                MAX_OUTPUT_TOKENS as usize,
+            )?;
             integer(&frame["matches"], 0, MAX_OUTPUT_TOKENS)?;
             integer(&frame["comparisons"], 0, MAX_OUTPUT_TOKENS)?;
             duration(&frame["prefill_ms"])?;

@@ -932,6 +932,7 @@ fn replay(
     let mut previous = first_argmax;
     let mut per_step = Vec::with_capacity(steps);
     let mut emitted = 0usize;
+    let mut emitted_ids: Vec<u32> = Vec::with_capacity(steps);
     for step in 0..steps {
         // Teacher forcing: the next input is the caller's token when supplied,
         // otherwise the engine's own argmax (a plain autoregressive smoke run).
@@ -942,6 +943,7 @@ fn replay(
         per_step.push(started.elapsed().as_secs_f64() * 1e3);
         position += 1;
         emitted += 1;
+        emitted_ids.push(argmax);
         if let Some(expected) = target.get(step + 1) {
             comparisons += 1;
             if argmax == *expected {
@@ -969,6 +971,7 @@ fn replay(
             "prompt_tokens": prompt.len(),
             "target_tokens": target.len(),
             "tokens_emitted": emitted,
+            "emitted_token_ids": emitted_ids,
             "prefill_ms": prefill_ms,
             "decode_ms_total": total,
             "decode_ms_per_token": {

@@ -273,6 +273,7 @@ async fn replay_request(
         "prompt_tokens": result["prompt_tokens"],
         "target_tokens": result["target_tokens"],
         "tokens_emitted": result["tokens_emitted"],
+        "emitted_token_ids": result["emitted_token_ids"],
         "prefill_ms": result["prefill_ms"],
         "decode_ms_total": result["decode_ms_total"],
         "decode_ms_per_token": result["decode_ms_per_token"],
