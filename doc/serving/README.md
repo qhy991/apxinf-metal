@@ -14,6 +14,7 @@
 | [支持范围与验证边界](support-status.md) | 各配置的实现范围、证据来源和未验证能力。 |
 | [依赖边界](dependencies.md) | 原生运行时与外部 provider 的依赖及执行边界。 |
 | [原生 MiniCPM5](native-minicpm-v0.1.md) | 显式原生文本配置和运行时身份。 |
+| [原生文本家族](native-text-v0.1.md) | `--provider native` 的参数化家族、lane ChatML prompt、`/v1/replay` 强制回放与 JSONL 计时。 |
 | [原生采样](native-sampling-v0.1.md) | 采样接口、选项和模型边界。 |
 | [初始思考](native-thinking-v0.1.md) | 隐藏初始思考和公开输出的处理。 |
 | [有界初始思考](native-bounded-thinking-v0.1.md) | 显式思考预算与完整用量计数。 |
