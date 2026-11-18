@@ -577,6 +577,20 @@ mod tests {
         best
     }
 
+    /// Runs the shared greedy generation loop and returns its token ids.
+    fn generate_tokens(model: &mut Lfm3Model, prompt: &[u32], steps: usize) -> Result<Vec<u32>> {
+        let mut options = crate::GenerationOptions::greedy(steps, None);
+        options.eos_token_ids = None;
+        let output = model.generate_streaming_controlled_dyn(
+            crate::GenerationRequest {
+                input: LlmInput::text(prompt),
+                options: &options,
+            },
+            &mut |_| Ok(true),
+        )?;
+        Ok(output.token_ids())
+    }
+
     /// Logits rows as host f32. The tensor a Metal family returns carries a
     /// Metal device, so it is read through the backend's array view rather than
     /// `Tensor::to_f32_vec` (which accepts CPU storage only).
@@ -868,6 +882,31 @@ mod tests {
         let diff = max_abs_diff(&eager_forced, &bucketed_forced);
         eprintln!("lfm3 long-context parity: steps={steps} logits_max_abs_diff={diff:.3e}");
         assert!(diff <= 2e-3);
+        Ok(())
+    }
+
+    /// The public generation loop (reset -> prewarm_decode -> prefill ->
+    /// per-token forward) must produce the same greedy tokens on both arms, and
+    /// the bucketed arm must run prepared graphs rather than retracing.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock"]
+    fn generation_loop_matches_between_arms_and_engages_the_bucket() -> Result<()> {
+        let prompt: Vec<u32> = (0..96u32).map(|i| 8 + i % 500).collect();
+        let steps = 48usize;
+        let (mut model, backend) = synthetic_model(DecodePolicy::Eager)?;
+        let eager = generate_tokens(&mut model, &prompt, steps)?;
+        assert_eq!(eager.len(), steps);
+
+        model.select_decode_policy(DecodePolicy::Bucketed);
+        let traces = backend.stream().counters().trace_callbacks;
+        let bucketed = generate_tokens(&mut model, &prompt, steps)?;
+        assert_eq!(
+            backend.stream().counters().trace_callbacks,
+            traces,
+            "generation retraced on the bucketed arm"
+        );
+        assert_eq!(model.decode_buckets(), vec![256]);
+        assert_eq!(eager, bucketed);
         Ok(())
     }
 
