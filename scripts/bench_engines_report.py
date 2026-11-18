@@ -149,13 +149,20 @@ def group_key(stage: str, request: dict) -> tuple:
     return (kind, target, max_tokens)
 
 
+def _count(value) -> str:
+    """Render a token count without a spurious '.0' (external adapters emit floats)."""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def group_label(key: tuple) -> str:
     kind, target, max_tokens = key
     if kind == "single request":
-        return f"{target} tok in / {max_tokens} tok out (x N)"
+        return f"{_count(target)} tok in / {_count(max_tokens)} tok out (x N)"
     if max_tokens == 8:
-        return f"{target} tok prompt"
-    return f"{target} tok prompt / {max_tokens} tok out"
+        return f"{_count(target)} tok prompt"
+    return f"{_count(target)} tok prompt / {_count(max_tokens)} tok out"
 
 
 def median_or_none(values):
