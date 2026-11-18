@@ -87,22 +87,27 @@ struct ToolBoundary {
     is_json: Option<bool>,
     in_string: bool,
     escaped: bool,
+    closer: &'static str,
 }
 
 impl ToolBoundary {
+    fn new(closer: &'static str) -> Self {
+        Self { closer, ..Self::default() }
+    }
+
     fn find_end(&mut self, pending: &str) -> Option<usize> {
-        const END: &str = "</tool_call>";
+        let end = self.closer;
         while self.scanned < pending.len() {
             let remaining = &pending[self.scanned..];
             let character = remaining.chars().next().unwrap();
             if self.is_json.is_none() && !character.is_whitespace() {
                 self.is_json = Some(character == '{');
             }
-            if !self.in_string && character == '<' {
-                if remaining.starts_with(END) {
+            if !self.in_string && (character == '<' || character == '\n' || character == '`') {
+                if remaining.starts_with(end) {
                     return Some(self.scanned);
                 }
-                if END.starts_with(remaining) {
+                if end.starts_with(remaining) {
                     // Only an unfinished delimiter needs inspection on the next push.
                     return None;
                 }
@@ -122,21 +127,69 @@ impl ToolBoundary {
     }
 }
 
+/// How tool calls are recognised in the model's text.
+///
+/// `Qwen` is the historical grammar (`<tool_call>` with JSON or `<function=…>`).
+/// `BashFence` accepts the shape small instruction-tuned models actually emit -
+/// a fenced ```bash / ```sh block or a `<bash>…</bash>` span - and maps it onto
+/// whichever declared tool takes a single `command` string.  It exists so a
+/// tool-use client can drive a model that has not learned the Qwen markers;
+/// it is opt-in through `APXINF_SERVING_TOOL_GRAMMAR` and the default keeps
+/// every byte of the Qwen behaviour.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Grammar {
+    Qwen,
+    BashFence,
+    /// Both shapes at once: the model may answer with the Qwen markers or with a
+    /// fenced/tagged command, and the parser accepts whichever arrives.  Tool
+    /// names are matched case-insensitively here because small models copy the
+    /// schema's casing inconsistently (`read` for `Read`).
+    Auto,
+}
+
+impl Grammar {
+    pub fn from_env() -> Self {
+        match std::env::var("APXINF_SERVING_TOOL_GRAMMAR").ok().as_deref() {
+            Some("bash_fence") => Grammar::BashFence,
+            Some("auto") => Grammar::Auto,
+            _ => Grammar::Qwen,
+        }
+    }
+}
+
 pub struct OutputParser {
     pending: String,
     mode: Mode,
     tools: Vec<Value>,
+    grammar: Grammar,
+    /// Treat a terminal `length` truncation inside a structured block as plain
+    /// text instead of a protocol fault (default: true; set false to restore
+    /// the pre-D4 behaviour where max_tokens mid-block returns 500).
+    truncate_is_error: bool,
     pub tool_count: usize,
 }
 
 impl OutputParser {
     pub fn new(tools: Vec<Value>) -> Self {
+        Self::with_grammar(tools, Grammar::Qwen)
+    }
+
+    pub fn with_grammar(tools: Vec<Value>, grammar: Grammar) -> Self {
         Self {
             pending: String::new(),
             mode: Mode::Text,
             tools,
+            grammar,
+            truncate_is_error: true,
             tool_count: 0,
         }
+    }
+
+    /// Downgrade an open structured block at `length` to plain text (D4 fix).
+    /// After this call the terminal push returns Ok and the supervisor maps
+    /// the frame to a normal `length` finish.
+    pub fn allow_length_truncation(&mut self) {
+        self.truncate_is_error = false;
     }
 
     pub fn push(&mut self, text: &str, last: bool) -> Result<Vec<Part>, String> {
@@ -148,7 +201,25 @@ impl OutputParser {
         loop {
             match &mut self.mode {
                 Mode::Text => {
-                    let markers = ["<tool_call>", "<think>"];
+                    // (opener, closer) pairs; the closer tells the scanner where the body stops.
+                    let openers: &[(&str, &str)] = match self.grammar {
+                        Grammar::Qwen => &[("<tool_call>", "</tool_call>")],
+                        Grammar::Auto => &[
+                            ("<tool_call>", "</tool_call>"),
+                            ("```bash\n", "\n```"),
+                            ("```sh\n", "\n```"),
+                            ("```mswea_bash_command\n", "\n```"),
+                            ("<bash>", "</bash>"),
+                        ],
+                        Grammar::BashFence => &[
+                            ("```bash\n", "\n```"),
+                            ("```sh\n", "\n```"),
+                            ("```mswea_bash_command\n", "\n```"),
+                            ("<bash>", "</bash>"),
+                        ],
+                    };
+                    let mut markers: Vec<&str> = openers.iter().map(|(open, _)| *open).collect();
+                    markers.push("<think>");
                     let found = markers
                         .iter()
                         .filter_map(|m| self.pending.find(m).map(|i| (i, *m)))
@@ -158,10 +229,15 @@ impl OutputParser {
                             parts.push(Part::Text(self.pending[..i].to_owned()));
                         }
                         self.pending.drain(..i + marker.len());
-                        self.mode = if marker == markers[0] {
-                            Mode::Tool(ToolBoundary::default())
-                        } else {
+                        self.mode = if marker == "<think>" {
                             Mode::Thinking
+                        } else {
+                            let closer = openers
+                                .iter()
+                                .find(|(open, _)| *open == marker)
+                                .map(|(_, close)| *close)
+                                .unwrap_or("</tool_call>");
+                            Mode::Tool(ToolBoundary::new(closer))
                         };
                     } else {
                         let keep = if last {
@@ -189,8 +265,14 @@ impl OutputParser {
                 }
                 Mode::Tool(boundary) => {
                     if let Some(i) = boundary.find_end(&self.pending) {
-                        let (name, input) = parse_tool(&self.pending[..i], &self.tools)?;
-                        self.pending.drain(..i + "</tool_call>".len());
+                        let closer = boundary.closer;
+                        let body = self.pending[..i].to_owned();
+                        let (name, input) = if closer == "</tool_call>" {
+                            parse_tool(&body, &self.tools, self.grammar == Grammar::Auto)?
+                        } else {
+                            parse_command_tool(&body, &self.tools, self.grammar == Grammar::Auto)?
+                        };
+                        self.pending.drain(..i + closer.len());
                         parts.push(Part::Tool {
                             id: format!("toolu_{}", uuid::Uuid::new_v4().simple()),
                             name,
@@ -205,13 +287,20 @@ impl OutputParser {
             }
         }
         if last && !matches!(self.mode, Mode::Text) {
-            return Err("The model output contains an incomplete structured block.".into());
+            if self.truncate_is_error {
+                return Err("The model output contains an incomplete structured block.".into());
+            }
+            // D4 fix: a max_tokens truncation is a normal finish, not a
+            // protocol fault. Drop the unfinished tail (the worker ledger
+            // keeps the raw bytes) and let the supervisor emit Done.
+            self.pending.clear();
+            self.mode = Mode::Text;
         }
         Ok(parts)
     }
 }
 
-fn parse_tool(body: &str, tools: &[Value]) -> Result<(String, Value), String> {
+fn parse_tool(body: &str, tools: &[Value], fold_case: bool) -> Result<(String, Value), String> {
     let body = body.trim();
     let (name, input) = if body.starts_with('{') {
         let value = crate::contracts::parse_document(body.as_bytes())
@@ -233,7 +322,7 @@ fn parse_tool(body: &str, tools: &[Value]) -> Result<(String, Value), String> {
             .ok_or("The tool call has no function marker.")?;
         let end = rest.find('>').ok_or("The function marker has no end.")?;
         let name = rest[..end].to_owned();
-        let schema = find_tool(tools, &name)?;
+        let schema = find_tool(tools, &name, fold_case)?;
         let mut rest = rest[end + 1..].trim();
         let mut args = Map::new();
         while !rest.starts_with("</function>") {
@@ -266,20 +355,72 @@ fn parse_tool(body: &str, tools: &[Value]) -> Result<(String, Value), String> {
         }
         (name, Value::Object(args))
     };
-    let schema = find_tool(tools, &name)?;
+    let schema = find_tool(tools, &name, fold_case)?;
     if !input.is_object() {
         return Err("Tool arguments must be an object.".into());
     }
     validate_arguments(&input, &schema["parameters"])?;
+    Ok((canonical_tool_name(tools, &name, fold_case), input))
+}
+
+/// Map a fenced command block onto the declared tool that takes one command string.
+///
+/// A tool-use client such as Claude Code declares `Bash` with a required
+/// `command` string; small models emit the command but not the Qwen markers, so
+/// the grammar adapter rewrites the fenced body into that tool's arguments and
+/// then runs the same declaration and type validation as the JSON path.
+fn parse_command_tool(body: &str, tools: &[Value], fold_case: bool) -> Result<(String, Value), String> {
+    let command = body.trim();
+    if command.is_empty() {
+        return Err("The tool call has an empty command.".into());
+    }
+    let name = tool_for_command(tools)?;
+    let mut arguments = Map::new();
+    arguments.insert("command".to_owned(), Value::String(command.to_owned()));
+    let input = Value::Object(arguments);
+    let schema = find_tool(tools, &name, fold_case)?;
+    validate_arguments(&input, &schema["parameters"])?;
     Ok((name, input))
 }
 
-fn find_tool<'a>(tools: &'a [Value], name: &str) -> Result<&'a Value, String> {
+fn tool_for_command(tools: &[Value]) -> Result<String, String> {
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap_or(""))
+        .collect();
+    if names.iter().any(|name| *name == "Bash") {
+        return Ok("Bash".to_owned());
+    }
+    tools
+        .iter()
+        .find(|tool| {
+            tool["function"]["parameters"]["properties"]["command"]["type"].as_str() == Some("string")
+        })
+        .and_then(|tool| tool["function"]["name"].as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "No declared tool takes a command string.".into())
+}
+
+fn find_tool<'a>(tools: &'a [Value], name: &str, fold_case: bool) -> Result<&'a Value, String> {
     tools
         .iter()
         .map(|t| &t["function"])
-        .find(|t| t["name"].as_str() == Some(name))
+        .find(|t| match t["name"].as_str() {
+            Some(declared) if fold_case => declared.eq_ignore_ascii_case(name),
+            Some(declared) => declared == name,
+            None => false,
+        })
         .ok_or_else(|| "The model selected an undeclared tool.".into())
+}
+
+/// The declared spelling of a tool the model named, so the wire response keeps
+/// the schema's casing even when the model wrote `read` for `Read`.
+fn canonical_tool_name(tools: &[Value], name: &str, fold_case: bool) -> String {
+    find_tool(tools, name, fold_case)
+        .ok()
+        .and_then(|tool| tool["name"].as_str())
+        .unwrap_or(name)
+        .to_owned()
 }
 
 fn validate_arguments(value: &Value, schema: &Value) -> Result<(), String> {
@@ -352,6 +493,86 @@ pub fn anthropic_blocks(parts: &[Part]) -> Vec<Value> {
     blocks
 }
 
+
+fn bash_tools() -> Vec<Value> {
+    vec![json!({"type": "function", "function": {"name": "Bash", "parameters": {
+        "type": "object",
+        "properties": {"command": {"type": "string"}, "description": {"type": "string"}},
+        "required": ["command"]
+    }}})]
+}
+
+fn collect(grammar: Grammar, pieces: &[&str]) -> (String, Vec<Part>) {
+    let mut parser = OutputParser::with_grammar(bash_tools(), grammar);
+    let mut parts = Vec::new();
+    for (i, piece) in pieces.iter().enumerate() {
+        parts.extend(parser.push(piece, i + 1 == pieces.len()).unwrap());
+    }
+    (parser.pending.clone(), parts)
+}
+
+#[test]
+fn bash_fence_becomes_a_tool_call() {
+    let (_, parts) = collect(Grammar::BashFence, &["I will look.\n```bash\nls -la\n```\ndone"]);
+    assert_eq!(parts[0], Part::Text("I will look.\n".into()));
+    match &parts[1] {
+        Part::Tool { name, input, .. } => {
+            assert_eq!(name, "Bash");
+            assert_eq!(input["command"], json!("ls -la"));
+        }
+        other => panic!("expected a tool part, got {other:?}"),
+    }
+    assert!(matches!(parts.last(), Some(Part::Text(text)) if text == "\ndone"));
+}
+
+#[test]
+fn bash_fence_survives_character_by_character_streaming() {
+    let text = "` `x`\n```bash\necho 27 > answer.txt\n```\n";
+    // stream the fence body one character at a time, the way tokens arrive
+    let mut parser = OutputParser::with_grammar(bash_tools(), Grammar::BashFence);
+    let mut parts = Vec::new();
+    for ch in text.chars() {
+        parts.extend(parser.push(&ch.to_string(), false).unwrap());
+    }
+    parts.extend(parser.push("", true).unwrap());
+    let calls: Vec<_> = parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Tool { name, input, .. } => Some((name.clone(), input.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "expected exactly one tool call: {parts:?}");
+    assert_eq!(calls[0].0, "Bash");
+    assert_eq!(calls[0].1["command"], json!("echo 27 > answer.txt"));
+}
+
+#[test]
+fn bash_tag_span_is_also_accepted() {
+    let (_, parts) = collect(Grammar::BashFence, &["<bash>\nuname -a\n</bash>"]);
+    let tool = parts
+        .iter()
+        .find_map(|part| match part {
+            Part::Tool { input, .. } => Some(input.clone()),
+            _ => None,
+        })
+        .expect("tool part");
+    assert_eq!(tool["command"], json!("uname -a"));
+}
+
+#[test]
+fn qwen_grammar_ignores_fenced_commands() {
+    let (_, parts) = collect(Grammar::Qwen, &["```bash\nls\n```"]);
+    assert!(parts.iter().all(|part| !matches!(part, Part::Tool { .. })));
+}
+
+#[test]
+fn bash_fence_without_a_command_tool_is_rejected() {
+    let mut parser = OutputParser::with_grammar(vec![], Grammar::BashFence);
+    let error = parser.push("```bash\nls\n```", false).err();
+    assert!(matches!(parser.push("", true), Err(_)) || error.is_some());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +613,61 @@ mod tests {
             .is_err());
         let mut p = OutputParser::new(vec![]);
         assert!(p.push("<tool_call>{", true).is_err());
+    }
+
+
+    fn claude_tools() -> Vec<Value> {
+        vec![
+            json!({"type": "function", "function": {"name": "Read", "parameters": {
+                "type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}}),
+            json!({"type": "function", "function": {"name": "Bash", "parameters": {
+                "type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}),
+        ]
+    }
+
+    #[test]
+    fn auto_grammar_accepts_the_native_block_with_a_lowercase_tool_name() {
+        // exactly what LFM3 emitted under Claude Code's declarations (PR 113, raw-on/proxy/0001.json)
+        let output = "<tool_call><function=read><parameter=file_path>/workspace/x.py</parameter></function></tool_call>";
+        let mut parser = OutputParser::with_grammar(claude_tools(), Grammar::Auto);
+        let parts = parser.push(output, true).unwrap();
+        let (name, input) = parts
+            .iter()
+            .find_map(|part| match part {
+                Part::Tool { name, input, .. } => Some((name.clone(), input.clone())),
+                _ => None,
+            })
+            .expect("tool part");
+        assert_eq!(name, "Read", "the declared spelling wins");
+        assert_eq!(input["file_path"], json!("/workspace/x.py"));
+    }
+
+    #[test]
+    fn auto_grammar_still_accepts_a_fence_under_the_same_parser() {
+        let mut parser = OutputParser::with_grammar(claude_tools(), Grammar::Auto);
+        let parts = parser.push("ok\n```bash\nls\n```", true).unwrap();
+        let (name, input) = parts
+            .iter()
+            .find_map(|part| match part {
+                Part::Tool { name, input, .. } => Some((name.clone(), input.clone())),
+                _ => None,
+            })
+            .expect("tool part");
+        assert_eq!(name, "Bash");
+        assert_eq!(input["command"], json!("ls"));
+    }
+
+    #[test]
+    fn default_grammar_keeps_exact_tool_matching() {
+        // the shipped Qwen path must not start accepting `read` for `Read`
+        let mut parser = OutputParser::with_grammar(claude_tools(), Grammar::Qwen);
+        let output = "<tool_call><function=read><parameter=file_path>/x</parameter></function></tool_call>";
+        let parts = parser.push(output, true);
+        assert!(parts.is_err()
+            || parts
+                .unwrap()
+                .iter()
+                .all(|part| !matches!(part, Part::Tool { .. })));
     }
 
     fn typed_parameter_tools() -> Vec<Value> {

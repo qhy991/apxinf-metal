@@ -25,7 +25,7 @@ use crate::{
     diagnostics::{self, WorkerDiagnostics},
     host_pressure::{HostPressure, HostPressurePolicy},
     metrics::{ObservationMetrics, Outcome, RequestObservation},
-    output::{OutputParser, Part, StopMatcher},
+    output::{Grammar, OutputParser, Part, StopMatcher},
 };
 use generation::{wait_for_generation_control, GenerationPublic};
 use pending_queue::PendingQueue;
@@ -93,6 +93,10 @@ pub struct Config {
     pub memory_budget: u64,
     pub sequence_reservation: u64,
     pub host_pressure_policy: HostPressurePolicy,
+    /// Extra worker command-line arguments; empty keeps the mlx-lm launch unchanged.
+    pub worker_args: Vec<String>,
+    /// Extra worker environment entries applied after ``env_clear``.
+    pub worker_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
 
 impl Config {
@@ -516,6 +520,8 @@ async fn launch_worker_until(
         .env("TRANSFORMERS_OFFLINE", "1")
         .env("TOKENIZERS_PARALLELISM", "false")
         .env("PYTHONNOUSERSITE", "1")
+        .envs(config.worker_env.iter().map(|(key, value)| (key, value)))
+        .args(&config.worker_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1378,21 +1384,17 @@ fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
             return Err(format!("The model artifact identity differs: {name}"));
         }
     }
-    let root = config
-        .worker
-        .ancestors()
-        .nth(5)
-        .ok_or("Cannot locate the runtime pin helper.")?;
+    let execution = &manifest["execution"];
+    let provider = execution["provider"].as_str().unwrap_or("");
+    if provider != "mlx-lm" && provider != "enginetailor-lfm3" {
+        return Err("The execution provider is not supported.".into());
+    }
     let files = [
         ("adapter_sha256", config.worker.clone()),
         ("python_sha256", config.python.clone()),
         (
             "contracts_sha256",
             config.worker.with_file_name("contracts.py"),
-        ),
-        (
-            "runtime_pins_sha256",
-            root.join("scripts/apxinf_mlx_generate.py"),
         ),
     ];
     for (field, path) in files {
@@ -1401,9 +1403,23 @@ fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
             return Err(format!("The runtime identity differs: {field}"));
         }
     }
-    let execution = &manifest["execution"];
-    if execution["provider"] != "mlx-lm"
-        || execution["precision"] != "bundle"
+    // The mlx-lm profile also binds its pinned toolchain helper; the LFM3
+    // provider is an EngineTailor tree and declares no mlx-lm pin helper.
+    let precision = if provider == "mlx-lm" {
+        let root = config
+            .worker
+            .ancestors()
+            .nth(5)
+            .ok_or("Cannot locate the runtime pin helper.")?;
+        let (_, digest) = file_digest(&root.join("scripts/apxinf_mlx_generate.py"))?;
+        if manifest["runtime_pins_sha256"].as_str() != Some(&digest) {
+            return Err("The runtime identity differs: runtime_pins_sha256".into());
+        }
+        "bundle"
+    } else {
+        "packed4"
+    };
+    if execution["precision"] != precision
         || execution["prefill_step_size"].as_u64() != Some(config.prefill_step_size as u64)
         || execution["output_batch_tokens"].as_u64() != Some(config.output_batch_tokens as u64)
         || execution["memory_limit_bytes"].as_u64() != Some(config.memory_budget)
@@ -1490,7 +1506,8 @@ async fn execute(
         return settle_stopped_submission(worker, service, &job, tracker, stopped).await;
     }
     let mut public = GenerationPublic::new(&mut job, begin);
-    let mut parser = OutputParser::new(job.request.tools.clone());
+    let mut parser =
+        OutputParser::with_grammar(job.request.tools.clone(), Grammar::from_env());
     let mut stops = StopMatcher::new(job.request.stops.clone());
     let mut output_tokens = 0;
     let mut control_sent = false;
@@ -1574,6 +1591,12 @@ async fn execute(
                         frame["text_delta"].as_str().unwrap_or(""),
                         kind == "terminal",
                     );
+                    // A max_tokens truncation mid-structured-block is a normal
+                    // `length` finish (cause already validated by contracts.rs);
+                    // downgrade the open block instead of 500ing (D4 repro).
+                    if kind == "terminal" && frame["cause"].as_str() == Some("length") {
+                        parser.allow_length_truncation();
+                    }
                     match parser.push(&text, kind == "terminal" && frame["status"] == "completed") {
                         Ok(parts) => {
                             public.expire(&job, service, timeout, public_error.as_ref(),
