@@ -44,6 +44,9 @@
 #       --evidence-pattern 'n_past|prompt eval time'
 #
 #   # apxinf-native: the gateway has no bare-completion route
+#   # engine-primary timing basis (buffered-SSE servers; apxinf-serve on the M4)
+#   scripts/bench_engines.sh --protocol openai-chat --engine-timings ...
+#
 #   # ollama with a pinned context (M4: avoids a runner reload per num_ctx)
 #   scripts/bench_engines.sh --arm ollama --stage s1 --protocol ollama-generate \
 #       --ollama-num-ctx 16384 ...
@@ -86,6 +89,7 @@ evidence_log=""
 evidence_pattern=""
 request_log=""
 ollama_num_ctx=""
+engine_timings=""
 stream=""
 quantization=""
 prompt_protocol=""
@@ -124,6 +128,12 @@ while [[ $# -gt 0 ]]; do
         # num_ctx for every request to keep the arm comparable to llama.cpp's
         # fixed -c. 0/empty keeps the legacy per-case behaviour.
         --ollama-num-ctx) need_value "$@"; ollama_num_ctx="$2"; shift 2 ;;
+        # Primary timing basis = the engine's own reported durations. Required when
+        # a server buffers its SSE until generation completes (observed on
+        # apxinf-serve 2026-11-18: first content delta at wall, decode window ~0),
+        # so a client-observed decode window would be degenerate. Applied to both
+        # arms of a pair so the table has one basis.
+        --engine-timings) engine_timings="1"; shift ;;
         --quantization) need_value "$@"; quantization="$2"; shift 2 ;;
         --prompt-protocol) need_value "$@"; prompt_protocol="$2"; shift 2 ;;
         --stream) stream="1"; shift ;;
@@ -218,7 +228,7 @@ export BENCH_CONTEXTS="$contexts" BENCH_GEN_LENGTHS="$gen_lengths" BENCH_COUNT="
 export BENCH_S3_LENGTH="$s3_length" BENCH_WARMUP="$warmup" BENCH_TIMEOUT="$timeout_s"
 export BENCH_EVIDENCE_LOG="$evidence_log" BENCH_EVIDENCE_PATTERN="$evidence_pattern"
 export BENCH_REQUEST_LOG="$request_log" BENCH_STREAM="$stream" BENCH_DRY_RUN="$dry_run"
-export BENCH_OLLAMA_NUM_CTX="$ollama_num_ctx"
+export BENCH_OLLAMA_NUM_CTX="$ollama_num_ctx" BENCH_ENGINE_TIMINGS="$engine_timings"
 export BENCH_QUANTIZATION="$quantization" BENCH_PROMPT_PROTOCOL="$prompt_protocol"
 
 # The request machinery lives in one embedded Python program: bash cannot time an
@@ -923,6 +933,33 @@ def main():
     if CFG["request_log"]:
         attach_request_log(samples, CFG["request_log"])
 
+    # Engine-primary timing basis (see --engine-timings). The client-observed
+    # values are kept under *_observed so the file still shows what the socket
+    # delivered, but they no longer decide the primary metric.
+    if CFG.get("engine_timings") == "1":
+        for record in samples:
+            engine_prefill = record.get("engine_prefill_ms")
+            engine_decode = record.get("engine_decode_ms")
+            if engine_prefill is None and engine_decode is None:
+                continue
+            record["client_ttft_ms_observed"] = record.get("client_ttft_ms")
+            record["client_decode_ms_observed"] = record.get("client_decode_ms")
+            record.pop("client_ttft_ms", None)
+            record.pop("client_decode_ms", None)
+            if engine_prefill is not None:
+                record["ttft_ms"] = engine_prefill
+                record["ttft_basis"] = "engine"
+                if record.get("prompt_tokens"):
+                    record["prefill_tok_s"] = record["prompt_tokens"] / (engine_prefill / 1000.0)
+            if engine_decode is not None:
+                tokens = record.get("completion_tokens") or record.get("engine_decode_tokens") or 1
+                tokens = max(tokens - 1, 1)
+                record["decode_ms"] = engine_decode
+                record["decode_tokens"] = tokens
+                record["decode_ms_per_token"] = engine_decode / tokens
+                record["decode_tok_s"] = 1000.0 / record["decode_ms_per_token"]
+                record["decode_basis"] = "engine"
+
     # Fallback prompt counts for streamed responses that omitted usage.
     if any(record.get("prompt_tokens") is None and record.get("status") == "ok" for record in samples) \
             and STAGE in ("s1", "s2", "s3"):
@@ -964,6 +1001,7 @@ def main():
             "timeout_s": MAX_WAIT,
         },
         "cases": cases,
+        "timing_primary": "engine" if CFG.get("engine_timings") == "1" else "client-first",
         "requests": records,
         "evidence": {
             "engaged": engaged,
