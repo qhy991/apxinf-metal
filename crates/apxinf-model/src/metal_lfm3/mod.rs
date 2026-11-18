@@ -6,6 +6,7 @@
 //! parameter sets. See `README.md` for the supported contract and scope.
 
 pub mod config;
+mod decode;
 mod model;
 mod weights;
 pub use model::Lfm3Model;

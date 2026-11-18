@@ -13,15 +13,18 @@
 
 use super::{
     config::{LayerKind, Lfm3Config},
+    decode::{self, DecodePolicy, PreparedDecode},
     weights::{LayerWeights, Mixer, Weights},
 };
-use crate::llm_trait::{LlmInput, LlmTrait, TextPreparationState, TextPreparationStatus};
+use crate::llm_trait::{
+    LlmInput, LlmTrait, TextCompilationScope, TextPreparationState, TextPreparationStatus,
+};
 use apxinf_core::{Backend, Device, Error, Result, Tensor};
 use apxinf_loader::ModelConfig;
-use apxinf_mlx::{fusions::CausalDepthwiseConv, Array, MlxBackend, MlxDType, Stream};
-use std::{collections::HashMap, sync::Arc};
+use apxinf_mlx::{fusions::CausalDepthwiseConv, Array, Compiled, MlxBackend, MlxDType, Stream};
+use std::{collections::HashMap, rc::Rc, sync::Arc};
 
-fn err(message: impl Into<String>) -> Error {
+pub(super) fn err(message: impl Into<String>) -> Error {
     Error::Other(message.into())
 }
 
@@ -37,7 +40,7 @@ extern "C" {
 }
 
 /// Weighted RMSNorm over the last axis on BF16 activations.
-fn norm(x: &Array, weight: &Array, epsilon: f32) -> Result<Array> {
+pub(super) fn norm(x: &Array, weight: &Array, epsilon: f32) -> Result<Array> {
     if weight.dtype() != MlxDType::BF16 || x.dtype() != MlxDType::BF16 {
         return Err(err("LFM3 RMSNorm requires BF16 activations and weights"));
     }
@@ -45,7 +48,7 @@ fn norm(x: &Array, weight: &Array, epsilon: f32) -> Result<Array> {
 }
 
 /// HF `rotate_half` over the last axis: `[x1, x2] -> [-x2, x1]`.
-fn rotate_half(x: &Array, dim: usize) -> Result<Array> {
+pub(super) fn rotate_half(x: &Array, dim: usize) -> Result<Array> {
     let half = dim / 2;
     Array::concat(
         &[
@@ -58,7 +61,7 @@ fn rotate_half(x: &Array, dim: usize) -> Result<Array> {
 
 /// Reference rotary application: FP32 arithmetic against the precomputed
 /// zero-tail tables, then a single cast back to the activation dtype.
-fn apply_rope(x: &Array, cos: &Array, sin: &Array, dim: usize) -> Result<Array> {
+pub(super) fn apply_rope(x: &Array, cos: &Array, sin: &Array, dim: usize) -> Result<Array> {
     let xf = x.cast(MlxDType::F32)?;
     xf.mul(cos)?
         .add(&rotate_half(&xf, dim)?.mul(sin)?)?
@@ -66,7 +69,7 @@ fn apply_rope(x: &Array, cos: &Array, sin: &Array, dim: usize) -> Result<Array> 
 }
 
 /// `silu(gate) * up` expressed exactly as the reference's `nn.silu(g) * u`.
-fn silu_mul(gate: &Array, up: &Array) -> Result<Array> {
+pub(super) fn silu_mul(gate: &Array, up: &Array) -> Result<Array> {
     gate.mul(&gate.sigmoid()?)?.mul(up)
 }
 
@@ -78,7 +81,7 @@ fn silu_mul(gate: &Array, up: &Array) -> Result<Array> {
 /// `[1, 1, hidden]` layout the gate multiplies it in) and rows `0..kernel - 1`
 /// are the six columns the next step reads. Returns
 /// `([1, 1, hidden], [1, hidden, kernel - 1])`.
-fn fused_conv_window(
+pub(super) fn fused_conv_window(
     conv: &CausalDepthwiseConv,
     window: &Array,
     taps_bf16: &Array,
@@ -137,9 +140,10 @@ enum LayerState {
 pub struct Lfm3Model {
     config: Lfm3Config,
     backend: MlxBackend,
-    weights: Weights,
+    /// Shared with the compiled decode graphs, which capture the weights.
+    weights: Rc<Weights>,
     /// Compiled `apxinf_causal_depthwise_conv` pipeline for the decode step.
-    causal_conv: CausalDepthwiseConv,
+    causal_conv: Rc<CausalDepthwiseConv>,
     kinds: Vec<LayerKind>,
     /// One dense row per attention layer, `[1, kv_heads, capacity, head_dim]`.
     initial_kv: Vec<Option<KvState>>,
@@ -154,6 +158,10 @@ pub struct Lfm3Model {
     capacity: usize,
     position: usize,
     invalid: Option<String>,
+    /// Which per-token step this model runs (`APXINF_LFM3_BUCKETED_DECODE`).
+    decode_policy: DecodePolicy,
+    /// Pre-captured compiled decode step(s) for the current capacity bucket.
+    decode: Option<PreparedDecode>,
 }
 
 impl Lfm3Model {
@@ -162,15 +170,32 @@ impl Lfm3Model {
         tensors: HashMap<String, Tensor>,
         backend: Arc<dyn Backend>,
     ) -> Result<Self> {
+        let policy =
+            DecodePolicy::from_override(std::env::var_os(decode::BUCKETED_DECODE_ENV).as_deref());
+        Self::build(config, tensors, backend, policy, true)
+    }
+
+    /// `enforce_scope == false` is the maintained test seam for reduced
+    /// geometries; the production constructor always validates the pinned
+    /// LFM3-1.7B checkpoint scope.
+    fn build(
+        config: Lfm3Config,
+        tensors: HashMap<String, Tensor>,
+        backend: Arc<dyn Backend>,
+        policy: DecodePolicy,
+        enforce_scope: bool,
+    ) -> Result<Self> {
         config.validate()?;
-        config.validate_checkpoint_scope()?;
+        if enforce_scope {
+            config.validate_checkpoint_scope()?;
+        }
         let backend = backend
             .as_any()
             .downcast_ref::<MlxBackend>()
             .ok_or_else(|| err("LFM3 native implementation requires an MLX backend"))?
             .clone();
-        let weights = Weights::load(&config, tensors, backend.stream())?;
-        let causal_conv = CausalDepthwiseConv::new(backend.stream())?;
+        let weights = Rc::new(Weights::load(&config, tensors, backend.stream())?);
+        let causal_conv = Rc::new(CausalDepthwiseConv::new(backend.stream())?);
         let kinds = config.layer_kinds()?;
         let layers = config.num_hidden_layers;
         let mut model = Self {
@@ -190,9 +215,37 @@ impl Lfm3Model {
             capacity: 0,
             position: 0,
             invalid: None,
+            decode_policy: policy,
+            decode: None,
         };
         model.prepare(1, 0)?;
         Ok(model)
+    }
+
+    /// Test seam: build a model without the pinned LFM3-1.7B scope check.
+    #[cfg(test)]
+    pub(super) fn build_for_test(
+        config: Lfm3Config,
+        tensors: HashMap<String, Tensor>,
+        backend: Arc<dyn Backend>,
+        policy: DecodePolicy,
+    ) -> Result<Self> {
+        Self::build(config, tensors, backend, policy, false)
+    }
+
+    /// Test seam: switch the per-token step without reconstructing the model.
+    #[cfg(test)]
+    pub(super) fn select_decode_policy(&mut self, policy: DecodePolicy) {
+        self.decode_policy = policy;
+        self.decode = None;
+    }
+
+    #[cfg(test)]
+    pub(super) fn decode_buckets(&self) -> Vec<usize> {
+        self.decode
+            .as_ref()
+            .map(|prepared| prepared.widths())
+            .unwrap_or_default()
     }
 
     pub fn position(&self) -> usize {
@@ -203,14 +256,166 @@ impl Lfm3Model {
         self.capacity
     }
 
-    /// Prepare the total position capacity for a prompt plus its output budget.
-    /// Existing capacity is retained when it already covers the request.
+    /// Prepare the total position capacity for a prompt plus its output budget,
+    /// then pre-capture the compiled decode step(s) the request will hit.
+    ///
+    /// Existing capacity is retained when it already covers the request, and so
+    /// are the compiled steps for that capacity: a smaller re-prepare reuses the
+    /// bucket instead of recompiling. With `APXINF_LFM3_BUCKETED_DECODE` unset
+    /// this only reserves capacity (and marks the eager arm).
     pub fn prepare(&mut self, prompt_len: usize, max_new_tokens: usize) -> Result<()> {
         if let Err(error) = self.ensure_capacity(prompt_len, max_new_tokens) {
             self.invalid = Some(error.to_string());
             return Err(error);
         }
+        if let Err(error) = self.prepare_decode(prompt_len, max_new_tokens) {
+            self.invalid = Some(error.to_string());
+            return Err(error);
+        }
         Ok(())
+    }
+
+    /// Pre-capture and warm every compiled decode step this request will hit.
+    ///
+    /// A capacity bucket is prepared once: `decode_widths` names the attention
+    /// widths the request crosses, and a width that already has a graph is
+    /// reused (`… compiled reused`) instead of recompiled (`… compiled`). The
+    /// markers let a measurement window prove which arm actually ran.
+    fn prepare_decode(&mut self, prompt_len: usize, max_new_tokens: usize) -> Result<()> {
+        if !self.decode_policy.is_bucketed() {
+            self.decode = None;
+            eprintln!("lfm3 decode bucket=eager");
+            return Ok(());
+        }
+        // Construction and prefill-only prepares reserve capacity, not a decode
+        // budget: there is no step to capture yet.
+        if max_new_tokens == 0 {
+            return Ok(());
+        }
+        let capacity = self.capacity;
+        if self
+            .decode
+            .as_ref()
+            .is_none_or(|prepared| prepared.capacity() != capacity)
+        {
+            self.decode = Some(PreparedDecode::new(capacity));
+        }
+        for width in decode::decode_widths(prompt_len + 1, capacity) {
+            if self
+                .decode
+                .as_ref()
+                .is_some_and(|prepared| prepared.contains(width))
+            {
+                eprintln!("lfm3 decode bucket={width} compiled reused");
+                continue;
+            }
+            let step = self.compile_decode_step(width)?;
+            self.warm_decode_step(&step, width)?;
+            self.decode
+                .as_mut()
+                .ok_or_else(|| err("LFM3 decode preparation lost its bucket set"))?
+                .insert(width, step);
+            eprintln!("lfm3 decode bucket={width} compiled");
+        }
+        Ok(())
+    }
+
+    fn compile_decode_step(&self, width: usize) -> Result<Compiled> {
+        decode::compile_step(
+            self.backend.stream(),
+            self.weights.clone(),
+            self.config.clone(),
+            self.kinds.clone(),
+            self.causal_conv.clone(),
+            self.capacity,
+            width,
+        )
+    }
+
+    /// Trace, compile and replay-verify one step on zeroed state so no decode
+    /// position later pays a trace. `Compiled::prepare` fails if the profile
+    /// retraces, which is the fail-closed compiled-execution check.
+    fn warm_decode_step(&self, step: &Compiled, width: usize) -> Result<()> {
+        let position = width - 1;
+        let tokens = Array::from_i32(self.backend.stream(), &[1, 1], &[0])?;
+        let args = self.decode_step_args(tokens, position, &self.initial_kv, &self.initial_conv)?;
+        step.prepare(&args)?;
+        Ok(())
+    }
+
+    /// Explicit compiled-step arguments: the changing token and position, the
+    /// two RoPE rows, and every KV/conv state array in layer order.
+    fn decode_step_args(
+        &self,
+        tokens: Array,
+        position: usize,
+        kv: &[Option<KvState>],
+        conv: &[Option<Array>],
+    ) -> Result<Vec<Array>> {
+        let index = Array::from_i32(self.backend.stream(), &[1], &[position as i32])?;
+        let (cos_full, sin_full) = self.cos_sin(LayerKind::FullAttention, position, 1)?;
+        let (cos_sliding, sin_sliding) = self.cos_sin(LayerKind::SlidingAttention, position, 1)?;
+        let mut args = vec![tokens, index, cos_full, sin_full, cos_sliding, sin_sliding];
+        for (layer_index, kind) in self.kinds.iter().enumerate() {
+            if kind.is_conv() {
+                let state = conv[layer_index]
+                    .as_ref()
+                    .ok_or_else(|| err("LFM3 conv state is missing"))?;
+                args.push(state.clone());
+            } else {
+                let state = kv[layer_index]
+                    .as_ref()
+                    .ok_or_else(|| err("LFM3 KV state is missing"))?;
+                args.push(state.keys.clone());
+                args.push(state.values.clone());
+            }
+        }
+        Ok(args)
+    }
+
+    /// One decode position as a pure graph replay.
+    ///
+    /// Fails closed: a position whose attention width was not prepared is a
+    /// contract error, never an eager step, so the reported `DecodeStep` scope
+    /// is the scope that actually executed.
+    fn execute_compiled_step(&mut self, token: u32, end: usize) -> Result<Tensor> {
+        let position = end - 1;
+        let width = decode::attention_width(end, self.capacity);
+        let tokens = Array::from_i32(self.backend.stream(), &[1, 1], &[token as i32])?;
+        let args = self.decode_step_args(tokens, position, &self.kv, &self.conv)?;
+        let outputs = {
+            let prepared = self.decode.as_ref().ok_or_else(|| {
+                err("LFM3 bucketed decode requires prepare() with an output budget")
+            })?;
+            let step = prepared
+                .step(width)
+                .ok_or_else(|| err(format!("LFM3 decode bucket={width} was not prepared")))?;
+            step.call(&args)?
+        };
+        self.backend.stream().eval(&outputs)?;
+        let mut outputs = outputs.into_iter();
+        let logits = outputs
+            .next()
+            .ok_or_else(|| err("LFM3 compiled decode step returned no logits"))?;
+        for layer_index in 0..self.kinds.len() {
+            if self.kinds[layer_index].is_conv() {
+                self.conv[layer_index] = Some(
+                    outputs
+                        .next()
+                        .ok_or_else(|| err("LFM3 compiled decode step returned too few states"))?,
+                );
+            } else {
+                let keys = outputs
+                    .next()
+                    .ok_or_else(|| err("LFM3 compiled decode step returned too few states"))?;
+                let values = outputs
+                    .next()
+                    .ok_or_else(|| err("LFM3 compiled decode step returned too few states"))?;
+                self.kv[layer_index] = Some(KvState { keys, values });
+            }
+        }
+        self.position = end;
+        self.backend.from_array(logits)
     }
 
     fn ensure_capacity(&mut self, prompt_len: usize, max_new_tokens: usize) -> Result<()> {
@@ -232,7 +437,11 @@ impl Lfm3Model {
     }
 
     /// Allocate KV rows, conv history and both rotary tables for `capacity`.
+    ///
+    /// A new capacity is a new bucket: the compiled steps of the previous
+    /// capacity describe the previous KV shapes and are dropped.
     fn allocate(&mut self, capacity: usize) -> Result<()> {
+        self.decode = None;
         let stream = self.backend.stream().clone();
         let c = &self.config;
         let row = [1, c.num_key_value_heads, capacity, c.head_dim];
@@ -791,6 +1000,12 @@ impl Lfm3Model {
         let len = token_ids.len();
         let start = self.position;
         let end = start + len;
+        // A decode position above the first runs the pre-captured compiled step
+        // when the bucketed policy is selected; prefill (position 0) and prompt
+        // chunks are untouched.
+        if len == 1 && start > 0 && self.decode_policy.is_bucketed() {
+            return self.execute_compiled_step(token_ids[0], end);
+        }
         let ids: Vec<i32> = token_ids.iter().map(|&id| id as i32).collect();
         let ids = Array::from_i32(&stream, &[len], &ids)?;
         let mut x = self
@@ -845,6 +1060,18 @@ impl LlmTrait for Lfm3Model {
             && self.kv.len() == self.config.num_hidden_layers
             && self.position <= self.capacity
             && self.cos_full.is_some();
+        // The compiled scope is claimed only when a step is prepared, and then
+        // decode must execute it (see `execute_compiled_step`, which fails closed).
+        let prepared = ready
+            .then_some(self.decode.as_ref())
+            .flatten()
+            .filter(|prepared| prepared.capacity() == self.capacity);
+        let mut scopes = Vec::new();
+        let mut lengths = Vec::new();
+        if let Some(prepared) = prepared {
+            scopes.push(TextCompilationScope::DecodeStep);
+            lengths = prepared.widths();
+        }
         TextPreparationStatus {
             state: if self.invalid.is_some() {
                 TextPreparationState::Invalidated
@@ -854,12 +1081,14 @@ impl LlmTrait for Lfm3Model {
                 TextPreparationState::Unprepared
             },
             implementation: "metal_lfm3",
-            variant: Some(VARIANT),
-            // This port composes eager device primitives only: no compiled or
-            // captured scope is claimed.
-            compiled_scopes: Vec::new(),
+            variant: Some(if scopes.is_empty() {
+                VARIANT
+            } else {
+                VARIANT_BUCKETED
+            }),
+            compiled_scopes: scopes,
             prepared_prompt_tokens: None,
-            prepared_sequence_lengths: Vec::new(),
+            prepared_sequence_lengths: lengths,
             kv_capacity: (self.capacity > 0).then_some(self.capacity),
             max_decode_rows: ready.then_some(1),
             error: self.invalid.clone(),
@@ -927,6 +1156,8 @@ impl LlmTrait for Lfm3Model {
         self.capacity = 0;
         self.position = 0;
         self.invalid = None;
+        // The capacity is gone, so the graphs that describe its KV shapes are too.
+        self.decode = None;
         self.backend.stream().synchronize()
     }
 
@@ -948,8 +1179,12 @@ impl LlmTrait for Lfm3Model {
     }
 }
 
-/// Implementation identity reported through `preparation_status`.
+/// Implementation identity reported through `preparation_status` for the eager
+/// decode step (the default).
 pub const VARIANT: &str = "bf16-eager";
+
+/// Implementation identity reported when a compiled decode step is prepared.
+pub const VARIANT_BUCKETED: &str = "bf16-bucketed-decode";
 
 #[cfg(test)]
 mod tests {
