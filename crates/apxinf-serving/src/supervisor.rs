@@ -32,6 +32,8 @@ mod submit_regressions;
 #[cfg(test)]
 mod thinking_regressions;
 #[cfg(test)]
+mod truncation_regressions;
+#[cfg(test)]
 mod vision_regressions;
 use crate::{
     contracts,
@@ -2702,11 +2704,22 @@ async fn execute(
                     };
                     let incomplete_reasoning = thinking_prefix.as_ref().is_some_and(|prefix| !prefix.is_open())
                         && kind == "terminal" && frame["status"] == "completed" && frame["cause"] == "eos";
+                    // Only the output allowance turning a structured block open
+                    // is a truncation to surface; a stop sequence cutting the
+                    // block is a malformed emission and keeps failing.
+                    let allowance_exhausted = kind == "terminal"
+                        && frame["status"] == "completed"
+                        && stops.matched.is_none()
+                        && frame["cause"] == "length";
                     let parsed = if incomplete_reasoning {
                         Err("The model ended before closing its initial reasoning block.".to_owned())
                     } else {
                         let text = stops.push(&text, kind == "terminal");
-                        parser.push(&text, kind == "terminal" && frame["status"] == "completed")
+                        if allowance_exhausted {
+                            parser.push_truncated(&text)
+                        } else {
+                            parser.push(&text, kind == "terminal" && frame["status"] == "completed")
+                        }
                     };
                     match parsed {
                         Ok(parts) => {
