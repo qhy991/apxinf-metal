@@ -898,6 +898,9 @@ mod tests {
         assert_eq!(eager.len(), steps);
 
         model.select_decode_policy(DecodePolicy::Bucketed);
+        // Prepare first: the bucket compile is preparation, not decode. The
+        // measured window starts after it, exactly like the perf gate does.
+        model.prepare(prompt.len(), steps)?;
         let traces = backend.stream().counters().trace_callbacks;
         let bucketed = generate_tokens(&mut model, &prompt, steps)?;
         assert_eq!(
