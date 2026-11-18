@@ -177,8 +177,16 @@ impl ToolBoundary {
     }
 }
 
+/// Cap on the retained thinking text. The block limit already bounds a single
+/// unresolved block; the output allowance bounds the whole generation.
+const BLOCK_RETENTION_LIMIT: usize = 262_144;
+
 pub struct OutputParser {
     pending: String,
+    /// Thinking text seen since the block opened. Nothing from a thinking block
+    /// is exposed until the block closes, but retaining it lets an allowance
+    /// truncation still surface the partial reasoning.
+    block: String,
     mode: Mode,
     profile: OutputProfile,
     tools: Vec<Value>,
@@ -193,6 +201,7 @@ impl OutputParser {
     pub fn with_profile(tools: Vec<Value>, profile: OutputProfile) -> Self {
         Self {
             pending: String::new(),
+            block: String::new(),
             mode: Mode::Text,
             profile,
             tools,
@@ -201,6 +210,27 @@ impl OutputParser {
     }
 
     pub fn push(&mut self, text: &str, last: bool) -> Result<Vec<Part>, String> {
+        self.push_inner(text, last, false)
+    }
+
+    /// Push the final chunk of a generation that stopped at its output
+    /// allowance (`cause: length`).
+    ///
+    /// A structured block still open at that point is a truncation of the
+    /// output, not a malformed emission: the partial block contents are
+    /// surfaced as text so the client can read the truncated answer. No tool
+    /// part is produced, even when the block body happens to parse, because the
+    /// closing marker never arrived.
+    pub fn push_truncated(&mut self, text: &str) -> Result<Vec<Part>, String> {
+        self.push_inner(text, true, true)
+    }
+
+    fn push_inner(
+        &mut self,
+        text: &str,
+        last: bool,
+        allowance_exhausted: bool,
+    ) -> Result<Vec<Part>, String> {
         self.pending.push_str(text);
         if self.pending.len() > 262_144 {
             return Err("The output block exceeds the byte limit.".into());
@@ -223,6 +253,7 @@ impl OutputParser {
                         }
                         self.pending.drain(..i + marker.len());
                         self.mode = if marker == markers[1] {
+                            self.block.clear();
                             Mode::Thinking
                         } else {
                             match self.profile {
@@ -249,10 +280,17 @@ impl OutputParser {
                 Mode::Thinking => {
                     if let Some(i) = self.pending.find("</think>") {
                         self.pending.drain(..i + "</think>".len());
+                        self.block.clear();
                         self.mode = Mode::Text;
                     } else {
+                        // Hold back only a possible close-tag prefix, and keep
+                        // the rest so a truncation can still surface it.
                         let keep = suffix_prefix_len(&self.pending, &["</think>"]);
-                        self.pending.drain(..self.pending.len() - keep);
+                        let tail = self.pending.split_off(self.pending.len() - keep);
+                        if self.block.len() < BLOCK_RETENTION_LIMIT {
+                            self.block.push_str(&self.pending);
+                        }
+                        self.pending = tail;
                         break;
                     }
                 }
@@ -305,7 +343,21 @@ impl OutputParser {
             }
         }
         if last && !matches!(self.mode, Mode::Text) {
-            return Err("The model output contains an incomplete structured block.".into());
+            if !allowance_exhausted {
+                return Err("The model output contains an incomplete structured block.".into());
+            }
+            // The allowance ended the generation inside a structured block.
+            // Truncation is a normal termination, so the partial contents are
+            // surfaced as text (never as a half-parsed tool call). A thinking
+            // block's body is held in `block`; a tool block's raw body is still
+            // in `pending` because it is only parsed once the end marker lands.
+            let mut partial = std::mem::take(&mut self.block);
+            partial.push_str(&self.pending);
+            self.pending.clear();
+            if !partial.is_empty() {
+                parts.push(Part::Text(partial));
+            }
+            self.mode = Mode::Text;
         }
         Ok(parts)
     }
@@ -791,5 +843,73 @@ mod tests {
             assert!(error.contains(expected), "{key}={raw}: {error}");
             assert_eq!(parser.tool_count, 0);
         }
+    }
+
+    #[test]
+    fn truncated_thinking_block_surfaces_its_partial_text() {
+        let mut parser = OutputParser::new(vec![]);
+        let mut parts = parser.push("preamble<thi", false).unwrap();
+        assert_eq!(parts, vec![Part::Text("preamble".into())]);
+        parts.clear();
+        // Chunked like a real token stream: the body does not stay in `pending`
+        // between pushes, so the retention buffer is what makes this possible.
+        for chunk in ["nk>We need to", " check the"] {
+            assert!(parser.push(chunk, false).unwrap().is_empty());
+        }
+        parts.extend(parser.push_truncated(" log").unwrap());
+        assert_eq!(
+            parts,
+            vec![Part::Text("We need to check the log".into())],
+            "the allowance cut must surface the partial reasoning"
+        );
+        assert_eq!(parser.tool_count, 0);
+    }
+
+    #[test]
+    fn truncated_tool_block_never_emits_a_half_parsed_call() {
+        let body = "{\"name\":\"configure\",\"arguments\":{\"label\":\"x\"}}";
+        let mut parser = OutputParser::new(typed_parameter_tools());
+        assert!(parser.push("<tool_call>", false).unwrap().is_empty());
+        assert!(
+            parser.push(body, false).unwrap().is_empty(),
+            "the closing marker has not arrived"
+        );
+        let parts = parser.push_truncated("").unwrap();
+        assert_eq!(parser.tool_count, 0, "a truncated tool block has no call");
+        assert_eq!(parts, vec![Part::Text(body.into())]);
+    }
+
+    #[test]
+    fn incomplete_blocks_without_an_allowance_cut_stay_errors() {
+        // A finished generation (eos) inside a block is malformed output.
+        let mut parser = OutputParser::new(vec![]);
+        assert!(parser.push("<think>We need", false).unwrap().is_empty());
+        let error = parser.push("", true).unwrap_err();
+        assert!(error.contains("incomplete structured block"), "{error}");
+        let mut parser = OutputParser::new(typed_parameter_tools());
+        assert!(parser.push("<tool_call>{", false).unwrap().is_empty());
+        let error = parser.push("", true).unwrap_err();
+        assert!(error.contains("incomplete structured block"), "{error}");
+        assert_eq!(parser.tool_count, 0);
+    }
+
+    #[test]
+    fn complete_blocks_on_an_allowance_cut_keep_their_parts() {
+        // A complete think block is ordinary text, not a truncation.
+        let mut parser = OutputParser::new(vec![]);
+        assert_eq!(
+            parser.push("<think>hidden</think>answer", false).unwrap(),
+            vec![Part::Text("answer".into())]
+        );
+        assert!(parser.push_truncated("").unwrap().is_empty());
+        // A complete tool call still parses when the allowance ends the turn.
+        let mut parser = OutputParser::new(typed_parameter_tools());
+        let parts = parser
+            .push_truncated(
+                "<tool_call>{\"name\":\"configure\",\"arguments\":{\"label\":\"x\"}}</tool_call>",
+            )
+            .unwrap();
+        assert_eq!(parser.tool_count, 1);
+        assert!(matches!(parts.as_slice(), [Part::Tool { name, .. }] if name == "configure"));
     }
 }
