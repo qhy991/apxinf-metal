@@ -111,6 +111,7 @@ while [[ $# -gt 0 ]]; do
         --prompt-protocol) need_value "$@"; prompt_protocol="$2"; shift 2 ;;
         --stream) stream="1"; shift ;;
         --no-stream) stream="0"; shift ;;
+        --no-seed) seed=""; shift ;;
         --dry-run) dry_run="1"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 64 ;;
@@ -219,7 +220,7 @@ PROTOCOL = CFG["protocol"]
 STREAM = CFG["stream"] == "1"
 OUT = CFG["out"]
 DRY = CFG["dry_run"] == "1"
-SEED = int(CFG["seed"])
+SEED = int(CFG["seed"]) if CFG["seed"] else None
 CORPUS_SEED = int(CFG["corpus_seed"])
 MAX_WAIT = float(CFG["timeout"])
 
@@ -405,9 +406,10 @@ def payload_for(case, prompt):
             "max_tokens": case["max_tokens"],
             "temperature": 0.0,
             "top_p": 1.0,
-            "seed": SEED,
             "stream": STREAM,
         }
+        if SEED is not None:
+            body["seed"] = SEED
         if STREAM:
             body["stream_options"] = {"include_usage": True}
         return "/v1/completions", body
@@ -417,9 +419,10 @@ def payload_for(case, prompt):
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": case["max_tokens"],
             "temperature": 0.0,
-            "seed": SEED,
             "stream": STREAM,
         }
+        if SEED is not None:
+            body["seed"] = SEED
         if STREAM:
             body["stream_options"] = {"include_usage": True}
         return "/v1/chat/completions", body
@@ -433,11 +436,12 @@ def payload_for(case, prompt):
         "stream": STREAM,
         "options": {
             "temperature": 0.0,
-            "seed": SEED,
             "num_predict": case["max_tokens"],
             "num_ctx": max(case.get("context", 0), case["target_tokens"] + case["max_tokens"] + 16),
         },
     }
+    if SEED is not None:
+        body["options"]["seed"] = SEED
     return "/api/generate", body
 
 

@@ -261,11 +261,12 @@ OpenAI-compatible response carries no durations, so at least one ollama run uses
 
 ## Results
 
-Every table below is produced by `bench_engines_report.py`; empty cells mean
-"not measured", not "zero". Arm set in this window: `llamacpp` (Q4_K_M),
-`ollama` (Q4_K_M), `apxinf-native` (BF16), `llamacpp-f16` (16-bit tier);
-`apxinf-mlx-lane` is incomplete (2026-11-18 amendment).
+<!-- BEGIN RESULTS -->
+Not measured yet. Every table below is produced by `bench_engines_report.py`;
+an empty cell means "not measured", not "zero".
+<!-- END RESULTS -->
 
+<!-- BEGIN TABLES -->
 ### Artifact and host identity
 
 | arm | engine version / commit | binary sha256 | weights sha256 | quantization |
@@ -308,6 +309,38 @@ swapouts before/after `<...>`, disk free `<...>`.
 | stage | case | `apxinf-native` prompt tokens | `llamacpp` prompt tokens | `ollama` prompt tokens |
 |---|---|---|---|---|
 | | | | | |
+
+### 2026-11-18 (second amendment) - stage-2 host change: M1 Pro offline, measurements move to M4
+
+The M1 Pro acceptance host went offline during stage-2 provisioning: it stopped
+advertising on mDNS, stopped answering ssh, and is not resolvable from the
+authoring host. Provisioning on it had completed (llama.cpp master with
+`LLM_ARCH_LFM3`, ollama 0.40.16 with the Q4_K_M model imported, `apxinf-serve`
+and `apxinf-native-worker` built from `feat/lfm3-metal`, the exact-token corpus
+verified against llama.cpp `/tokenize`), but **no measurement window ran there**:
+the first tier-A window aborted on a runner bug (bash 3.2 has no associative
+arrays) before the first arm was driven, and it wrote no raw JSON.
+
+Stage 2 therefore runs on `haiyan-mac-mini` (Apple M4, 16 GB, macOS 27.0.1), or is
+reported as blocked/incomplete with that reason. Consequences that must be quoted
+with every number:
+
+1. **Host change**: these are M4 numbers. Nothing in this document compares an M4
+   number with an M1 number, and the M1 provisioning above is not evidence of any
+   measurement.
+2. **Arms on M4**: the 4-bit tier is `apxinf-mlx-lane` (packed4; EngineTailor LFM3
+   engine + `lfm3_worker.py`, served by `apxinf-serve` from PR #110) against
+   `llamacpp` (Q4_K_M) and, if installed, `ollama` (Q4_K_M). The 16-bit tier
+   (`apxinf-native` BF16 vs `llamacpp-f16`) is measured only if the BF16 snapshot
+   and the F16 GGUF finish downloading on the M4's ~0.4-0.5 MB/s link; otherwise it
+   is reported INCOMPLETE with that reason.
+3. **Locks**: the M4 has no `flock(1)` and no `lockrun.py`, so the window runs
+   under an fcntl implementation of the same contract (two lock paths, same order,
+   held for the whole child). This is stated rather than silently assumed.
+4. **No verdict without a validated window**: A/A <= 5% per arm, at least three
+   ABBA segments per arm, one generation-evidence line per arm in the raw JSON,
+   host state before/after, and every server stopped afterwards. A blocked
+   download or an unavailable arm is reported as INCOMPLETE, never substituted.
 
 ## Verdict
 
@@ -365,3 +398,4 @@ silently retune the gate after seeing the data.
    the model chat template by default and S1-S3 are bare completion. Without `raw`,
    the same 128-token corpus text is evaluated as 138 prompt tokens (the template
    prefix), which would break the corpus identity check.
+<!-- END TABLES -->
