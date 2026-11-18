@@ -44,6 +44,10 @@
 #       --evidence-pattern 'n_past|prompt eval time'
 #
 #   # apxinf-native: the gateway has no bare-completion route
+#   # ollama with a pinned context (M4: avoids a runner reload per num_ctx)
+#   scripts/bench_engines.sh --arm ollama --stage s1 --protocol ollama-generate \
+#       --ollama-num-ctx 16384 ...
+#
 #   scripts/bench_engines.sh --arm apxinf-native --stage s1 --protocol openai-chat \
 #       --endpoint http://127.0.0.1:8099 --model LFM3-1.7B \
 #       --binary-hash ... --model-hash ... --request-log .../requests.jsonl
@@ -81,6 +85,7 @@ timeout_s="900"
 evidence_log=""
 evidence_pattern=""
 request_log=""
+ollama_num_ctx=""
 stream=""
 quantization=""
 prompt_protocol=""
@@ -113,6 +118,12 @@ while [[ $# -gt 0 ]]; do
         --evidence-log) need_value "$@"; evidence_log="$2"; shift 2 ;;
         --evidence-pattern) need_value "$@"; evidence_pattern="$2"; shift 2 ;;
         --request-log) need_value "$@"; request_log="$2"; shift 2 ;;
+        # M4 adaptation: ollama restarts its llama-server child whenever the
+        # per-request num_ctx changes (observed 2026-11-18: one runner start per
+        # request), so a context ladder turns prefill into model reload. Pin one
+        # num_ctx for every request to keep the arm comparable to llama.cpp's
+        # fixed -c. 0/empty keeps the legacy per-case behaviour.
+        --ollama-num-ctx) need_value "$@"; ollama_num_ctx="$2"; shift 2 ;;
         --quantization) need_value "$@"; quantization="$2"; shift 2 ;;
         --prompt-protocol) need_value "$@"; prompt_protocol="$2"; shift 2 ;;
         --stream) stream="1"; shift ;;
@@ -207,6 +218,7 @@ export BENCH_CONTEXTS="$contexts" BENCH_GEN_LENGTHS="$gen_lengths" BENCH_COUNT="
 export BENCH_S3_LENGTH="$s3_length" BENCH_WARMUP="$warmup" BENCH_TIMEOUT="$timeout_s"
 export BENCH_EVIDENCE_LOG="$evidence_log" BENCH_EVIDENCE_PATTERN="$evidence_pattern"
 export BENCH_REQUEST_LOG="$request_log" BENCH_STREAM="$stream" BENCH_DRY_RUN="$dry_run"
+export BENCH_OLLAMA_NUM_CTX="$ollama_num_ctx"
 export BENCH_QUANTIZATION="$quantization" BENCH_PROMPT_PROTOCOL="$prompt_protocol"
 
 # The request machinery lives in one embedded Python program: bash cannot time an
@@ -477,7 +489,11 @@ def payload_for(case, prompt):
         "options": {
             "temperature": 0.0,
             "num_predict": case["max_tokens"],
-            "num_ctx": max(case.get("context", 0), case["target_tokens"] + case["max_tokens"] + 16),
+            # Pinned when --ollama-num-ctx is given: a changing num_ctx makes ollama
+            # reload its runner (and the reload lands inside TTFT), so the context
+            # ladder must not double as a model-reload ladder.
+            "num_ctx": int(CFG["ollama_num_ctx"]) if CFG.get("ollama_num_ctx")
+            else max(case.get("context", 0), case["target_tokens"] + case["max_tokens"] + 16),
         },
     }
     if SEED is not None:
