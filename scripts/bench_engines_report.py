@@ -320,6 +320,20 @@ class Report:
         return results
 
     # -- tables ------------------------------------------------------------
+    def timing_primary(self) -> str:
+        """What decided the primary metric in this data set: client or engine.
+
+        A window measured with `--engine-timings` (buffered-SSE servers such as
+        apxinf-serve, where the first content delta arrives at completion and the
+        client decode window is degenerate) is engine-primary for both arms and
+        must not be described as client-observed.
+        """
+        for run in self.runs:
+            if run.get("timing_primary") == "engine" or (
+                    run.get("params") or {}).get("timing_primary") == "engine":
+                return "engine"
+        return "client"
+
     def stage_rows(self, stage: str):
         """(group, arm) -> pooled medians + samples, client-first basis."""
         metric = PRIMARY_METRIC[stage]
@@ -460,14 +474,25 @@ class Report:
                 "reported `prompt_tokens`, and the corpus table above shows the offset; S1 TTFT "
                 "for those arms includes rendering/evaluating that prefix."
             )
-        lines.append(
-            "Measurement basis: S1 TTFT and S2 decode are client-observed (first and last SSE "
-            "content delta). Engine-reported prefill/decode durations are shown separately, and "
-            "they cover different spans per engine (llama.cpp prompt eval; apxinf state reset + "
-            "capacity preparation + prefill). S3 subtracts the engine-reported durations from "
-            "client wall where they exist; where they do not, S3 overhead is n/a and the wall "
-            "column alone must not be read as serving overhead."
-        )
+        if self.timing_primary() == "engine":
+            lines.append(
+                "Measurement basis: **engine-reported** (this window ran with `--engine-timings`). "
+                "apxinf-serve emits its generated text only at completion, so a client-observed "
+                "decode window would be degenerate (first and last content delta arrive within "
+                "microseconds). The spans differ per engine and are declared: llama.cpp reports "
+                "prompt-eval and predicted (decode) durations; apxinf reports state reset + "
+                "capacity preparation + prefill as `prefill_ms` and its decode stage as "
+                "`decode_ms`. S3 overhead is n/a under this basis."
+            )
+        else:
+            lines.append(
+                "Measurement basis: S1 TTFT and S2 decode are client-observed (first and last SSE "
+                "content delta). Engine-reported prefill/decode durations are shown separately, and "
+                "they cover different spans per engine (llama.cpp prompt eval; apxinf state reset + "
+                "capacity preparation + prefill). S3 subtracts the engine-reported durations from "
+                "client wall where they exist; where they do not, S3 overhead is n/a and the wall "
+                "column alone must not be read as serving overhead."
+            )
         lines.append(
             "Pairing: every delta in these tables is the median over ABBA segments of the "
             "within-segment median ratio against "
@@ -645,9 +670,15 @@ class Report:
             print(f"## {STAGE_TITLES[stage]}")
             print()
             if stage == "s1":
-                print("Client-observed time to first content delta (the S1 metric), with the "
-                      "engine-reported prefill as a cross-check. Ratio is paired against "
-                      f"`{self.args.baseline}` per segment (baseline/arm; >1 = this arm faster).")
+                if self.timing_primary() == "engine":
+                    print("Engine-reported prefill duration (the S1 metric for this window: "
+                          "`--engine-timings`, because apxinf-serve buffers its SSE and a "
+                          "client TTFT would be a wall time, not a prefill). Ratio is paired "
+                          f"against `{self.args.baseline}` per segment (baseline/arm; >1 = this arm faster).")
+                else:
+                    print("Client-observed time to first content delta (the S1 metric), with the "
+                          "engine-reported prefill as a cross-check. Ratio is paired against "
+                          f"`{self.args.baseline}` per segment (baseline/arm; >1 = this arm faster).")
                 print()
                 print("| case | arm | TTFT p50 (ms) | prefill tok/s p50 | engine prefill p50 (ms) "
                       "| vs baseline | n | seg |")
@@ -663,9 +694,14 @@ class Report:
                               f"| {ratio_label(ratio)} "
                               f"| {row['n']} | {row['segments']} |")
             elif stage == "s2":
-                print("Client-observed decode window (first to last content delta) per generated "
-                      "token. This file already declares that the decode basis is the client; the "
-                      "engine-reported ms/token is shown next to it.")
+                if self.timing_primary() == "engine":
+                    print("Engine-reported decode duration per generated token (this window ran "
+                          "with `--engine-timings`: apxinf-serve emits its content only at "
+                          "completion, so a client decode window would be degenerate).")
+                else:
+                    print("Client-observed decode window (first to last content delta) per generated "
+                          "token. This file already declares that the decode basis is the client; the "
+                          "engine-reported ms/token is shown next to it.")
                 print()
                 print("| case | arm | decode ms/token p50 | decode tok/s p50 | engine ms/token p50 "
                       "| vs baseline | n | seg |")

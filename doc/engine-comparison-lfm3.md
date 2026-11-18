@@ -1,9 +1,13 @@
 # LFM3-1.7B engine comparison: apxinf vs llama.cpp vs ollama
 
-Status: **method + pre-registered gate; stage-2 tier-A window complete on the M4
-(2026-11-18) — `llamacpp` vs `ollama` on identical Q4_K_M weights, every gate met.**
-The `apxinf-native` arm and the 16-bit matched-precision pair are **not** measured
-(see the stage-2 section); no apxinf-vs-llama.cpp claim is made in this document.
+Status: **method + pre-registered gate; two stage-2 windows complete on the M4
+(2026-11-18).** Tier A: `llamacpp` vs `ollama` on identical Q4_K_M weights — every
+gate met, no measurable serving-layer difference. Tier B (cross-precision):
+`apxinf-native` BF16 vs `llamacpp` Q4_K_M — every gate met; the 2.95x decode gap is
+explained by the 3.14x weight-byte ratio, so it is a **precision** statement, not
+an engine statement. The 16-bit matched pair (apxinf BF16 vs `llamacpp` F16) is
+**still pending** the official F16 GGUF; no engine-implementation claim is made in
+this document.
 Design: GitHub issue [qhy991/apxinf-metal#111](https://github.com/qhy991/apxinf-metal/issues/111)
 (the working copy under `devlocal/engine-comparison-lfm3/DESIGN.md` is git-ignored).
 Harness: [`scripts/bench_engines.sh`](../scripts/bench_engines.sh),
@@ -446,6 +450,12 @@ memory ceiling and **not** a speed comparison between the M1 Pro and the M4.
 
 ### Tier B — `apxinf-native`: builds, but the arm is still not measurable (2026-11-18)
 
+> **Superseded 2026-11-18 23:51 CST** by the cross-precision section below: PR #118
+> fixed the truncated-structured-block rejection, `apxinf-serve` was rebuilt from
+> `fbd1e2e9`, and the arm now runs (report exit 0). The text below is retained
+> because it is the exact failure that blocked the previous window.
+
+
 `apxinf-serve` does build on the M4 from `feat/lfm3-metal` (source commit
 `5104123b`: `cargo build --release -p apxinf-serving --features native-minicpm5
 --bins`, `SDKROOT=…/MacOSX26.5.sdk`, `MLX_ROOT=~/mlx-sdk`), and its native worker
@@ -477,6 +487,149 @@ is still not measurable, and the blocker is the serving contract, not the build:
   comparison.
 
 
+
+## Stage-2 tier B — cross-precision: `apxinf-native` BF16 vs `llamacpp` Q4_K_M (2026-11-18, M4)
+
+Status: **KEEP** (measurement accepted) — this is a **precision statement, not an
+engine statement**. The matched BF16-vs-F16 pair that the decision rule needs is
+still pending (see the last subsection).
+Claim: in one ABBA window on the M4, apxinf's native `metal_lfm3` path at MLX BF16
+decodes at **36.60 / 36.93 ms per token** (27.3 / 27.1 tok/s) while llama.cpp at
+Q4_K_M does **12.39 / 12.71 ms** (80.7 / 78.7 tok/s): apxinf is **2.95x slower per
+token**. That gap is explained by the **3.14x weight-byte ratio** (3.458 GB BF16
+vs 1.0996 GB Q4_K_M): effective streaming bandwidth is **94.5 vs 88.7 GB/s**, i.e.
+the same class. Prefill is at parity: apxinf 142.7 / 430.9 / 1462.8 ms vs
+llama.cpp 116.5 / 412.6 / 1531.2 ms for 106/401/1571 vs 97/392/1562 prompt tokens
+(apxinf 17% slower at 128 tokens, 4% slower at 512, 4.5% **faster** at 2048).
+Evidence: `devlocal/engine-comparison-lfm3/results/tierb-20261118T155745Z/`
+(12 raw JSON, report, identity, request log, host state); report **exit 0**;
+window 2026-11-18 23:58:13-00:00:31 CST.
+Gate: A/A `apxinf-native` s1 **2.7%**, s2 **0.4%**; `llamacpp` s1 **2.1%**, s2
+**0.9%** (all <= 5%, three ABBA segments per arm); engine-log evidence on both
+arms; matched spans declared below.
+Decision rule: cross-tier by construction, so **no engine-implementation
+attribution** is made. The pre-registered matched-precision decision is applied
+only to the BF16-vs-F16 pair (last subsection).
+Caveats: engine-reported timing basis; +9-token ChatML prefix on the apxinf arm;
+apxinf `prefill_ms` includes state reset + capacity preparation; one host, one
+window; batch-1; Q4_K_M vs BF16 only.
+Supersedes: the `### Tier B — apxinf-native: builds, but the arm is still not
+measurable` subsection above (the truncated-structured-block bug it reports was
+fixed by PR #118; that text stays visible, this section is the measurement).
+
+### What unblocked the arm
+
+`apxinf-serve` was rebuilt on the M4 from `feat/lfm3-metal` tip **`fbd1e2e9`**
+(PR #118; source tarball of that tree sha256 `da5b6cb9…`; `cargo build --release -p
+apxinf-serving --features native-minicpm5 --bins`, `SDKROOT=…/MacOSX26.5.sdk`,
+`MLX_ROOT=~/mlx-sdk`): `apxinf-serve` sha256 `f3ff54661cc8565d183038eb725c9dcdc89dc1f9a9722562241f29b189e75f24`,
+`apxinf-native-worker` sha256 `04f4692a4d0bb4923dac6765c0bb87b2fa4709c2d184987e55fae727ca4633a5`.
+Sanity check on the exact failure shape of the previous window (word-salad
+prompt, `max_tokens=8`, streaming): **HTTP 200**, one content chunk, then
+`finish_reason: "length"` and `[DONE]`; the request log records
+`"status":"completed","cause":"length", "completion_tokens":8`.
+
+### Artifact and host identity
+
+| artifact | value |
+|---|---|
+| `apxinf-serve` / worker sha256 | `f3ff5466…` / `04f4692a…` (built on the M4 at source tip `fbd1e2e9`) |
+| apxinf weights | reconstructed BF16 HF checkpoint, `model.safetensors` 3,457,635,448 B, sha256 `135922caef64e81e52af88ede8b7c3ddaa9d6da220a9737fb3065275dbfb4330`; served identity `quant: bf16`, `ane: off` |
+| `llama_server_sha256` | `d635b19fb11a19d3262ee8544252f20cb92620b58c426b820453bb4f4535e55e` (llama.cpp `5297534`, Metal) |
+| `gguf_sha256` / bytes | `3793e1e6…` / 1,099,627,808 |
+| arch proof | llama.cpp `print_info: arch = lfm3`; apxinf `Metal 0: Apple M4 (applegpu_g16g)` + 3.46 GB resident |
+| window discipline | both Metal locks via `lockrun_m4.py`; `pmset displaysleepnow` + `caffeinate -si`; host GUI agents paused (same conditioning as tier A, PIDs recorded) |
+
+Host state: load **2.73/2.94/2.70 -> 2.15/2.57/2.58**; swap used **649.7 -> 609.7 MB**;
+`Swapouts` **46055875** before and after (unchanged), so the window did not move
+materially.
+
+### Corpus and prompt-token identity
+
+| stage | case | `apxinf-native` (chat, +9 prefix) | `llamacpp` (bare) |
+|---|---|---|---|
+| s1 | 128-token target | 106 | 97 |
+| s1 | 512-token target | 401 | 392 |
+| s1 | 2048-token target | 1571 | 1562 |
+| s2 | ctx 1024 / 128 out | 794 | 785 |
+| s2 | ctx 4096 / 128 out | 3125 | 3116 |
+
+The offset is exactly the lane ChatML prefix every apxinf text request carries;
+it is a declared mixed factor, not a corpus mismatch (bare-completion arms agree
+exactly with each other, as the tier-A window showed).
+
+### S1 prefill (engine-reported, `--engine-timings`)
+
+| case | arm | prefill p50 (ms) | prefill tok/s p50 | vs `llamacpp` | n | seg |
+|---|---|---|---|---|---|---|
+| 128-token prompt | `apxinf-native` | 142.7 | 745.0 | 0.83x | 3 | 3 |
+| 128-token prompt | `llamacpp` | 116.5 | 836.2 | (baseline) | 3 | 3 |
+| 512-token prompt | `apxinf-native` | 430.9 | 937.8 | 0.96x | 3 | 3 |
+| 512-token prompt | `llamacpp` | 412.6 | 950.0 | (baseline) | 3 | 3 |
+| 2048-token prompt | `apxinf-native` | 1462.8 | 1078.4 | 1.05x | 3 | 3 |
+| 2048-token prompt | `llamacpp` | 1531.2 | 1020.8 | (baseline) | 3 | 3 |
+
+### S2 decode (engine-reported, `--engine-timings`)
+
+| case | arm | decode ms/token p50 | decode tok/s p50 | weight bytes / token | effective GB/s | vs `llamacpp` | n | seg |
+|---|---|---|---|---|---|---|---|---|
+| ctx 1024 / 128 out | `apxinf-native` | 36.60 | 27.3 | 3.458 GB (BF16) | ≈94.5 | 0.34x | 3 | 3 |
+| ctx 1024 / 128 out | `llamacpp` | 12.39 | 80.7 | 1.0996 GB (Q4_K_M) | ≈88.7 | (baseline) | 3 | 3 |
+| ctx 4096 / 128 out | `apxinf-native` | 36.93 | 27.1 | 3.458 GB (BF16) | ≈93.6 | 0.34x | 3 | 3 |
+| ctx 4096 / 128 out | `llamacpp` | 12.71 | 78.7 | 1.0996 GB (Q4_K_M) | ≈86.5 | (baseline) | 3 | 3 |
+
+Attribution arithmetic (the point of labelling this a precision statement):
+weight-byte ratio 3.458 / 1.0996 = **3.14x**; measured decode-time ratio is
+36.60 / 12.39 = **2.95x** at ctx 1024 and 36.93 / 12.71 = **2.91x** at ctx 4096.
+The BF16 arm therefore streams at *slightly higher* effective bandwidth than the
+Q4 arm (94.5 vs 88.7 GB/s). A 2.95x decode gap whose byte ratio is 3.14x is what
+a weight-stream-bound pair at different precisions looks like; it is **not**
+evidence that apxinf's engine is 3x slower. Likewise the prefill near-parity
+(apxinf 4.5% faster at 2048 tokens) cannot be read as an engine win, because
+apxinf's `prefill_ms` spans state reset + capacity preparation + prefill while
+llama.cpp's `prompt_ms` is prompt evaluation only — the wider span is the
+conservative one.
+
+### Why the client-observed basis is unusable on this pair
+
+`apxinf-serve` buffers its streamed answer: the harness observed
+`client_ttft_ms` ≈ `client_wall_ms` (7742 ms against an engine `prefill_ms` of
+783 ms) and a client "decode window" of **0.0004 ms**, i.e. every content delta
+arrives at completion. The window therefore ran with the new
+`--engine-timings` harness flag for **both** arms, and each raw file records
+`"timing_primary": "engine"`; the client-observed values are preserved as
+`client_*_ms_observed`. This is a real serving-contract difference (a client
+cannot stream apxinf output token-by-token) and is recorded as such; it is why
+the per-engine durations above, not TTFT, are the comparable metric.
+
+### Mixed factors (quote with the tables)
+
+1. **Precision differs: BF16 (3.458 GB/token) vs Q4_K_M (1.0996 GB/token), 3.14x
+   in weight bytes.** Any decode delta here is a precision statement.
+2. **Prompt protocol differs**: apxinf is chat-only (lane ChatML prefix, +9
+   prompt tokens on every case); llama.cpp is bare completion.
+3. **Timing basis is engine-reported for both arms**, with declared span
+   differences (llama.cpp prompt-eval/predicted; apxinf prefill incl. state
+   preparation, decode). Neither number is a client-observed TTFT.
+4. **One host, one window**, batch-1 serial, greedy, 3 ABBA segments per arm.
+
+### Matched-precision pair — pending (pre-registered protocol)
+
+The engine-implementation comparison is `apxinf-native` BF16 vs `llamacpp` F16 on
+the **same** weights at 16-bit. The official `LFM3-1.7B-F16.gguf` (3.47 GB) was
+still downloading on the M4 during this window, so this pair has **no numbers
+yet**. When the file lands (extent and sha256 verified), the same protocol will be
+run and this subsection replaced by its tables; the pre-registered decision rule
+is:
+
+```
+Gate: same-arm repeat (A/A) <= 5%, engine-reported basis for both arms,
+      matched spans declared.
+Decision: apxinf decode < 0.8 x llamacpp  -> "apxinf decode lags" (no softening);
+          0.8-1.25x                       -> "same efficiency class";
+          > 1.25x                         -> report the win with the effective
+                                             GB/s arithmetic for both arms.
+```
 
 > **Superseded 2026-11-18** by the M4 tier-A result above. This window is void
 > (its own A/A gate failed on every arm) and stays visible for history; nothing
