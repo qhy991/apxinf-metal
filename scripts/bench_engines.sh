@@ -426,6 +426,10 @@ def payload_for(case, prompt):
     body = {
         "model": CFG["model"],
         "prompt": prompt,
+        # `raw` keeps ollama from applying the model's chat template: S1-S3 are
+        # bare completion, and the reported prompt_tokens must be the corpus
+        # tokens, not corpus + template.
+        "raw": True,
         "stream": STREAM,
         "options": {
             "temperature": 0.0,

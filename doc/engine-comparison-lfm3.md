@@ -17,11 +17,16 @@ rather than that apxinf wins.
 
 | arm | engine | weights | serving surface | declared prompt protocol |
 |---|---|---|---|---|
-| `apxinf-native` | apxinf-metal `metal_lfm3` (Rust + Metal) | MLX packed4, affine group 64 | `apxinf-serve` (`/v1/chat/completions`) | lane ChatML (family-rendered) |
-| `apxinf-mlx-lane` | EngineTailor MLX engine + Python worker (current agent stack) | MLX packed4 | `apxinf-serve` (Python provider) | lane ChatML |
+| `apxinf-native` | apxinf-metal `metal_lfm3` (Rust + Metal) | **MLX BF16** (`bf16-eager`, the only implemented variant) | `apxinf-serve` (`/v1/chat/completions`) | lane ChatML (family-rendered) |
+| `apxinf-mlx-lane` | EngineTailor MLX engine + Python worker (current agent stack) | MLX packed4, affine group 64 | `apxinf-serve` (Python provider) | lane ChatML |
 | `llamacpp` | llama.cpp `llama-server` | `LFM3-1.7B-Q4_K_M.gguf` | `/v1/completions` | bare completion |
-| `ollama` | ollama (llama.cpp runtime + its own scheduler) | the same Q4_K_M GGUF, imported by Modelfile | `/v1/completions` (primary), `/api/generate` (S3 decomposition) | bare completion |
-| `llamacpp-f16`, `apxinf-bf16` | as above | 16-bit tier | as above | as above (optional, disk permitting) |
+| `ollama` | ollama (llama.cpp runtime + its own scheduler) | the same Q4_K_M GGUF, imported by Modelfile | `/v1/completions` (primary), `/api/generate` with `raw: true` (S3 decomposition, template-free) | bare completion |
+| `llamacpp-f16` | llama.cpp `llama-server` | `LFM3-1.7B-F16.gguf` (16-bit tier) | `/v1/completions` | bare completion |
+
+The 16-bit tier (`apxinf-native` BF16 vs `llamacpp-f16`) is the quantization-neutral
+pair the decision rule needs; the 4-bit tier is `llamacpp` vs `ollama`. `apxinf-mlx-lane`
+is the only packed4 intersection between the two engines, and it could not be
+provisioned in this window (see the 2026-11-18 amendment).
 
 `apxinf-serve` publishes no bare-completion route (its declared text surface is
 `/v1/chat/completions` plus `/v1/replay`), so the apxinf arms are measured on the
@@ -84,9 +89,11 @@ blocker.
 
 ## Stages
 
-**S1 prefill / TTFT.** Prompts of 128 / 512 / 2048 / 8192 tokens, `max_tokens=8`,
-three repeats per segment. Metric: client TTFT (first SSE content delta), prefill
-tok/s, with the engine-reported prefill as a cross-check.
+**S1 prefill / TTFT.** Prompts of 128 / 512 / 2048 / 8183 tokens, `max_tokens=8`,
+three repeats per segment, plus one 8192-token rejection probe per arm (see the
+2026-11-18 amendment). Metric: client TTFT (first SSE content delta), prefill tok/s
+from each engine's own reported prompt tokens, with the engine-reported prefill as a
+cross-check.
 
 **S2 decode.** `max_tokens` 128 and 512 at context 1024 and 4096, batch 1. Metric:
 client decode window per generated token (first to last content delta), decode
@@ -105,18 +112,17 @@ allow it; it is a separate tool and is not driven by `bench_engines.sh`.
 report token agreement and solved-set differences, not cross-quantization
 bit-exactness.
 
-### The 8192-token S1 point
+### The 8K S1 point
 
 The LFM3 family's `MAX_CONTEXT` is 8192 and its capacity check counts prompt plus
 generation (`request_capacity(MAX_CONTEXT - 1, 1)` is the largest permitted
-request), so an 8192-token prompt with `max_tokens=8` is **rejected** by
-`apxinf-serve` by construction. llama.cpp and ollama can serve it when launched
-with a larger context window (see below). The harness records the rejection as a
-failed request in the raw JSON instead of silently shortening the prompt; the
-paired 8K row therefore exists for llama.cpp and ollama only, and the apxinf
-8K column is reported as "not servable at this length" rather than estimated. If
-an apxinf 8K prefill number is wanted, it needs a dated amendment (e.g. an
-8183-token prompt with the same 8 generated tokens).
+request), so an 8192-token prompt with `max_tokens=8` is **rejected** by the native
+family by construction; llama.cpp and ollama serve it when launched with a larger
+context window. Per the 2026-11-18 amendment the measured 8K row uses a
+**8183-token prompt** on every arm (8183 + 8 = 8191), and the exact 8192-token
+request is still sent once per arm so the raw JSON records which engines accept it.
+That rejection is reported as a serving-contract capability finding, not as a
+measurement.
 
 ## Running it
 
@@ -224,14 +230,16 @@ OpenAI-compatible response carries no durations, so at least one ollama run uses
 
 ## Mixed factors (must be quoted with every result table)
 
-1. **Quantization is not the same between arms.** `apxinf-*` run MLX packed4
-   (affine, group 64); `llamacpp` and `ollama` run `LFM3-1.7B-Q4_K_M.gguf`
-   (llama.cpp K-quant, ~4.5-5 bits per weight). Both are "4-bit" deployment
-   tiers, but they are different formats with different bytes per weight, so an
-   absolute tok/s gap is expected even from two perfect engine implementations.
-   Per the pre-registered decision rule, a difference measured only in the 4-bit
-   tier is attributed to the **quantization tier**, not to the engine
-   implementation; the 16-bit arms are what separate the two.
+1. **Quantization is not the same between arms.** The three tiers in this
+   report are MLX **BF16** (`apxinf-native`), GGUF **Q4_K_M** (`llamacpp`,
+   `ollama`, ~4.5-5 bits per weight) and GGUF **F16** (`llamacpp-f16`). An
+   absolute tok/s gap between tiers is expected even from two perfect engine
+   implementations, so cross-tier rows are context, not evidence. Per the
+   pre-registered decision rule, the engine-implementation comparison is the
+   16-bit pair (`apxinf-native` BF16 vs `llamacpp-f16`); anything measured only
+   across tiers is attributed to the **quantization tier**. The packed4 lane
+   (`apxinf-mlx-lane`) would have been the 4-bit apxinf comparison and is
+   incomplete in this window (2026-11-18 amendment).
 2. **Prompt protocol is not uniform.** S1-S3 use bare completion for llama.cpp
    and ollama. apxinf has no bare-completion route, so its arms go through the
    lane ChatML prefix; their `prompt_tokens` include it and the corpus table
@@ -253,8 +261,10 @@ OpenAI-compatible response carries no durations, so at least one ollama run uses
 
 ## Results
 
-Filled in stage 2. Every table below is produced by
-`bench_engines_report.py`; empty cells mean "not measured", not "zero".
+Every table below is produced by `bench_engines_report.py`; empty cells mean
+"not measured", not "zero". Arm set in this window: `llamacpp` (Q4_K_M),
+`ollama` (Q4_K_M), `apxinf-native` (BF16), `llamacpp-f16` (16-bit tier);
+`apxinf-mlx-lane` is incomplete (2026-11-18 amendment).
 
 ### Artifact and host identity
 
@@ -323,3 +333,35 @@ corpus hash in each file are what make the numbers re-checkable.
 
 None yet. Date any change to the gate, the stage plan, or the corpus here; do not
 silently retune the gate after seeing the data.
+
+
+### 2026-11-18 - precision of the apxinf arms, the 8K row, and the MLX lane (recorded before any stage-2 number)
+
+1. **`apxinf-native` runs BF16, not packed4.** `crates/apxinf-model/src/metal_lfm3/README.md`
+   declares "BF16 only; `auto` and `bf16-eager` (the only implemented variant)"; the
+   served replay echoes `quant: bf16`; the resident set is 3.46 GB. The packed4
+   (affine group 64) tier belongs to the **MLX lane** checkpoint
+   (`~/models/LFM3-1.7B-MLX-4bit`, `quantization {group_size: 64, bits: 4, mode: affine}`).
+   The design's arm table said the native arm ran packed4; that was wrong and is
+   corrected here. Consequence: the quantization-neutral engine comparison is the
+   **16-bit tier** (`apxinf-native` BF16 vs `llamacpp-f16`), and the S2 decode gate is
+   evaluated on that pair; the 4-bit tier is `llamacpp` vs `ollama`.
+2. **The 8K S1 row uses an 8183-token prompt** on every arm (8183 + 8 = 8191, the
+   largest request the native family admits), while the exact **8192-token** request
+   is sent once per arm so the raw JSON records which engines accept it. The native
+   family counts prompt + generation against `MAX_CONTEXT` (8192) and rejects it;
+   llama.cpp and ollama serve it with a larger context window. This is a real
+   serving-contract difference and is reported as a capability finding.
+3. **`apxinf-mlx-lane` is incomplete, not measured.** The serving contract pins
+   `mlx-lm 0.31.3`, whose upstream model registry has no `lfm3` model type
+   (`ValueError: Model type lfm3 not supported`), and the repo's Python text worker
+   rejects the checkpoint's `auto_map` ("requests custom code"). No LFM3 MLX
+   integration exists in this repository's serving path, so the packed4 lane could
+   not be served through `apxinf-serve` in this window. It is reported as
+   incomplete; no 4-bit apxinf comparison is claimed, and the absence is visible
+   in the arms table rather than silently dropped.
+4. **ollama is measured with `raw: true`** on `/api/generate` (and its
+   OpenAI-compatible `/v1/completions` as a control surface), because ollama applies
+   the model chat template by default and S1-S3 are bare completion. Without `raw`,
+   the same 128-token corpus text is evaluated as 138 prompt tokens (the template
+   prefix), which would break the corpus identity check.

@@ -434,13 +434,14 @@ class Report:
                 "Quantization is not declared in the raw files: use --quantization when running "
                 "the harness, otherwise the tables cannot state the mixed factor they carry."
             )
-        if len(distinct_quant) > 1 and any(
-                "gguf" in value and "q4" in value.lower() for value in distinct_quant):
+        if len(distinct_quant) > 1:
             lines.append(
-                "Concretely: `apxinf-*` arms run MLX packed4 (affine group 64); `llamacpp` and "
-                "`ollama` run LFM3-1.7B-Q4_K_M.gguf (llama.cpp K-quant, 4.5-5 bpw). EP weight "
-                "bytes per token therefore differ, so an absolute tok/s gap is expected even for "
-                "two perfect engine implementations."
+                "Concretely, weight bytes per token differ across these tiers, so an absolute "
+                "tok/s gap is expected even for two perfect engine implementations: "
+                + "; ".join(f"`{arm}` = {', '.join(sorted(values)) or 'undeclared'}"
+                            for arm, values in sorted(quantization.items()))
+                + ". Compare only arms inside one tier, or use the 16-bit tier for an "
+                  "engine-implementation comparison."
             )
         if any("chat" in value for values in protocols.values() for value in values) and \
                 any("completions" in value for values in protocols.values() for value in values):
