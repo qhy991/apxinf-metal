@@ -231,8 +231,7 @@ This checks anticipated placement, not actual or exclusive ANE execution.
 
 Before returning a GPU+ANE runner, construction warms the actual retained
 programs in two complete layer-ordered passes through their native prediction
-entry points. Neuron batches use the declared maximum tile depth where that
-composition is implemented. Warmup failures abort construction. This does not
+entry points. Neuron batches use the declared maximum tile depth. Warmup failures abort construction. This does not
 replace complete-request, artifact-identity, transfer, lifetime or native trace
 qualification in [the Core ML contract](coreml-ane.md).
 
