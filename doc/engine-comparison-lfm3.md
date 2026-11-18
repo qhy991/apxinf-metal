@@ -156,6 +156,16 @@ and exits `3` when no request produced a token and no evidence line was found: a
 no-op arm is not a result. `--dry-run` prints the case plan and the corpus hash
 without sending anything.
 
+Client behaviour is fixed and identical for every arm: stdlib `http.client` only,
+one fresh connection per request, response always closed, a streamed response
+abandoned at `[DONE]` (or ollama's `done: true`), and one retry on a transport
+error with the retry count recorded per request. This matters for portability:
+reusing a connection after an abandoned SSE response raises
+`http.client.ResponseNotReady: Request-sent` on newer CPythons (observed on 3.14
+against llama-server). Tested on CPython 3.9 and 3.14; anything older is not
+supported. The same client is used for every arm, so the loopback/TCP setup cost
+is common mode and does not enter a paired delta.
+
 ### Launching the arms
 
 `llama-server` (LFM3 support: `llama-cli --version` plus `lfm3` in the load log

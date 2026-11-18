@@ -13,6 +13,12 @@
 # implementation detail of the driver; here the operator owns the order and each
 # file records the segment it belongs to.
 #
+# Portability: stdlib only, tested on CPython 3.9 and 3.14. Every request uses a
+# fresh HTTP connection and closes its response: an SSE response is abandoned at
+# `[DONE]` (or ollama's `done: true`), and reusing a connection after that raises
+# `http.client.ResponseNotReady: Request-sent` on newer Pythons. Transport errors
+# are retried once and the retry count is recorded per request.
+#
 # Measurement surface (see the doc for why):
 #   openai-completions  POST /v1/completions  bare completion, no chat template
 #                       (llama-server, and ollama's OpenAI compatibility layer)
@@ -210,7 +216,8 @@ export BENCH_QUANTIZATION="$quantization" BENCH_PROMPT_PROTOCOL="$prompt_protoco
 python3 - <<'PY'
 import hashlib, json, os, platform, re, socket, subprocess, sys, time
 from datetime import datetime, timezone
-from http.client import HTTPConnection
+from http.client import (HTTPConnection, HTTPException, IncompleteRead,
+                         RemoteDisconnected, ResponseNotReady)
 from statistics import median
 
 CFG = {key[len("BENCH_"):].lower(): value for key, value in os.environ.items() if key.startswith("BENCH_")}
@@ -397,6 +404,39 @@ def parse_endpoint(endpoint):
 
 HOST, PORT = parse_endpoint(CFG["endpoint"])
 
+# One connection per request. An SSE response is abandoned as soon as `[DONE]`
+# (or ollama's `done: true`) arrives, so reusing the connection would leave an
+# unread response behind and the next request raises
+# `http.client.ResponseNotReady: Request-sent` (observed on CPython 3.14 against
+# llama-server). Fresh connections are <1 ms on loopback and keep every arm on
+# exactly the same client behaviour. Transport errors are retried once.
+TRANSPORT_ERRORS = (HTTPException, OSError, IncompleteRead, RemoteDisconnected,
+                    ResponseNotReady)
+
+
+def new_connection():
+    return HTTPConnection(HOST, PORT, timeout=MAX_WAIT)
+
+
+def perform(path, body, streaming):
+    attempt = 0
+    while True:
+        connection = new_connection()
+        try:
+            if streaming:
+                return consume_stream(connection, path, body)
+            return consume_plain(connection, path, body)
+        except TRANSPORT_ERRORS as error:
+            attempt += 1
+            if attempt > 1:
+                return {"status": f"error:{type(error).__name__}:{error}",
+                        "transport_retry": attempt - 1, "wall_ms": None}
+        finally:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
 
 def payload_for(case, prompt):
     if PROTOCOL == "openai-completions":
@@ -462,48 +502,60 @@ def consume_stream(connection, path, body):
     connection.request("POST", path, raw, {"content-type": "application/json", "accept": "text/event-stream"})
     response = connection.getresponse()
     headers_at = time.perf_counter()
-    if response.status != 200:
-        detail = response.read()[:2000].decode("utf-8", "replace")
-        return {"status": f"error:http_{response.status}", "http_status": response.status,
-                "error": detail, "wall_ms": (time.perf_counter() - started) * 1000.0}
-    first_at = None
-    last_at = None
-    events = []
-    while True:
-        line = response.readline()
-        if not line:
-            break
-        text = line.decode("utf-8", "replace").strip()
-        if not text:
-            continue
-        if PROTOCOL == "ollama-generate":
-            if not text.startswith("{"):
+    try:
+        if response.status != 200:
+            detail = response.read()[:2000].decode("utf-8", "replace")
+            return {"status": f"error:http_{response.status}", "http_status": response.status,
+                    "error": detail, "wall_ms": (time.perf_counter() - started) * 1000.0}
+        first_at = None
+        last_at = None
+        events = []
+        while True:
+            try:
+                line = response.readline()
+            except IncompleteRead:
+                break
+            if not line:
+                break
+            text = line.decode("utf-8", "replace").strip()
+            if not text:
                 continue
-            event = json.loads(text)
+            if PROTOCOL == "ollama-generate":
+                if not text.startswith("{"):
+                    continue
+                try:
+                    event = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                events.append(event)
+                if first_at is None and content_delta(PROTOCOL, event):
+                    first_at = time.perf_counter()
+                if content_delta(PROTOCOL, event):
+                    last_at = time.perf_counter()
+                if event.get("done"):
+                    break
+                continue
+            if text.startswith("event:"):
+                continue
+            if not text.startswith("data:"):
+                continue
+            data = text[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                event = json.loads(data)
+            except json.JSONDecodeError:
+                continue
             events.append(event)
             if first_at is None and content_delta(PROTOCOL, event):
                 first_at = time.perf_counter()
             if content_delta(PROTOCOL, event):
                 last_at = time.perf_counter()
-            if event.get("done"):
-                break
-            continue
-        if text.startswith("event:"):
-            continue
-        if not text.startswith("data:"):
-            continue
-        data = text[5:].strip()
-        if data == "[DONE]":
-            break
+    finally:
         try:
-            event = json.loads(data)
-        except json.JSONDecodeError:
-            continue
-        events.append(event)
-        if first_at is None and content_delta(PROTOCOL, event):
-            first_at = time.perf_counter()
-        if content_delta(PROTOCOL, event):
-            last_at = time.perf_counter()
+            response.close()
+        except (OSError, HTTPException):
+            pass
     closed_at = time.perf_counter()
     timing = {
         "client_ttft_ms": (first_at - started) * 1000.0 if first_at else None,
@@ -521,7 +573,13 @@ def consume_plain(connection, path, body):
     connection.request("POST", path, raw, {"content-type": "application/json"})
     response = connection.getresponse()
     headers_at = time.perf_counter()
-    data = response.read()
+    try:
+        data = response.read()
+    finally:
+        try:
+            response.close()
+        except (OSError, HTTPException):
+            pass
     finished = time.perf_counter()
     if response.status != 200:
         return {"status": f"error:http_{response.status}", "http_status": response.status,
@@ -726,7 +784,6 @@ def main():
     host_before = host_state()
     started_at = utc_now()
 
-    connection = HTTPConnection(HOST, PORT, timeout=MAX_WAIT)
     records = []
     failures = 0
 
@@ -735,15 +792,16 @@ def main():
         prompt = prompts[case["id"]]
         path, body = payload_for(case, prompt)
         started = time.perf_counter()
-        try:
-            if STREAM:
-                outcome = consume_stream(connection, path, body)
-            else:
-                outcome = consume_plain(connection, path, body)
-        except (OSError, socket.timeout) as error:
+        outcome = perform(path, body, STREAM)
+        if outcome.get("wall_ms") is None and outcome.get("status", "").startswith("error"):
             return {"case": case["id"], "target_tokens": case["target_tokens"],
-                    "max_tokens": case["max_tokens"], "status": f"error:{type(error).__name__}:{error}",
+                    "max_tokens": case["max_tokens"], "status": outcome["status"],
+                    "transport_retry": outcome.get("transport_retry"),
                     "wall_ms": (time.perf_counter() - started) * 1000.0}
+        if outcome.get("transport_retry"):
+            retries = outcome["transport_retry"]
+        else:
+            retries = 0
         record = {
             "case": case["id"],
             "target_tokens": case["target_tokens"],
@@ -751,6 +809,8 @@ def main():
             "status": outcome["status"],
             "http_status": outcome.get("http_status"),
         }
+        if retries:
+            record["transport_retry"] = retries
         record.update(outcome.get("timing") or {})
         if outcome["status"] != "ok":
             record["error"] = outcome.get("error")
@@ -829,25 +889,19 @@ def main():
         }, ensure_ascii=False)[:400]
         return record
 
-    try:
-        for _ in range(int(CFG["warmup"])):
-            warm_case = {"id": "__warmup__", "target_tokens": 128, "max_tokens": 8}
-            prompts["__warmup__"] = generate_prompt(warm_case)
-            warm = one(warm_case)
-            warm["warmup"] = True
-            records.append(warm)
-            if warm["status"] != "ok":
-                failures += 1
-        for case in cases:
-            record = one(case)
-            if record["status"] != "ok":
-                failures += 1
-            records.append(record)
-    finally:
-        try:
-            connection.close()
-        except OSError:
-            pass
+    for _ in range(int(CFG["warmup"])):
+        warm_case = {"id": "__warmup__", "target_tokens": 128, "max_tokens": 8}
+        prompts["__warmup__"] = generate_prompt(warm_case)
+        warm = one(warm_case)
+        warm["warmup"] = True
+        records.append(warm)
+        if warm["status"] != "ok":
+            failures += 1
+    for case in cases:
+        record = one(case)
+        if record["status"] != "ok":
+            failures += 1
+        records.append(record)
 
     samples = [record for record in records if not record.get("warmup")]
     if CFG["request_log"]:
