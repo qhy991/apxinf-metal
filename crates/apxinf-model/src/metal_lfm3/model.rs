@@ -5,8 +5,11 @@
 //! RMSNorm, explicit FP32 zero-tail rotary tables, FP32 depthwise convolution
 //! with a six-column input history, per-head sigmoid output gate, and a dense KV
 //! row for full-attention layers with a 256-token read window for sliding ones.
-//! No fused variants are selected here yet; every operation names the backend
-//! primitive the reference itself calls.
+//! The one deliberate exception is the single-token convolve: its seven-tap
+//! window is convolved by one fused causal-depthwise kernel (the same primitive
+//! `metal_clef` and `metal_d3_lite` use), and the reference's per-tap host-side
+//! accumulation is kept only as the test-only parity reference. Every other
+//! operation names the backend primitive the reference itself calls.
 
 use super::{
     config::{LayerKind, Lfm3Config},
@@ -15,7 +18,7 @@ use super::{
 use crate::llm_trait::{LlmInput, LlmTrait, TextPreparationState, TextPreparationStatus};
 use apxinf_core::{Backend, Device, Error, Result, Tensor};
 use apxinf_loader::ModelConfig;
-use apxinf_mlx::{Array, MlxBackend, MlxDType, Stream};
+use apxinf_mlx::{fusions::CausalDepthwiseConv, Array, MlxBackend, MlxDType, Stream};
 use std::{collections::HashMap, sync::Arc};
 
 fn err(message: impl Into<String>) -> Error {
@@ -67,6 +70,58 @@ fn silu_mul(gate: &Array, up: &Array) -> Result<Array> {
     gate.mul(&gate.sigmoid()?)?.mul(up)
 }
 
+/// Fused one-token depthwise convolution over a seven-column window.
+///
+/// `window` is `[1, kernel, hidden]` BF16 in tap order (oldest first) and
+/// `taps_bf16` is `[hidden, kernel]` BF16. One kernel launch writes every row;
+/// row `kernel - 1` is the current token's convolution (already in the
+/// `[1, 1, hidden]` layout the gate multiplies it in) and rows `0..kernel - 1`
+/// are the six columns the next step reads. Returns
+/// `([1, 1, hidden], [1, hidden, kernel - 1])`.
+fn fused_conv_window(
+    conv: &CausalDepthwiseConv,
+    window: &Array,
+    taps_bf16: &Array,
+) -> Result<(Array, Array)> {
+    let [1, kernel, hidden] = *window.shape() else {
+        return Err(err("LFM3 conv window must be [1, kernel, hidden]"));
+    };
+    let out = conv.call(window, &taps_bf16.reshape(&[hidden, kernel, 1])?)?;
+    // The current row is already `[1, 1, hidden]`; the state is kept in the
+    // family's `[1, hidden, kernel - 1]` layout.
+    let current = out.slice_axis(1, kernel - 1, kernel)?;
+    let next = window.slice_axis(1, 1, kernel)?.transpose(&[0, 2, 1])?;
+    Ok((current, next))
+}
+
+/// Pre-migration one-token convolution arithmetic: seven host-side tap
+/// accumulations, kept only as the test reference for `fused_conv_window`.
+///
+/// The decode path never calls it. Its operands are the FP32 tap table
+/// widened from the checkpoint's BF16 bytes, so the residual against the
+/// fused path is the accumulation form, not a precision class.
+#[cfg(test)]
+fn legacy_window_conv(window: &Array, taps_f32: &Array) -> Result<(Array, Array)> {
+    let [1, kernel, hidden] = *window.shape() else {
+        return Err(err("LFM3 conv window must be [1, kernel, hidden]"));
+    };
+    let legacy_window = window.transpose(&[0, 2, 1])?;
+    // Every operand of the accumulation is `[1, hidden, 1]`; adding a
+    // `[1, 1, hidden]` accumulator to it would broadcast into `[1, h, h]`.
+    let mut conv = Array::zeros(window.stream(), &[1, hidden, 1], MlxDType::F32)?;
+    for tap in 0..kernel {
+        let weight = taps_f32
+            .slice_axis(1, tap, tap + 1)?
+            .reshape(&[1, hidden, 1])?;
+        conv = conv.add(&weight.mul(&legacy_window.slice_axis(2, tap, tap + 1)?)?)?;
+    }
+    let conv = conv.transpose(&[0, 2, 1])?.cast(MlxDType::BF16)?;
+    Ok((
+        conv,
+        window.slice_axis(1, 1, kernel)?.transpose(&[0, 2, 1])?,
+    ))
+}
+
 #[derive(Clone)]
 struct KvState {
     keys: Array,
@@ -83,6 +138,8 @@ pub struct Lfm3Model {
     config: Lfm3Config,
     backend: MlxBackend,
     weights: Weights,
+    /// Compiled `apxinf_causal_depthwise_conv` pipeline for the decode step.
+    causal_conv: CausalDepthwiseConv,
     kinds: Vec<LayerKind>,
     /// One dense row per attention layer, `[1, kv_heads, capacity, head_dim]`.
     initial_kv: Vec<Option<KvState>>,
@@ -113,12 +170,14 @@ impl Lfm3Model {
             .ok_or_else(|| err("LFM3 native implementation requires an MLX backend"))?
             .clone();
         let weights = Weights::load(&config, tensors, backend.stream())?;
+        let causal_conv = CausalDepthwiseConv::new(backend.stream())?;
         let kinds = config.layer_kinds()?;
         let layers = config.num_hidden_layers;
         let mut model = Self {
             config,
             backend,
             weights,
+            causal_conv,
             kinds,
             initial_kv: vec![None; layers],
             kv: vec![None; layers],
@@ -339,6 +398,7 @@ impl Lfm3Model {
             in_proj,
             out_proj,
             taps,
+            ..
         } = &layer.mixer
         else {
             return Err(err("LFM3 conv layer has an attention weight plan"));
@@ -384,37 +444,40 @@ impl Lfm3Model {
         Ok((op, next))
     }
 
-    /// One-token short-conv step: seven-tap FP32 accumulation over the retained
-    /// history plus the new input column.
+    /// One-token short-conv step. The six retained input columns plus the new
+    /// column are one `[1, kernel, hidden]` window, and one fused
+    /// causal-depthwise kernel writes all of its rows; the last row is this
+    /// token's convolution and the leading `kernel - 1` rows are the next state.
+    ///
+    /// The pre-migration implementation accumulated the taps one at a time on
+    /// the host graph (7 slices + 7 multiplies + 6 adds per conv layer). It was
+    /// replaced by the single kernel launch; see `legacy_window_conv` for the
+    /// preserved reference and `crates/apxinf-mlx/native/causal_depthwise_conv.metal`
+    /// for the kernel's contract.
     fn conv_step(&self, n: &Array, layer: &LayerWeights, state: &Array) -> Result<(Array, Array)> {
         let Mixer::Conv {
             in_proj,
             out_proj,
-            taps,
+            taps_bf16,
+            ..
         } = &layer.mixer
         else {
             return Err(err("LFM3 conv layer has an attention weight plan"));
         };
         let c = &self.config;
         let h = c.hidden_size;
-        let kernel = c.conv_l_cache;
         let bcx = in_proj.call(n)?;
         let b = bcx.slice_axis(2, 0, h)?;
         let gate = bcx.slice_axis(2, h, 2 * h)?;
         let z = bcx.slice_axis(2, 2 * h, 3 * h)?;
-        let z = b.mul(&z)?.transpose(&[0, 2, 1])?;
-        let window = Array::concat(&[state, &z], 2)?;
-        // Every operand of the accumulation is `[1, hidden, 1]`; adding a
-        // `[1, 1, hidden]` accumulator to it would broadcast into `[1, h, h]`.
-        let mut conv = Array::zeros(self.backend.stream(), &[1, h, 1], MlxDType::F32)?;
-        for tap in 0..kernel {
-            let weight = taps.slice_axis(1, tap, tap + 1)?.reshape(&[1, h, 1])?;
-            conv = conv.add(&weight.mul(&window.slice_axis(2, tap, tap + 1)?)?)?;
-        }
-        let conv = conv.transpose(&[0, 2, 1])?;
-        let y = gate.mul(&conv.cast(MlxDType::BF16)?)?;
+        let z = b.mul(&z)?;
+        // Build the window in the kernel's `[1, L, C]` layout instead of
+        // concatenating `[1, hidden, kernel]` and transposing the copy.
+        let window = Array::concat(&[&state.transpose(&[0, 2, 1])?, &z], 1)?;
+        let (conv, next) = fused_conv_window(&self.causal_conv, &window, taps_bf16)?;
+        let y = gate.mul(&conv)?;
         let op = out_proj.call(&y)?;
-        Ok((op, window.slice_axis(2, 1, kernel)?))
+        Ok((op, next))
     }
 
     /// Attention branch for a prompt chunk (`len >= 1`, `continuing` when the
@@ -887,3 +950,87 @@ impl LlmTrait for Lfm3Model {
 
 /// Implementation identity reported through `preparation_status`.
 pub const VARIANT: &str = "bf16-eager";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic pseudo-random values in `[-scale, scale)`; enough entropy
+    /// to exercise the rounding paths without a checkpoint.
+    fn values(len: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let unit = (state >> 40) as f32 / (1u64 << 24) as f32;
+                (unit * 2.0 - 1.0) * scale
+            })
+            .collect()
+    }
+
+    /// The decode short-conv arithmetic: one fused causal-depthwise kernel over
+    /// the seven-column window versus the pre-migration seven-tap host-side
+    /// accumulation, on the same window and the same checkpoint-shaped tap
+    /// table.
+    ///
+    /// The two arms issue different kernels, so this test does not *require*
+    /// bit-exactness; it measures the residual and the element-exact fraction
+    /// against the migration's 2e-3 numeric gate. Both operands are BF16, so
+    /// every tap product is exactly representable in F32 (8 + 8 mantissa bits
+    /// < 24), and both arms add those exact products in tap order and round once
+    /// to BF16; the expected residual is therefore zero, and the measured values
+    /// are reported below rather than asserted a priori.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock"]
+    fn fused_decode_conv_matches_the_per_tap_reference() -> Result<()> {
+        let stream = Stream::metal(0)?;
+        let conv = CausalDepthwiseConv::new(&stream)?;
+        let (hidden, kernel) = (2048, 7);
+        // The tap table as `Weights::load` produces it: BF16 checkpoint bytes
+        // widened to F32, then handed to the fused kernel as BF16 again (an
+        // exact round trip, not a second quantization).
+        let taps_f32 = Array::from_f32(
+            &stream,
+            &[hidden, kernel],
+            &values(hidden * kernel, 7, 0.25),
+        )?
+        .cast(MlxDType::BF16)?
+        .cast(MlxDType::F32)?;
+        let taps_bf16 = taps_f32.cast(MlxDType::BF16)?;
+        let window = Array::from_f32(
+            &stream,
+            &[1, kernel, hidden],
+            &values(kernel * hidden, 19, 2.0),
+        )?
+        .cast(MlxDType::BF16)?;
+
+        let (fused, next) = fused_conv_window(&conv, &window, &taps_bf16)?;
+        let (reference, reference_next) = legacy_window_conv(&window, &taps_f32)?;
+        stream.eval(&[fused.clone(), reference.clone(), next.clone()])?;
+
+        let got = fused.cast(MlxDType::F32)?.to_f32_vec()?;
+        let want = reference.cast(MlxDType::F32)?.to_f32_vec()?;
+        let (mut max_abs, mut exact) = (0f64, 0usize);
+        for (a, b) in got.iter().zip(&want) {
+            exact += usize::from(a == b);
+            max_abs = max_abs.max((*a as f64 - *b as f64).abs());
+        }
+        eprintln!(
+            "decode-conv fused vs per-tap: n={} max_abs_diff={max_abs:.3e} element_exact={exact}/{} ({:.3}%)",
+            got.len(),
+            got.len(),
+            100.0 * exact as f64 / got.len() as f64
+        );
+        assert!(
+            max_abs <= 2e-3,
+            "decode-conv parity residual {max_abs:.3e} exceeds the 2e-3 numeric gate"
+        );
+        // The next-step state is the leading rows of the same window: both
+        // implementations must hand the caller those identical columns.
+        assert_eq!(next.shape(), reference_next.shape());
+        assert_eq!(next.to_f32_vec()?, reference_next.to_f32_vec()?);
+        Ok(())
+    }
+}
