@@ -1,6 +1,9 @@
 # LFM3-1.7B engine comparison: apxinf vs llama.cpp vs ollama
 
-Status: **method + pre-registered gate; measurements pending (stage 2).**
+Status: **method + pre-registered gate; stage-2 tier-A window complete on the M4
+(2026-11-18) — `llamacpp` vs `ollama` on identical Q4_K_M weights, every gate met.**
+The `apxinf-native` arm and the 16-bit matched-precision pair are **not** measured
+(see the stage-2 section); no apxinf-vs-llama.cpp claim is made in this document.
 Design: GitHub issue [qhy991/apxinf-metal#111](https://github.com/qhy991/apxinf-metal/issues/111)
 (the working copy under `devlocal/engine-comparison-lfm3/DESIGN.md` is git-ignored).
 Harness: [`scripts/bench_engines.sh`](../scripts/bench_engines.sh),
@@ -13,6 +16,11 @@ prompts, and (3) end-to-end agent work? A result of "apxinf decode lags" is a
 useful result; the point of this document is that the comparison is re-checkable
 rather than that apxinf wins.
 
+Host amendment 2026-11-18 (stage 2): the M1 Pro is offline. The reported stage-2
+tier-A window ran on the **M4 mini** (`haiyan-mac-mini`: Apple M4, 10 cores, 16 GB,
+macOS 27.0.1). The earlier M2-Air window is reference-only and void; no number in
+this document is compared across hosts.
+
 ## Arms
 
 | arm | engine | weights | serving surface | declared prompt protocol |
@@ -20,7 +28,7 @@ rather than that apxinf wins.
 | `apxinf-native` | apxinf-metal `metal_lfm3` (Rust + Metal) | **MLX BF16** (`bf16-eager`, the only implemented variant) | `apxinf-serve` (`/v1/chat/completions`) | lane ChatML (family-rendered) |
 | `apxinf-mlx-lane` | EngineTailor MLX engine + Python worker (current agent stack) | MLX packed4, affine group 64 | `apxinf-serve` (Python provider) | lane ChatML |
 | `llamacpp` | llama.cpp `llama-server` | `LFM3-1.7B-Q4_K_M.gguf` | `/v1/completions` | bare completion |
-| `ollama` | ollama (llama.cpp runtime + its own scheduler) | the same Q4_K_M GGUF, imported by Modelfile | `/v1/completions` (primary), `/api/generate` with `raw: true` (S3 decomposition, template-free) | bare completion |
+| `ollama` | ollama (llama.cpp runtime + its own scheduler) | the same Q4_K_M GGUF, imported by Modelfile | `/api/generate` with `raw: true` (the M4 stage-2 tier-A surface: template-free bare completion; `/v1/completions` applies the model chat template and is therefore not bare) | bare completion |
 | `llamacpp-f16` | llama.cpp `llama-server` | `LFM3-1.7B-F16.gguf` (16-bit tier) | `/v1/completions` | bare completion |
 
 The 16-bit tier (`apxinf-native` BF16 vs `llamacpp-f16`) is the quantization-neutral
@@ -183,6 +191,10 @@ printf 'FROM %s\nPARAMETER num_ctx 16384\nPARAMETER temperature 0\nPARAMETER see
   "$PWD/LFM3-1.7B-Q4_K_M.gguf" > Modelfile
 ollama create lfm3-q4km -f Modelfile
 ollama serve            # 127.0.0.1:11434
+# Fixed-context arm (used by the M4 stage-2 window): a per-request num_ctx makes
+# ollama reload its runner for every distinct context and the reload lands inside
+# TTFT. Pin one context for the whole arm, matching llama.cpp's -c:
+#   scripts/bench_engines.sh --protocol ollama-generate --ollama-num-ctx 16384 ...
 ```
 
 `apxinf-serve` (built on the M1 host from `feat/lfm3-metal`; the native worker is
@@ -272,6 +284,203 @@ OpenAI-compatible response carries no durations, so at least one ollama run uses
 ## Results
 
 <!-- BEGIN RESULTS -->
+
+## Stage-2 tier-A result — same weights behind two servers (2026-11-18, M4)
+
+Status: **KEEP** (the measurement stands; no configuration change follows from it).
+Claim: with the identical Q4_K_M GGUF in one M4 window, ollama 0.40.16's serving
+stack and a source-built llama.cpp `llama-server` are indistinguishable at this
+precision and batch-1: paired decode medians agree within 0.4% (12.55 vs 12.51
+ms/token at context 1024; 12.82 vs 12.80 at context 4096, 128 generated tokens)
+and prefill TTFT within 2% (118.5 / 414.6 / 1533.4 ms vs 120.9 / 417.3 / 1543.4 ms
+for 97 / 392 / 1562-token prompts), ollama ~1-2% slower.
+Evidence: `devlocal/engine-comparison-lfm3/results/tiera-20261118T151518Z/`
+(12 raw JSON files, the report, artifact identity, host state — git-ignored per
+`AGENTS.md`); report exit `0`; window 2026-11-18 23:15:27-23:16:31 CST.
+Gate: the pre-registered comparability gate passed on **every** group — A/A
+`llamacpp` s1 1.4%, s2 0.3%; `ollama` s1 1.8%, s2 1.2% (all <= 5%, three ABBA
+segments per arm); a generated-token and engine-log evidence line for both arms;
+corpus prompt-token identity exact on all five cases (97/392/1562, 785/3116).
+Decision rule: ollama embeds llama.cpp as its runner, so this is a **same-runtime
+comparison**: it measures the serving layer and scheduler, never the engine
+implementation. No matched-precision pair exists in this window, so the decision
+rule's "engine implementation" branch is not taken and must not be quoted as one.
+Caveats: batch-1 serial; one host; Q4_K_M only (4-bit); greedy; S1 `max_tokens=8`,
+S2 `max_tokens=128`; S3/S4/S5 not run; two different HTTP surfaces (declared
+below); ollama `num_ctx` pinned to 16384.
+Supersedes: the `m2-quiet` window below (void; retained for history).
+
+### Artifact and host identity
+
+| artifact | value |
+|---|---|
+| `gguf_sha256` / bytes | `3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4` / 1,099,627,808 |
+| `llama_server_sha256` | `d635b19fb11a19d3262ee8544252f20cb92620b58c426b820453bb4f4535e55e` |
+| llama.cpp source | ggml-org `llama.cpp` commit `5297534`, built on the M4: `cmake -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON`, `SDKROOT=…/MacOSX26.5.sdk` (the 27.0 SDK fails `ld`: `tapi error: malformed file`) |
+| llama.cpp version | `version: 1.0.0-dev (build 0)` with AppleClang 21.0.0; `print_info: arch = lfm3`, `file type = Q4_K - Medium`, 24 layers |
+| `ollama_binary_sha256` / version | `5c3cf935be8d896433a5caefefc8857bc2bb9e32c77c35e7c3d38b7c5919822f` / `ollama 0.40.16` (official darwin build) |
+| ollama model | `lfm3-q4km` from a Modelfile over the same GGUF; its runner loads `/Users/haiyan-mini/.ollama/models/blobs/sha256-3793e1e6…` (byte-identical to the llama.cpp file) |
+| host | `haiyan-mac-mini`: Apple M4, 10 cores, 16 GB, macOS 27.0.1 — not the M1 Pro the design was written for |
+| window discipline | both EngineTailor Metal locks held by `lockrun_m4.py` (fcntl, waited, never stolen); `pmset displaysleepnow` + `caffeinate -si`; greedy decode (`temperature=0`, fixed seed) |
+
+Host state (recorded before and after by the window script):
+
+| | load average (1/5/15) | swap used / free | Swapouts | busy >= 20% CPU |
+|---|---|---|---|---|
+| before | 2.55 / 2.57 / 2.69 | 793.69 MB / 1254.31 MB | 45960175 | Logitech GUI agent (paused for the window) |
+| after | 1.82 / 2.33 / 2.59 | 785.69 MB / 1262.31 MB | 45960175 | `ollama`'s own runner (the engine under test) |
+
+Swapouts did not move and swap use moved by 8 MB, so the window is not a
+contaminated reference-only window (`skills/perf-verdict-gate` rule 2).
+
+### Corpus and prompt-token identity
+
+The same deterministic text was sent to both arms (one distinct text per segment;
+identical text for the two arms inside one segment). Prompt tokens are the
+engines' own reported counts for byte-identical input:
+
+| stage | case | `llamacpp` | `ollama` |
+|---|---|---|---|
+| s1 | 128-token target | 97 | 97 |
+| s1 | 512-token target | 392 | 392 |
+| s1 | 2048-token target | 1562 | 1562 |
+| s2 | ctx 1024 / 128 out | 785 | 785 |
+| s2 | ctx 4096 / 128 out | 3116 | 3116 |
+
+### S1 prefill / TTFT
+
+Client-observed time to first content delta, engine-reported prefill as the
+cross-check; ratio is paired per segment against `llamacpp` (>1 = this arm faster).
+
+| case | arm | TTFT p50 (ms) | prefill tok/s p50 | engine prefill p50 (ms) | vs baseline | n | seg |
+|---|---|---|---|---|---|---|---|
+| 128-token prompt | `llamacpp` | 118.5 | 821.9 | 117.3 | (baseline) | 3 | 3 |
+| 128-token prompt | `ollama` | 120.9 | 802.2 | 118.8 | 0.98x | 3 | 3 |
+| 512-token prompt | `llamacpp` | 414.6 | 945.7 | 413.4 | (baseline) | 3 | 3 |
+| 512-token prompt | `ollama` | 417.3 | 939.3 | 415.0 | 0.99x | 3 | 3 |
+| 2048-token prompt | `llamacpp` | 1533.4 | 1018.6 | 1531.4 | (baseline) | 3 | 3 |
+| 2048-token prompt | `ollama` | 1543.4 | 1012.1 | 1540.2 | 0.99x | 3 | 3 |
+
+### S2 decode
+
+Client-observed decode window (first to last content delta) per generated token;
+engine-reported ms/token next to it.
+
+| case | arm | decode ms/token p50 | decode tok/s p50 | engine ms/token p50 | vs baseline | n | seg |
+|---|---|---|---|---|---|---|---|
+| ctx 1024 / 128 out | `llamacpp` | 12.55 | 79.7 | 12.45 | (baseline) | 3 | 3 |
+| ctx 1024 / 128 out | `ollama` | 12.51 | 80.0 | 12.41 | 1.00x | 3 | 3 |
+| ctx 4096 / 128 out | `llamacpp` | 12.82 | 78.0 | 12.72 | (baseline) | 3 | 3 |
+| ctx 4096 / 128 out | `ollama` | 12.80 | 78.1 | 12.70 | 1.00x | 3 | 3 |
+
+### Engine evidence (one distinctive line per engine)
+
+`llamacpp` (its own request log):
+
+```
+print_info: arch                  = lfm3
+slot print_timing: id 0 | task 10 | prompt eval time =    118.60 ms /    97 tokens (   1.22 ms per token,   817.89 tokens per second)
+slot print_timing: id 0 | task 10 |        eval time =     91.31 ms /     8 tokens (  13.04 ms per token,    76.66 tokens per second)
+```
+
+`ollama` (its own runner log on the same bytes, and the request that was served):
+
+```
+starting llama-server cmd="…/Ollama.app/Contents/Resources/llama-server --model /Users/haiyan-mini/.ollama/models/blobs/sha256-3793e1e6… --c 16384 …"
+llama_model_loader: loaded meta data with 45 key-value pairs and 287 tensors from …/blobs/sha256-3793e1e6… (version GGUF V3 (latest))
+[GIN] 2026/11/18 - 23:15:31 | 200 | 789.34ms | 127.0.0.1 | POST     "/api/generate"
+```
+
+### Mixed factors (quote with the tables)
+
+1. **Precision is uniform**: both arms read the same Q4_K_M file; the hash above is
+   the same bytes for both.
+2. **HTTP surface differs, prompt text does not.** `llamacpp` is measured on
+   `/v1/completions`; `ollama` on `/api/generate` with `raw: true`, because
+   ollama's `/v1/completions` applies the model chat template — the same 5-token
+   text comes back as `prompt_tokens: 15` there, and the completion starts as a
+   chat answer. The raw surface reports `prompt_tokens: 5` for the same text and
+   exposes ollama's own `prompt_eval_duration`/`eval_duration`. This is why both
+   engines can report identical prompt-token counts.
+3. **Context pinning.** ollama is given the same `num_ctx 16384` on every request
+   (new harness flag `--ollama-num-ctx 16384`) as llama.cpp's `-c 16384`. Without
+   the pin, ollama reloads its runner for each distinct context and the reload
+   lands inside TTFT (one `starting llama-server` line per request was observed).
+4. **Corpus is distinct per segment.** One repeat per segment would otherwise
+   replay the identical prompt three times; llama.cpp's slot prefix cache then
+   serves the 2nd/3rd prefill from KV (`prompt eval time = 21.02 ms / 4 tokens`
+   for a 1562-token prompt). Each segment therefore uses its own corpus seed, the
+   two arms in a segment sharing that seed.
+5. **Measurement base.** TTFT/decode are client-observed (first/last SSE content
+   delta) for both arms; the engine-reported durations are printed next to them
+   and cover similar spans here (llama.cpp prompt-eval; ollama prompt-eval).
+6. **One host, one window, both engines resident.** No absolute number crosses a
+   window or a host. Batch-1 serial, one request at a time.
+
+### Void windows and their fixes (kept visible)
+
+Three earlier windows in this campaign are void and are **not** part of the data
+set above. They are recorded because each one looked plausible until its own A/A
+gate was applied (the git-ignored ledger keeps the full detail):
+
+| window | what looked wrong | A/A | fix applied before the next window |
+|---|---|---|---|
+| `tiera-20261118T145912Z` | identical prompt text in all three segments + `repeats=1`; llama.cpp's prefix cache answered the 2nd/3rd prefill from KV (`prompt eval time / 4 tokens` for a 1562-token prompt) | `llamacpp` s1 **8162.5%**; `ollama` s1 8.3% | per-segment corpus seed |
+| `tiera-20261118T150153Z` | ollama ran `/api/generate` with a per-request `num_ctx`, so it restarted its runner for every request (19 `starting llama-server` lines in one window) and the reload landed inside TTFT | `ollama` s1 **5.9%** | `--ollama-num-ctx 16384` (one runner, fixed context) |
+| `tiera-20261118T150358Z` | protocol clean, but one 2048-token prefill outlier: a 10-repeat probe of that exact case spanned 1539-1645 ms (**6.4%**), i.e. that group could not pass a 5% gate by chance | `ollama` s1 **7.0%** | pause the user's Logitech GUI helper processes (`SIGSTOP`, PIDs recorded, `SIGCONT` in teardown): the same probe spans 1539-1570 ms (**2.0%**) |
+
+The desktop-agent pause is a **measurement-condition change**, not a corpus or
+gate change: it is stated here, the resumed PIDs were verified after the window,
+and the reported window's host table is the state with those agents paused.
+
+### Efficiency arithmetic (not a cross-host speed ranking)
+
+The decode arm streams 1.0996 GB of weights per generated token, so 12.55 ms/token
+is ≈88 GB/s effective. The campaign's packed4 MLX lane measured 11.8 ms/token on
+the M1 Pro with a 0.973 GB checkpoint ≈82 GB/s by the same arithmetic (≈79 GB/s on
+the campaign's own effective-byte count). On two different hosts, that puts both
+engines in the same ~80 GB/s **bandwidth-efficiency class** for LFM3 at 4 bits —
+consistent with batch-1 decode being weight-stream bound. This is an arithmetic
+ratio between the checkpoint's bytes and the measured wall, **not** a measured
+memory ceiling and **not** a speed comparison between the M1 Pro and the M4.
+
+### Tier B — `apxinf-native`: builds, but the arm is still not measurable (2026-11-18)
+
+`apxinf-serve` does build on the M4 from `feat/lfm3-metal` (source commit
+`5104123b`: `cargo build --release -p apxinf-serving --features native-minicpm5
+--bins`, `SDKROOT=…/MacOSX26.5.sdk`, `MLX_ROOT=~/mlx-sdk`), and its native worker
+loads the reconstructed BF16 checkpoint (`model.safetensors` 3,457,635,448 bytes,
+sha256 `135922ca…`, `Metal 0: Apple M4 (applegpu_g16g)`, 3.46 GB resident). The arm
+is still not measurable, and the blocker is the serving contract, not the build:
+
+- Every harness request (S1 `max_tokens=8`, S2 `max_tokens=128`, the word-salad
+  corpus) is answered with
+  `{"type":"error","error":{"type":"api_error","code":"internal_error","message":"The model output contains an incomplete structured block."}}`
+  while the worker itself completed it (`native_request_settled` … `output_tokens: 8`,
+  `ttft_ns` 48 ms, 364 ms elapsed). The family emits a `<think>` block as its first
+  token; a short `max_tokens` truncates it and the gateway's structured-block
+  validation turns a completed generation into `internal_error`. A direct question
+  with `max_tokens=120` succeeds (57 completion tokens, `finish_reason: stop`,
+  "The capital of France is **Paris**."), so this is protocol/content dependent,
+  not a load or build failure.
+- Consequence: there are **no tier-B numbers** in this document and the decision
+  rule's matched-precision pair still does not exist. A fix belongs to the server
+  (allow a truncated structured block when `finish_reason=length`) or to a
+  benchmark protocol that never truncates structured output.
+- Matched-precision path: `convert_hf_to_gguf.py` at llama.cpp commit `5297534` has
+  **no `lfm3` support** (zero case-insensitive `lfm` matches), so the BF16
+  checkpoint cannot be converted to an F16 GGUF locally; the pair needs the
+  official `LFM3-1.7B-F16.gguf` (3.47 GB). Even then, the cross-tier caveat
+  applies: `apxinf-native` BF16 (3.46 GB) vs llama.cpp Q4_K_M (1.10 GB) differ
+  ~3x in precision, so a delta across them is a **precision statement, not an
+  engine statement**; only BF16-vs-F16 would be an engine-implementation
+  comparison.
+
+
+
+> **Superseded 2026-11-18** by the M4 tier-A result above. This window is void
+> (its own A/A gate failed on every arm) and stays visible for history; nothing
+> below is a result.
 
 Window: **`m2-quiet` — Apple M2 Air (reference only, VOID)**. Host amendment 2026-11-18: M1 Pro offline, M4 relay ~17 KB/s; the two-arm window ran on the Lead's M2 Air. These are M2 numbers, not M1 numbers, and this window failed the pre-registered comparability gate (see the verdict at the end of this section): nothing here is a result. Every table below is the report's own output.
 
