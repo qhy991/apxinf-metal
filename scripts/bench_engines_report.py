@@ -434,14 +434,15 @@ class Report:
                 "Quantization is not declared in the raw files: use --quantization when running "
                 "the harness, otherwise the tables cannot state the mixed factor they carry."
             )
-        if len(distinct_quant) > 1:
+        packed4_tier = {value for value in distinct_quant
+                        if "packed4" in value or "affine" in value}
+        gguf_tier = {value for value in distinct_quant if "gguf" in value}
+        if packed4_tier and gguf_tier:
             lines.append(
-                "Concretely, weight bytes per token differ across these tiers, so an absolute "
-                "tok/s gap is expected even for two perfect engine implementations: "
-                + "; ".join(f"`{arm}` = {', '.join(sorted(values)) or 'undeclared'}"
-                            for arm, values in sorted(quantization.items()))
-                + ". Compare only arms inside one tier, or use the 16-bit tier for an "
-                  "engine-implementation comparison."
+                "Concretely, the packed4 tier and the GGUF tier store different bytes per weight "
+                "(MLX affine group 64 vs llama.cpp K-quant), so an absolute tok/s gap is expected "
+                "even for two perfect engine implementations. Compare only arms inside one tier, "
+                "or use the 16-bit tier for an engine-implementation comparison."
             )
         if any("chat" in value for values in protocols.values() for value in values) and \
                 any("completions" in value for values in protocols.values() for value in values):
@@ -546,7 +547,9 @@ class Report:
         print()
         print(f"- raw directory: `{self.raw_dir}`")
         print(f"- runs read: {len(self.runs)}")
-        print(f"- stages: {', '.join(self.stages) or '(none)'}")
+        present = [stage for stage in self.stages
+                   if any(run.get("stage") == stage for run in self.runs)]
+        print(f"- stages with data: {', '.join(present) or '(none)'}")
         print(f"- baseline: `{self.args.baseline}`; apxinf arms: "
               f"{', '.join(f'`{arm}`' for arm in self.args.apxinf_arms)}")
         print(f"- generated: {now}")
