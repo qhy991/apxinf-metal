@@ -1,13 +1,14 @@
 # LFM3-1.7B engine comparison: apxinf vs llama.cpp vs ollama
 
-Status: **method + pre-registered gate; two stage-2 windows complete on the M4
-(2026-11-18).** Tier A: `llamacpp` vs `ollama` on identical Q4_K_M weights — every
-gate met, no measurable serving-layer difference. Tier B (cross-precision):
-`apxinf-native` BF16 vs `llamacpp` Q4_K_M — every gate met; the 2.95x decode gap is
-explained by the 3.14x weight-byte ratio, so it is a **precision** statement, not
-an engine statement. The 16-bit matched pair (apxinf BF16 vs `llamacpp` F16) is
-**still pending** the official F16 GGUF; no engine-implementation claim is made in
-this document.
+Status: **method + pre-registered gate; three stage-2 windows complete on the M4
+(2026-11-18/19).** Tier A: `llamacpp` vs `ollama` on identical Q4_K_M weights —
+every gate met, no measurable serving-layer difference. Tier B cross-precision:
+`apxinf-native` BF16 vs `llamacpp` Q4_K_M — every gate met, and the 2.95x decode
+gap is explained by the 3.14x weight-byte ratio (**precision** statement).
+Tier B matched precision: `apxinf-native` BF16 vs `llamacpp` F16 — every gate met
+on the quoted cells; apxinf is **within 2%** of llama.cpp at 128 generated tokens,
+which is the pre-registered **"same efficiency class"** verdict for the
+engine-implementation comparison.
 Design: GitHub issue [qhy991/apxinf-metal#111](https://github.com/qhy991/apxinf-metal/issues/111)
 (the working copy under `devlocal/engine-comparison-lfm3/DESIGN.md` is git-ignored).
 Harness: [`scripts/bench_engines.sh`](../scripts/bench_engines.sh),
@@ -492,7 +493,8 @@ is still not measurable, and the blocker is the serving contract, not the build:
 
 Status: **KEEP** (measurement accepted) — this is a **precision statement, not an
 engine statement**. The matched BF16-vs-F16 pair that the decision rule needs is
-still pending (see the last subsection).
+measured in the last subsection of this section ("same efficiency class, apxinf
+within 2%").
 Claim: in one ABBA window on the M4, apxinf's native `metal_lfm3` path at MLX BF16
 decodes at **36.60 / 36.93 ms per token** (27.3 / 27.1 tok/s) while llama.cpp at
 Q4_K_M does **12.39 / 12.71 ms** (80.7 / 78.7 tok/s): apxinf is **2.95x slower per
@@ -613,23 +615,132 @@ the per-engine durations above, not TTFT, are the comparable metric.
    preparation, decode). Neither number is a client-observed TTFT.
 4. **One host, one window**, batch-1 serial, greedy, 3 ABBA segments per arm.
 
-### Matched-precision pair — pending (pre-registered protocol)
+### Matched-precision result: `apxinf-native` BF16 vs `llamacpp` F16 (2026-11-19, M4)
 
-The engine-implementation comparison is `apxinf-native` BF16 vs `llamacpp` F16 on
-the **same** weights at 16-bit. The official `LFM3-1.7B-F16.gguf` (3.47 GB) was
-still downloading on the M4 during this window, so this pair has **no numbers
-yet**. When the file lands (extent and sha256 verified), the same protocol will be
-run and this subsection replaced by its tables; the pre-registered decision rule
-is:
+> **Amended 2026-11-19 05:19 CST:** the pair is measured. The pre-registered
+> protocol paragraph below is kept verbatim; the tables after it are window
+> `f16-20261118T211938Z` (report exit 0). The earlier hand-processed run
+> `f16-20261118T194957Z` is cited only where it agrees, as a reproduction check.
 
-```
-Gate: same-arm repeat (A/A) <= 5%, engine-reported basis for both arms,
-      matched spans declared.
-Decision: apxinf decode < 0.8 x llamacpp  -> "apxinf decode lags" (no softening);
-          0.8-1.25x                       -> "same efficiency class";
-          > 1.25x                         -> report the win with the effective
-                                             GB/s arithmetic for both arms.
-```
+Status: **KEEP** — this is the engine-implementation comparison the decision rule
+applies to.
+Claim: at 16-bit on both sides and batch-1 on one M4 window, `apxinf-native` (MLX
+BF16) and `llamacpp-f16` (GGUF F16) decode LFM3 at the **same rate**: 37.20 vs
+36.42 ms/token at context 1024 and 37.50 vs 36.67 ms/token at context 4096
+(128 generated tokens), i.e. **apxinf within 2% of llama.cpp** — apxinf/llamacpp
+= 1.021 / 1.023, inside the pre-registered 0.8-1.25x "same efficiency class"
+band. Effective bandwidth: 92.9 / 92.2 GB/s (apxinf) vs 95.2 / 94.5 GB/s
+(llama.cpp). Prefill (the pre-registered S1 metric): apxinf 11.2% slower at 128
+prompt tokens, 8.6% slower at 512, 0.6% slower at 2048.
+Evidence: `devlocal/engine-comparison-lfm3/results/f16-20261118T211938Z/`
+(12 raw JSON, report, identity, request ledger, host state); report **exit 0**;
+window 2026-11-19 05:19:38-05:23:01 CST.
+Gate: per-cell A/A is in every table below; every quoted cell is <= 5%. The
+request ledger joined **15/15** apxinf requests by `request_id`
+(`request_log: {matched: 15, by_request_id: 15, by_order: 0}`), so the apxinf
+timings are the engine's own, not a fallback guess.
+Decision rule: apxinf/llamacpp decode ratio 1.021 / 1.023 lies in the 0.8-1.25x
+band → **"same efficiency class"**; no "apxinf decode lags" verdict, and no win is
+claimed.
+Caveats: engine-reported timing basis on both arms (see mixed factor 3); +9-token
+ChatML prefix on the apxinf arm; S1 decode-at-8 excluded (below); one host, one
+window; batch-1; greedy.
+
+> Pre-registered protocol (from the campaign design, unchanged):
+>
+> ```
+> Gate: same-arm repeat (A/A) <= 5%, engine-reported basis for both arms,
+>       matched spans declared.
+> Decision: apxinf decode < 0.8 x llamacpp  -> "apxinf decode lags" (no softening);
+>           0.8-1.25x                       -> "same efficiency class";
+>           > 1.25x                         -> report the win with the effective
+>                                              GB/s arithmetic for both arms.
+> ```
+
+**Arms.** `llamacpp-f16`: the official `LFM3-1.7B-F16.gguf`, GGUF F16, bare
+completion on `/v1/completions`. `apxinf-native`: the reconstructed BF16 HF
+checkpoint served natively on Metal, chat surface (lane ChatML), engine-reported
+durations. Both are 16-bit weights of the same model; this is the pair the
+decision rule admits.
+
+### Identity block
+
+| item | value |
+|---|---|
+| llama.cpp weights | `LFM3-1.7B-F16.gguf`, **3,466,626,336 B**, sha256 `b7ab8b69a85e4dfbf62cdfd0e02d7d051ed09f2c5b84c701771dddb073b85970` (equals the upstream HF LFS hash) |
+| apxinf weights | reconstructed BF16 `model.safetensors`, **3,457,635,448 B**, sha256 `135922caef64e81e52af88ede8b7c3ddaa9d6da220a9737fb3065275dbfb4330` |
+| `llama_server_sha256` | `d635b19fb11a19d3262ee8544252f20cb92620b58c426b820453bb4f4535e55e` (llama.cpp `5297534`, Metal, SDK 26.5) |
+| `apxinf_serve_sha256` | `f3ff54661cc8565d183038eb725c9dcdc89dc1f9a9722562241f29b189e75f24` (source tip `fbd1e2e9`, includes #118) |
+| `apxinf_native_worker_sha256` | `04f4692a4d0bb4923dac6765c0bb87b2fa4709c2d184987e55fae727ca4633a5` |
+| arch proof | llama.cpp `print_info: arch = lfm3`; apxinf `Metal 0: Apple M4 (applegpu_g16g)`, `quant: bf16` |
+
+Host state: load **2.64/2.51/2.64 -> 2.90/2.72/2.70**; swap used
+**901.4 -> 893.4 MB**; `Swapouts` **46284047** before and after (unchanged).
+Two system daemons (`mediaanalysisd`, `spotlightknowledged`) appeared in the top-CPU
+list during the window; A/A stayed clean (<= 3.5% per cell, below), so the window
+is kept, with that recorded as a caveat rather than silently dropped.
+
+### S2 decode — engine-reported, matched precision
+
+| case | arm | decode ms/token p50 | decode tok/s p50 | A/A (this cell) | weight bytes / token | effective GB/s | apxinf/llamacpp |
+|---|---|---|---|---|---|---|---|
+| ctx 1024 / 128 out | `apxinf-native` | 37.20 | 26.9 | 3.3% | 3.4576 GB (BF16) | ≈92.9 | **1.021x** |
+| ctx 1024 / 128 out | `llamacpp-f16` | 36.42 | 27.5 | 2.4% | 3.4666 GB (F16) | ≈95.2 | (baseline) |
+| ctx 4096 / 128 out | `apxinf-native` | 37.50 | 26.7 | 0.9% | 3.4576 GB (BF16) | ≈92.2 | **1.023x** |
+| ctx 4096 / 128 out | `llamacpp-f16` | 36.67 | 27.3 | 1.0% | 3.4666 GB (F16) | ≈94.5 | (baseline) |
+
+The two arms stream the same number of bytes (0.26% apart, container difference)
+at 92-95 GB/s effective, so the 2% difference is the implementation, and it is
+below the pre-registered "same efficiency class" boundary in both directions.
+
+### S1 prefill — engine-reported (supporting data, not part of the decode verdict)
+
+| case | arm | prefill p50 (ms) | prefill tok/s p50 | A/A (this cell) | apxinf/llamacpp |
+|---|---|---|---|---|---|
+| 128-token prompt | `apxinf-native` | 141.8 | 747.8 | 1.9% | 1.112x |
+| 128-token prompt | `llamacpp-f16` | 127.4 | 761.1 | 3.5% | (baseline) |
+| 512-token prompt | `apxinf-native` | 435.1 | 921.7 | 1.9% | 1.086x |
+| 512-token prompt | `llamacpp-f16` | 400.4 | 978.9 | 1.0% | (baseline) |
+| 2048-token prompt | `apxinf-native` | 1461.5 | 1074.3 | 0.8% | 1.006x |
+| 2048-token prompt | `llamacpp-f16` | 1453.1 | 1074.3 | 0.4% | (baseline) |
+
+### S1 cells excluded as non-quotable
+
+`max_tokens=8` gives a seven-interval generation window, and the apxinf arm's
+same-arm spread on that window is not certifiable: the 512-token cell is
+**5.02% A/A** (over the pre-registered 5% gate: per-segment medians
+37.855 / 38.349 / 39.781 ms/token), and the earlier hand-processed run measured
+**9.7-9.9%** on the same cells. **No S1 decode cell is quoted as a result**, and
+the hand-processed s1 rows are not carried into this document. The S1 *prefill*
+table above is the pre-registered S1 metric and is quotable (all cells
+0.4-3.5%); it is supporting data only, because the verdict is defined on decode.
+
+### Mixed factors (quote with the tables)
+
+1. **Matched precision, not identical bytes.** Both arms are 16-bit, but one is
+   GGUF F16 (3,466,626,336 B) and the other MLX BF16 (3,457,635,448 B): 0.26% more
+   bytes on the llama.cpp side from container layout. Weights and precision are
+   matched for the purpose of the decision rule.
+2. **Prompt protocol.** `apxinf-native` is chat-only: every case carries the lane
+   ChatML prefix, **+9 prompt tokens** (106/401/1571 vs 97/392/1562 prefill;
+   794/3125 vs 785/3116 decode).
+3. **Timing basis is engine-reported for both arms** because `apxinf-serve`
+   buffers its SSE (issue [#120](https://github.com/qhy991/apxinf-metal/issues/120):
+   client TTFT 7.7 s against engine prefill 0.78 s, client decode window
+   ~0.0004 ms). Raw files record `timing_primary: "engine"` and keep
+   `client_*_ms_observed`; spans are declared (llama.cpp prompt-eval/predicted;
+   apxinf prefill incl. state preparation, decode).
+4. **One host, one window**, batch-1 serial, greedy, three ABBA segments per arm,
+   both Metal locks held, host GUI agents paused as in tier A.
+5. **Reproduction against the earlier hand-processed run
+   `f16-20261118T194957Z`:** s2 ctx1024 36.78 vs 36.42 (llama) and 37.45 vs 37.20
+   (apxinf); ctx4096 37.13 vs 36.67 and 37.80 vs 37.50; s1 short-gen
+   34.3-34.6 vs 34.9-35.5 (llama) and 37.1-38.2 vs 38.1-39.2 (apxinf) — every
+   number reproduces within ~1-2%. The one value that moved is the apxinf s1 A/A:
+   9.7-9.9% in the hand run (its 512-token prefill had one 505.7 ms segment against
+   ~431 ms on the others) versus 1.8-5.0% here; that is window noise, not a
+   systematic difference, and the certified s1 decode still stays excluded as
+   above.
 
 > **Superseded 2026-11-18** by the M4 tier-A result above. This window is void
 > (its own A/A gate failed on every arm) and stays visible for history; nothing
