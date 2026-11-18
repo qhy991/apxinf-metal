@@ -381,9 +381,29 @@ Status: **INCONCLUSIVE** (no number from this window may be quoted as a result)
 Claim: In the M2-Air two-arm window (2026-11-18 10:51:40-11:00:45) both arms
 failed the pre-registered A/A gate on every stage, and the host moved materially
 during the window, so the window is void by the campaign's own comparability
-rule. Separately, no `apxinf` arm ran on any reachable host (M1 Pro offline, M4
-relay ~17 KB/s), so the pre-registered `apxinf` vs `llamacpp` S2 decode gate has
-no data.
+rule. Separately, **no `apxinf` arm ran on any reachable host** (M1 Pro offline,
+M4 relay ~17 KB/s), so nothing about apxinf — faster, slower or equal — can be
+claimed from this campaign, and the pre-registered `apxinf` vs `llamacpp` S2
+decode gate has no data.
+
+Read the five points below as the whole verdict:
+
+1. **INCONCLUSIVE, window void**: A/A failed the pre-registered 5% gate on every
+   arm — `llamacpp` s1 **123.9%**, s2 **61.9%**; `ollama` s1 **115.9%**, s2
+   **143.4%** (worst segment-median spread over 4 ABBA segments).
+2. **Why**: the host was contaminated during the window — load average
+   16.24/26.87/30.85 -> 43.67/52.56/43.53 on 8 cores, swap used 8.63 GiB ->
+   9.82 GiB (free 1.61 GiB -> 0.42 GiB). By `skills/perf-verdict-gate` rule 2 the
+   run is reference-only.
+3. **What survives the window**: the two engines report *identical* prompt-token
+   counts for the same corpus (155/523/1996 prefill, 1007/3951 decode), so corpus
+   identity across arms is proven by the engines themselves; and the driver's
+   client-side accounting is internally consistent
+   (`decode_tok_s = (gen_n - 1) / decode_ms`).
+4. **No apxinf arm ran**, on any host, for any stage — the apxinf rows, the
+   packed4 lane arm and the native BF16 arm do not exist in this data set.
+5. **All numbers here are M2 Air reference-only.** They are not M1 numbers and
+   nothing in this document compares across hosts.
 
 Gate:
 
@@ -424,6 +444,15 @@ nothing in this document compares across hosts. A verdict needs a quiet window o
 the acceptance host (both metal locks, display asleep, no other user process) and
 an actual `apxinf` arm; neither existed for this report, so the pool of
 `apxinf`-vs-`llamacpp` questions remains open rather than answered.
+
+Open question for a future attempt (not a conclusion): the operator reported both
+engines at roughly 10-16 tok/s with GPU utilisation 60-72% and CPU ~90% on an
+8-core M2. That pattern is consistent with the LFM3 path inside
+llama.cpp/ollama being dispatch/CPU-bound rather than Metal-bound — the same
+*class* of problem measured on the MLX side — but this window has no arithmetic
+that separates launch cost from bytes, so the mechanism is **unknown** here. A
+future attempt should measure per-op/launch attribution on the LFM3 path, not
+just tok/s.
 
 Follow-up (needed before any apxinf claim): re-run the minimum window (S2 decode,
 `llamacpp` vs `apxinf-mlx-lane`, ABBA, 3+ segments) on a host that is actually
