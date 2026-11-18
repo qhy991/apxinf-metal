@@ -33,6 +33,10 @@ pub(crate) enum Mixer {
         out_proj: Linear,
         /// `[hidden, kernel]` FP32 depthwise tap table (checkpoint stores `[C, 1, K]`).
         taps: Array,
+        /// The same table as BF16 for the fused decode kernel. The checkpoint
+        /// stores BF16 taps and `taps` above is their exact F32 widening, so this
+        /// cast restores the checkpoint's bytes: it quantizes nothing new.
+        taps_bf16: Array,
     },
     Attention {
         q: Linear,
@@ -171,6 +175,9 @@ impl Weights {
                 )?
                 .reshape(&[h, config.conv_l_cache])?
                 .cast(MlxDType::F32)?;
+                // BF16 -> F32 is exact, so this round trip reproduces the
+                // checkpoint's tap values for the fused kernel's BF16 input.
+                let taps_bf16 = taps.cast(MlxDType::BF16)?;
                 Mixer::Conv {
                     in_proj: linear(
                         &mut map,
@@ -181,6 +188,7 @@ impl Weights {
                     )?,
                     out_proj: linear(&mut map, &format!("{p}.conv.out_proj.weight"), h, h, stream)?,
                     taps,
+                    taps_bf16,
                 }
             } else {
                 Mixer::Attention {
@@ -293,8 +301,14 @@ impl Weights {
                     in_proj,
                     out_proj,
                     taps,
+                    taps_bf16,
                 } => {
-                    arrays.extend([in_proj.array(), out_proj.array(), taps.clone()]);
+                    arrays.extend([
+                        in_proj.array(),
+                        out_proj.array(),
+                        taps.clone(),
+                        taps_bf16.clone(),
+                    ]);
                 }
                 Mixer::Attention {
                     q,
