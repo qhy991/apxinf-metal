@@ -916,6 +916,9 @@ mod tests {
     /// Real-checkpoint parity, run only when the BF16 checkpoint is complete:
     /// `APXINF_LFM3_CHECKPOINT=~/lfm3bench/models/bf16 cargo test -p apxinf-model
     /// metal_lfm3::decode::tests::real_checkpoint -- --ignored --nocapture`.
+    ///
+    /// Every admitted capacity bucket gets its own comparison: prompt length plus
+    /// the 64 decode steps is chosen to land exactly on 256 / 512 / 1024 / 2048.
     #[test]
     #[ignore = "requires the complete LFM3-1.7B BF16 checkpoint, isolated process and shared Metal lock"]
     fn real_checkpoint_bucketed_parity() -> Result<()> {
@@ -944,31 +947,34 @@ mod tests {
                 ))
             })?;
         let mut model = Lfm3Model::new(config, tensors, backend.clone())?;
-        let prompt: Vec<u32> = (0..64u32).map(|i| 8 + i % 500).collect();
-        model.prepare(prompt.len(), 64)?;
-        let (eager_tokens, _) = greedy(&mut model, &backend, &prompt, 64)?;
-        model.reset();
-        let eager_forced = teacher_forced(&mut model, &backend, &prompt, &eager_tokens)?;
+        let steps = 64usize;
+        for (prompt_len, bucket) in [(64usize, 256usize), (448, 512), (960, 1024), (1984, 2048)] {
+            let prompt: Vec<u32> = (0..prompt_len as u32).map(|i| 8 + i % 500).collect();
+            model.reset();
+            model.prepare(prompt.len(), steps)?;
+            assert_eq!(model.capacity(), bucket, "prompt {prompt_len}");
+            let (eager_tokens, _) = greedy(&mut model, &backend, &prompt, steps)?;
+            model.reset();
+            let eager_forced = teacher_forced(&mut model, &backend, &prompt, &eager_tokens)?;
 
-        model.reset();
-        model.select_decode_policy(DecodePolicy::Bucketed);
-        model.prepare(prompt.len(), 64)?;
-        assert_eq!(model.decode_buckets(), vec![model.capacity()]);
-        let traces = backend.stream().counters().trace_callbacks;
-        let (bucketed_tokens, _) = greedy(&mut model, &backend, &prompt, 64)?;
-        assert_eq!(backend.stream().counters().trace_callbacks, traces);
-        assert_eq!(
-            first_token_difference(&eager_tokens, &bucketed_tokens),
-            None
-        );
-        model.reset();
-        let bucketed_forced = teacher_forced(&mut model, &backend, &prompt, &eager_tokens)?;
-        let diff = max_abs_diff(&eager_forced, &bucketed_forced);
-        eprintln!(
-            "lfm3 real-checkpoint parity: checkpoint_bytes={size} bucket={} tokens=64 identical=true logits_max_abs_diff={diff:.3e}",
-            model.capacity()
-        );
-        assert!(diff <= 2e-3);
+            model.reset();
+            model.select_decode_policy(DecodePolicy::Bucketed);
+            model.prepare(prompt.len(), steps)?;
+            assert_eq!(model.decode_buckets(), vec![bucket]);
+            let traces = backend.stream().counters().trace_callbacks;
+            let (bucketed_tokens, _) = greedy(&mut model, &backend, &prompt, steps)?;
+            assert_eq!(backend.stream().counters().trace_callbacks, traces);
+            model.reset();
+            let bucketed_forced = teacher_forced(&mut model, &backend, &prompt, &eager_tokens)?;
+            let diff = max_abs_diff(&eager_forced, &bucketed_forced);
+            eprintln!(
+                "lfm3 real-geometry parity: checkpoint_bytes={size} bucket={bucket} \
+                 prompt={prompt_len} steps={steps} greedy_tokens_identical={} \
+                 logits_max_abs_diff={diff:.3e}",
+                eager_tokens == bucketed_tokens
+            );
+            assert!(diff <= 2e-3, "bucket {bucket} logits residual {diff:.3e}");
+        }
         Ok(())
     }
 }
