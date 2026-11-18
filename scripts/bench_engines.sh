@@ -244,6 +244,12 @@ from statistics import median
 
 CFG = {key[len("BENCH_"):].lower(): value for key, value in os.environ.items() if key.startswith("BENCH_")}
 REPO = CFG["repo_root"]
+# The request-log correlation lives in scripts/bench_engines_request_log.py so it
+# can be exercised by a fixture test without a host or a model:
+#   python3 scripts/test_bench_engines_request_log.py
+sys.path.insert(0, os.path.join(REPO, "scripts"))
+from bench_engines_request_log import attach_request_log  # noqa: E402
+
 STAGE = CFG["stage"]
 PROTOCOL = CFG["protocol"]
 STREAM = CFG["stream"] == "1"
@@ -682,60 +688,6 @@ def response_id(document, events):
     return None
 
 
-# --------------------------------------------------- apxinf request-log glue ---
-def request_log_entries(path):
-    entries = {}
-    if not path:
-        return entries
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if record.get("request_id"):
-                    entries[record["request_id"]] = record
-    except OSError:
-        return {}
-    return entries
-
-
-def attach_request_log(records, path):
-    entries = request_log_entries(path)
-    if not entries:
-        return 0
-    matched = 0
-    for record in records:
-        identifier = record.get("response_id") or ""
-        key = identifier.split("-", 1)[1] if identifier.startswith("chatcmpl-") else identifier
-        entry = entries.get(key)
-        if entry is None and record.get("prompt_tokens") and record.get("completion_tokens"):
-            candidates = [
-                candidate for candidate in entries.values()
-                if candidate.get("prompt_tokens") == record["prompt_tokens"]
-                and candidate.get("completion_tokens") == record["completion_tokens"]
-                and candidate.get("kind") in (None, "chat")
-            ]
-            entry = candidates[-1] if len(candidates) == 1 else None
-        if entry is None:
-            continue
-        # Engine-reported durations stay flat next to the client ones: the report
-        # reads one schema for every arm and never has to know which surface the
-        # number came from.
-        record["engine_prefill_ms"] = entry.get("prefill_ms")
-        record["engine_decode_ms"] = entry.get("decode_ms")
-        record["engine_decode_ms_per_token"] = entry.get("decode_ms_per_token")
-        record["engine_decode_tokens"] = entry.get("completion_tokens")
-        record["engine_ttft_ms"] = entry.get("ttft_ms")
-        record["engine_source"] = "apxinf.request_log"
-        matched += 1
-    return matched
-
-
 # ---------------------------------------------------------------- evidence ---
 def log_evidence(path, pattern):
     if not path or not pattern:
@@ -930,8 +882,15 @@ def main():
         records.append(record)
 
     samples = [record for record in records if not record.get("warmup")]
+    recorded_at = utc_now()
+    ledger_join = {"enabled": bool(CFG["request_log"]), "matched": 0,
+                   "by_request_id": 0, "by_order": 0}
     if CFG["request_log"]:
-        attach_request_log(samples, CFG["request_log"])
+        ledger_join["matched"] = attach_request_log(
+            samples, CFG["request_log"],
+            window=(started_at, recorded_at), n_warmup=int(CFG["warmup"]))
+        ledger_join["by_request_id"] = sum(1 for r in samples if r.get("engine_ledger_join") == "request_id")
+        ledger_join["by_order"] = sum(1 for r in samples if r.get("engine_ledger_join") == "ordered")
 
     # Engine-primary timing basis (see --engine-timings). The client-observed
     # values are kept under *_observed so the file still shows what the socket
@@ -988,7 +947,7 @@ def main():
         "endpoint": CFG["endpoint"],
         "model": CFG["model"],
         "started_at": started_at,
-        "finished_at": utc_now(),
+        "finished_at": recorded_at,
         "artifact": identity,
         "host": {"before": host_before, "after": host_after},
         "corpus": {**corpus_info, "sha256": corpus_sha, "case_count": len(cases)},
@@ -1002,6 +961,7 @@ def main():
         },
         "cases": cases,
         "timing_primary": "engine" if CFG.get("engine_timings") == "1" else "client-first",
+        "request_log": {"path": CFG["request_log"] or None, **ledger_join},
         "requests": records,
         "evidence": {
             "engaged": engaged,
