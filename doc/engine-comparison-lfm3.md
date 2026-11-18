@@ -272,8 +272,165 @@ OpenAI-compatible response carries no durations, so at least one ollama run uses
 ## Results
 
 <!-- BEGIN RESULTS -->
-Not measured yet. Every table below is produced by `bench_engines_report.py`;
-an empty cell means "not measured", not "zero".
+
+Window: **`m2-quiet` — Apple M2 Air (reference only, VOID)**. Host amendment 2026-11-18: M1 Pro offline, M4 relay ~17 KB/s; the two-arm window ran on the Lead's M2 Air. These are M2 numbers, not M1 numbers, and this window failed the pre-registered comparability gate (see the verdict at the end of this section): nothing here is a result. Every table below is the report's own output.
+
+### Artifact and host identity
+
+| artifact | value |
+|---|---|
+| `llama_server_sha256` | `e5b1bd78bdf73c6388bd382995586a49958905c4a1aa85104025193983efe43f` |
+| `llama_version` | `version: 1.0.0-dev (build 1, commit 5297534)` |
+| `ollama_version` | `ollama version is 0.40.16` |
+| `gguf_sha256` | `3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4` |
+
+Host before: macOS 27.0.1 (Apple M2, 8 cores); load [16.24, 26.87, 30.85]; swapouts swap used 8628.81M free 1611.19M (pre); thermal unavailable; disk None; busy: host load average 16 -> 52 across window
+
+Host after: macOS 27.0.1 (Apple M2, 8 cores); load [43.67, 52.56, 43.53]; swapouts swap used 9820.75M free 419.25M (post); thermal unavailable; disk None; busy: host load average 16 -> 52 across window
+
+## Arms
+
+| arm | stage | protocol | quantization | segments | requests | failed | generated | evidence | A/A |
+|---|---|---|---|---|---|---|---|---|---|
+| `llamacpp` | s1 | openai-completions | gguf-q4_k_m | 4 | 12 | 0 | 12 | yes | FAIL (123.9%) |
+| `llamacpp` | s2 | openai-completions | gguf-q4_k_m | 4 | 8 | 0 | 8 | yes | FAIL (61.9%) |
+| `ollama` | s1 | openai-completions | gguf-q4_k_m | 4 | 12 | 0 | 12 | yes | FAIL (115.9%) |
+| `ollama` | s2 | openai-completions | gguf-q4_k_m | 4 | 8 | 0 | 8 | yes | FAIL (143.4%) |
+
+## Corpus and token-count comparability
+
+Prompt tokens are the engines' own reported counts for byte-identical text. Bare-completion arms must agree; a chat-protocol arm carries its template offset (mixed factor 2).
+
+| stage | case | `llamacpp` | `ollama` |
+|---|---|---|---|
+| s1 | 128 tok prompt | 155 | 155 |
+| s1 | 512 tok prompt | 523 | 523 |
+| s1 | 2048 tok prompt | 1996 | 1996 |
+| s2 | 1024 tok prompt / 128 tok out | 1007 | 1007 |
+| s2 | 4096 tok prompt / 128 tok out | 3951 | 3951 |
+
+## S1 prefill / TTFT
+
+Client-observed time to first content delta (the S1 metric), with the engine-reported prefill as a cross-check. Ratio is paired against `llamacpp` per segment (baseline/arm; >1 = this arm faster).
+
+| case | arm | TTFT p50 (ms) | prefill tok/s p50 | engine prefill p50 (ms) | vs baseline | n | seg |
+|---|---|---|---|---|---|---|---|
+| 128 tok prompt | `llamacpp` | 623.7 | 255.4 | n/a | (baseline / unpaired) | 4 | 4 |
+| 128 tok prompt | `ollama` | 662.3 | 237.5 | n/a | 1.09x | 4 | 4 |
+| 512 tok prompt | `llamacpp` | 2608.5 | 200.6 | n/a | (baseline / unpaired) | 4 | 4 |
+| 512 tok prompt | `ollama` | 1762.3 | 299.3 | n/a | 1.26x | 4 | 4 |
+| 2048 tok prompt | `llamacpp` | 12267.4 | 163.2 | n/a | (baseline / unpaired) | 4 | 4 |
+| 2048 tok prompt | `ollama` | 11076.3 | 191.8 | n/a | 1.03x | 4 | 4 |
+
+## S2 decode
+
+Client-observed decode window (first to last content delta) per generated token. This file already declares that the decode basis is the client; the engine-reported ms/token is shown next to it.
+
+| case | arm | decode ms/token p50 | decode tok/s p50 | engine ms/token p50 | vs baseline | n | seg |
+|---|---|---|---|---|---|---|---|
+| 1024 tok prompt / 128 tok out | `llamacpp` | 82.74 | 12.7 | n/a | (baseline / unpaired) | 4 | 4 |
+| 1024 tok prompt / 128 tok out | `ollama` | 80.49 | 12.5 | n/a | 1.02x | 4 | 4 |
+| 4096 tok prompt / 128 tok out | `llamacpp` | 100.11 | 10.5 | n/a | (baseline / unpaired) | 4 | 4 |
+| 4096 tok prompt / 128 tok out | `ollama` | 61.36 | 16.3 | n/a | 1.26x | 4 | 4 |
+
+## S3 serving-layer overhead
+
+No data.
+
+## S4 end-to-end agent suite
+
+No data.
+
+## Mixed factors (quote these with every table above)
+
+1. Quantization is uniform in this data: gguf-q4_k_m. Cross-tier attribution still requires the 16-bit arm (Decision rule).
+2. Measurement basis: S1 TTFT and S2 decode are client-observed (first and last SSE content delta). Engine-reported prefill/decode durations are shown separately, and they cover different spans per engine (llama.cpp prompt eval; apxinf state reset + capacity preparation + prefill). S3 subtracts the engine-reported durations from client wall where they exist; where they do not, S3 overhead is n/a and the wall column alone must not be read as serving overhead.
+3. Pairing: every delta in these tables is the median over ABBA segments of the within-segment median ratio against `llamacpp`. No absolute number in this report crosses a window, and no single-order number is reported.
+
+## Pre-registered gate
+
+**Gate (comparability):** A/A <= 5% per arm; otherwise the arm's data is void.
+- `llamacpp` s1: A/A FAIL (worst group spread 123.9%, 4 segments)
+- `llamacpp` s2: A/A FAIL (worst group spread 61.9%, 4 segments)
+- `ollama` s1: A/A FAIL (worst group spread 115.9%, 4 segments)
+- `ollama` s2: A/A FAIL (worst group spread 143.4%, 4 segments)
+
+**Gate (S2 decode):** paired median; if apxinf < 0.8 x baseline the verdict is written as 'apxinf decode lags' and a follow-up is opened; the word 'parity' is not used.
+- S2 decode for `apxinf-native` vs `llamacpp`: not measured (no paired S2 decode data for both arms).
+
+**Gate (S4 end-to-end):** equal solved set and wall delta > 10% => engine-level difference; different solved set => check template/quantization first.
+- S4: not measured by this harness (the 12-task agent suite is a separate tool); no end-to-end claim is made here.
+
+**Decision rule:** claim the difference as an engine-implementation difference only when the 16-bit arms reproduce its sign; otherwise attribute it to the quantization tier.
+- No 16-bit arm was measured: differences in this report stay attributed to the quantization tier, not to the engine implementation.
+
+## Status
+
+- BLOCKED: `llamacpp` s1: A/A spread 123.9% exceeds 5%; the arm's data is void and must be re-measured
+- BLOCKED: `llamacpp` s2: A/A spread 61.9% exceeds 5%; the arm's data is void and must be re-measured
+- BLOCKED: `ollama` s1: A/A spread 115.9% exceeds 5%; the arm's data is void and must be re-measured
+- BLOCKED: `ollama` s2: A/A spread 143.4% exceeds 5%; the arm's data is void and must be re-measured
+
+No verdict may be claimed from this data set until the blockers above clear (skills/perf-verdict-gate).
+
+
+## Stage-2 verdict: window void, apxinf not measured (2026-11-18)
+
+Status: **INCONCLUSIVE** (no number from this window may be quoted as a result)
+
+Claim: In the M2-Air two-arm window (2026-11-18 10:51:40-11:00:45) both arms
+failed the pre-registered A/A gate on every stage, and the host moved materially
+during the window, so the window is void by the campaign's own comparability
+rule. Separately, no `apxinf` arm ran on any reachable host (M1 Pro offline, M4
+relay ~17 KB/s), so the pre-registered `apxinf` vs `llamacpp` S2 decode gate has
+no data.
+
+Gate:
+
+| gate | result | measured |
+|---|---|---|
+| comparability: A/A <= 5% per arm | **FAIL** | `llamacpp` s1 123.9%, s2 61.9%; `ollama` s1 115.9%, s2 143.4% (worst group spread of the segment medians) |
+| S2 decode: `apxinf` < 0.8 x `llamacpp` | **not evaluable** | no `apxinf` request exists in this window |
+| host state: label contaminated if swap/load moved | **contaminated** | load average 16.24/26.87/30.85 -> 43.67/52.56/43.53 on 8 cores; swap used 8.63 GiB -> 9.82 GiB (free 1.61 GiB -> 0.42 GiB) |
+
+What the data does show (reference only, not a verdict): both arms serve the same
+`LFM3-1.7B-Q4_K_M.gguf` and the engines report identical prompt-token counts for
+the same corpus (155/523/1996 for the prefill cases, 1007/3951 for the decode
+cases), so the corpus is identical across arms; the observed decode rate in this
+window is about 10-16 tok/s and prefill at 2048 prompt tokens takes 11-12 s — both
+far below the M1 smoke numbers and consistent with the measured load/swap move,
+which is exactly why the window cannot separate engine effects from host effects.
+
+Evidence: `devlocal/engine-comparison-lfm3/raw-m2-quiet/{raw.jsonl, identity.txt,
+run.log, llama-server.log}`; normalized to the harness schema under
+`raw-m2-quiet/normalized/`; rendered tables in
+`devlocal/engine-comparison-lfm3/report-m2-quiet.md`; machine-readable gate state
+in `summary-m2-quiet.json`.
+
+Arms: 2 arms (`llamacpp`, `ollama`) x 4 ABBA segments x 5 cases
+(S1 prompt 128/512/2048, S2 context 1024/4096 with 128 generated tokens).
+Medians only; no single-order number is reported. Neither arm carries an
+engine-reported duration in this window (the driver recorded client timings
+only), so the engine-reported columns are n/a and no S3 decomposition exists.
+
+Artifact: llama.cpp `1.0.0-dev` build 5297534 (sha256
+`e5b1bd78bdf73c6388bd382995586a49958905c4a1aa85104025193983efe43f`), ollama
+0.40.16, GGUF `LFM3-1.7B-Q4_K_M.gguf` sha256
+`3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4`
+(1,099,627,808 bytes).
+
+Host: Apple M2 Air, 8 cores, macOS 27.0.1. **M2 numbers are not M1 numbers** and
+nothing in this document compares across hosts. A verdict needs a quiet window on
+the acceptance host (both metal locks, display asleep, no other user process) and
+an actual `apxinf` arm; neither existed for this report, so the pool of
+`apxinf`-vs-`llamacpp` questions remains open rather than answered.
+
+Follow-up (needed before any apxinf claim): re-run the minimum window (S2 decode,
+`llamacpp` vs `apxinf-mlx-lane`, ABBA, 3+ segments) on a host that is actually
+quiet; the one-command window and its acceptance checklist are in
+`devlocal/engine-comparison-lfm3/M4-RUNBOOK.md` (same script for M1:
+`m1/run_min_window_m1.sh`, with M1 paths).
+
 <!-- END RESULTS -->
 
 <!-- BEGIN TABLES -->
@@ -351,6 +508,33 @@ with every number:
    ABBA segments per arm, one generation-evidence line per arm in the raw JSON,
    host state before/after, and every server stopped afterwards. A blocked
    download or an unavailable arm is reported as INCOMPLETE, never substituted.
+
+### 2026-11-18 (third amendment) - the two-arm stage-2 window ran on an M2 Air and is VOID
+
+With M1 offline and the M4 relay at ~17 KB/s, the two-arm window (`llamacpp` vs
+`ollama`, both the same Q4_K_M GGUF) was run on the Lead's Apple M2 Air. The
+rendered tables and the machine-readable gate state are in the results section.
+
+That window is **void by the pre-registered comparability rule**: A/A failed on
+every arm (worst segment-median spread 61.9%-143.4% against a 5% gate) and the
+host moved materially during it (load average 16.2/26.9/30.9 -> 43.7/52.6/43.5 on
+8 cores; swap used 8.63 GiB -> 9.82 GiB). No `apxinf` arm was measured, so the
+pre-registered apxinf-vs-llamacpp decode gate has no data. The verdict for this
+document is therefore INCONCLUSIVE, not "parity" and not "apxinf lags"; the
+observed ~10-16 tok/s and 11-12 s at 2048 prompt tokens are reported as a
+reference-only property of this contaminated window, not as an engine result.
+
+Consequences for the reader:
+
+1. Everything under Results is **M2 Air** data, reference-only. It is not
+   comparable with any M1 number and must not be quoted as a stage-2 result.
+2. The apxinf-vs-llamacpp question is open. The harness, corpus, runbooks and
+   one-command window are in place; a quiet acceptance-host window running
+   `apxinf-mlx-lane` (packed4) against `llamacpp` (Q4_K_M) is the follow-up.
+3. The window did establish two things that survive it: the two engines report
+   identical prompt-token counts for the same corpus (155/523/1996 prefill,
+   1007/3951 decode), and the driver's client-side accounting is internally
+   consistent (decode tok/s = (gen_n - 1) / decode_ms).
 
 ## Verdict
 
