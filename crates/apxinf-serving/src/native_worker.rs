@@ -445,6 +445,18 @@ fn error(code: &str, message: &str) -> Value {
     json!({"code":code,"message":message,"scope":"request","state_validity":"none"})
 }
 
+/// QUEUE #6: batch size armed by `APXINF_LFM3_BATCH`. Unset, non-numeric or
+/// zero resolve to 1 (the single-request baseline), so an empty-arm launch
+/// never claims a batched run. Called once at construction; the banner and the
+/// dispatcher must use this same source.
+fn batch_size() -> usize {
+    std::env::var("APXINF_LFM3_BATCH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|batch| *batch >= 1)
+        .unwrap_or(1)
+}
+
 struct Incoming {
     value: Value,
     valid: bool,
@@ -536,14 +548,19 @@ fn run(args: Args) -> Result<()> {
     // truthfully reports whether the worker was launched with the switch
     // (empty-arm gate — an unset switch must print false, not claim a run).
     let native_4bit = std::env::var_os("APXINF_LFM3_4BIT").is_some_and(|v| v == "1");
+    // QUEUE #6: the same env source the dispatcher will read. Unset or invalid
+    // resolves to 1 so the empty-arm baseline can never claim a batched run;
+    // the banner's `batch=<B>` field is the §6.3 effect proof for a window.
+    let batch = batch_size();
     eprintln!(
-        "decode_schedule={} overlaps_callbacks={} decode_stages={} kkernel={} prefill_fast={} native_4bit={}",
+        "decode_schedule={} overlaps_callbacks={} decode_stages={} kkernel={} prefill_fast={} native_4bit={} batch={}",
         if sync_decode { "sync" } else { "pipelined" },
         if sync_decode { "false" } else { "true" },
         if decode_stages { "true" } else { "false" },
         if kkernel { "true" } else { "false" },
         if prefill_fast { "true" } else { "false" },
         if native_4bit { "true" } else { "false" },
+        batch,
     );
     // QUEUE #7: banner printed → identity/manifest work begins.
     let host_identity_started = Instant::now();
@@ -1474,6 +1491,28 @@ mod tests {
             assert!(!fault);
             assert!(!commands[0].valid);
         }
+    }
+
+    #[test]
+    fn batch_env_switch_defaults_to_one_and_reports_valid_values() {
+        const BATCH_ENV: &str = "APXINF_LFM3_BATCH";
+        std::env::remove_var(BATCH_ENV);
+        assert_eq!(
+            batch_size(),
+            1,
+            "An unset switch must stay on the single-request baseline (empty-arm gate)."
+        );
+        for (value, expected) in [("1", 1), ("2", 2), ("4", 4), ("8", 8), ("0", 1), ("abc", 1)] {
+            std::env::set_var(BATCH_ENV, value);
+            assert_eq!(
+                batch_size(),
+                expected,
+                "APXINF_LFM3_BATCH={value} must resolve to {expected}."
+            );
+        }
+        // Entry and exit both clear the switch so a panic cannot poison the
+        // baseline arm for the next test in the same process.
+        std::env::remove_var(BATCH_ENV);
     }
 
     #[test]
