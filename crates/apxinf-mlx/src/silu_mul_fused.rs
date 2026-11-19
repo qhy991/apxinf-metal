@@ -46,13 +46,16 @@ impl SiluMulFused {
                 &[(gate.shape(), MlxDType::BF16)],
                 [elements, 1, 1],
                 [256, 1, 1],
-                &[(
-                    "ELEMENTS",
-                    TemplateArg::Int(
-                        i32::try_from(elements)
-                            .map_err(|_| Error::Contract("silu_mul elements exceed i32"))?,
+                &[
+                    ("T", TemplateArg::DType(MlxDType::BF16)),
+                    (
+                        "ELEMENTS",
+                        TemplateArg::Int(
+                            i32::try_from(elements)
+                                .map_err(|_| Error::Contract("silu_mul elements exceed i32"))?,
+                        ),
                     ),
-                )],
+                ],
             )?
         };
         Ok(out.into_iter().next().unwrap())
