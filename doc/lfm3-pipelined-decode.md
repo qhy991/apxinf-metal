@@ -149,5 +149,114 @@ and gates are untouched.
 
 ## Results
 
-_Not yet measured. This section is filled after the window; the verdict uses
-exactly the section-7 vocabulary._
+Window: 2026-11-19 02:50–03:01 CST (M4, both Metal locks held via
+`lockrun_m4.py`, `pmset displaysleepnow` + `caffeinate -si`, no GUI agents
+needed pausing, host state recorded before/after). The sync-arm decomposition
+and the T1/T2/T3 acceptance tests ran in a second locked session immediately
+after (see amendments). Verdict per the frozen section-7 rule: **WIN**.
+
+### Identity block
+
+| item | value |
+|---|---|
+| llama.cpp weights | `LFM3-1.7B-F16.gguf`, 3,466,626,336 B, sha256 `b7ab8b69a85e4dfbf62cdfd0e02d7d051ed09f2c5b84c701771dddb073b85970` (reused from #121) |
+| apxinf weights | reconstructed BF16 `model.safetensors`, 3,457,635,448 B, sha256 `135922caef64e81e52af88ede8b7c3ddaa9d6da220a9737fb3065275dbfb4330` |
+| `llama_server_sha256` | `d635b19fb11a19d3262ee8544252f20cb92620b58c426b820453bb4f4535e55e` (llama.cpp `5297534`, Metal, SDK 26.5) |
+| `apxinf_serve_sha256` | `c8cec3ead88f63e120c1f034efb7af547fa1fd30a6fbb4f25b8e1aa1c672d60c` (source tip `d1703a2d` + test fixes `bd34d4a8`; M4 tree archive sha256 `d30502bb30db749ffad29747…` of the exact source) |
+| `apxinf_native_worker_sha256` | recorded in the window log (same build) |
+| arch proof | apxinf worker stderr: `Metal 0: Apple M4 (applegpu_g16g)`; llama.cpp `print_info: arch = lfm3` |
+
+The M4 clone is a tree archive of the PR branch (the M4's GitHub relay is
+~17 KB/s, too slow to clone); the archive hash plus the branch commit give the
+same re-checkability as a checkout.
+
+### Per-arm effect evidence (banner lines)
+
+Every apxinf arm segment's gateway log carries the worker's construction-time
+banner; no arm ran without it.
+
+- `apxinf-sync` segments: `decode_schedule=sync overlaps_callbacks=false decode_stages=false`
+- `apxinf-pipe` segments: `decode_schedule=pipelined overlaps_callbacks=true decode_stages=false`
+- decomposition segments: `decode_schedule=sync overlaps_callbacks=false decode_stages=true`
+
+### S2 decode — engine-reported, three arms (`--engine-timings`)
+
+| case | arm | decode ms/token p50 | paired R vs `llamacpp-f16` | A/A |
+|---|---|---|---|---|
+| ctx 1024 / 128 out | `apxinf-pipe` | **36.07** | **0.952** | 0.5% |
+| ctx 1024 / 128 out | `apxinf-sync` | 37.15 | 0.981 | 0.4% |
+| ctx 1024 / 128 out | `llamacpp-f16` | 37.87 | (baseline) | 0.3% |
+| ctx 4096 / 128 out | `apxinf-pipe` | **36.40** | **0.955** | 0.5% |
+| ctx 4096 / 128 out | `apxinf-sync` | 37.53 | 0.984 | 0.4% |
+| ctx 4096 / 128 out | `llamacpp-f16` | 38.12 | (baseline) | 0.3% |
+
+Per-segment paired medians (ms/token; the WIN rule's "every segment" test):
+
+| cell | seg 0 pipe / llama | seg 1 pipe / llama | seg 2 pipe / llama |
+|---|---|---|---|
+| ctx 1024 | 36.34 / 38.23 | 36.38 / 38.16 | 36.34 / 38.17 |
+| ctx 4096 | 36.68 / 38.40 | 36.66 / 38.45 | 36.77 / 38.42 |
+
+Pipe < llama in **all 6 segment pairings of both cells** → the WIN
+per-segment condition holds. Token streams: the paired parity probe (4 fixed
+prompts × 128 tokens through both schedules, byte-exact SSE text compare) is
+PASS, and the per-cell A/A gates are 0.3–0.5% (≤ 5%), so the window is not
+INVALID.
+
+**Verdict: WIN** — `apxinf-pipe` beats `llamacpp-f16` on both cells
+(R = 0.952 / 0.955 ≤ 0.98) with every segment paired in its favour.
+
+Notation quantities: **G** = sync − llama = −0.72 / −0.59 ms/token (negative:
+this window's llama.cpp arm ran slower than #121's, so the "0.8 ms gap" from
+#121 did not reproduce as a gap — see caveats); **P** = sync − pipe =
++1.08 / +1.13 ms/token — the pipelined path recovers ~1.1 ms/token of
+host-side work.
+
+### M4 bandwidth ceiling (same window)
+
+Streaming probe over 3,457,635,448 B BF16 (`copy` = elementwise add of a zero
+scalar, read+write; `reduce` = mean over the whole buffer, read-stream):
+
+| probe | median ms | GB/s | 3.4576 GB lower bound ms/token |
+|---|---|---|---|
+| copy | 68.50 | 50.5 (declared bytes; ~101 GB/s r+w fabric) | 68.50 |
+| reduce | 34.36 | **100.6** | **34.36** |
+
+Both engines run at 92–97% of the ~100.6 GB/s read-stream ceiling. The M1
+Pro's 162/172 GB/s figures are not quoted for the M4.
+
+### Sync-arm decomposition
+
+_See the 2026-11-19 amendment below; the four-stage table and the ≤10%
+reconciliation are in `doc/receipts/lfm3-pipelined-decode/decomposition.json`._
+
+### Tests
+
+_See the amendment; T1/T2/T3 outputs are in
+`doc/receipts/lfm3-pipelined-decode/tests.log`, and the T3 fault-injection
+failure output is pasted in the PR body as required._
+
+### Mixed factors (quote with the tables)
+
+1. **Matched precision, not identical bytes**, same as #121: GGUF F16
+   (3,466,626,336 B) vs MLX BF16 (3,457,635,448 B), 0.26% container delta.
+2. **Prompt protocol**: `apxinf-*` arms carry the +9-token lane ChatML prefix;
+   `llamacpp-f16` is bare completion.
+3. **Timing basis is engine-reported** on all three arms (`--engine-timings`);
+   apxinf-serve buffers its SSE (issue #120), so a client decode window would
+   be degenerate. Spans declared per engine.
+4. **One host, one window**, batch-1 serial, greedy, three ABBA segments per
+   arm, both Metal locks held, per-segment corpus seeds.
+5. **Window drift vs #121**: this window's `llamacpp-f16` ran 37.87/38.12
+   ms/token vs 36.42/36.67 in `f16-20261118T211938Z` (+1.4 ms), while
+   `apxinf-sync` reproduced #121 within 0.1 ms (37.15/37.53 vs 37.20/37.50).
+   Cross-window absolute numbers are not comparable; the verdict rests only on
+   within-window pairing, which is why the pre-registered rule is defined on
+   paired medians.
+
+### Amendments
+
+_Amendment 2026-11-19 (to be filled): the first window session's test phase
+hit a PATH issue and the decomposition phase an evidence-path mismatch; both
+were fixed and re-run in a second locked session without changing any
+decision rule, threshold, or gate._

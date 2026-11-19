@@ -1,0 +1,19 @@
+ApxInf diagnostics file at /Users/haiyan-mini/lfm3bench/lfm3-pipelined-decode/apxinf-metal/devlocal/engine-comparison-lfm3/logs/apxinf-parity-sync-diag.jsonl
+ApxInf listener bound at http://127.0.0.1:8099
+{"event":"worker_stderr","worker_epoch":"8ae9e82a-77ee-4c8e-9f25-2ace9f10259d","text":"decode_schedule="}
+{"event":"worker_stderr","worker_epoch":"8ae9e82a-77ee-4c8e-9f25-2ace9f10259d","text":"sync overlaps_callbacks=false decode_stages=false\n"}
+{"event":"worker_stderr","worker_epoch":"8ae9e82a-77ee-4c8e-9f25-2ace9f10259d","text":"Metal 0: "}
+{"event":"worker_stderr","worker_epoch":"8ae9e82a-77ee-4c8e-9f25-2ace9f10259d","text":"Apple M4 (applegpu_g16g)\n"}
+{"event":"worker_stderr","worker_epoch":"8ae9e82a-77ee-4c8e-9f25-2ace9f10259d","text":"{\"event\":\"native_request_settled\",\"request_id\":\"b8e24cd7-a64d-49b9-b738-e7e7ba80ebc9\",\"preparation_ns\":2669500,"}
+{"event":"worker_stderr","worker_epoch":"8ae9e82a-77ee-4c8e-9f25-2ace9f10259d","text":"\"detokenization_ns\":267751,\"cleanup_ns\":1448583,\"memory\":{\"active_bytes\":3458508288,\"cache_bytes\":0,"}
+{"event":"worker_stderr","worker_epoch":"8ae9e82a-77ee-4c8e-9f25-2ace9f10259d","text":"\"peak_bytes\":3628561040}}\n"}
+{"event":"request_settled","request_id":"b8e24cd7-a64d-49b9-b738-e7e7ba80ebc9","status":"completed","worker_status":"completed","consumer_stop":null,"input_tokens":799,"output_tokens":128,"elapsed_ms":8019,"worker_metrics":{"elapsed_ns":5704649583,"ttft_ns":939484042,"peak_memory_bytes":3628561040}}
+{"event":"worker_stderr","worker_epoch":"8ae9e82a-77ee-4c8e-9f25-2ace9f10259d","text":"{\"event\":\"native_request_settled\",\""}
+{"event":"worker_stderr","worker_epoch":"8ae9e82a-77ee-4c8e-9f25-2ace9f10259d","text":"request_id\":\"c4f5c045-1c7a-48bf-a0c1-931b4d73f945\",\"preparation_ns\":2423625,\"detokenization_ns\":263667,\"cleanup_ns\":1457750,\"memory\":{\"active_bytes\":"}
+{"event":"worker_stderr","worker_epoch":"8ae9e82a-77ee-4c8e-9f25-2ace9f10259d","text":"3458508288,\"cache_bytes\":0,\"peak_bytes\":3628561040}}\n"}
+{"event":"request_settled","request_id":"c4f5c045-1c7a-48bf-a0c1-931b4d73f945","status":"completed","worker_status":"completed","consumer_stop":null,"input_tokens":769,"output_tokens":128,"elapsed_ms":7745,"worker_metrics":{"elapsed_ns":5532618417,"ttft_ns":780323709,"peak_memory_bytes":3628561040}}
+{"event":"worker_stderr","worker_epoch":"8ae9e82a-77ee-4c8e-9f25-2ace9f10259d","text":"{\"event\":\"native_request_settled\",\"request_id\":\"f2f8370b-2ac7-41f3-abd1-a2de2474335d\",\"preparation_ns\":4790291,\"detokenization_ns\":250129,\"cleanup_ns\":3531958,\"memory\":{\"active_bytes\":3458508288,\"cache_bytes\":0,\"peak_bytes\":4110543200}}\n"}
+{"event":"request_settled","request_id":"f2f8370b-2ac7-41f3-abd1-a2de2474335d","status":"completed","worker_status":"completed","consumer_stop":null,"input_tokens":3142,"output_tokens":128,"elapsed_ms":16821,"worker_metrics":{"elapsed_ns":7708149333,"ttft_ns":2899294458,"peak_memory_bytes":4110543200}}
+{"event":"worker_stderr","worker_epoch":"8ae9e82a-77ee-4c8e-9f25-2ace9f10259d","text":"{\"event\":\"native_request_settled\",\"request_id\":\"22968fc9-fbd0-4979-9c9c-170c4a8b9ab8\",\"preparation_ns\":4985291,\"detokenization_ns\":261796,\""}
+{"event":"worker_stderr","worker_epoch":"8ae9e82a-77ee-4c8e-9f25-2ace9f10259d","text":"cleanup_ns\":3458542,\"memory\":{\"active_bytes\":3458508288,\"cache_bytes\":0,\"peak_bytes\":4110543200}}\n"}
+{"event":"request_settled","request_id":"22968fc9-fbd0-4979-9c9c-170c4a8b9ab8","status":"completed","worker_status":"completed","consumer_stop":null,"input_tokens":3141,"output_tokens":128,"elapsed_ms":16817,"worker_metrics":{"elapsed_ns":7723668500,"ttft_ns":2909331250,"peak_memory_bytes":4110543200}}

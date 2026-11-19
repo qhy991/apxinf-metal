@@ -1,0 +1,97 @@
+{
+  "raw_dir": "/Users/haiyan-mini/lfm3bench/lfm3-pipelined-decode/apxinf-metal/devlocal/engine-comparison-lfm3/raw",
+  "stages": {
+    "s2": {
+      "rows": [
+        {
+          "group": "1024 tok prompt / 128 tok out",
+          "arm": "apxinf-pipe",
+          "primary": 36.07438265234374,
+          "primary_metric": "decode_ms_per_token",
+          "rate": 27.720509719543102,
+          "engine_primary": 36.07438265234374,
+          "n": 6,
+          "segments": 3,
+          "vs_baseline": 1.050480785600296
+        },
+        {
+          "group": "1024 tok prompt / 128 tok out",
+          "arm": "apxinf-sync",
+          "primary": 37.147889484375,
+          "primary_metric": "decode_ms_per_token",
+          "rate": 26.919434257019194,
+          "engine_primary": 37.147889484375,
+          "n": 6,
+          "segments": 3,
+          "vs_baseline": 1.0192845427243211
+        },
+        {
+          "group": "1024 tok prompt / 128 tok out",
+          "arm": "llamacpp-f16",
+          "primary": 37.873953125,
+          "primary_metric": "decode_ms_per_token",
+          "rate": 26.403466644456437,
+          "engine_primary": 37.873953125,
+          "n": 6,
+          "segments": 3,
+          "vs_baseline": null
+        },
+        {
+          "group": "4096 tok prompt / 128 tok out",
+          "arm": "apxinf-pipe",
+          "primary": 36.39937695703125,
+          "primary_metric": "decode_ms_per_token",
+          "rate": 27.473004501964375,
+          "engine_primary": 36.39937695703125,
+          "n": 6,
+          "segments": 3,
+          "vs_baseline": 1.0462199511987278
+        },
+        {
+          "group": "4096 tok prompt / 128 tok out",
+          "arm": "apxinf-sync",
+          "primary": 37.52614957421875,
+          "primary_metric": "decode_ms_per_token",
+          "rate": 26.64812146714792,
+          "engine_primary": 37.52614957421875,
+          "n": 6,
+          "segments": 3,
+          "vs_baseline": 1.018918062216147
+        },
+        {
+          "group": "4096 tok prompt / 128 tok out",
+          "arm": "llamacpp-f16",
+          "primary": 38.11966015625,
+          "primary_metric": "decode_ms_per_token",
+          "rate": 26.233188160369536,
+          "engine_primary": 38.11966015625,
+          "n": 6,
+          "segments": 3,
+          "vs_baseline": null
+        }
+      ]
+    }
+  },
+  "aa": {
+    "apxinf-pipe/s2": {
+      "status": "PASS",
+      "worst_spread": 0.004809097731175951,
+      "segments": 3,
+      "metric": "decode_ms_per_token"
+    },
+    "apxinf-sync/s2": {
+      "status": "PASS",
+      "worst_spread": 0.0037186137603065035,
+      "segments": 3,
+      "metric": "decode_ms_per_token"
+    },
+    "llamacpp-f16/s2": {
+      "status": "PASS",
+      "worst_spread": 0.003117522297706989,
+      "segments": 3,
+      "metric": "decode_ms_per_token"
+    }
+  },
+  "blockers": [],
+  "warnings": []
+}

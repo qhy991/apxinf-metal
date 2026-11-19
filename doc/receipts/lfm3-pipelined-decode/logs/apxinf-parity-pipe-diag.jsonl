@@ -1,0 +1,24 @@
+ApxInf diagnostics file at /Users/haiyan-mini/lfm3bench/lfm3-pipelined-decode/apxinf-metal/devlocal/engine-comparison-lfm3/logs/apxinf-parity-pipe-diag.jsonl
+ApxInf listener bound at http://127.0.0.1:8099
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":"decode_schedule=pipelined overlaps_callbacks=true decode_stages=false\n"}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":"Metal 0: Apple M4 (applegpu_g16g)\n"}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":"{\"event\":\"native_request_settled\",\"request_id\""}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":":\"c0d7fa8c-04a3-4459-8f54-9646068b7d6d\",\"preparation_ns\":2651791,\"detokenization_ns\":379542,\"cleanup_ns\":1472042,\"memory\":{\"active_bytes\":3458508288,\"cache_bytes\""}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":":0,\"peak_bytes\":3628561040}}\n"}
+{"event":"request_settled","request_id":"c0d7fa8c-04a3-4459-8f54-9646068b7d6d","status":"completed","worker_status":"completed","consumer_stop":null,"input_tokens":799,"output_tokens":128,"elapsed_ms":7781,"worker_metrics":{"elapsed_ns":5471437375,"ttft_ns":853991208,"peak_memory_bytes":3628561040}}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":"{\"event\":\"native_request_settled\",\"request_id\":\"82309356-8d67-4001-ae53-e5130b377cee\",\"preparation_ns\":2920167,\""}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":"detokenization_ns\":356584,\"cleanup_ns\":1460708,\"memory\":{\"active_bytes\":3458508288,\"cache_bytes"}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":"\":0,\"peak_bytes\":3628561040}}"}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":"\n"}
+{"event":"request_settled","request_id":"82309356-8d67-4001-ae53-e5130b377cee","status":"completed","worker_status":"completed","consumer_stop":null,"input_tokens":769,"output_tokens":128,"elapsed_ms":7631,"worker_metrics":{"elapsed_ns":5407592833,"ttft_ns":794315125,"peak_memory_bytes":3628561040}}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":"{\"event\":\"native_request_settled\",\"request_id\":\"cf7b5fca-7b87-439c-ae5d-fd8a16548c65\",\"preparation_ns\":5626084,"}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":"\"detokenization_ns\":570913,\"cleanup_ns\":4914416,\""}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":"memory\":{\"active_bytes\""}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":":3458508288,\"cache_bytes\""}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":":0,\"peak_bytes"}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":"\":4110543200}}\n"}
+{"event":"request_settled","request_id":"cf7b5fca-7b87-439c-ae5d-fd8a16548c65","status":"completed","worker_status":"completed","consumer_stop":null,"input_tokens":3142,"output_tokens":128,"elapsed_ms":17258,"worker_metrics":{"elapsed_ns":7611179000,"ttft_ns":2937073125,"peak_memory_bytes":4110543200}}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":"{\"event\":\"native_request_settled\",\"request_id\":\"950b2eec-bad6-4490-bc17-2d7c64d31f6a\",\"preparation_ns\":5903416,\"detokenization_ns\":358037"}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":",\"cleanup_ns\":4264959,\"memory\":{\"active_bytes\":3458508288,\"cache_bytes\":"}
+{"event":"worker_stderr","worker_epoch":"6fb11608-a14f-4d5b-81d8-1cf2ce12bbbf","text":"0,\"peak_bytes\":4110543200}}\n"}
+{"event":"request_settled","request_id":"950b2eec-bad6-4490-bc17-2d7c64d31f6a","status":"completed","worker_status":"completed","consumer_stop":null,"input_tokens":3141,"output_tokens":128,"elapsed_ms":17273,"worker_metrics":{"elapsed_ns":7560280208,"ttft_ns":2926540125,"peak_memory_bytes":4110543200}}

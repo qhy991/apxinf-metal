@@ -1560,6 +1560,7 @@ mod tests {
         let (_, conv_faulted) = state_bytes(&faulted, faulted.position())?;
 
         let mut reference = load_checkpoint_model()?;
+        reference.disable_conv_restore = false;
         drive_pipelined_prefix(&mut reference, &prompt, take)?;
         let (_, conv_reference) = state_bytes(&reference, reference.position())?;
 

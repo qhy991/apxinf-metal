@@ -1,0 +1,328 @@
+{
+  "schema": "apxinf-engine-bench-arm-v1",
+  "arm": "llamacpp-f16",
+  "stage": "s2",
+  "protocol": "openai-completions",
+  "prompt_protocol": "bare",
+  "endpoint": "http://127.0.0.1:8081",
+  "model": "LFM3-1.7B-F16",
+  "started_at": "2026-11-19T02:53:27+00:00",
+  "finished_at": "2026-11-19T02:53:54+00:00",
+  "artifact": {
+    "binary_sha256": "d635b19fb11a19d3262ee8544252f20cb92620b58c426b820453bb4f4535e55e",
+    "model_sha256": "b7ab8b69a85e4dfbf62cdfd0e02d7d051ed09f2c5b84c701771dddb073b85970",
+    "quantization": "gguf-f16",
+    "protocol": "openai-completions",
+    "prompt_protocol": "bare",
+    "commit": "c7f41fbd0de819ed0d2f7cc1feb41bc9daa9fd77",
+    "branch": "agent/lfm-pipelined-decode-999ba7b193af",
+    "apxinf_env": {}
+  },
+  "host": {
+    "before": {
+      "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+      "machine": "arm64",
+      "python": "3.14.3",
+      "loadavg": [
+        3.92919921875,
+        3.56787109375,
+        3.294921875
+      ],
+      "started_at": "2026-11-19T02:53:26+00:00",
+      "top_cpu": [
+        {
+          "pid": "19856",
+          "pcpu": 15.3,
+          "etime": "00:03",
+          "comm": "/Users/haiyan-mini/lfm3bench/engines/llama.cpp/build/bin/llama-server"
+        },
+        {
+          "pid": "1338",
+          "pcpu": 7.3,
+          "etime": "01-11:26:11",
+          "comm": "/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_agent.app/Contents/MacOS/logioptionsplus_agent"
+        },
+        {
+          "pid": "770",
+          "pcpu": 6.0,
+          "etime": "01-11:26:20",
+          "comm": "/usr/libexec/trustd"
+        },
+        {
+          "pid": "19865",
+          "pcpu": 5.9,
+          "etime": "00:01",
+          "comm": "/opt/homebrew/bin/gh"
+        },
+        {
+          "pid": "512",
+          "pcpu": 5.1,
+          "etime": "01-11:26:26",
+          "comm": "/usr/libexec/syspolicyd"
+        }
+      ],
+      "swapouts": "Swapouts:                                   53905789.",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "disk_free": "/dev/disk3s1s1   460Gi    13Gi    15Gi    47%    484k  154M    0%   /"
+    },
+    "after": {
+      "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+      "machine": "arm64",
+      "python": "3.14.3",
+      "loadavg": [
+        2.83447265625,
+        3.3369140625,
+        3.2197265625
+      ],
+      "started_at": "2026-11-19T02:53:54+00:00",
+      "top_cpu": [
+        {
+          "pid": "19856",
+          "pcpu": 93.1,
+          "etime": "00:30",
+          "comm": "/Users/haiyan-mini/lfm3bench/engines/llama.cpp/build/bin/llama-server"
+        },
+        {
+          "pid": "1338",
+          "pcpu": 68.4,
+          "etime": "01-11:26:38",
+          "comm": "/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_agent.app/Contents/MacOS/logioptionsplus_agent"
+        },
+        {
+          "pid": "770",
+          "pcpu": 30.8,
+          "etime": "01-11:26:47",
+          "comm": "/usr/libexec/trustd"
+        },
+        {
+          "pid": "1460",
+          "pcpu": 24.9,
+          "etime": "01-11:26:35",
+          "comm": "/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_logivoice.app/Contents/MacOS/logioptionsplus_logivoice"
+        },
+        {
+          "pid": "20014",
+          "pcpu": 4.6,
+          "etime": "00:01",
+          "comm": "/opt/homebrew/bin/gh"
+        }
+      ],
+      "swapouts": "Swapouts:                                   53905789.",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "disk_free": "/dev/disk3s1s1   460Gi    13Gi    15Gi    47%    484k  154M    0%   /"
+    }
+  },
+  "corpus": {
+    "source": "generated",
+    "seed": 20261119,
+    "chars_per_token": 3.85,
+    "sha256": "0ce954ecccbacdba498a887dbddbc94e662dd73be224f8c9e414183fca5a0990",
+    "case_count": 4
+  },
+  "params": {
+    "temperature": 0.0,
+    "seed": 20261118,
+    "stream": true,
+    "segment": 0,
+    "warmup_requests": 1,
+    "timeout_s": 900.0
+  },
+  "cases": [
+    {
+      "id": "s2-c1024-g128-r0",
+      "target_tokens": 1024,
+      "max_tokens": 128,
+      "context": 1024,
+      "round": 0
+    },
+    {
+      "id": "s2-c4096-g128-r0",
+      "target_tokens": 4096,
+      "max_tokens": 128,
+      "context": 4096,
+      "round": 0
+    },
+    {
+      "id": "s2-c1024-g128-r1",
+      "target_tokens": 1024,
+      "max_tokens": 128,
+      "context": 1024,
+      "round": 1
+    },
+    {
+      "id": "s2-c4096-g128-r1",
+      "target_tokens": 4096,
+      "max_tokens": 128,
+      "context": 4096,
+      "round": 1
+    }
+  ],
+  "timing_primary": "engine",
+  "request_log": {
+    "path": null,
+    "enabled": false,
+    "matched": 0,
+    "by_request_id": 0,
+    "by_order": 0
+  },
+  "requests": [
+    {
+      "case": "__warmup__",
+      "target_tokens": 128,
+      "max_tokens": 8,
+      "status": "ok",
+      "http_status": 200,
+      "client_ttft_ms": 131.70666601217818,
+      "client_decode_ms": 263.69079199503176,
+      "client_wall_ms": 395.39745800720993,
+      "client_headers_ms": 2.355333010200411,
+      "client_close_ms": 1.1723329953383654,
+      "prompt_tokens": 92,
+      "completion_tokens": 8,
+      "engine_prefill_ms": 129.241,
+      "engine_decode_ms": 263.675,
+      "engine_decode_tokens": 8,
+      "engine_prompt_tokens": 92,
+      "engine_source": "llama.cpp.timings",
+      "response_id": "chatcmpl-vF2YkS9iVqvjLGTIMlxNLbBk2uI2486u",
+      "ttft_ms": 131.70666601217818,
+      "ttft_basis": "client",
+      "decode_ms": 263.69079199503176,
+      "decode_tokens": 7,
+      "decode_basis": "client",
+      "decode_ms_per_token": 37.67011314214739,
+      "prefill_tok_s": 698.5219714808761,
+      "decode_tok_s": 26.546243602362452,
+      "evidence": "{\"response_id\": \"chatcmpl-vF2YkS9iVqvjLGTIMlxNLbBk2uI2486u\", \"completion_tokens\": 8, \"engine_source\": \"llama.cpp.timings\", \"finish_reason\": null}",
+      "warmup": true
+    },
+    {
+      "case": "s2-c1024-g128-r0",
+      "target_tokens": 1024,
+      "max_tokens": 128,
+      "status": "ok",
+      "http_status": 200,
+      "client_wall_ms": 5634.777915998711,
+      "client_headers_ms": 2.6835829921765253,
+      "client_close_ms": 0.1334169937763363,
+      "prompt_tokens": 789,
+      "completion_tokens": 128,
+      "engine_prefill_ms": 757.905,
+      "engine_decode_ms": 4874.336,
+      "engine_decode_tokens": 128,
+      "engine_prompt_tokens": 789,
+      "engine_source": "llama.cpp.timings",
+      "response_id": "chatcmpl-29ZPQHt8qT5pclPOfCDMwI10Q4Rvb6uy",
+      "ttft_ms": 757.905,
+      "ttft_basis": "engine",
+      "decode_ms": 4874.336,
+      "decode_tokens": 127,
+      "decode_basis": "engine",
+      "decode_ms_per_token": 38.38059842519685,
+      "prefill_tok_s": 1041.0275694183308,
+      "decode_tok_s": 26.05483085285873,
+      "evidence": "{\"response_id\": \"chatcmpl-29ZPQHt8qT5pclPOfCDMwI10Q4Rvb6uy\", \"completion_tokens\": 128, \"engine_source\": \"llama.cpp.timings\", \"finish_reason\": null}",
+      "client_ttft_ms_observed": 760.400999992271,
+      "client_decode_ms_observed": 4874.37691600644
+    },
+    {
+      "case": "s2-c4096-g128-r0",
+      "target_tokens": 4096,
+      "max_tokens": 128,
+      "status": "ok",
+      "http_status": 200,
+      "client_wall_ms": 7818.639208009699,
+      "client_headers_ms": 7.847541011869907,
+      "client_close_ms": 0.08245799108408391,
+      "prompt_tokens": 3141,
+      "completion_tokens": 128,
+      "engine_prefill_ms": 2934.016,
+      "engine_decode_ms": 4877.003,
+      "engine_decode_tokens": 128,
+      "engine_prompt_tokens": 3141,
+      "engine_source": "llama.cpp.timings",
+      "response_id": "chatcmpl-RSmWatvQkp1hZCLYEHxFQFgJw78c8Q3V",
+      "ttft_ms": 2934.016,
+      "ttft_basis": "engine",
+      "decode_ms": 4877.003,
+      "decode_tokens": 127,
+      "decode_basis": "engine",
+      "decode_ms_per_token": 38.401598425196845,
+      "prefill_tok_s": 1070.546309222581,
+      "decode_tok_s": 26.040582710324358,
+      "evidence": "{\"response_id\": \"chatcmpl-RSmWatvQkp1hZCLYEHxFQFgJw78c8Q3V\", \"completion_tokens\": 128, \"engine_source\": \"llama.cpp.timings\", \"finish_reason\": null}",
+      "client_ttft_ms_observed": 2941.5887909999583,
+      "client_decode_ms_observed": 4877.050417009741
+    },
+    {
+      "case": "s2-c1024-g128-r1",
+      "target_tokens": 1024,
+      "max_tokens": 128,
+      "status": "ok",
+      "http_status": 200,
+      "client_wall_ms": 5603.094416990643,
+      "client_headers_ms": 10.532291998970322,
+      "client_close_ms": 0.14083299902267754,
+      "prompt_tokens": 796,
+      "completion_tokens": 128,
+      "engine_prefill_ms": 757.248,
+      "engine_decode_ms": 4835.356,
+      "engine_decode_tokens": 128,
+      "engine_prompt_tokens": 796,
+      "engine_source": "llama.cpp.timings",
+      "response_id": "chatcmpl-hFrO75kccKtDYEOADuUFPNVjFVVc1qNi",
+      "ttft_ms": 757.248,
+      "ttft_basis": "engine",
+      "decode_ms": 4835.356,
+      "decode_tokens": 127,
+      "decode_basis": "engine",
+      "decode_ms_per_token": 38.07366929133858,
+      "prefill_tok_s": 1051.1747802569303,
+      "decode_tok_s": 26.264870673431286,
+      "evidence": "{\"response_id\": \"chatcmpl-hFrO75kccKtDYEOADuUFPNVjFVVc1qNi\", \"completion_tokens\": 128, \"engine_source\": \"llama.cpp.timings\", \"finish_reason\": null}",
+      "client_ttft_ms_observed": 767.4498749984195,
+      "client_decode_ms_observed": 4835.644541992224
+    },
+    {
+      "case": "s2-c4096-g128-r1",
+      "target_tokens": 4096,
+      "max_tokens": 128,
+      "status": "ok",
+      "http_status": 200,
+      "client_wall_ms": 7814.579541009152,
+      "client_headers_ms": 8.295541003462858,
+      "client_close_ms": 0.22595899645239115,
+      "prompt_tokens": 3125,
+      "completion_tokens": 128,
+      "engine_prefill_ms": 2894.174,
+      "engine_decode_ms": 4912.08,
+      "engine_decode_tokens": 128,
+      "engine_prompt_tokens": 3125,
+      "engine_source": "llama.cpp.timings",
+      "response_id": "chatcmpl-HbKQBFOe9YaFehvAroyz7q0TBjcOkgiY",
+      "ttft_ms": 2894.174,
+      "ttft_basis": "engine",
+      "decode_ms": 4912.08,
+      "decode_tokens": 127,
+      "decode_basis": "engine",
+      "decode_ms_per_token": 38.67779527559055,
+      "prefill_tok_s": 1079.7553982587087,
+      "decode_tok_s": 25.854627774791943,
+      "evidence": "{\"response_id\": \"chatcmpl-HbKQBFOe9YaFehvAroyz7q0TBjcOkgiY\", \"completion_tokens\": 128, \"engine_source\": \"llama.cpp.timings\", \"finish_reason\": null}",
+      "client_ttft_ms_observed": 2902.1877080085687,
+      "client_decode_ms_observed": 4912.391833000584
+    }
+  ],
+  "evidence": {
+    "engaged": true,
+    "generated_requests": 4,
+    "response": "{\"response_id\": \"chatcmpl-29ZPQHt8qT5pclPOfCDMwI10Q4Rvb6uy\", \"completion_tokens\": 128, \"engine_source\": \"llama.cpp.timings\", \"finish_reason\": null}",
+    "log": {
+      "path": "/Users/haiyan-mini/lfm3bench/lfm3-pipelined-decode/apxinf-metal/devlocal/engine-comparison-lfm3/logs/llama-server.log",
+      "pattern": "n_past|prompt eval time|eval time|\"timings\"",
+      "matched": true,
+      "line": "0.29.365.436 I slot print_timing: id  0 | task 404 |        eval time =    4912.08 ms /   128 tokens (   38.68 ms per token,    25.85 tokens per second)"
+    }
+  },
+  "failures": 0
+}

@@ -1,0 +1,19 @@
+[02:50:57] identity apxinf-serve=c8cec3ead88f63e120c1f034efb7af547fa1fd30a6fbb4f25b8e1aa1c672d60c model=135922caef64e81e52af88ede8b7c3ddaa9d6da220a9737fb3065275dbfb4330 llama=d635b19fb11a19d3262ee8544252f20cb92620b58c426b820453bb4f4535e55e gguf=b7ab8b69a85e4dfbf62cdfd0e02d7d051ed09f2c5b84c701771dddb073b85970
+[02:50:57] paused GUI agent pids: none
+[02:50:57] phase 0 done
+[02:50:57] tests exit=127 (see logs/tests.log)
+[02:50:57] fault-injection exit=127 (state equality must FAIL here)
+[02:51:00] bandwidth probe exit=0
+[02:51:16] apxinf gateway up tag=parity-sync pid=18984 env=--worker-env APXINF_MLX_SYNC_DECODE=1
+[02:52:20] apxinf gateway up tag=parity-pipe pid=19366 env=
+[02:53:24] apxinf gateway up tag=decomp pid=19741 env=--worker-env APXINF_MLX_SYNC_DECODE=1 --worker-env APXINF_LFM3_DECODE_STAGES=1
+[02:53:26] llama-server up pid=19856
+[02:54:10] apxinf gateway up tag=apxinf-sync-0 pid=20020 env=--worker-env APXINF_MLX_SYNC_DECODE=1
+[02:55:17] apxinf gateway up tag=apxinf-pipe-0 pid=20308 env=
+[02:56:23] apxinf gateway up tag=apxinf-pipe-1 pid=20642 env=
+[02:57:29] apxinf gateway up tag=apxinf-sync-1 pid=20935 env=--worker-env APXINF_MLX_SYNC_DECODE=1
+[02:59:31] apxinf gateway up tag=apxinf-sync-2 pid=21490 env=--worker-env APXINF_MLX_SYNC_DECODE=1
+[03:00:38] apxinf gateway up tag=apxinf-pipe-2 pid=21804 env=
+[03:01:28] ABBA done
+[03:01:28] resumed GUI agent pids: none
+[03:01:28] WINDOW COMPLETE
