@@ -2005,16 +2005,18 @@ mod tests {
         );
 
         // Same-shape replay: two equal-length prompts in a row must not return
-        // the first prompt's logits either.
+        // the first prompt's logits either — run peer_b in the already-warm
+        // model and compare against peer_b in a fresh model.
         let peer_a = pseudo_prompt(24, 501);
         let peer_b = pseudo_prompt(24, 502);
-        let replayed = run_greedy(&mut fresh, &peer_a, 64)?;
+        run_greedy(&mut fresh, &peer_a, 64)?;
+        let replayed_b = run_greedy(&mut fresh, &peer_b, 64)?;
         let mut fresh_b = load_checkpoint_model()?;
         fresh_b.set_prefill_fast(true);
         let expected_b = run_greedy(&mut fresh_b, &peer_b, 64)?;
         assert_eq!(
-            replayed, expected_b,
-            "P3: same-shape replay diverged from a fresh run — stale cache on cache-hit (doc §Tests P3)"
+            replayed_b, expected_b,
+            "P3: same-shape replay of a different prompt diverged from a fresh run — stale cache on cache-hit (doc §Tests P3)"
         );
 
         model.set_prefill_fast(false);
