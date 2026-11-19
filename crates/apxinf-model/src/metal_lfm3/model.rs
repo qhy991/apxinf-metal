@@ -1055,6 +1055,18 @@ impl Lfm3Model {
             self.conv = snapshot;
         }
     }
+
+    /// QUEUE #3 test toggle (P1/P3 harness): flip the fast arm on an already
+    /// loaded model so the token gate does not pay for a second 3.4 GB weight
+    /// load. Clearing the cache when switching off keeps the empty-arm
+    /// assertion (`prefill_cache.is_none()`) load-bearing.
+    #[cfg(test)]
+    fn set_prefill_fast(&mut self, on: bool) {
+        self.prefill_fast = on;
+        if !on {
+            self.prefill_cache = None;
+        }
+    }
 }
 
 impl DeviceDecode for Lfm3Model {
@@ -1364,6 +1376,7 @@ mod tests {
     const SYNC_ENV: &str = "APXINF_MLX_SYNC_DECODE";
     const NO_RESTORE_ENV: &str = "APXINF_LFM3_TEST_NO_CONV_RESTORE";
     const KKERNEL_ENV: &str = "APXINF_LFM3_KKERNEL";
+    const PREFILL_FAST_ENV: &str = "APXINF_LFM3_PREFILL_FAST";
 
     fn test_checkpoint() -> Result<std::path::PathBuf> {
         std::env::var_os("APXINF_LFM3_TEST_MODEL")
@@ -1410,6 +1423,14 @@ mod tests {
             std::env::set_var(KKERNEL_ENV, "1");
         } else {
             std::env::remove_var(KKERNEL_ENV);
+        }
+    }
+
+    fn set_prefill_fast(on: bool) {
+        if on {
+            std::env::set_var(PREFILL_FAST_ENV, "1");
+        } else {
+            std::env::remove_var(PREFILL_FAST_ENV);
         }
     }
 
@@ -1892,6 +1913,112 @@ mod tests {
             "fault injection: {diff}/{} conv layers diverged after the skipped restore",
             conv_reference.len()
         );
+        Ok(())
+    }
+
+    /// P1 — the QUEUE #3 hard gate (doc §Gate.1): with the fast arm on, greedy
+    /// decode emits the identical token ids on every prompt at the full
+    /// 128-token depth. One differing token ⇒ INVALID. The fast toggle flips
+    /// the already-loaded model so both arms share one weight set; the env is
+    /// still reset at entry and exit so `prefill_fast_enabled()` (and thus the
+    /// banner source) cannot be poisoned by a prior panicked test.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn p1_fast_prefill_greedy_matches_baseline_token_for_token() -> Result<()> {
+        let prompts: Vec<Vec<u32>> = (0..4).map(|i| pseudo_prompt(24, 201 + i)).collect();
+
+        set_prefill_fast(false);
+        let mut model = load_checkpoint_model()?;
+        model.set_prefill_fast(false);
+        assert!(!model.prefill_fast, "P1: baseline arm must be off");
+        assert!(model.prefill_cache.is_none(), "P1: baseline arm must hold no cached graph");
+        let mut expected = Vec::with_capacity(prompts.len());
+        for prompt in &prompts {
+            expected.push(run_greedy(&mut model, prompt, 128)?);
+        }
+
+        model.set_prefill_fast(true);
+        assert!(model.prefill_fast, "P1: fast arm toggle did not take");
+        for (index, prompt) in prompts.iter().enumerate() {
+            let got = run_greedy(&mut model, prompt, 128)?;
+            assert_eq!(
+                got, expected[index],
+                "prompt {index}: fast prefill diverged from baseline — INVALID (doc §Gate.1)"
+            );
+        }
+
+        model.set_prefill_fast(false);
+        set_prefill_fast(false);
+        Ok(())
+    }
+
+    /// P2 — the empty-arm gate (doc §Gate.4): with the env unset, the model
+    /// captured the fast arm off, holds no cached graph after a full request,
+    /// and `prefill_fast_enabled()` (the same source the worker banner reads)
+    /// reports false. If the fast path dispatched while the switch was off,
+    /// `prefill_cache` would be `Some` here.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn p2_fast_arm_stays_off_when_switch_unset() -> Result<()> {
+        set_prefill_fast(false);
+        assert!(!prefill_fast_enabled(), "P2: helper must report false when the env is unset");
+        let mut model = load_checkpoint_model()?;
+        assert!(!model.prefill_fast, "P2: model captured the fast arm while the env was unset");
+        let prompt = pseudo_prompt(24, 301);
+        let ids = run_greedy(&mut model, &prompt, 32)?;
+        assert_eq!(ids.len(), 32, "P2: budget must be honoured");
+        assert!(model.prefill_cache.is_none(), "P2: empty-arm — a cached prefill graph was built with the switch off");
+        Ok(())
+    }
+
+    /// P3 — cache correctness (doc §Tests P3): the armed model runs two
+    /// different prompts back to back. The second prompt (a different length,
+    /// so the static key differs) must match a fresh single-prompt run token
+    /// for token. This is the stale-cache canary for the review-time finding
+    /// that a cache hit replays the previous prompt's logits array without
+    /// re-binding the new ids.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn p3_cached_second_prompt_matches_fresh_run() -> Result<()> {
+        let first = pseudo_prompt(24, 401);
+        let second = pseudo_prompt(128, 402);
+
+        // Armed model: two different prompts in one process. The second has a
+        // different static key, so it must rebuild (or be provably equivalent).
+        set_prefill_fast(true);
+        let mut model = load_checkpoint_model()?;
+        model.set_prefill_fast(true);
+        let armed_first = run_greedy(&mut model, &first, 64)?;
+        let armed_second = run_greedy(&mut model, &second, 64)?;
+
+        // Fresh armed model, only the second prompt — the single-run reference.
+        let mut fresh = load_checkpoint_model()?;
+        fresh.set_prefill_fast(true);
+        let fresh_second = run_greedy(&mut fresh, &second, 64)?;
+        assert_eq!(
+            armed_first.len(), 64,
+            "P3: first prompt budget must be honoured before the second starts"
+        );
+        assert_eq!(
+            armed_second, fresh_second,
+            "P3: second prompt in-process diverged from a fresh run — stale cache (doc §Tests P3)"
+        );
+
+        // Same-shape replay: two equal-length prompts in a row must not return
+        // the first prompt's logits either.
+        let peer_a = pseudo_prompt(24, 501);
+        let peer_b = pseudo_prompt(24, 502);
+        let replayed = run_greedy(&mut fresh, &peer_a, 64)?;
+        let mut fresh_b = load_checkpoint_model()?;
+        fresh_b.set_prefill_fast(true);
+        let expected_b = run_greedy(&mut fresh_b, &peer_b, 64)?;
+        assert_eq!(
+            replayed, expected_b,
+            "P3: same-shape replay diverged from a fresh run — stale cache on cache-hit (doc §Tests P3)"
+        );
+
+        model.set_prefill_fast(false);
+        set_prefill_fast(false);
         Ok(())
     }
 }
