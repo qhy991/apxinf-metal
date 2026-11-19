@@ -380,3 +380,123 @@ residual was measured on) — not a WIN/PARITY read from a no-op B arm. The
 
 *(window pending — appended after the locked M4 run; only dated amendments to
 the pre-registration above may appear before the verdict.)*
+### 2026-11-19 21:20 Window S verdict (M4, `run-window-s.sh` v2, harness outside the branch)
+
+**Verdict: INVALID** — two independent hard-gate fires, both decisive on
+their own. Recorded with all raw numbers; §7's revert rule applies.
+
+**Run identity.** Locks `LOCKS_ACQUIRED 2026-11-19T20:55:05` (fcntl order,
+waited not stolen); census 20:55:11–20:57:21; ABBA 20:57:21–21:03:49;
+`apxinf-serve` sha256 `c8cec3ead88f63e120c1f034efb7af547fa1fd30a6fbb4f25b8e1aa1c672d60c`;
+model `135922caef64e81e52af88ede8b7c3ddaa9d6da220a9737fb3065275dbfb4330`;
+S2 ctx 1024/4096 × 128 tok, `--engine-timings`, order `A B B A A B`
+(segments 0/3/4 = A, 1/2/5 = B). All 8 bench invocations `exit=0`;
+stage decomposition both arms exit=0, reconciliation 100.0%, 515 steps.
+
+**Receipts (M4, `~/lfm3-dig-run/window-s/`).**
+`window-s.log` (`PAIRED`/`CELL` lines above), `raw/apxinf-sync-A-s2-*.json`
+(segments 0,3,4), `raw/apxinf-sync-async-B-s2-*.json` (1,2,5),
+`logs/decomp-census.json`, `logs/decomp-census-async.json`,
+`logs/apxinf-{census,census-async,s-A-0,s-B-1,s-B-2,s-A-3,s-A-4,s-B-5}-stdout.log`.
+
+#### Hard gate 1 — §1 effect proof: the armed banner is missing ⇒ empty arm
+
+Per §115's effect-proof contract, "a segment whose banner lacks
+`decode_async_eval=true` is void", and every armed segment must be
+banner-gated. **All 8 gateway banners are the 3-field line**
+
+```
+decode_schedule=sync overlaps_callbacks=false decode_stages=true
+```
+
+— the field added by this ticket (`decode_async_eval=<false|true>`) never
+appears, in the census gateway *or any armed segment*. Cause, verified on
+M4 by mtime:
+
+| object | mtime (PST) |
+| --- | --- |
+| `target/release/apxinf-serve`, `apxinf-native-worker` | Nov 19 16:04:27 |
+| `crates/apxinf-serving/src/native_worker.rs` (banner edit) | Nov 19 19:55:44 |
+| `crates/apxinf-model/src/metal_lfm3/model.rs` (switch/seam) | Nov 19 20:29:18 |
+
+The runner builds only `if [ ! -x "$SERVE" ] || [ ! -x "$WORKER" ]`; both
+binaries pre-existed (16:04, from the #127-era `cp -R`), so **no build ran
+before the window** and `apxinf-serve=c8cec3ea…` is a pre-ticket binary.
+The `APXINF_LFM3_DECODE_ASYNC_EVAL=1` worker env was passed to a process
+whose executable contains neither the banner field nor (from the same
+16:04 artifact) the `execute_inner` seam ⇒ **Arm B never dispatched the
+probe**; the measurement is A vs A. This is exactly the 空臂 trap §1's
+effect proof exists to catch, and it is the reason the banner was frozen
+into the protocol. Independent of Gate 2, this fires §5.2 and §6's INVALID.
+
+#### Hard gate 2 — §5.3 A/A = 6.95% > 5%
+
+Cell values are the median of three segment medians; A/A is the worst
+segmented-median spread per arm per cell (documented formula, harness
+verbatim):
+
+| cell | A segments (1024) | A cell | B segments | B cell | E = A−B | A/A_worst |
+| --- | --- | --- | --- | --- | --- | --- |
+| (1024,128) | 40.0336, 37.4735, 37.4300 | 37.4735 | 37.5440, 37.4929, 38.0331 | 37.5440 | **−0.0705** | **6.95%** (A) |
+| (4096,128) | 38.8158, 37.6788, 37.5890 | 37.6788 | 37.9455, 37.7445, 37.6815 | 37.6788 | **−0.0657** | 3.26% (B) |
+
+Spread arithmetic: A(1024) `(40.0336−37.4300)/37.4735 = 6.947%`;
+B(4096) `(37.9455−37.6815)/37.7445 = 0.699%` — the *B(4096)* A/A the
+harness reports; A(4096) `(38.8158−37.5890)/37.6788 = 3.255%`; B(1024)
+`(38.0331−37.4929)/37.5440 = 1.441%`. **A(1024) 6.95% exceeds the frozen
+5%** ⇒ §5.3 ⇒ window INVALID. Drivers: segment-0 outliers
+40.03/38.82 ms/token (first ABBA segment, machine warming), while A
+segments 3/4 sit at 37.43–37.68. RUNNER §4 forbids taking medians to
+massage this; no rerun was taken in this round.
+
+#### Census decomposition (non-timed segment 100, 5 reqs × 128 tok, 515 steps)
+
+| stage (ms/token) | A sync (unset) | armed (`=1`) | Δ |
+| --- | --- | --- | --- |
+| `build_ms` | 0.2576 | 0.2792 | +0.0216 |
+| `eval_wait_ms` | **36.9772** | **37.1152** | **+0.1380 (rose)** |
+| `sample_ms` | 0.3600 | 0.3655 | +0.0055 |
+| `callback_ms` | 0.0094 | 0.0110 | +0.0016 |
+| median decode | 37.6764 | 37.7993 | +0.1229 |
+
+Mechanism arithmetic: the hypothesis predicts `eval_wait_ms` **falls** by
+the moved host-wait content; it **rose +0.138 ms/token** and the request
+total rose +0.123. Also §8's `StreamCounters` deltas (`eval_calls`,
+`trace_callbacks`, bytes) are **absent from both receipts** — the census
+runner never emitted a counters line (grep returns 0) ⇒ §8's per-step
+`eval_calls=+1`/equal-bytes contract is **unverified**; reported as
+机制未知, not assumed. Reconciliation = 100.0% (stage sum vs engine
+`decode_ms_per_token`), so the stage numbers are internally complete.
+Kernel-launch count: 机制未知 (`xctrace` unavailable, §8).
+
+**Why INVALID rather than FALSIFIED.** The frozen decision rule in §6 says
+INVALID takes precedence: "INVALID — any of the three hard gates in §5
+fires", and §5.3 (A/A > 5%) and §5.2 (effect proof / host-GPU split) both
+fire here. A census that measured the mechanism would be eligible for
+FALSIFIED under §5.4; this window's census is additionally confounded by
+Gate 1 (the decomp `=1` run is an unarmed binary, so its `eval_wait` rose
+under a no-op arm — drift, not mechanism) and Gate 2 (spread 6.95% > the
+A/A floor §5.4 rests on). Therefore the correct read is **INVALID +
+机制未知**, with a recorded *negative mechanism signal*: even in the
+no-op data the direction is opposite to the prediction, and a clean
+banner-gated rerun (rebuild first, verify `decode_async_eval=true`) would
+be required to convert that signal into a FALSIFIED.
+
+**§7 default rule (this round's immediate action).** This ticket is a
+census/probe; INVALID ⇒ revert the `APXINF_LFM3_DECODE_ASYNC_EVAL` switch,
+its `decode_async_eval` banner field, and the `async_eval`/`synchronize`
+seam in a following commit, keeping this record only — no opt-in dead
+path stays in the tree. Window P (pipelined census, no verdict, expected
+empty arm) is still owed per the dated amendment; it is not needed to
+decide this ticket and runs only after the revert or as a same-session
+empty-arm confirmation.
+
+**Follow-up queue state.** QUEUE items #1/#2/#3 remain at their prior
+dispositions (#1 INCONCLUSIVE, #2/#3 INVALID); this INVALID reopens
+nothing by itself. A banner-gated Window S rerun (rebuild `cargo build
+--release -p apxinf-serving --features mlx,coreml`, assert the 6-field
+banner before the first request) is the minimal next measurement if the
+launch-gap hypothesis is still to be adjudicated; otherwise the next
+QUEUE candidate is pre-registered individually per §"Candidate
+enumeration" above.
+
