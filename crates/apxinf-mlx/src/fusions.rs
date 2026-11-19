@@ -20,8 +20,6 @@ pub use crate::q4_f16::{
 pub use crate::bf16_qk_table_rope::Bf16QkTableRope;
 pub use crate::qk_norm_rope::QkNormRope;
 pub use crate::swiglu_gemv::{SwigluMlpGemv, SwigluWeights};
-pub use crate::lm_head_gemv::LmHeadGemv;
-pub use crate::silu_mul_fused::SiluMulFused;
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};
 

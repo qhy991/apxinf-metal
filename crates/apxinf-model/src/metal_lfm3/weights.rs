@@ -475,13 +475,9 @@ impl Weights {
         self.embedding.take(ids)
     }
 
-    pub fn project(&self, x: &Array, kkernel: &crate::metal_lfm3::kkernel::KKernel) -> Result<Array> {
-        // The QUEUE #2 custom lm_head kernel takes the BF16 `[K,V]` table;
-        // with a quantized embedding there is no such table, so the Q4
-        // projection is used directly (kkernel is a separate, already-INVALID
-        // arm and is not expected to be armed together with 4-bit).
+    pub fn project(&self, x: &Array) -> Result<Array> {
         match &self.embedding {
-            Embedding::Bf16 { head, .. } => kkernel.project(x, head),
+            Embedding::Bf16 { head, .. } => x.matmul(head),
             Embedding::Q4(q4) => q4.apply(x),
         }
     }

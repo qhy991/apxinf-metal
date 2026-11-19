@@ -8,9 +8,7 @@
 pub mod config;
 mod model;
 mod weights;
-mod kkernel;
 mod q4;
-pub use kkernel::enabled as kkernel_enabled;
 pub use model::{native_4bit_enabled, prefill_fast_enabled, Lfm3Model};
 
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};

@@ -59,7 +59,3 @@ pub use rms_norm_add::RmsNormAdd;
 pub mod qmm_bm64;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod swiglu_gemv;
-#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
-mod lm_head_gemv;
-#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
-mod silu_mul_fused;
