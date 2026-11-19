@@ -17,7 +17,7 @@
 # (each request is independent; no timing median is formed from it).
 #
 # Runs under both Metal locks, fcntl, in order, waited never stolen
-# (RUNNER 3). Usage: run-g1prime.sh [run_dir] [segments_per_arm]
+# (RUNNER 3). Usage: scripts/run-g1prime.sh [run_dir] [segments_per_arm]
 #   (defaults: ~/lfm3-dig-run, 3; pass 2 to reproduce the n=6 ABBA shape)
 set -uo pipefail
 export PATH=$HOME/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin
@@ -40,7 +40,7 @@ fi
 SUITE=$RES/suite.json
 SUITE_K=$(( SEGS_PER_ARM == 2 ? 5 : 19 ))   # 6 tasks / 2 segs (v1); 20 tasks / >=3 segs (v2, Lead 02:18)
 echo "building suite (deterministic, offline, k=$SUITE_K) at $(date +%FT%T)" >> "$CLOG"
-python3 $RUN/build-g1prime-suite.py --force \
+python3 $RUN/scripts/build-g1prime-suite.py --force \
     --k $SUITE_K \
     --mbpp-cache $HOME/ag2-datasets-cache/google-research-datasets__mbpp__sanitized__test.json \
     --ag2-suite $HOME/ag-run/suite/AG2-suite-v1.json \
@@ -154,7 +154,7 @@ seg_arm() { # arm seg tag model_root expect_4bit [worker_env...]
   start_gw "$tag" "$root" "$@" || { stop_gw; exit 5; }
   check_banner "$tag" "$expect" || { echo "G3_FAIL tag=$tag" >> "$CLOG"; stop_gw; exit 101; }
   echo "seg start arm=$arm seg=$seg at $(date +%FT%T)" >> "$CLOG"
-  python3 $RUN/agents-code-loop.py \
+  python3 $RUN/scripts/code-loop.py \
     --suite "$SUITE" \
     --gateway http://127.0.0.1:8099 --model LFM3-1.7B \
     --request-log "$RES/apxinf-$tag-requests.jsonl" \
@@ -190,6 +190,6 @@ done
 echo "PHASE abba_done $(date +%FT%T)" >> "$CLOG"
 
 # ---- G1' analysis (standalone file, no inline heredoc: round-55 bug 3) ----
-python3 $RUN/analyze-g1prime.py "$RES" >> "$CLOG" 2>&1
+python3 $RUN/scripts/analyze-g1prime.py "$RES" >> "$CLOG" 2>&1
 echo "G1PRIME_EXIT=$?" >> "$CLOG"
 echo "PHASE all_done $(date +%FT%T)" >> "$CLOG"

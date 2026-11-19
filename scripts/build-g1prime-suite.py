@@ -58,7 +58,7 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--force", action="store_true",
-                    help="always rebuild (run-g1prime.sh passes this for the "
+                    help="always rebuild (scripts/run-g1prime.sh passes this for the "
                          "20-task suite so a stale suite.json is never reused)")
     args = ap.parse_args()
 
