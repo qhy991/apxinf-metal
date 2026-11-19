@@ -14,7 +14,10 @@ path (`mlx_decode::GreedySequence`), measures where the 0.8 ms actually goes, an
 re-runs the matched-precision M4 window to decide whether pipelined apxinf beats
 llama.cpp F16 under the pre-registered rule.
 
-Status: **pre-registered; no device run has happened yet at this commit.**
+Status: **measured (2026-11-19, M4 window `pipe-20261119T0250Z`); verdict WIN per
+the section-7 rule. The pre-registration text below is kept verbatim from
+the first commit (`71cb94ea`, pushed before any device run); amendments are
+dated at the end of the Results section.**
 Methodology references: [`doc/engine-comparison-lfm3.md`](engine-comparison-lfm3.md)
 (#121, the matched-precision window this ticket extends) and
 [`scripts/bench_engines.sh`](../scripts/bench_engines.sh).
@@ -227,14 +230,60 @@ Pro's 162/172 GB/s figures are not quoted for the M4.
 
 ### Sync-arm decomposition
 
-_See the 2026-11-19 amendment below; the four-stage table and the ≤10%
-reconciliation are in `doc/receipts/lfm3-pipelined-decode/decomposition.json`._
+`apxinf-decomp`, two segments × (warmup + 4 S2 cases) with
+`APXINF_LFM3_DECODE_STAGES=1`, 1,030 instrumented decode steps in 10 requests;
+every request's step count equals `completion − 1`
+(`step_counts_all_match: true`). Per-token means:
+
+| stage | ms/token | share |
+|---|---|---|
+| `build_ms` (host graph, ~700 MLX ops) | 0.263 | 0.7% |
+| `eval_wait_ms` (blocking `stream.eval`) | 37.052 | 98.3% |
+| `sample_ms` (cast + argmax + synchronising read) | 0.353 | 0.9% |
+| `callback_ms` (detokenize, IPC `tokens`, `memory_stats`, controls) | 0.009 | 0.0% |
+| **staged total** | **37.678** | 100% |
+
+Measured sync-arm decode: 37.634 ms/token (median over the decomposition
+requests). **Reconciliation 100.0%** (requirement ≤10%). The sync step is
+~0.62 ms of serial host work on top of a 37.05 ms GPU-bound eval; that host
+time is what the pipelined path removes from the critical path. P (sync −
+pipe = 1.08–1.13 ms/token) exceeds the 0.62 ms of measured host stages: the
+remainder is per-step GPU scheduling overlap (the sync arm's eval wait
+includes launch-gap drain between steps; the pipelined queue stays fed), a
+GPU-side effect — recorded here per the PARTIAL-branch discipline even
+though the window verdict is WIN.
+
+Full table: `doc/receipts/lfm3-pipelined-decode/decomposition.json`.
 
 ### Tests
 
-_See the amendment; T1/T2/T3 outputs are in
-`doc/receipts/lfm3-pipelined-decode/tests.log`, and the T3 fault-injection
-failure output is pasted in the PR body as required._
+M4, real BF16 checkpoint, single-threaded, under the Metal locks
+(`APXINF_LFM3_TEST_MODEL=$SNAPSHOT cargo test --release -p apxinf-model
+--features mlx,coreml metal_lfm3 -- --ignored --test-threads=1`):
+
+```
+test metal_lfm3::model::tests::fused_decode_conv_matches_the_per_tap_reference ... ok
+test metal_lfm3::model::tests::t1_pipelined_greedy_matches_sync_token_for_token ... ok
+test metal_lfm3::model::tests::t2_budget_eos_and_cancel_boundaries_match_sync ... ok
+test metal_lfm3::model::tests::t3_fault_injection_without_conv_restore_is_detected ... ok
+test metal_lfm3::model::tests::t3_pipelined_continuation_state_matches_sync_byte_for_byte ... ok
+test result: ok. 5 passed; 0 failed
+```
+
+- **T1**: 4 prompts × 128 tokens, pipelined == sync token-for-token.
+- **T2**: budget 1 and 8, synthetic first-token EOS (state equals prefill
+  state after the rollback), cancel after first publish — published
+  sequences and `position == P+N−1` all match sync.
+- **T3**: after the lookahead rollback, all KV rows `[0, position)` and all
+  13 conv windows are byte-identical to sync, and a 16-token continuation
+  matches token-for-token.
+- **Fault proof**: with `APXINF_LFM3_TEST_NO_CONV_RESTORE=1`, the T3 state
+  equality fails (`assertion left == right failed: 13 conv windows must
+  match sync byte-for-byte after the rollback`) — full output in
+  `doc/receipts/lfm3-pipelined-decode/tests-fault-injection.log` and pasted
+  in the PR body.
+
+Logs: `doc/receipts/lfm3-pipelined-decode/tests.log` (+ `-fault-injection`).
 
 ### Mixed factors (quote with the tables)
 
@@ -256,7 +305,34 @@ failure output is pasted in the PR body as required._
 
 ### Amendments
 
-_Amendment 2026-11-19 (to be filled): the first window session's test phase
-hit a PATH issue and the decomposition phase an evidence-path mismatch; both
-were fixed and re-run in a second locked session without changing any
-decision rule, threshold, or gate._
+**Amendment 2026-11-19 (operational only; no decision rule, threshold, gate,
+arm, cell, or order changed).** Three operational defects were found during
+the window and fixed between locked sessions; every number above comes from
+the corrected sessions:
+
+1. **Session 1 test phase**: the orchestrator exported a `PATH` without
+   `~/.cargo/bin`, so `cargo test` exited 127 without running. Fixed PATH;
+   T1/T2/T3 ran and passed in session 3.
+2. **Sessions 1–2 decomposition phase**: `bench_engines.sh` requires its
+   `--evidence-log`/`--request-log` files to pre-exist; a path mismatch and
+   a leftover gateway holding port 8099 (SIGTERM during its model load is
+   processed late) made both decomp segments no-op. Hardened the runner
+   (pre-kill gateways, verify the port is free, proper readiness wait) and
+   re-ran in session 4; the analyzer was also fixed to reassemble
+   worker-stderr lines split across 512-byte diagnostic chunks (the
+   unfixed analyzer under-counted steps and showed a spurious 73%
+   reconciliation; the fixed one shows 100.0% with `steps_total = 1030`
+   exactly matching the expected step count).
+3. **Fault-injection log**: the raw assert output prints full conv windows
+   (8.7 MB of decimal byte vectors); the committed receipt keeps the
+   failure header plus a bounded excerpt, with the full log preserved in
+   the git-ignored feature directory.
+
+**Conclusion: WIN.** Both cells satisfy R ≤ 0.98 (0.952 / 0.955) and all
+three segments pair pipe < llama in both cells; token streams are
+bit-identical between the two apxinf arms and every A/A gate is ≤ 0.5%. Per
+the section-8 default rule (not INVALID, P = +1.08 / +1.13 ≥ 0 on both
+cells), LFM3 greedy decode **defaults to the pipelined path** in this
+branch, with the synchronous path kept only behind the explicit
+`APXINF_MLX_SYNC_DECODE=1` operator switch (no opt-in dead path: the switch
+is the escape hatch the benchmark arms themselves use).
