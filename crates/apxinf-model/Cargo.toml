@@ -39,6 +39,9 @@ cc = "1"
 
 [features]
 default = []
+# Merge the LFM3 attention q/k/v/gate projections and the gated-MLP w1/w3
+# projections into one matmul each (fewer kernel launches, same bytes).
+merged-gemv = []
 # Full NVIDIA CUDA inference on the apxinf-cuda-new runtime.
 cuda = ["dep:apxinf-cuda-new"]
 mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2", "dep:apxinf-tokenizer"]

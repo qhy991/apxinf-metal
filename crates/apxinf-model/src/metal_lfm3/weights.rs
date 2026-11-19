@@ -18,6 +18,9 @@ pub(crate) struct Linear {
 }
 
 impl Linear {
+    pub fn from_canonical(canonical: Array) -> Self {
+        Self { canonical }
+    }
     pub fn call(&self, x: &Array) -> Result<Array> {
         x.matmul(&self.canonical)
     }
@@ -60,6 +63,13 @@ pub(crate) struct LayerWeights {
     pub w3: Linear,
     pub w2: Linear,
     pub mixer: Mixer,
+    /// `[hidden, q + 2*kv + heads]` fused attention projection, present only with
+    /// the `merged-gemv` feature: q, k, v and the per-head gate share one input,
+    /// so one matmul replaces four launches over the same bytes.
+    pub qkvg: Option<Linear>,
+    /// `[hidden, 2*intermediate]` fused gated-MLP projection (`w1` then `w3`),
+    /// present only with the `merged-gemv` feature.
+    pub w13: Option<Linear>,
 }
 
 pub(crate) struct Weights {
@@ -241,6 +251,22 @@ impl Weights {
                     )?,
                 }
             };
+            #[cfg(feature = "merged-gemv")]
+            let (qkvg, w13) = {
+                let w13 = Some(Linear::from_canonical(Array::concat(
+                    &[&w1.array(), &w3.array()],
+                    1,
+                )?));
+                let qkvg = match &mixer {
+                    Mixer::Attention { q, k, v, gate, .. } => Some(Linear::from_canonical(
+                        Array::concat(&[&q.array(), &k.array(), &v.array(), &gate.array()], 1)?,
+                    )),
+                    Mixer::Conv { .. } => None,
+                };
+                (qkvg, w13)
+            };
+            #[cfg(not(feature = "merged-gemv"))]
+            let (qkvg, w13) = (None, None);
             layers.push(LayerWeights {
                 operator_norm,
                 ffn_norm,
@@ -250,6 +276,8 @@ impl Weights {
                 w3,
                 w2,
                 mixer,
+                qkvg,
+                w13,
             });
         }
         // The checkpoint ships no `lm_head`: the token table is tied, and the

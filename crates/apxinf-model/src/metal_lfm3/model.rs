@@ -509,14 +509,34 @@ impl Lfm3Model {
         let dim = c.head_dim;
         let scale = (dim as f64).powf(-0.5) as f32;
         let continuing = start > 0;
-        let q = q_proj.call(n)?.reshape(&[1, len, heads, dim])?;
+        // One matmul for q/k/v/gate when the fused projection is available: the
+        // four projections read the same `n`, so a single launch over the
+        // concatenated weights produces the same four outputs in one kernel.
+        let (q_raw, k_raw, v_raw, gate_raw) = match &layer.qkvg {
+            Some(fused) => {
+                let merged = fused.call(n)?;
+                let q_out = heads * dim;
+                let kv_out = c.num_key_value_heads * dim;
+                let gate_out = heads;
+                (
+                    merged.slice_axis(2, 0, q_out)?,
+                    merged.slice_axis(2, q_out, q_out + kv_out)?,
+                    merged.slice_axis(2, q_out + kv_out, q_out + 2 * kv_out)?,
+                    merged.slice_axis(2, q_out + 2 * kv_out, q_out + 2 * kv_out + gate_out)?,
+                )
+            }
+            None => (
+                q_proj.call(n)?,
+                k_proj.call(n)?,
+                v_proj.call(n)?,
+                gate.call(n)?,
+            ),
+        };
+        let q = q_raw.reshape(&[1, len, heads, dim])?;
         let q = norm(&q, q_norm, c.norm_eps)?.transpose(&[0, 2, 1, 3])?;
-        let k = k_proj
-            .call(n)?
-            .reshape(&[1, len, c.num_key_value_heads, dim])?;
+        let k = k_raw.reshape(&[1, len, c.num_key_value_heads, dim])?;
         let k = norm(&k, k_norm, c.norm_eps)?.transpose(&[0, 2, 1, 3])?;
-        let v = v_proj
-            .call(n)?
+        let v = v_raw
             .reshape(&[1, len, c.num_key_value_heads, dim])?
             .transpose(&[0, 2, 1, 3])?;
         let (cos, sin) = self.cos_sin(kind, start, len)?;
@@ -563,7 +583,7 @@ impl Lfm3Model {
             )?
         };
         // Per-head sigmoid output gate: `[1, len, heads] -> [1, heads, len, 1]`.
-        let gate = gate.call(n)?.sigmoid()?.transpose(&[0, 2, 1])?;
+        let gate = gate_raw.sigmoid()?.transpose(&[0, 2, 1])?;
         let gated = attention.mul(&gate.reshape(&[1, heads, len, 1])?)?;
         let merged = gated
             .transpose(&[0, 2, 1, 3])?
@@ -628,19 +648,36 @@ impl Lfm3Model {
         let heads = c.num_attention_heads;
         let dim = c.head_dim;
         let scale = (dim as f64).powf(-0.5) as f32;
-        let q = q_proj
-            .call(n)
-            .map_err(|e| err(format!("q_proj: {e}")))?
+        // Same fused projection as the chunked path: one launch for q/k/v/gate.
+        let (q_raw, k_raw, v_raw, gate_raw) = match &layer.qkvg {
+            Some(fused) => {
+                let merged = fused.call(n)?;
+                let q_out = heads * dim;
+                let kv_out = c.num_key_value_heads * dim;
+                let gate_out = heads;
+                (
+                    merged.slice_axis(2, 0, q_out)?,
+                    merged.slice_axis(2, q_out, q_out + kv_out)?,
+                    merged.slice_axis(2, q_out + kv_out, q_out + 2 * kv_out)?,
+                    merged.slice_axis(2, q_out + 2 * kv_out, q_out + 2 * kv_out + gate_out)?,
+                )
+            }
+            None => (
+                q_proj.call(n).map_err(|e| err(format!("q_proj: {e}")))?,
+                k_proj.call(n)?,
+                v_proj.call(n)?,
+                gate.call(n)?,
+            ),
+        };
+        let q = q_raw
             .reshape(&[1, 1, heads, dim])
             .map_err(|e| err(format!("q reshape n={:?}: {e}", n.shape())))?;
         let q = norm(&q, q_norm, c.norm_eps)?.transpose(&[0, 2, 1, 3])?;
-        let k = k_proj
-            .call(n)?
+        let k = k_raw
             .reshape(&[1, 1, c.num_key_value_heads, dim])
             .map_err(|e| err(format!("k reshape: {e}")))?;
         let k = norm(&k, k_norm, c.norm_eps)?.transpose(&[0, 2, 1, 3])?;
-        let v = v_proj
-            .call(n)?
+        let v = v_raw
             .reshape(&[1, 1, c.num_key_value_heads, dim])
             .map_err(|e| err(format!("v reshape: {e}")))?
             .transpose(&[0, 2, 1, 3])?;
@@ -664,7 +701,7 @@ impl Lfm3Model {
             false,
             None,
         )?;
-        let gate = gate.call(n)?.sigmoid()?.transpose(&[0, 2, 1])?;
+        let gate = gate_raw.sigmoid()?.transpose(&[0, 2, 1])?;
         let gated = attention.mul(
             &gate
                 .reshape(&[1, heads, 1, 1])
@@ -683,8 +720,17 @@ impl Lfm3Model {
         let op = norm(op, &layer.post_operator_norm, eps)?;
         let hidden = x.add(&op)?;
         let ffn = norm(&hidden, &layer.ffn_norm, eps)?;
-        let gate = layer.w1.call(&ffn)?;
-        let up = layer.w3.call(&ffn)?;
+        let (gate, up) = match &layer.w13 {
+            Some(fused) => {
+                let merged = fused.call(&ffn)?;
+                let inter = self.config.intermediate_size;
+                (
+                    merged.slice_axis(2, 0, inter)?,
+                    merged.slice_axis(2, inter, 2 * inter)?,
+                )
+            }
+            None => (layer.w1.call(&ffn)?, layer.w3.call(&ffn)?),
+        };
         let activated = silu_mul(&gate, &up)?;
         let down = layer.w2.call(&activated)?;
         let down = norm(&down, &layer.post_ffn_norm, eps)?;
