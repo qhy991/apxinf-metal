@@ -56,6 +56,7 @@ impl Fixture {
             sequence_reservation: 1024,
             host_pressure_policy: HostPressurePolicy::Disabled,
             request_log: None,
+            worker_env: Vec::new(),
         };
         Self { root, config }
     }

@@ -6,27 +6,45 @@
 //! and widened to FP32, which is the dtype the reference convolution multiplies
 //! in. The convolution weight layout is the one adaptation this family needs, so
 //! it is recorded here and replayed against captured reference tensors.
+//!
+//! QUEUE #8 adds a second representation: with `APXINF_LFM3_4BIT=1` and the
+//! quantized triple present, a projection runs MLX's affine group-64
+//! `quantized_matmul` instead of BF16 matmul. The default (unset) arm never
+//! inspects quantized keys and is byte-for-byte the original path.
 
 use super::config::Lfm3Config;
 use apxinf_core::{DType, Device, Error, Result, Tensor};
 use apxinf_mlx::{Array, MlxDType, Stream};
 use std::collections::HashMap;
 
-/// One HF linear projection, kept as a canonical `[in, out]` view.
-pub(crate) struct Linear {
-    canonical: Array,
+/// One HF linear projection. The BF16 path keeps a canonical `[in, out]`
+/// view; the QUEUE #8 4-bit path (when armed and the quantized triple is
+/// present) instead holds MLX affine group-64 weights and runs
+/// `quantized_matmul` — the same op the Python lane's packed4 engine uses.
+#[derive(Clone)]
+pub(crate) enum Linear {
+    Bf16 { canonical: Array },
+    Q4(super::q4::Q4),
 }
 
 impl Linear {
     pub fn call(&self, x: &Array) -> Result<Array> {
-        x.matmul(&self.canonical)
+        match self {
+            Linear::Bf16 { canonical } => x.matmul(canonical),
+            Linear::Q4(q4) => q4.apply(x),
+        }
     }
-    pub fn array(&self) -> Array {
-        self.canonical.clone()
+    /// All arrays to warm at load: the BF16 operand, or the Q4 triple.
+    pub fn warm_arrays(&self) -> Vec<Array> {
+        match self {
+            Linear::Bf16 { canonical } => vec![canonical.clone()],
+            Linear::Q4(q4) => q4.arrays().to_vec(),
+        }
     }
 }
 
 /// The layer's non-residual operator: exactly one of the two branches exists.
+#[derive(Clone)]
 pub(crate) enum Mixer {
     Conv {
         in_proj: Linear,
@@ -51,6 +69,7 @@ pub(crate) enum Mixer {
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct LayerWeights {
     pub operator_norm: Array,
     pub ffn_norm: Array,
@@ -62,12 +81,43 @@ pub(crate) struct LayerWeights {
     pub mixer: Mixer,
 }
 
+/// Tied embedding/lm-head: BF16 gather table plus its precomputed `[H, V]`
+/// logit view (HEAD's `head` field), or QUEUE #8's quantized `embed_tokens`
+/// triple. `take` / the logits dispatch select the representation.
+#[derive(Clone)]
+enum Embedding {
+    Bf16 { table: Array, head: Array },
+    Q4(super::q4::Q4),
+}
+
+impl Embedding {
+    fn take(&self, ids: &Array) -> Result<Array> {
+        match self {
+            Embedding::Bf16 { table, .. } => table.take(ids, 0),
+            // Gather the packed rows first, then dequantize just those — the
+            // input side of the tied table. Packed rows are `[in/8]` U32
+            // words, so a plain `take` on the packed weight alone would drop
+            // the matching scales/biases; `take_rows` keeps all three in
+            // lockstep.
+            Embedding::Q4(q4) => q4.take_rows(ids),
+        }
+    }
+    fn warm_arrays(&self) -> Vec<Array> {
+        match self {
+            Embedding::Bf16 { table, head } => vec![table.clone(), head.clone()],
+            Embedding::Q4(q4) => q4.arrays().to_vec(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct Weights {
     /// Tied embedding/lm-head table: gather rows for input, transpose for logits.
-    embedding: Array,
-    head: Array,
+    embedding: Embedding,
     pub final_norm: Array,
     pub layers: Vec<LayerWeights>,
+    /// True when at least one projection was loaded as Q4 (gate-0 census).
+    pub quantized_layers: usize,
 }
 
 fn take(
@@ -101,15 +151,25 @@ fn take(
     Array::from_bytes(stream, shape, MlxDType::BF16, bytes)
 }
 
-/// Canonical `[in, out]` view of the checkpoint's immutable `[out, in]` rows.
+/// Canonical `[in, out]` view of the checkpoint's immutable `[out, in]` rows,
+/// or — when the QUEUE #8 switch is armed and the quantized triple is present
+/// in `map` — the MLX affine group-64 4-bit weights. `use_4bit` is `false` on
+/// the default (unset) arm, so that path never even inspects quantized keys
+/// (empty-arm gate).
 fn linear(
     map: &mut HashMap<String, Tensor>,
     name: &str,
     input: usize,
     output: usize,
     stream: &Stream,
+    use_4bit: bool,
 ) -> Result<Linear> {
-    Ok(Linear {
+    if use_4bit {
+        if let Some(q4) = super::q4::take(map, name, input, output, stream)? {
+            return Ok(Linear::Q4(q4));
+        }
+    }
+    Ok(Linear::Bf16 {
         canonical: take(map, name, &[output, input], stream)?.transpose(&[1, 0])?,
     })
 }
@@ -134,6 +194,9 @@ impl Weights {
         let h = config.hidden_size;
         let q = config.num_attention_heads * config.head_dim;
         let kv = config.num_key_value_heads * config.head_dim;
+        // The default (unset) arm never looks for quantized keys.
+        let use_4bit = super::q4::enabled();
+        let mut quantized_layers = 0usize;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             let kind = config.layer_kind(i)?;
@@ -151,6 +214,7 @@ impl Weights {
                 h,
                 config.intermediate_size,
                 stream,
+                use_4bit,
             )?;
             let w3 = linear(
                 &mut map,
@@ -158,6 +222,7 @@ impl Weights {
                 h,
                 config.intermediate_size,
                 stream,
+                use_4bit,
             )?;
             let w2 = linear(
                 &mut map,
@@ -165,61 +230,110 @@ impl Weights {
                 config.intermediate_size,
                 h,
                 stream,
+                use_4bit,
             )?;
             let mixer = if kind.is_conv() {
-                let taps = take(
-                    &mut map,
-                    &format!("{p}.conv.conv.weight"),
-                    &[h, 1, config.conv_l_cache],
-                    stream,
-                )?
-                .reshape(&[h, config.conv_l_cache])?
-                .cast(MlxDType::F32)?;
+                // The depthwise tap table is stored as `[C, 1, K]` in the
+                // BF16 checkpoint and `[C, K, 1]` in the Hugging Face MLX
+                // quantized export (the quantizer reorders the singleton
+                // axis). The flattened `[C, K]` result is identical; the
+                // default (unset) arm keeps the original `[C, 1, K]` lookup
+                // so its path is unchanged byte-for-byte.
+                let conv_key = format!("{p}.conv.conv.weight");
+                let conv_shape: [usize; 3] = if use_4bit
+                    && map
+                        .get(&conv_key)
+                        .is_some_and(|t| t.shape().dims() == [h, config.conv_l_cache, 1])
+                {
+                    [h, config.conv_l_cache, 1]
+                } else {
+                    [h, 1, config.conv_l_cache]
+                };
+                let taps = take(&mut map, &conv_key, &conv_shape, stream)?
+                    .reshape(&[h, config.conv_l_cache])?
+                    .cast(MlxDType::F32)?;
                 // BF16 -> F32 is exact, so this round trip reproduces the
                 // checkpoint's tap values for the fused kernel's BF16 input.
                 let taps_bf16 = taps.cast(MlxDType::BF16)?;
+                let in_proj = linear(
+                    &mut map,
+                    &format!("{p}.conv.in_proj.weight"),
+                    h,
+                    3 * h,
+                    stream,
+                    use_4bit,
+                )?;
+                let out_proj = linear(
+                    &mut map,
+                    &format!("{p}.conv.out_proj.weight"),
+                    h,
+                    h,
+                    stream,
+                    use_4bit,
+                )?;
+                for linear in [&w1, &w3, &w2, &in_proj, &out_proj] {
+                    quantized_layers += usize::from(matches!(linear, Linear::Q4(_)));
+                }
                 Mixer::Conv {
-                    in_proj: linear(
-                        &mut map,
-                        &format!("{p}.conv.in_proj.weight"),
-                        h,
-                        3 * h,
-                        stream,
-                    )?,
-                    out_proj: linear(&mut map, &format!("{p}.conv.out_proj.weight"), h, h, stream)?,
+                    in_proj,
+                    out_proj,
                     taps,
                     taps_bf16,
                 }
             } else {
+                // `q` above is the projection width `heads × head_dim`; the
+                // per-projection bindings are hoisted so their Q4 census can
+                // run before the mixer is built (HEAD inlined these in the
+                // struct literal and never shadowed it).
+                let q_in = q;
+                let q = linear(
+                    &mut map,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    h,
+                    q_in,
+                    stream,
+                    use_4bit,
+                )?;
+                let k = linear(
+                    &mut map,
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    h,
+                    kv,
+                    stream,
+                    use_4bit,
+                )?;
+                let v = linear(
+                    &mut map,
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    h,
+                    kv,
+                    stream,
+                    use_4bit,
+                )?;
+                let o = linear(
+                    &mut map,
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    q_in,
+                    h,
+                    stream,
+                    use_4bit,
+                )?;
+                let gate = linear(
+                    &mut map,
+                    &format!("{p}.self_attn.gate_proj.weight"),
+                    h,
+                    config.num_attention_heads,
+                    stream,
+                    use_4bit,
+                )?;
+                for linear in [&w1, &w3, &w2, &q, &k, &v, &o, &gate] {
+                    quantized_layers += usize::from(matches!(linear, Linear::Q4(_)));
+                }
                 Mixer::Attention {
-                    q: linear(
-                        &mut map,
-                        &format!("{p}.self_attn.q_proj.weight"),
-                        h,
-                        q,
-                        stream,
-                    )?,
-                    k: linear(
-                        &mut map,
-                        &format!("{p}.self_attn.k_proj.weight"),
-                        h,
-                        kv,
-                        stream,
-                    )?,
-                    v: linear(
-                        &mut map,
-                        &format!("{p}.self_attn.v_proj.weight"),
-                        h,
-                        kv,
-                        stream,
-                    )?,
-                    o: linear(
-                        &mut map,
-                        &format!("{p}.self_attn.o_proj.weight"),
-                        q,
-                        h,
-                        stream,
-                    )?,
+                    q,
+                    k,
+                    v,
+                    o,
                     q_norm: norm(
                         &mut map,
                         &format!("{p}.self_attn.q_norm.weight"),
@@ -232,13 +346,7 @@ impl Weights {
                         config.head_dim,
                         stream,
                     )?,
-                    gate: linear(
-                        &mut map,
-                        &format!("{p}.self_attn.gate_proj.weight"),
-                        h,
-                        config.num_attention_heads,
-                        stream,
-                    )?,
+                    gate,
                 }
             };
             layers.push(LayerWeights {
@@ -267,12 +375,39 @@ impl Weights {
                 ));
             }
         }
-        let embedding = take(
-            &mut map,
-            "model.embed_tokens.weight",
-            &[config.vocab_size, h],
-            stream,
-        )?;
+        let embedding = if use_4bit {
+            if let Some(q4) = super::q4::take(
+                &mut map,
+                "model.embed_tokens.weight",
+                h,
+                config.vocab_size,
+                stream,
+            )? {
+                Embedding::Q4(q4)
+            } else {
+                let table = take(
+                    &mut map,
+                    "model.embed_tokens.weight",
+                    &[config.vocab_size, h],
+                    stream,
+                )?;
+                let head = table.transpose(&[1, 0])?;
+                Embedding::Bf16 { table, head }
+            }
+        } else {
+            // Default path: identical to HEAD (table + one-time head view).
+            let table = take(
+                &mut map,
+                "model.embed_tokens.weight",
+                &[config.vocab_size, h],
+                stream,
+            )?;
+            let head = table.transpose(&[1, 0])?;
+            Embedding::Bf16 { table, head }
+        };
+        // The tied table is the 154th quantized triple in the official
+        // export (153 layer projections + this one).
+        quantized_layers += usize::from(matches!(embedding, Embedding::Q4(_)));
         let final_norm = norm(&mut map, "model.embedding_norm.weight", h, stream)?;
         // Any leftover tensor means this is not the architecture analyzed here.
         if !map.is_empty() {
@@ -284,18 +419,18 @@ impl Weights {
                 names.join(", ")
             )));
         }
-        let head = embedding.transpose(&[1, 0])?;
-        let mut arrays = vec![embedding.clone(), head.clone(), final_norm.clone()];
+        let mut arrays = embedding.warm_arrays();
+        arrays.push(final_norm.clone());
         for layer in &layers {
             arrays.extend([
                 layer.operator_norm.clone(),
                 layer.ffn_norm.clone(),
                 layer.post_operator_norm.clone(),
                 layer.post_ffn_norm.clone(),
-                layer.w1.array(),
-                layer.w2.array(),
-                layer.w3.array(),
             ]);
+            arrays.extend(layer.w1.warm_arrays());
+            arrays.extend(layer.w2.warm_arrays());
+            arrays.extend(layer.w3.warm_arrays());
             match &layer.mixer {
                 Mixer::Conv {
                     in_proj,
@@ -303,12 +438,9 @@ impl Weights {
                     taps,
                     taps_bf16,
                 } => {
-                    arrays.extend([
-                        in_proj.array(),
-                        out_proj.array(),
-                        taps.clone(),
-                        taps_bf16.clone(),
-                    ]);
+                    arrays.extend(in_proj.warm_arrays());
+                    arrays.extend(out_proj.warm_arrays());
+                    arrays.extend([taps.clone(), taps_bf16.clone()]);
                 }
                 Mixer::Attention {
                     q,
@@ -319,15 +451,12 @@ impl Weights {
                     k_norm,
                     gate,
                 } => {
-                    arrays.extend([
-                        q.array(),
-                        k.array(),
-                        v.array(),
-                        o.array(),
-                        q_norm.clone(),
-                        k_norm.clone(),
-                        gate.array(),
-                    ]);
+                    arrays.extend(q.warm_arrays());
+                    arrays.extend(k.warm_arrays());
+                    arrays.extend(v.warm_arrays());
+                    arrays.extend(o.warm_arrays());
+                    arrays.extend(gate.warm_arrays());
+                    arrays.extend([q_norm.clone(), k_norm.clone()]);
                 }
             }
         }
@@ -336,17 +465,20 @@ impl Weights {
         stream.eval(&arrays)?;
         Ok(Self {
             embedding,
-            head,
             final_norm,
             layers,
+            quantized_layers,
         })
     }
 
     pub fn embed(&self, ids: &Array) -> Result<Array> {
-        self.embedding.take(ids, 0)
+        self.embedding.take(ids)
     }
 
     pub fn project(&self, x: &Array) -> Result<Array> {
-        x.matmul(&self.head)
+        match &self.embedding {
+            Embedding::Bf16 { head, .. } => x.matmul(head),
+            Embedding::Q4(q4) => q4.apply(x),
+        }
     }
 }

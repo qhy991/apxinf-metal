@@ -12,6 +12,17 @@ pub struct CausalDepthwiseConv {
     kernel: MetalKernel,
 }
 
+// Clones the kernel dispatch object (`Rc`-backed stream, refcounted Metal
+// pipeline), so the same callable can be captured by a compiled graph and
+// kept by the model.
+impl Clone for CausalDepthwiseConv {
+    fn clone(&self) -> Self {
+        Self {
+            kernel: self.kernel.clone(),
+        }
+    }
+}
+
 impl CausalDepthwiseConv {
     pub fn new(stream: &Stream) -> Result<Self> {
         Ok(Self {

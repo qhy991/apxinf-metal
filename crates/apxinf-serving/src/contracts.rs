@@ -1070,8 +1070,15 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                     "thermal",
                     "memory",
                 ],
-                &[],
+                // QUEUE #7 (doc/lfm3-queue7-preregister.md §4): worker-side
+                // replay setup decomposition. Optional: the pre-registration
+                // baseline arm omits it, the instrumented arm emits it, and
+                // cross-arm token comparison must accept both frames.
+                &["setup_ns"],
             )?;
+            if let Some(setup) = frame.get("setup_ns") {
+                object(setup)?;
+            }
             integer(&frame["prompt_tokens"], 1, MAX_PROMPT_TOKENS)?;
             integer(&frame["target_tokens"], 0, MAX_OUTPUT_TOKENS)?;
             integer(&frame["tokens_emitted"], 0, MAX_OUTPUT_TOKENS)?;
@@ -1518,6 +1525,7 @@ impl AttemptTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -1564,6 +1572,48 @@ mod tests {
                 assert!(validate_frame(&frame).is_err());
             }
         }
+    }
+
+    #[test]
+    fn replay_result_accepts_optional_setup_ns() {
+        // QUEUE #7: the instrumented worker emits a `setup_ns` object on
+        // replay_result; the pre-registration baseline omits it. The contract
+        // must accept both frames so a cross-arm token comparison can run.
+        let envelope = |setup: Option<Value>| {
+            let mut frame = json!({
+                "protocol": NATIVE_PROTOCOL,
+                "kind": "replay_result",
+                "worker_epoch": "11111111-1111-1111-1111-111111111111",
+                "command_id": "22222222-2222-2222-2222-222222222222",
+                "prompt_tokens": 16,
+                "target_tokens": 0,
+                "tokens_emitted": 128,
+                "emitted_token_ids": [],
+                "prefill_ms": 1.0,
+                "decode_ms_total": 100.0,
+                "decode_ms_per_token": {},
+                "match_rate": 0.0,
+                "matches": 0,
+                "comparisons": 0,
+                "prefill_argmax": 7,
+                "config_echo": {},
+                "thermal": {},
+                "memory": {},
+            });
+            if let Some(setup) = setup {
+                frame["setup_ns"] = setup;
+            }
+            frame
+        };
+        validate_frame(&envelope(None)).unwrap();
+        validate_frame(&envelope(Some(json!({
+            "dispatch_ns": 1, "parse_ns": 1, "state_prewarm_ns": 1
+        }))))
+        .unwrap();
+        // An unexpected sibling still fails.
+        let mut extra = envelope(None);
+        extra["nope"] = json!(1);
+        assert!(validate_frame(&extra).is_err());
     }
 
     #[test]

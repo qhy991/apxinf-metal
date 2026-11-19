@@ -13,6 +13,7 @@
 
 use super::{
     config::{LayerKind, Lfm3Config},
+    q4,
     weights::{LayerWeights, Mixer, Weights},
 };
 use crate::llm_trait::{
@@ -34,6 +35,22 @@ fn err(message: impl Into<String>) -> Error {
 /// environment when it spawns the worker).
 fn decode_stages_enabled() -> bool {
     std::env::var_os("APXINF_LFM3_DECODE_STAGES").is_some_and(|value| value == "1")
+}
+
+/// `APXINF_LFM3_PREFILL_FAST=1` reuses the last prefill graph for a repeated
+/// static shape instead of rebuilding it per prompt (QUEUE #3,
+/// `doc/lfm3-short-prompt-prefill.md`). Same env source the worker banner
+/// reports, and the model captures it once at construction, so the unset
+/// baseline arm takes the unchanged path (empty-arm gate).
+pub fn prefill_fast_enabled() -> bool {
+    std::env::var_os("APXINF_LFM3_PREFILL_FAST").is_some_and(|value| value == "1")
+}
+
+/// `true` when the QUEUE #8 native 4-bit arm was requested. Same env source
+/// the worker banner reports (`native_4bit`), captured once at construction
+/// so the unset baseline arm never inspects quantized keys (empty-arm gate).
+pub fn native_4bit_enabled() -> bool {
+    q4::enabled()
 }
 
 // Platform C math library, used only to generate the fixed rotary tables on the
@@ -145,6 +162,17 @@ enum LayerState {
     Conv(Array),
 }
 
+/// QUEUE #3 (doc §Decision): the last prefill graph and the static shape it
+/// was traced for. Holding the graph plus its initial states skips the host
+/// re-trace of the 24 layers when the next prompt has the same shape.
+/// `len` is the token count, `start` the absolute position (0 for the whole
+/// prompt), and `continuing` whether conv windows are concatenated.
+struct PrefillCache {
+    key: (usize, usize, bool),
+    logits: Array,
+    states: Vec<LayerState>,
+}
+
 pub struct Lfm3Model {
     config: Lfm3Config,
     backend: MlxBackend,
@@ -172,6 +200,14 @@ pub struct Lfm3Model {
     conv_snapshot: Option<Vec<Option<Array>>>,
     stages: bool,
     stage_seq: usize,
+    /// QUEUE #3 prefill fast arm, captured once at construction from the same
+    /// env the banner reports (`prefill_fast_enabled`). When unset the model
+    /// never builds or touches a cached prefill graph (empty-arm gate).
+    prefill_fast: bool,
+    /// Last built prefill graph plus the static shape it was traced for
+    /// (`(len, start, continuing)`). Kept only while the fast arm is on and
+    /// only for the multi-token path; `None` means no reuse this request.
+    prefill_cache: Option<PrefillCache>,
     /// Test-only fault injection for T3: skip the conv restore in
     /// `finish_decode` and prove the byte-level state check catches it.
     #[cfg(test)]
@@ -215,9 +251,22 @@ impl Lfm3Model {
             conv_snapshot: None,
             stages: decode_stages_enabled(),
             stage_seq: 0,
+            prefill_fast: prefill_fast_enabled(),
+            prefill_cache: None,
             #[cfg(test)]
             disable_conv_restore: false,
         };
+        // Gate-0 census: proves the 4-bit switch actually consumed quantized
+        // triples (empty-arm trap — a banner saying true while zero triples
+        // loaded is an INVALID run). The official export has 153 layer
+        // projections (13 conv × 5 + 11 attn × 8) + 1 tied table = 154; the
+        // default (unset) arm prints nothing.
+        if q4::enabled() {
+            eprintln!(
+                "native_4bit census: quantized_triples={}/154",
+                model.weights.quantized_layers
+            );
+        }
         model.prepare(1, 0)?;
         Ok(model)
     }
@@ -429,12 +478,7 @@ impl Lfm3Model {
         state: &Array,
         continuing: bool,
     ) -> Result<(Array, Array)> {
-        let Mixer::Conv {
-            in_proj,
-            out_proj,
-            taps,
-            ..
-        } = &layer.mixer
+        let Mixer::Conv { in_proj, out_proj, taps, .. } = &layer.mixer
         else {
             return Err(err("LFM3 conv layer has an attention weight plan"));
         };
@@ -458,20 +502,11 @@ impl Lfm3Model {
             return Err(err("LFM3 conv input shorter than its chunk"));
         }
         let weight = taps.reshape(&[h, taps_kernel, 1])?;
-        let conv = z_stream
-            .cast(MlxDType::F32)?
-            .conv1d(&weight, 1, taps_kernel - 1, 1, h)?;
-        // conv1d pads both sides; outputs [stream-len, stream) are this chunk.
-        let y = gate.mul(
-            &conv
-                .slice_axis(1, stream_len - len, stream_len)?
-                .cast(MlxDType::BF16)?,
-        )?;
+        let conv = z_stream.cast(MlxDType::F32)?.conv1d(&weight, 1, taps_kernel - 1, 1, h)?;
+        let y = gate.mul(&conv.slice_axis(1, stream_len - len, stream_len)?.cast(MlxDType::BF16)?)?;
         let op = out_proj.call(&y)?;
         let first = stream_len.saturating_sub(keep);
-        let mut next = z_stream
-            .slice_axis(1, first, stream_len)?
-            .transpose(&[0, 2, 1])?;
+        let mut next = z_stream.slice_axis(1, first, stream_len)?.transpose(&[0, 2, 1])?;
         let width = next.shape()[2];
         if width < keep {
             next = next.pad(&[0, 0, keep - width], &[0, 0, 0])?;
@@ -499,9 +534,8 @@ impl Lfm3Model {
         else {
             return Err(err("LFM3 conv layer has an attention weight plan"));
         };
-        let c = &self.config;
-        let h = c.hidden_size;
         let bcx = in_proj.call(n)?;
+        let h = n.shape()[2];
         let b = bcx.slice_axis(2, 0, h)?;
         let gate = bcx.slice_axis(2, h, 2 * h)?;
         let z = bcx.slice_axis(2, 2 * h, 3 * h)?;
@@ -647,6 +681,30 @@ impl Lfm3Model {
         kv: &KvState,
         start: usize,
     ) -> Result<(Array, KvState)> {
+        let (cos, sin) = self
+            .cos_sin(kind, start, 1)
+            .map_err(|e| err(format!("rope slice start={start}: {e}")))?;
+        let stream = self.backend.stream();
+        let heads = self.config.num_attention_heads;
+        let eps = self.config.norm_eps;
+        let dim = self.config.head_dim;
+        Self::attention_step_parts(n, layer, kind, kv, start, &cos, &sin, stream, heads, eps, dim)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_step_parts(
+        n: &Array,
+        layer: &LayerWeights,
+        kind: LayerKind,
+        kv: &KvState,
+        start: usize,
+        cos: &Array,
+        sin: &Array,
+        stream: &Stream,
+        heads: usize,
+        eps: f32,
+        dim: usize,
+    ) -> Result<(Array, KvState)> {
         let Mixer::Attention {
             q: q_proj,
             k: k_proj,
@@ -659,37 +717,34 @@ impl Lfm3Model {
         else {
             return Err(err("LFM3 attention layer has a conv weight plan"));
         };
-        let c = &self.config;
-        let heads = c.num_attention_heads;
-        let dim = c.head_dim;
+        let kv_heads = kv.keys.shape()[1];
         let scale = (dim as f64).powf(-0.5) as f32;
         let q = q_proj
             .call(n)
             .map_err(|e| err(format!("q_proj: {e}")))?
             .reshape(&[1, 1, heads, dim])
             .map_err(|e| err(format!("q reshape n={:?}: {e}", n.shape())))?;
-        let q = norm(&q, q_norm, c.norm_eps)?.transpose(&[0, 2, 1, 3])?;
+        let q = norm(&q, q_norm, eps)?.transpose(&[0, 2, 1, 3])?;
         let k = k_proj
             .call(n)?
-            .reshape(&[1, 1, c.num_key_value_heads, dim])
+            .reshape(&[1, 1, kv_heads, dim])
             .map_err(|e| err(format!("k reshape: {e}")))?;
-        let k = norm(&k, k_norm, c.norm_eps)?.transpose(&[0, 2, 1, 3])?;
+        let k = norm(&k, k_norm, eps)?.transpose(&[0, 2, 1, 3])?;
         let v = v_proj
             .call(n)?
-            .reshape(&[1, 1, c.num_key_value_heads, dim])
+            .reshape(&[1, 1, kv_heads, dim])
             .map_err(|e| err(format!("v reshape: {e}")))?
             .transpose(&[0, 2, 1, 3])?;
-        let (cos, sin) = self
-            .cos_sin(kind, start, 1)
-            .map_err(|e| err(format!("rope slice start={start}: {e}")))?;
-        let q = apply_rope(&q, &cos, &sin, dim)?;
-        let k = apply_rope(&k, &cos, &sin, dim)?;
-        let index = Array::from_i32(self.backend.stream(), &[1], &[start as i32])?;
+        let q = apply_rope(&q, cos, sin, dim)?;
+        let k = apply_rope(&k, cos, sin, dim)?;
+        let index = Array::from_i32(stream, &[1], &[start as i32])?;
         let keys = kv.keys.slice_update(&k, &index, &[2])?;
         let values = kv.values.slice_update(&v, &index, &[2])?;
         let end = start + 1;
+        // Sliding attention reads exactly the 256 positions before `end` (the
+        // window is a fixed family constant; see `Lfm3Config::window`).
         let low = match kind {
-            LayerKind::SlidingAttention => end.saturating_sub(c.window()),
+            LayerKind::SlidingAttention => end.saturating_sub(256),
             _ => 0,
         };
         let attention = q.sdpa(
@@ -713,7 +768,12 @@ impl Lfm3Model {
     }
 
     /// Sandwich-norm residual composition shared by both branches.
-    fn mix_and_residual(&self, x: &Array, op: &Array, layer: &LayerWeights) -> Result<Array> {
+    fn mix_and_residual(
+        &self,
+        x: &Array,
+        op: &Array,
+        layer: &LayerWeights,
+    ) -> Result<Array> {
         let eps = self.config.norm_eps;
         let op = norm(op, &layer.post_operator_norm, eps)?;
         let hidden = x.add(&op)?;
@@ -735,6 +795,7 @@ impl Lfm3Model {
         start: usize,
         len: usize,
         evaluate: bool,
+        states: Option<&mut Vec<LayerState>>,
     ) -> Result<Array> {
         let eps = self.config.norm_eps;
         let kind = self.kinds[layer_idx];
@@ -762,6 +823,27 @@ impl Lfm3Model {
             (op, LayerState::Attention(next))
         };
         let output = self.mix_and_residual(x, &op, layer)?;
+        if let Some(states) = states {
+            // The fast arm publishes the captured snapshot into the live slots
+            // inside `build_graph` so both stay in lockstep; skip the eval here
+            // and let the caller evaluate the finished graph once.
+            states.push(state);
+        } else {
+            self.publish_layer_state(layer_idx, state, &output, evaluate)?;
+        }
+        Ok(output)
+    }
+
+    /// Publish a completed layer's state to the request (and optionally eval
+    /// it alongside the output). Shared by `run_layer` and the cached prefill
+    /// graph so the store ordering cannot drift between the two paths.
+    fn publish_layer_state(
+        &mut self,
+        layer_idx: usize,
+        state: LayerState,
+        output: &Array,
+        evaluate: bool,
+    ) -> Result<()> {
         match state {
             LayerState::Attention(next) => {
                 if evaluate {
@@ -778,7 +860,37 @@ impl Lfm3Model {
                 self.conv[layer_idx] = Some(next);
             }
         }
-        Ok(output)
+        Ok(())
+    }
+
+    /// Restore request state from a prefill cache snapshot and re-evaluate the
+    /// cached logits (QUEUE #3 cache-last-graph reuse).
+    fn run_cached_prefill(
+        &mut self,
+        cache: &PrefillCache,
+        len: usize,
+        start: usize,
+    ) -> Result<Array> {
+        self.kv = cache
+            .states
+            .iter()
+            .map(|s| match s {
+                LayerState::Attention(kv) => Some(kv.clone()),
+                LayerState::Conv(_) => None,
+            })
+            .collect();
+        self.conv = cache
+            .states
+            .iter()
+            .map(|s| match s {
+                LayerState::Conv(c) => Some(c.clone()),
+                LayerState::Attention(_) => None,
+            })
+            .collect();
+        let stream = self.backend.stream().clone();
+        stream.eval(std::slice::from_ref(&cache.logits))?;
+        self.position = start + len;
+        Ok(cache.logits.clone())
     }
 
     fn validate_input(&self, token_ids: &[u32], start_pos: usize) -> Result<usize> {
@@ -839,9 +951,13 @@ impl Lfm3Model {
         // A prompt chunk evaluates every layer boundary (bounded peak memory);
         // a single-token step keeps one graph and evaluates once by the caller.
         let per_layer_eval = len > 1;
+        // QUEUE #3: capture each layer's next state so the built graph can be
+        // cached and replayed for the same static shape. Decode (len == 1) and
+        // the unset arm never allocate or fill this vector (empty-arm gate).
+        let mut cached_states = (self.prefill_fast && len > 1).then(Vec::new);
         for layer_idx in 0..self.config.num_hidden_layers {
             x = self
-                .run_layer(&x, layer_idx, start, len, per_layer_eval)
+                .run_layer(&x, layer_idx, start, len, per_layer_eval, cached_states.as_mut())
                 .map_err(|e| err(format!("layer {layer_idx}: {e}")))?;
         }
         let hidden = norm(&x, &self.weights.final_norm, self.config.norm_eps)
@@ -851,12 +967,29 @@ impl Lfm3Model {
         } else {
             hidden
         };
+        let rows_shape = rows.shape().to_vec();
         let logits = self
             .weights
             .project(&rows)
             .map_err(|e| err(format!("head projection: {e}")))?
-            .reshape(&[rows.shape()[1], self.config.vocab_size])
-            .map_err(|e| err(format!("head reshape rows={:?}: {e}", rows.shape())))?;
+            .reshape(&[rows_shape[1], self.config.vocab_size])
+            .map_err(|e| err(format!("head reshape rows={rows_shape:?}: {e}")))?;
+        // Publish the captured states into both the request's live slots and
+        // the cache snapshot, so the two paths stay in lockstep (a later
+        // same-shape prompt must see the same state a rebuild would produce).
+        if let Some(states) = cached_states {
+            for (layer_idx, state) in states.iter().enumerate() {
+                match state {
+                    LayerState::Attention(next) => self.kv[layer_idx] = Some(next.clone()),
+                    LayerState::Conv(next) => self.conv[layer_idx] = Some(next.clone()),
+                }
+            }
+            self.prefill_cache = Some(PrefillCache {
+                key: (len, start, start > 0),
+                logits: logits.clone(),
+                states,
+            });
+        }
         Ok(logits)
     }
 
@@ -885,18 +1018,43 @@ impl Lfm3Model {
         let end = start + len;
         let ids: Vec<i32> = token_ids.iter().map(|&id| id as i32).collect();
         let ids = Array::from_i32(&stream, &[len], &ids)?;
-        // Stage attribution covers decode steps only (single-token forwards at
-        // a nonzero position); prefill builds/evaluates chunk-wise above.
+        // QUEUE #3 armed arm: when the static shape matches the cached
+        // prefill graph, restore the request state and re-evaluate the cached
+        // logits instead of rebuilding the 24-layer graph. Decode (len == 1)
+        // and the unset arm always take the original build path (empty-arm).
+        // The cache is taken out of `self` so the replay/build below can borrow
+        // `self` mutably; a miss rebuilds and re-populates it.
+        let cached = self
+            .prefill_fast
+            .then(|| self.prefill_cache.take())
+            .flatten();
+        let (cache, reuse) = match cached {
+            Some(cache) if cache.key == (len, start, start > 0) => (Some(cache), true),
+            other => (other, false),
+        };
         let stages = self.stages && len == 1 && start > 0;
         let build_started = stages.then(Instant::now);
-        let logits = self.build_graph(&ids, start, len, last_only)?;
+        let logits = if let Some(cache) = cache.as_ref() {
+            self.run_cached_prefill(cache, len, start)?
+        } else {
+            self.build_graph(&ids, start, len, last_only)?
+        };
         let build_ms = build_started.map(|t| t.elapsed().as_secs_f64() * 1000.);
         let mut required: Vec<Array> = vec![logits.clone()];
         if len == 1 {
             required.extend(self.step_state_arrays());
         }
         let eval_started = stages.then(Instant::now);
-        stream.eval(&required)?;
+        if !reuse {
+            stream.eval(&required)?;
+        }
+        // A replayed cache is still valid for the same static key (its
+        // snapshots are absolute-position state, independent of the prompt),
+        // so put it back for the next same-shape prompt; a miss was rebuilt by
+        // `build_graph` and already stored its fresh snapshot.
+        if reuse {
+            self.prefill_cache = cache;
+        }
         let eval_ms = eval_started.map(|t| t.elapsed().as_secs_f64() * 1000.);
         if let (Some(build_ms), Some(eval_ms)) = (build_ms, eval_ms) {
             self.report_stage("sync", build_ms, eval_ms);
@@ -908,6 +1066,18 @@ impl Lfm3Model {
     fn restore_conv_snapshot(&mut self) {
         if let Some(snapshot) = self.conv_snapshot.take() {
             self.conv = snapshot;
+        }
+    }
+
+    /// QUEUE #3 test toggle (P1/P3 harness): flip the fast arm on an already
+    /// loaded model so the token gate does not pay for a second 3.4 GB weight
+    /// load. Clearing the cache when switching off keeps the empty-arm
+    /// assertion (`prefill_cache.is_none()`) load-bearing.
+    #[cfg(test)]
+    fn set_prefill_fast(&mut self, on: bool) {
+        self.prefill_fast = on;
+        if !on {
+            self.prefill_cache = None;
         }
     }
 }
@@ -1218,6 +1388,7 @@ mod tests {
 
     const SYNC_ENV: &str = "APXINF_MLX_SYNC_DECODE";
     const NO_RESTORE_ENV: &str = "APXINF_LFM3_TEST_NO_CONV_RESTORE";
+    const PREFILL_FAST_ENV: &str = "APXINF_LFM3_PREFILL_FAST";
 
     fn test_checkpoint() -> Result<std::path::PathBuf> {
         std::env::var_os("APXINF_LFM3_TEST_MODEL")
@@ -1258,6 +1429,15 @@ mod tests {
             std::env::remove_var(SYNC_ENV);
         }
     }
+
+    fn set_prefill_fast(on: bool) {
+        if on {
+            std::env::set_var(PREFILL_FAST_ENV, "1");
+        } else {
+            std::env::remove_var(PREFILL_FAST_ENV);
+        }
+    }
+
 
     fn run_greedy(model: &mut Lfm3Model, prompt: &[u32], budget: usize) -> Result<Vec<u32>> {
         let options = GenerationOptions::greedy(budget, None);
@@ -1579,4 +1759,113 @@ mod tests {
         );
         Ok(())
     }
+
+    /// P1 — the QUEUE #3 hard gate (doc §Gate.1): with the fast arm on, greedy
+    /// decode emits the identical token ids on every prompt at the full
+    /// 128-token depth. One differing token ⇒ INVALID. The fast toggle flips
+    /// the already-loaded model so both arms share one weight set; the env is
+    /// still reset at entry and exit so `prefill_fast_enabled()` (and thus the
+    /// banner source) cannot be poisoned by a prior panicked test.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn p1_fast_prefill_greedy_matches_baseline_token_for_token() -> Result<()> {
+        let prompts: Vec<Vec<u32>> = (0..4).map(|i| pseudo_prompt(24, 201 + i)).collect();
+
+        set_prefill_fast(false);
+        let mut model = load_checkpoint_model()?;
+        model.set_prefill_fast(false);
+        assert!(!model.prefill_fast, "P1: baseline arm must be off");
+        assert!(model.prefill_cache.is_none(), "P1: baseline arm must hold no cached graph");
+        let mut expected = Vec::with_capacity(prompts.len());
+        for prompt in &prompts {
+            expected.push(run_greedy(&mut model, prompt, 128)?);
+        }
+
+        model.set_prefill_fast(true);
+        assert!(model.prefill_fast, "P1: fast arm toggle did not take");
+        for (index, prompt) in prompts.iter().enumerate() {
+            let got = run_greedy(&mut model, prompt, 128)?;
+            assert_eq!(
+                got, expected[index],
+                "prompt {index}: fast prefill diverged from baseline — INVALID (doc §Gate.1)"
+            );
+        }
+
+        model.set_prefill_fast(false);
+        set_prefill_fast(false);
+        Ok(())
+    }
+
+    /// P2 — the empty-arm gate (doc §Gate.4): with the env unset, the model
+    /// captured the fast arm off, holds no cached graph after a full request,
+    /// and `prefill_fast_enabled()` (the same source the worker banner reads)
+    /// reports false. If the fast path dispatched while the switch was off,
+    /// `prefill_cache` would be `Some` here.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn p2_fast_arm_stays_off_when_switch_unset() -> Result<()> {
+        set_prefill_fast(false);
+        assert!(!prefill_fast_enabled(), "P2: helper must report false when the env is unset");
+        let mut model = load_checkpoint_model()?;
+        assert!(!model.prefill_fast, "P2: model captured the fast arm while the env was unset");
+        let prompt = pseudo_prompt(24, 301);
+        let ids = run_greedy(&mut model, &prompt, 32)?;
+        assert_eq!(ids.len(), 32, "P2: budget must be honoured");
+        assert!(model.prefill_cache.is_none(), "P2: empty-arm — a cached prefill graph was built with the switch off");
+        Ok(())
+    }
+
+    /// P3 — cache correctness (doc §Tests P3): the armed model runs two
+    /// different prompts back to back. The second prompt (a different length,
+    /// so the static key differs) must match a fresh single-prompt run token
+    /// for token. This is the stale-cache canary for the review-time finding
+    /// that a cache hit replays the previous prompt's logits array without
+    /// re-binding the new ids.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn p3_cached_second_prompt_matches_fresh_run() -> Result<()> {
+        let first = pseudo_prompt(24, 401);
+        let second = pseudo_prompt(128, 402);
+
+        // Armed model: two different prompts in one process. The second has a
+        // different static key, so it must rebuild (or be provably equivalent).
+        set_prefill_fast(true);
+        let mut model = load_checkpoint_model()?;
+        model.set_prefill_fast(true);
+        let armed_first = run_greedy(&mut model, &first, 64)?;
+        let armed_second = run_greedy(&mut model, &second, 64)?;
+
+        // Fresh armed model, only the second prompt — the single-run reference.
+        let mut fresh = load_checkpoint_model()?;
+        fresh.set_prefill_fast(true);
+        let fresh_second = run_greedy(&mut fresh, &second, 64)?;
+        assert_eq!(
+            armed_first.len(), 64,
+            "P3: first prompt budget must be honoured before the second starts"
+        );
+        assert_eq!(
+            armed_second, fresh_second,
+            "P3: second prompt in-process diverged from a fresh run — stale cache (doc §Tests P3)"
+        );
+
+        // Same-shape replay: two equal-length prompts in a row must not return
+        // the first prompt's logits either — run peer_b in the already-warm
+        // model and compare against peer_b in a fresh model.
+        let peer_a = pseudo_prompt(24, 501);
+        let peer_b = pseudo_prompt(24, 502);
+        run_greedy(&mut fresh, &peer_a, 64)?;
+        let replayed_b = run_greedy(&mut fresh, &peer_b, 64)?;
+        let mut fresh_b = load_checkpoint_model()?;
+        fresh_b.set_prefill_fast(true);
+        let expected_b = run_greedy(&mut fresh_b, &peer_b, 64)?;
+        assert_eq!(
+            replayed_b, expected_b,
+            "P3: same-shape replay of a different prompt diverged from a fresh run — stale cache on cache-hit (doc §Tests P3)"
+        );
+
+        model.set_prefill_fast(false);
+        set_prefill_fast(false);
+        Ok(())
+    }
+
 }

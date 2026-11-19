@@ -346,6 +346,12 @@ fn parse_dtype(s: &str) -> Option<DType> {
         // producing wrong numbers, because every consumer of `E2M1Pair`
         // requires the NVFP4 quantization contract.
         "U8" => Some(DType::E2M1Pair),
+        // SafeTensors U32 is a raw 32-bit word; MLX affine 4-bit checkpoints
+        // store packed nibbles as U32. apxinf_core has no unsigned integer
+        // dtype, so the word is surfaced as I32 and reinterpreted as U32 by
+        // the consumer (metal_lfm3's Q4 loader) via byte-identical
+        // `Array::from_bytes` — the bits are never converted.
+        "U32" => Some(DType::I32),
         _ => None,
     }
 }
