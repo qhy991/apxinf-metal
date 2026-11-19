@@ -112,6 +112,31 @@
 
 ---
 
+### 2026-11-20 01:26 CST — G4-speed 判定：PASS（§2 G4-speed / §5；Lead 01:41 重算确认）
+
+> 注：本节结果在 Lead 2026-11-20 01:41 指示「把上表写进 doc」后补记，原始窗口运行于 01:19:05–01:24:31（round-55，预登记修订 commit `f10cae5f` 之后）。分析块当时因 typo（`floaint`，见 round-58 STATUS）SyntaxError 挂掉，以下数字为 Lead 从 raw 重算，已复核。
+
+**窗口**：ABBA `A B B A A B`，6 段 3/臂，cells `s2-c1024-g128` × 2 repeats + `s2-c4096-g128` × 2 repeats，engine basis（`--engine-timings`；`decode_ms_per_token` 由引擎自报，客户端计时因 #120 SSE 全缓冲不作主度量）。raw：`~/lfm3-dig-run/window-4bit/raw/*.json`（6 文件）。
+
+**原始数字（Lead 重算，每 case 3 段中位）**：
+
+| case | native-4bit | native-bf16 | 加速 | A/A（4bit / bf16） |
+|---|---:|---:| ---:| ---:|
+| s2-c1024-r0 | 11.13 ms/tok | 36.59 | 3.29× | 3.5% / 0.3% |
+| s2-c1024-r1 | 11.06 | 36.59 | 3.31× | 1.7% / 0.5% |
+| s2-c4096-r0 | 11.39 | 37.13 | 3.26× | 0.8% / 1.1% |
+| s2-c4096-r1 | 11.44 | 37.26 | 3.26× | 1.7% / 2.4% |
+
+**G3 effect proof**：armed 臂 banner `decode_schedule=… native_4bit=true` + census `quantized_triples=154/154`；BF16 臂 banner `native_4bit=false`（census 空属预期）；无空臂。
+
+**判据（§2 G4-speed，冻结）**：4-bit vs BF16 **≥2.5×** 且 **≤ llama Q4（12.39/12.71 ms/token 认证基线）**；A/A ≤5%（§2 G5）。
+
+**结论：G4-speed PASS**：3.26–3.31× ≥ 2.5×；11.06–11.44 ≤ 12.39/12.71，4bit/llama = 0.89–0.92（快 8–11%）；A/A 全部 ≤3.5% ≤ 5%；G3 空臂检查 PASS。
+
+**QUEUE #8 完整五档仍待 G1′（质量门）**：G4-speed 通过，但 §5 判据要求两门都过才判 WIN；G1′ 结果见 round-57 STATUS 与本文件 §7 后续节（质量 STOP ⇒ 默认不设 4-bit）。
+
+---
+
 ## Gate（原文，供 PR 引用）
 
 > **G1-diag（诊断，非门）** 记录原生 4-bit vs Python lane 4-bit 首处分叉（已知 v12 prompt 0 step 59，lane=125020 vs native=25797）并尝试 FP16 scale 路径复现 lane（`q4_f16.rs`）；修好则升级回 G1 硬门，修不好记为已知引擎差，不判 INVALID。**G1′（质量门）** 同批 agent 任务（≥6 题）4-bit vs BF16 solved rate 掉 ≤3 点通过、>10 点停。**G4-speed（速度门）** ABBA ≥3 段/臂、A/A ≤5%、engine basis，4-bit vs BF16 ≥2.5× 且 ≤ llama Q4（12.39/12.71 ms/token）。**G3** banner `native_4bit` 字段缺失或二进制未重编译 ⇒ 空臂 INVALID。**G4-shape** 任何 shape 漂移（padded/bucketed/wider/拆 K/换读向）⇒ 实现不可用。**G5** A/A ≤ 5%（本 ticket 自有）。
