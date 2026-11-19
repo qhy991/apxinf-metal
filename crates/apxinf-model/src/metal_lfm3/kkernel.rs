@@ -44,4 +44,18 @@ impl KKernel {
             None => gate.mul(&gate.sigmoid()?)?.mul(up),
         }
     }
+
+    /// `true` when the custom lm_head pipeline is armed (gate-0 census; used
+    /// by K3's empty-arm trap).
+    #[cfg(test)]
+    pub fn lm_head_armed(&self) -> bool {
+        self.lm_head.is_some()
+    }
+
+    /// `true` when the fused silu_mul pipeline is armed (gate-0 census; used
+    /// by K3's empty-arm trap).
+    #[cfg(test)]
+    pub fn silu_mul_armed(&self) -> bool {
+        self.silu_mul.is_some()
+    }
 }

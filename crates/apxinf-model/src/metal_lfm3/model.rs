@@ -1250,6 +1250,7 @@ mod tests {
 
     const SYNC_ENV: &str = "APXINF_MLX_SYNC_DECODE";
     const NO_RESTORE_ENV: &str = "APXINF_LFM3_TEST_NO_CONV_RESTORE";
+    const KKERNEL_ENV: &str = "APXINF_LFM3_KKERNEL";
 
     fn test_checkpoint() -> Result<std::path::PathBuf> {
         std::env::var_os("APXINF_LFM3_TEST_MODEL")
@@ -1288,6 +1289,14 @@ mod tests {
             std::env::set_var(SYNC_ENV, "1");
         } else {
             std::env::remove_var(SYNC_ENV);
+        }
+    }
+
+    fn set_kkernel(on: bool) {
+        if on {
+            std::env::set_var(KKERNEL_ENV, "1");
+        } else {
+            std::env::remove_var(KKERNEL_ENV);
         }
     }
 
@@ -1404,6 +1413,167 @@ mod tests {
                 "prompt {index}: pipelined greedy diverged from sync"
             );
         }
+        Ok(())
+    }
+
+    // ---- QUEUE #2 custom-kernel gates (doc/lfm3-lm-head-custom-kernel.md
+    // §9). Same real-checkpoint Metal lock and `--test-threads=1` discipline as
+    // T1/T2/T3; they mutate `APXINF_LFM3_KKERNEL`, which selects the kernels at
+    // model construction.
+
+    /// K1: the custom lm_head GEMV reproduces MLX's `[1,1,K]×[K,V]` matmul
+    /// bitwise (doc §9 K1's strict form). If MLX reduces in a different order,
+    /// the failure message carries the numeric delta to be recorded as the
+    /// amendment the doc permits — the hard gate is tokens, not logits (K3).
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn k1_lm_head_kernel_matches_matmul_bitwise() -> Result<()> {
+        use apxinf_mlx::fusions::LmHeadGemv;
+        let stream = Stream::metal(0)?;
+        let gemv = LmHeadGemv::new(&stream)?;
+        for (k, v, seed) in [(8usize, 1usize, 23u64), (32, 64, 29)] {
+            let x = Array::from_f32(&stream, &[1, 1, k], &values(k, seed, 0.5))?
+                .cast(MlxDType::BF16)?;
+            let w = Array::from_f32(&stream, &[k, v], &values(k * v, seed + 1, 0.25))?
+                .cast(MlxDType::BF16)?;
+            let custom = gemv.call(&x, &w)?;
+            let reference = x.matmul(&w)?;
+            assert_eq!(custom.shape(), reference.shape(), "K1: output shape must match");
+            stream.eval(&[custom.clone(), reference.clone()])?;
+            let got = custom.cast(MlxDType::F32)?.to_f32_vec()?;
+            let want = reference.cast(MlxDType::F32)?.to_f32_vec()?;
+            let (mut max_abs, mut exact) = (0f64, 0usize);
+            for (a, b) in got.iter().zip(&want) {
+                exact += usize::from(a == b);
+                max_abs = max_abs.max((*a as f64 - *b as f64).abs());
+            }
+            eprintln!(
+                "K1 lm_head vs matmul k={k} v={v}: max_abs_diff={max_abs:.3e} element_exact={exact}/{}",
+                got.len()
+            );
+            assert_eq!(
+                got, want,
+                "K1: lm_head GEMV must match MLX matmul bitwise (k={k} v={v}, max_abs_diff={max_abs:.3e}, exact={exact}/{}); if MLX reduces in a different order, record this delta as the §9 K1 amendment — the hard gate is tokens, not logits",
+                got.len()
+            );
+        }
+        Ok(())
+    }
+
+    /// K2: the fused `silu(gate)*up` matches the unfused graph on the exact
+    /// decode shape within the registered `rtol=1e-6, atol=1e-6` (doc §9 K2).
+    /// The delta and exact-element fraction are printed so a failure is
+    /// diagnostic rather than opaque.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn k2_fused_silu_mul_matches_graph_reference() -> Result<()> {
+        use apxinf_mlx::fusions::SiluMulFused;
+        let stream = Stream::metal(0)?;
+        let fused = SiluMulFused::new(&stream)?;
+        let gate = Array::from_f32(&stream, &[1, 1, 2048], &values(2048, 37, 2.0))?
+            .cast(MlxDType::BF16)?;
+        let up = Array::from_f32(&stream, &[1, 1, 2048], &values(2048, 41, 2.0))?
+            .cast(MlxDType::BF16)?;
+        let custom = fused.call(&gate, &up)?;
+        let reference = gate.mul(&gate.sigmoid()?)?.mul(&up)?;
+        assert_eq!(custom.shape(), reference.shape(), "K2: output shape must match");
+        stream.eval(&[custom.clone(), reference.clone()])?;
+        let got = custom.cast(MlxDType::F32)?.to_f32_vec()?;
+        let want = reference.cast(MlxDType::F32)?.to_f32_vec()?;
+        let (mut max_abs, mut exact) = (0f64, 0usize);
+        for (a, b) in got.iter().zip(&want) {
+            exact += usize::from(a == b);
+            max_abs = max_abs.max((*a as f64 - *b as f64).abs());
+        }
+        eprintln!(
+            "K2 fused silu vs graph: max_abs_diff={max_abs:.3e} element_exact={exact}/{}",
+            got.len()
+        );
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (*a - *b).abs() <= 1e-6 + 1e-6 * b.abs(),
+                "K2: element {i} fused={a} graph={b} exceeds rtol=1e-6 atol=1e-6 (max_abs_diff={max_abs:.3e}); record the numeric delta as an amendment — the hard gate is tokens (K3)"
+            );
+        }
+        Ok(())
+    }
+
+    /// K3 — the hard gate (doc §5.1): with both custom kernels armed, greedy
+    /// decode emits the identical token ids on every prompt at the full
+    /// 128-token depth. One differing token ⇒ INVALID. The env switch is
+    /// cleared at entry as well as exit so a prior panicked test cannot poison
+    /// the baseline arm (the empty-arm trap depends on it).
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn k3_armed_kkernel_greedy_matches_baseline_token_for_token() -> Result<()> {
+        let prompts: Vec<Vec<u32>> = (0..4).map(|i| pseudo_prompt(24, 101 + i)).collect();
+
+        set_kkernel(false);
+        let mut baseline = load_checkpoint_model()?;
+        assert!(!baseline.kkernel.lm_head_armed(), "K3: baseline arm must not construct the lm_head kernel");
+        assert!(!baseline.kkernel.silu_mul_armed(), "K3: baseline arm must not construct the silu_mul kernel");
+        let mut expected = Vec::with_capacity(prompts.len());
+        for prompt in &prompts {
+            expected.push(run_greedy(&mut baseline, prompt, 128)?);
+        }
+
+        set_kkernel(true);
+        let mut armed = load_checkpoint_model()?;
+        assert!(armed.kkernel.lm_head_armed(), "K3: empty-arm trap — lm_head kernel not constructed");
+        assert!(armed.kkernel.silu_mul_armed(), "K3: empty-arm trap — silu_mul kernel not constructed");
+        for (index, prompt) in prompts.iter().enumerate() {
+            let got = run_greedy(&mut armed, prompt, 128)?;
+            assert_eq!(
+                got, expected[index],
+                "prompt {index}: armed kkernel diverged from baseline — INVALID (doc §5.1)"
+            );
+        }
+
+        set_kkernel(false);
+        Ok(())
+    }
+
+    /// K4 — the shape guard is load-bearing (doc §5.2 / §9 K4): padded,
+    /// mis-rank, K-mismatched, shape-mismatched, or widened (non-BF16) inputs
+    /// must fail loudly, while the exact registered geometry must succeed, so
+    /// the `Err` assertions above cannot be vacuous.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn k4_shape_guard_rejects_padded_and_mismatched_inputs() -> Result<()> {
+        use apxinf_mlx::fusions::{LmHeadGemv, SiluMulFused};
+        let stream = Stream::metal(0)?;
+        let gemv = LmHeadGemv::new(&stream)?;
+        let silu = SiluMulFused::new(&stream)?;
+
+        // Exact geometry must dispatch and preserve the output shape.
+        let x = Array::from_f32(&stream, &[1, 1, 8], &values(8, 53, 0.5))?
+            .cast(MlxDType::BF16)?;
+        let w = Array::from_f32(&stream, &[8, 16], &values(128, 59, 0.25))?
+            .cast(MlxDType::BF16)?;
+        assert_eq!(gemv.call(&x, &w)?.shape(), &[1, 1, 16], "K4: exact geometry must dispatch");
+
+        // lm_head guards: rank, K match, dtype.
+        let bad_rank = Array::from_f32(&stream, &[1, 16], &values(16, 61, 0.5))?
+            .cast(MlxDType::BF16)?;
+        assert!(gemv.call(&bad_rank, &w).is_err(), "K4: non-[1,1,K] input must be rejected");
+        let w_k_mismatch = Array::from_f32(&stream, &[7, 16], &values(112, 67, 0.25))?
+            .cast(MlxDType::BF16)?;
+        assert!(gemv.call(&x, &w_k_mismatch).is_err(), "K4: K mismatch must be rejected");
+        let x_f32 = Array::from_f32(&stream, &[1, 1, 8], &values(8, 71, 0.5))?;
+        assert!(gemv.call(&x_f32, &w).is_err(), "K4: widened (non-BF16) input must be rejected");
+
+        // silu_mul guards: shape and dtype.
+        let gate = Array::from_f32(&stream, &[1, 1, 8], &values(8, 73, 1.0))?
+            .cast(MlxDType::BF16)?;
+        let up_ok = Array::from_f32(&stream, &[1, 1, 8], &values(8, 79, 1.0))?
+            .cast(MlxDType::BF16)?;
+        assert_eq!(silu.call(&gate, &up_ok)?.shape(), &[1, 1, 8], "K4: exact silu geometry must dispatch");
+        let up_wide = Array::from_f32(&stream, &[1, 1, 16], &values(16, 83, 1.0))?
+            .cast(MlxDType::BF16)?;
+        assert!(silu.call(&gate, &up_wide).is_err(), "K4: silu_mul shape mismatch must be rejected");
+        let gate_f32 = Array::from_f32(&stream, &[1, 1, 8], &values(8, 89, 1.0))?;
+        let up_f32 = Array::from_f32(&stream, &[1, 1, 8], &values(8, 97, 1.0))?;
+        assert!(silu.call(&gate_f32, &up_f32).is_err(), "K4: silu_mul widened (non-BF16) inputs must be rejected");
         Ok(())
     }
 
