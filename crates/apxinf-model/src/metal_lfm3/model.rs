@@ -14,6 +14,7 @@
 use super::{
     config::{LayerKind, Lfm3Config},
     kkernel::KKernel,
+    q4,
     weights::{LayerWeights, Mixer, Weights},
 };
 use crate::llm_trait::{
@@ -44,6 +45,13 @@ fn decode_stages_enabled() -> bool {
 /// baseline arm takes the unchanged path (empty-arm gate).
 pub fn prefill_fast_enabled() -> bool {
     std::env::var_os("APXINF_LFM3_PREFILL_FAST").is_some_and(|value| value == "1")
+}
+
+/// `true` when the QUEUE #8 native 4-bit arm was requested. Same env source
+/// the worker banner reports (`native_4bit`), captured once at construction
+/// so the unset baseline arm never inspects quantized keys (empty-arm gate).
+pub fn native_4bit_enabled() -> bool {
+    q4::enabled()
 }
 
 // Platform C math library, used only to generate the fixed rotary tables on the
@@ -254,6 +262,17 @@ impl Lfm3Model {
             #[cfg(test)]
             disable_conv_restore: false,
         };
+        // Gate-0 census: proves the 4-bit switch actually consumed quantized
+        // triples (empty-arm trap — a banner saying true while zero triples
+        // loaded is an INVALID run). The official export has 153 layer
+        // projections (13 conv × 5 + 11 attn × 8) + 1 tied table = 154; the
+        // default (unset) arm prints nothing.
+        if q4::enabled() {
+            eprintln!(
+                "native_4bit census: quantized_triples={}/154",
+                model.weights.quantized_layers
+            );
+        }
         model.prepare(1, 0)?;
         Ok(model)
     }

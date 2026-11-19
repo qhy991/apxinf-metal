@@ -528,13 +528,18 @@ fn run(args: Args) -> Result<()> {
     let kkernel = std::env::var_os("APXINF_LFM3_KKERNEL").is_some_and(|v| v == "1");
     let prefill_fast =
         std::env::var_os("APXINF_LFM3_PREFILL_FAST").is_some_and(|v| v == "1");
+    // QUEUE #8: same env source as `metal_lfm3::q4::enabled()`, so the banner
+    // truthfully reports whether the worker was launched with the switch
+    // (empty-arm gate — an unset switch must print false, not claim a run).
+    let native_4bit = std::env::var_os("APXINF_LFM3_4BIT").is_some_and(|v| v == "1");
     eprintln!(
-        "decode_schedule={} overlaps_callbacks={} decode_stages={} kkernel={} prefill_fast={}",
+        "decode_schedule={} overlaps_callbacks={} decode_stages={} kkernel={} prefill_fast={} native_4bit={}",
         if sync_decode { "sync" } else { "pipelined" },
         if sync_decode { "false" } else { "true" },
         if decode_stages { "true" } else { "false" },
         if kkernel { "true" } else { "false" },
         if prefill_fast { "true" } else { "false" },
+        if native_4bit { "true" } else { "false" },
     );
     let prepared = profile == NativeProfile::Prepared;
     if prepared {

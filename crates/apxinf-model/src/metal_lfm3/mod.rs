@@ -9,8 +9,9 @@ pub mod config;
 mod model;
 mod weights;
 mod kkernel;
+mod q4;
 pub use kkernel::enabled as kkernel_enabled;
-pub use model::{prefill_fast_enabled, Lfm3Model};
+pub use model::{native_4bit_enabled, prefill_fast_enabled, Lfm3Model};
 
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Backend, DType, Device, Error, Result};
@@ -32,7 +33,25 @@ pub fn load(
         .map_err(|e| Error::Other(format!("cannot read LFM3 config: {e}")))?;
     let config = Lfm3Config::from_json(&json)?;
     config.validate_checkpoint_scope()?;
-    let (tensors, _) = apxinf_loader::safetensors::load_native_path(path).map_err(Error::Other)?;
+    let (mut tensors, _) = apxinf_loader::safetensors::load_native_path(path).map_err(Error::Other)?;
+    // The BF16 checkpoint keys are `model.*`; the Hugging Face MLX-quantized
+    // export wraps them in `language_model.` and adds `{scales,biases}` next
+    // to each packed `weight`. Normalizing the prefix once here means the
+    // existing `model.*` lookup paths work unchanged for both arms, and the
+    // default (env-unset) arm still never inspects a quantized key.
+    if q4::enabled() {
+        let prefix = "language_model.";
+        for key in tensors
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let new = key[prefix.len()..].to_string();
+            let value = tensors.remove(&key).expect("key present");
+            tensors.insert(new, value);
+        }
+    }
     Ok(LoadedModel::text(Box::new(Lfm3Model::new(
         config, tensors, backend,
     )?)))
