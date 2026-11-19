@@ -1042,7 +1042,7 @@ impl Lfm3Model {
             let hidden = norm(&x, &weights.final_norm, c.norm_eps)?;
             let rows = hidden.slice_axis(1, len - 1, len)?;
             let logits = weights
-                .project(&rows)
+                .project(&rows)?
                 .reshape(&[rows.shape()[1], c.vocab_size])?;
             if state_index != states.len() {
                 return Err(err(format!(
