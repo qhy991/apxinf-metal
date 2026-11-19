@@ -92,6 +92,27 @@ struct Args {
     /// today; `on` (Neural Engine composed prefill) is a separate task.
     #[arg(long, default_value = "off", value_parser = ["off", "on"])]
     ane: String,
+    /// Environment entry declared for the worker process, `KEY=VALUE`; the
+    /// supervisor clears the worker environment at launch, so a switch that
+    /// must be visible inside the worker (for example
+    /// `APXINF_MLX_SYNC_DECODE=1`) has to be passed explicitly. Repeatable.
+    #[arg(long = "worker-env", value_name = "KEY=VALUE")]
+    worker_env: Vec<String>,
+}
+
+/// Parse the repeatable `--worker-env KEY=VALUE` option into (key, value) pairs.
+fn parse_worker_env(entries: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut parsed = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some((key, value)) = entry.split_once('=') else {
+            return Err(format!("--worker-env expects KEY=VALUE, got `{entry}`."));
+        };
+        if key.is_empty() {
+            return Err("--worker-env needs a non-empty key.".to_string());
+        }
+        parsed.push((key.to_string(), value.to_string()));
+    }
+    Ok(parsed)
 }
 
 #[tokio::main]
@@ -327,6 +348,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         sequence_reservation: args.sequence_reservation_bytes,
         host_pressure_policy: args.host_pressure_policy,
         request_log: args.request_log.clone(),
+        worker_env: parse_worker_env(&args.worker_env)?,
     };
     let shutdown = shutdown.shared();
     // Bind and serve before loading so a client can observe the loading phase

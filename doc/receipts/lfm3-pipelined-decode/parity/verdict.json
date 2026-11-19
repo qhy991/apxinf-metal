@@ -1,0 +1,42 @@
+{
+  "all_token_streams_identical": true,
+  "cases": [
+    {
+      "case": "parity-1024-0",
+      "prompts_identical": true,
+      "text_identical": true,
+      "completion_equal": true,
+      "ok": true,
+      "sync_tokens": null,
+      "pipe_tokens": null
+    },
+    {
+      "case": "parity-1024-1",
+      "prompts_identical": true,
+      "text_identical": true,
+      "completion_equal": true,
+      "ok": true,
+      "sync_tokens": null,
+      "pipe_tokens": null
+    },
+    {
+      "case": "parity-4096-0",
+      "prompts_identical": true,
+      "text_identical": true,
+      "completion_equal": true,
+      "ok": true,
+      "sync_tokens": null,
+      "pipe_tokens": null
+    },
+    {
+      "case": "parity-4096-1",
+      "prompts_identical": true,
+      "text_identical": true,
+      "completion_equal": true,
+      "ok": true,
+      "sync_tokens": null,
+      "pipe_tokens": null
+    }
+  ],
+  "gate": "PASS"
+}

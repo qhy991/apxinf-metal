@@ -1,0 +1,53 @@
+{
+  "ts": "2026-11-19T03:01:28+00:00",
+  "loadavg": [
+    2.888671875,
+    2.7392578125,
+    2.9375
+  ],
+  "swap": null,
+  "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+  "top_cpu": [
+    {
+      "pid": "1338",
+      "pcpu": 71.6,
+      "comm": "/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_agent.app/Contents/MacOS/logioptionsplus_agent"
+    },
+    {
+      "pid": "770",
+      "pcpu": 29.5,
+      "comm": "/usr/libexec/trustd"
+    },
+    {
+      "pid": "1460",
+      "pcpu": 25.0,
+      "comm": "/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_logivoice.app/Contents/MacOS/logioptionsplus_logivoice"
+    },
+    {
+      "pid": "512",
+      "pcpu": 2.4,
+      "comm": "/usr/libexec/syspolicyd"
+    },
+    {
+      "pid": "1437",
+      "pcpu": 1.3,
+      "comm": "/usr/libexec/trustd"
+    },
+    {
+      "pid": "559",
+      "pcpu": 1.0,
+      "comm": "/System/Library/PrivateFrameworks/BackgroundTaskManagement.framework/Resources/backgroundtaskmanagementd"
+    },
+    {
+      "pid": "22178",
+      "pcpu": 1.0,
+      "comm": "/opt/homebrew/bin/gh"
+    },
+    {
+      "pid": "369",
+      "pcpu": 0.9,
+      "comm": "/usr/libexec/logd"
+    }
+  ],
+  "swapouts": "Swapouts:                                   53905789."
+}

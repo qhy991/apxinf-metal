@@ -331,6 +331,11 @@ pub struct Config {
     pub host_pressure_policy: HostPressurePolicy,
     /// Append one JSON line per settled request here (chat and replay).
     pub request_log: Option<std::path::PathBuf>,
+    /// Extra environment for the worker process. The launch clears the
+    /// worker's environment, so every scheduling/debug switch that must be
+    /// visible inside the worker has to be declared here (for example
+    /// `APXINF_MLX_SYNC_DECODE=1`). Keys must be valid environment names.
+    pub worker_env: Vec<(String, String)>,
 }
 
 impl Config {
@@ -1128,6 +1133,20 @@ async fn launch_worker_until(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Declared switches only: the worker environment is cleared above, so an
+    // outer shell export never reaches the worker by accident (an undeclared
+    // switch is the empty-arm trap: the arm silently runs the default).
+    for (key, value) in &config.worker_env {
+        if key.is_empty()
+            || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || key.starts_with(|c: char| c.is_ascii_digit())
+        {
+            return Err(LaunchError::Worker(format!(
+                "Invalid worker environment name `{key}`."
+            )));
+        }
+        command.env(key, value);
+    }
     if let WorkerRuntime::NativeMiniCpm5Prepared { metal_library, .. }
     | WorkerRuntime::NativeMiniCpm5 { metal_library, .. }
     | WorkerRuntime::NativeMiniCpm5Sampled { metal_library, .. }

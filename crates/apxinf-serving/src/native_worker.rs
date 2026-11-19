@@ -518,6 +518,19 @@ fn run(args: Args) -> Result<()> {
     {
         return Err("Unsupported native launch profile".into());
     }
+    // Construction-time schedule banner: the supervisor pipes this stderr line
+    // into the gateway log, and a benchmark arm without its banner is void
+    // (an undeclared switch is the empty-arm trap). The worker environment is
+    // cleared at launch, so these report exactly what the launch declared.
+    let sync_decode = std::env::var_os("APXINF_MLX_SYNC_DECODE").is_some_and(|v| v == "1");
+    let decode_stages =
+        std::env::var_os("APXINF_LFM3_DECODE_STAGES").is_some_and(|v| v == "1");
+    eprintln!(
+        "decode_schedule={} overlaps_callbacks={} decode_stages={}",
+        if sync_decode { "sync" } else { "pipelined" },
+        if sync_decode { "false" } else { "true" },
+        if decode_stages { "true" } else { "false" },
+    );
     let prepared = profile == NativeProfile::Prepared;
     if prepared {
         if args.cache_limit_bytes.is_none_or(|v| v == 0 || v > args.memory_limit_bytes)

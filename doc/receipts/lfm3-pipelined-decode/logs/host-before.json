@@ -1,0 +1,53 @@
+{
+  "ts": "2026-11-19T02:50:57+00:00",
+  "loadavg": [
+    4.11669921875,
+    3.65673828125,
+    3.28369140625
+  ],
+  "swap": null,
+  "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+  "top_cpu": [
+    {
+      "pid": "1338",
+      "pcpu": 17.3,
+      "comm": "/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_agent.app/Contents/MacOS/logioptionsplus_agent"
+    },
+    {
+      "pid": "770",
+      "pcpu": 9.5,
+      "comm": "/usr/libexec/trustd"
+    },
+    {
+      "pid": "1460",
+      "pcpu": 7.7,
+      "comm": "/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_logivoice.app/Contents/MacOS/logioptionsplus_logivoice"
+    },
+    {
+      "pid": "18930",
+      "pcpu": 7.3,
+      "comm": "/opt/homebrew/bin/gh"
+    },
+    {
+      "pid": "99731",
+      "pcpu": 4.7,
+      "comm": "/opt/homebrew/opt/node@22/bin/node"
+    },
+    {
+      "pid": "18926",
+      "pcpu": 4.5,
+      "comm": "/opt/homebrew/bin/gh"
+    },
+    {
+      "pid": "442",
+      "pcpu": 1.6,
+      "comm": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer"
+    },
+    {
+      "pid": "443",
+      "pcpu": 1.6,
+      "comm": "/System/Library/PrivateFrameworks/TCC.framework/Support/tccd"
+    }
+  ],
+  "swapouts": "Swapouts:                                   53905789."
+}

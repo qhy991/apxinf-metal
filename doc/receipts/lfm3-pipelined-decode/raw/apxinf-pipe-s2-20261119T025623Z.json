@@ -1,0 +1,335 @@
+{
+  "schema": "apxinf-engine-bench-arm-v1",
+  "arm": "apxinf-pipe",
+  "stage": "s2",
+  "protocol": "openai-chat",
+  "prompt_protocol": "lane-chatml",
+  "endpoint": "http://127.0.0.1:8099",
+  "model": "LFM3-1.7B",
+  "started_at": "2026-11-19T02:56:23+00:00",
+  "finished_at": "2026-11-19T02:57:13+00:00",
+  "artifact": {
+    "binary_sha256": "c8cec3ead88f63e120c1f034efb7af547fa1fd30a6fbb4f25b8e1aa1c672d60c",
+    "model_sha256": "135922caef64e81e52af88ede8b7c3ddaa9d6da220a9737fb3065275dbfb4330",
+    "quantization": null,
+    "protocol": "openai-chat",
+    "prompt_protocol": "lane-chatml",
+    "commit": "c7f41fbd0de819ed0d2f7cc1feb41bc9daa9fd77",
+    "branch": "agent/lfm-pipelined-decode-999ba7b193af",
+    "apxinf_env": {}
+  },
+  "host": {
+    "before": {
+      "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+      "machine": "arm64",
+      "python": "3.14.3",
+      "loadavg": [
+        2.7626953125,
+        3.08544921875,
+        3.13232421875
+      ],
+      "started_at": "2026-11-19T02:56:23+00:00",
+      "top_cpu": [
+        {
+          "pid": "1338",
+          "pcpu": 10.2,
+          "etime": "01-11:29:07",
+          "comm": "/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_agent.app/Contents/MacOS/logioptionsplus_agent"
+        },
+        {
+          "pid": "20753",
+          "pcpu": 10.2,
+          "etime": "00:00",
+          "comm": "/opt/homebrew/Cellar/python@3.14/3.14.3/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"
+        },
+        {
+          "pid": "770",
+          "pcpu": 5.2,
+          "etime": "01-11:29:16",
+          "comm": "/usr/libexec/trustd"
+        },
+        {
+          "pid": "20731",
+          "pcpu": 4.2,
+          "etime": "00:00",
+          "comm": "/opt/homebrew/bin/gh"
+        },
+        {
+          "pid": "20738",
+          "pcpu": 2.6,
+          "etime": "00:00",
+          "comm": "bash"
+        }
+      ],
+      "swapouts": "Swapouts:                                   53905789.",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "disk_free": "/dev/disk3s1s1   460Gi    13Gi    15Gi    47%    484k  154M    0%   /"
+    },
+    "after": {
+      "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+      "machine": "arm64",
+      "python": "3.14.3",
+      "loadavg": [
+        2.734375,
+        2.99951171875,
+        3.09423828125
+      ],
+      "started_at": "2026-11-19T02:57:13+00:00",
+      "top_cpu": [
+        {
+          "pid": "1338",
+          "pcpu": 27.8,
+          "etime": "01-11:29:57",
+          "comm": "/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_agent.app/Contents/MacOS/logioptionsplus_agent"
+        },
+        {
+          "pid": "770",
+          "pcpu": 14.4,
+          "etime": "01-11:30:06",
+          "comm": "/usr/libexec/trustd"
+        },
+        {
+          "pid": "20645",
+          "pcpu": 11.5,
+          "etime": "01:06",
+          "comm": "/Users/haiyan-mini/lfm3bench/lfm3-pipelined-decode/apxinf-metal/target/release/apxinf-native-worker"
+        },
+        {
+          "pid": "1460",
+          "pcpu": 10.0,
+          "etime": "01-11:29:54",
+          "comm": "/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_logivoice.app/Contents/MacOS/logioptionsplus_logivoice"
+        },
+        {
+          "pid": "446",
+          "pcpu": 3.9,
+          "etime": "01-11:30:12",
+          "comm": "/usr/libexec/runningboardd"
+        }
+      ],
+      "swapouts": "Swapouts:                                   53905789.",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "disk_free": "/dev/disk3s1s1   460Gi    13Gi    15Gi    47%    484k  154M    0%   /"
+    }
+  },
+  "corpus": {
+    "source": "generated",
+    "seed": 20261120,
+    "chars_per_token": 3.85,
+    "sha256": "6d15aa01758d46acaf030ca0489e9d55f2dc896e06cf5fd31ea6b754699d5a72",
+    "case_count": 4
+  },
+  "params": {
+    "temperature": 0.0,
+    "seed": 20261118,
+    "stream": true,
+    "segment": 1,
+    "warmup_requests": 1,
+    "timeout_s": 900.0
+  },
+  "cases": [
+    {
+      "id": "s2-c1024-g128-r0",
+      "target_tokens": 1024,
+      "max_tokens": 128,
+      "context": 1024,
+      "round": 0
+    },
+    {
+      "id": "s2-c4096-g128-r0",
+      "target_tokens": 4096,
+      "max_tokens": 128,
+      "context": 4096,
+      "round": 0
+    },
+    {
+      "id": "s2-c1024-g128-r1",
+      "target_tokens": 1024,
+      "max_tokens": 128,
+      "context": 1024,
+      "round": 1
+    },
+    {
+      "id": "s2-c4096-g128-r1",
+      "target_tokens": 4096,
+      "max_tokens": 128,
+      "context": 4096,
+      "round": 1
+    }
+  ],
+  "timing_primary": "engine",
+  "request_log": {
+    "path": "/Users/haiyan-mini/lfm3bench/lfm3-pipelined-decode/apxinf-metal/devlocal/engine-comparison-lfm3/apxinf-apxinf-pipe-1-requests.jsonl",
+    "enabled": true,
+    "matched": 4,
+    "by_request_id": 4,
+    "by_order": 0
+  },
+  "requests": [
+    {
+      "case": "__warmup__",
+      "target_tokens": 128,
+      "max_tokens": 8,
+      "status": "ok",
+      "http_status": 200,
+      "client_ttft_ms": 1086.8335419945652,
+      "client_decode_ms": 0.0004580069798976183,
+      "client_wall_ms": 1086.834000001545,
+      "client_headers_ms": 319.52820799779147,
+      "client_close_ms": 2.472457999829203,
+      "prompt_tokens": 106,
+      "completion_tokens": 8,
+      "response_id": "chatcmpl-f7a409e9-287c-47bd-865a-0237b515325b",
+      "ttft_ms": 1086.8335419945652,
+      "ttft_basis": "client",
+      "decode_ms": 0.0004580069798976183,
+      "decode_tokens": 7,
+      "decode_basis": "client",
+      "decode_ms_per_token": 6.542956855680262e-05,
+      "prefill_tok_s": 97.53103479440651,
+      "decode_tok_s": 15283609.87329224,
+      "evidence": "{\"response_id\": \"chatcmpl-f7a409e9-287c-47bd-865a-0237b515325b\", \"completion_tokens\": 8, \"engine_source\": null, \"finish_reason\": null}",
+      "warmup": true
+    },
+    {
+      "case": "s2-c1024-g128-r0",
+      "target_tokens": 1024,
+      "max_tokens": 128,
+      "status": "ok",
+      "http_status": 200,
+      "client_wall_ms": 7733.898708000197,
+      "client_headers_ms": 2312.9663330037147,
+      "client_close_ms": 3.8368749956134707,
+      "prompt_tokens": 797,
+      "completion_tokens": 128,
+      "response_id": "chatcmpl-12b487a9-da29-4d65-a96b-7f721b0b5f4a",
+      "ttft_ms": 805.939583,
+      "ttft_basis": "engine",
+      "decode_ms": 4615.099792,
+      "decode_tokens": 127,
+      "decode_basis": "engine",
+      "decode_ms_per_token": 36.33936844094488,
+      "prefill_tok_s": 988.9078745000666,
+      "decode_tok_s": 27.518364872661458,
+      "evidence": "{\"response_id\": \"chatcmpl-12b487a9-da29-4d65-a96b-7f721b0b5f4a\", \"completion_tokens\": 128, \"engine_source\": null, \"finish_reason\": null}",
+      "engine_prefill_ms": 805.939583,
+      "engine_decode_ms": 4615.099792,
+      "engine_decode_ms_per_token": 36.33936844094488,
+      "engine_decode_tokens": 128,
+      "engine_ttft_ms": 805.939583,
+      "engine_ledger_request_id": "12b487a9-da29-4d65-a96b-7f721b0b5f4a",
+      "engine_ledger_join": "request_id",
+      "engine_source": "apxinf.ledger",
+      "client_ttft_ms_observed": 7733.898291000514,
+      "client_decode_ms_observed": 0.0004169996827840805
+    },
+    {
+      "case": "s2-c4096-g128-r0",
+      "target_tokens": 4096,
+      "max_tokens": 128,
+      "status": "ok",
+      "http_status": 200,
+      "client_wall_ms": 16710.374000002048,
+      "client_headers_ms": 9118.665792004322,
+      "client_close_ms": 9.057041999767534,
+      "prompt_tokens": 3147,
+      "completion_tokens": 128,
+      "response_id": "chatcmpl-f1ede6c9-4cf0-4b96-8dea-a9cc95909310",
+      "ttft_ms": 2936.904083,
+      "ttft_basis": "engine",
+      "decode_ms": 4654.898084,
+      "decode_tokens": 127,
+      "decode_basis": "engine",
+      "decode_ms_per_token": 36.65274081889764,
+      "prefill_tok_s": 1071.5365265812122,
+      "decode_tok_s": 27.283089276761917,
+      "evidence": "{\"response_id\": \"chatcmpl-f1ede6c9-4cf0-4b96-8dea-a9cc95909310\", \"completion_tokens\": 128, \"engine_source\": null, \"finish_reason\": null}",
+      "engine_prefill_ms": 2936.904083,
+      "engine_decode_ms": 4654.898084,
+      "engine_decode_ms_per_token": 36.65274081889764,
+      "engine_decode_tokens": 128,
+      "engine_ttft_ms": 2936.904083,
+      "engine_ledger_request_id": "f1ede6c9-4cf0-4b96-8dea-a9cc95909310",
+      "engine_ledger_join": "request_id",
+      "engine_source": "apxinf.ledger",
+      "client_ttft_ms_observed": 16710.373624999193,
+      "client_decode_ms_observed": 0.00037500285543501377
+    },
+    {
+      "case": "s2-c1024-g128-r1",
+      "target_tokens": 1024,
+      "max_tokens": 128,
+      "status": "ok",
+      "http_status": 200,
+      "client_wall_ms": 7751.2140839971835,
+      "client_headers_ms": 2329.643584002042,
+      "client_close_ms": 3.6087909975321963,
+      "prompt_tokens": 802,
+      "completion_tokens": 128,
+      "response_id": "chatcmpl-900931c0-6c90-4209-b95f-a1ec0674cb5f",
+      "ttft_ms": 797.116708,
+      "ttft_basis": "engine",
+      "decode_ms": 4624.555542,
+      "decode_tokens": 127,
+      "decode_basis": "engine",
+      "decode_ms_per_token": 36.41382316535433,
+      "prefill_tok_s": 1006.1261945095247,
+      "decode_tok_s": 27.462098540409315,
+      "evidence": "{\"response_id\": \"chatcmpl-900931c0-6c90-4209-b95f-a1ec0674cb5f\", \"completion_tokens\": 128, \"engine_source\": null, \"finish_reason\": null}",
+      "engine_prefill_ms": 797.116708,
+      "engine_decode_ms": 4624.555542,
+      "engine_decode_ms_per_token": 36.41382316535433,
+      "engine_decode_tokens": 128,
+      "engine_ttft_ms": 797.116708,
+      "engine_ledger_request_id": "900931c0-6c90-4209-b95f-a1ec0674cb5f",
+      "engine_ledger_join": "request_id",
+      "engine_source": "apxinf.ledger",
+      "client_ttft_ms_observed": 7751.213625000673,
+      "client_decode_ms_observed": 0.00045899651013314724
+    },
+    {
+      "case": "s2-c4096-g128-r1",
+      "target_tokens": 4096,
+      "max_tokens": 128,
+      "status": "ok",
+      "http_status": 200,
+      "client_wall_ms": 16566.35495800583,
+      "client_headers_ms": 9022.894792011357,
+      "client_close_ms": 8.105166998575442,
+      "prompt_tokens": 3124,
+      "completion_tokens": 128,
+      "response_id": "chatcmpl-4df50d3a-6ed8-4817-91d8-99d101a6e1ff",
+      "ttft_ms": 2886.76675,
+      "ttft_basis": "engine",
+      "decode_ms": 4656.804667,
+      "decode_tokens": 127,
+      "decode_basis": "engine",
+      "decode_ms_per_token": 36.66775328346457,
+      "prefill_tok_s": 1082.1795699288834,
+      "decode_tok_s": 27.27191906930804,
+      "evidence": "{\"response_id\": \"chatcmpl-4df50d3a-6ed8-4817-91d8-99d101a6e1ff\", \"completion_tokens\": 128, \"engine_source\": null, \"finish_reason\": null}",
+      "engine_prefill_ms": 2886.76675,
+      "engine_decode_ms": 4656.804667,
+      "engine_decode_ms_per_token": 36.66775328346457,
+      "engine_decode_tokens": 128,
+      "engine_ttft_ms": 2886.76675,
+      "engine_ledger_request_id": "4df50d3a-6ed8-4817-91d8-99d101a6e1ff",
+      "engine_ledger_join": "request_id",
+      "engine_source": "apxinf.ledger",
+      "client_ttft_ms_observed": 16566.354583002976,
+      "client_decode_ms_observed": 0.00037500285543501377
+    }
+  ],
+  "evidence": {
+    "engaged": true,
+    "generated_requests": 4,
+    "response": "{\"response_id\": \"chatcmpl-12b487a9-da29-4d65-a96b-7f721b0b5f4a\", \"completion_tokens\": 128, \"engine_source\": null, \"finish_reason\": null}",
+    "log": {
+      "path": "/Users/haiyan-mini/lfm3bench/lfm3-pipelined-decode/apxinf-metal/devlocal/engine-comparison-lfm3/logs/apxinf-apxinf-pipe-1-diag.jsonl",
+      "pattern": "request_settled",
+      "matched": true,
+      "line": "{\"event\":\"request_settled\",\"request_id\":\"4df50d3a-6ed8-4817-91d8-99d101a6e1ff\",\"status\":\"completed\",\"worker_status\":\"completed\",\"consumer_stop\":null,\"input_tokens\":3124,\"output_tokens\":128,\"elapsed_ms\":16572,\"worker_metrics\":{\"elapsed_ns\":7543571417,\"ttft_ns\":2886766750,\"peak_memory_bytes\":4111395228}}"
+    }
+  },
+  "failures": 0
+}

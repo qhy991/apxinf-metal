@@ -16,6 +16,22 @@ use serde::Serialize;
 use crate::generation_config::{GenerationOptions, ResolvedGenerationOptions};
 use crate::profiling::GenerationProfile;
 
+/// `APXINF_LFM3_DECODE_STAGES=1` turns on the per-token stage decomposition of
+/// the synchronous greedy path: `sample_ms` (the sampler's cast/argmax/read)
+/// in [`SyncTokenSequence`] and `callback_ms` (the driver's token boundary)
+/// in the shared loop, next to `build_ms`/`eval_ms` the model reports itself.
+/// Each stage logs one JSON line on stderr; it never runs inside a timed
+/// segment and reaches the worker only through explicit env forwarding.
+fn decode_stages_enabled() -> bool {
+    std::env::var_os("APXINF_LFM3_DECODE_STAGES").is_some_and(|value| value == "1")
+}
+
+fn next_stage_seq() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static STAGE_SEQ: AtomicUsize = AtomicUsize::new(0);
+    STAGE_SEQ.fetch_add(1, Ordering::Relaxed) + 1
+}
+
 /// Processor output for one or more images in a generation prompt.
 ///
 /// `pixel_values` is deliberately borrowed: creating a text-only request does
@@ -261,10 +277,18 @@ impl<M: LlmTrait + ?Sized> TokenSequence for SyncTokenSequence<'_, M> {
             self.position += 1;
             logits
         };
+        let sample_started = decode_stages_enabled().then(std::time::Instant::now);
         let sample = self
             .sampler
             .sampler()
             .sample(NextTokenLogits::last(&logits, self.model.vocab_size())?)?;
+        if let Some(started) = sample_started {
+            let sample_ms = started.elapsed().as_secs_f64() * 1000.;
+            eprintln!(
+                "{{\"kind\":\"decode_stage\",\"path\":\"sample\",\"seq\":{},\"sample_ms\":{sample_ms:.4}}}",
+                next_stage_seq(),
+            );
+        }
         let token = GeneratedToken {
             token_id: sample.token_id,
             logprob: sample.logprob,
@@ -633,8 +657,16 @@ where
             let token = sequence.next(index + 1 < options.max_new_tokens)?;
             if index == 0 { profile.record_first_token(); }
             generated.push(token);
+            let callback_started = decode_stages_enabled().then(std::time::Instant::now);
             let keep_going = if overlaps { boundary(GenerationBoundary::Token(token))? }
                 else { profile.run_unprofiled(|| boundary(GenerationBoundary::Token(token)))? };
+            if let Some(started) = callback_started {
+                let callback_ms = started.elapsed().as_secs_f64() * 1000.;
+                eprintln!(
+                    "{{\"kind\":\"decode_stage\",\"path\":\"callback\",\"seq\":{},\"callback_ms\":{callback_ms:.4}}}",
+                    next_stage_seq(),
+                );
+            }
             if !keep_going || options.eos_token_ids.contains(&token.token_id) { break; }
         }
         Ok(())

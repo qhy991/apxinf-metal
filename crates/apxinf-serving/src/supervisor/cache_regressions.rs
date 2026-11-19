@@ -140,6 +140,7 @@ async fn clef_launch_executes_current_source_despite_valid_stale_bytecode() {
         sequence_reservation: 1024,
         host_pressure_policy: HostPressurePolicy::Disabled,
         request_log: None,
+        worker_env: Vec::new(),
     };
     config.validate_memory().unwrap();
     let pressure = HostPressure::new(HostPressurePolicy::Disabled);

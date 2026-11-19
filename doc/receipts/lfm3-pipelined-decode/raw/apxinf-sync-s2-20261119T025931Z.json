@@ -1,0 +1,335 @@
+{
+  "schema": "apxinf-engine-bench-arm-v1",
+  "arm": "apxinf-sync",
+  "stage": "s2",
+  "protocol": "openai-chat",
+  "prompt_protocol": "lane-chatml",
+  "endpoint": "http://127.0.0.1:8099",
+  "model": "LFM3-1.7B",
+  "started_at": "2026-11-19T02:59:31+00:00",
+  "finished_at": "2026-11-19T03:00:21+00:00",
+  "artifact": {
+    "binary_sha256": "c8cec3ead88f63e120c1f034efb7af547fa1fd30a6fbb4f25b8e1aa1c672d60c",
+    "model_sha256": "135922caef64e81e52af88ede8b7c3ddaa9d6da220a9737fb3065275dbfb4330",
+    "quantization": null,
+    "protocol": "openai-chat",
+    "prompt_protocol": "lane-chatml",
+    "commit": "c7f41fbd0de819ed0d2f7cc1feb41bc9daa9fd77",
+    "branch": "agent/lfm-pipelined-decode-999ba7b193af",
+    "apxinf_env": {}
+  },
+  "host": {
+    "before": {
+      "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+      "machine": "arm64",
+      "python": "3.14.3",
+      "loadavg": [
+        2.2509765625,
+        2.76611328125,
+        2.98583984375
+      ],
+      "started_at": "2026-11-19T02:59:31+00:00",
+      "top_cpu": [
+        {
+          "pid": "1338",
+          "pcpu": 15.0,
+          "etime": "01-11:32:15",
+          "comm": "/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_agent.app/Contents/MacOS/logioptionsplus_agent"
+        },
+        {
+          "pid": "1460",
+          "pcpu": 10.2,
+          "etime": "01-11:32:12",
+          "comm": "/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_logivoice.app/Contents/MacOS/logioptionsplus_logivoice"
+        },
+        {
+          "pid": "636",
+          "pcpu": 3.8,
+          "etime": "01-11:32:26",
+          "comm": "/Library/sangfor/SDP/aTrust.app/Contents/Resources/bin/aTrustAgent"
+        },
+        {
+          "pid": "770",
+          "pcpu": 3.5,
+          "etime": "01-11:32:24",
+          "comm": "/usr/libexec/trustd"
+        },
+        {
+          "pid": "512",
+          "pcpu": 2.8,
+          "etime": "01-11:32:30",
+          "comm": "/usr/libexec/syspolicyd"
+        }
+      ],
+      "swapouts": "Swapouts:                                   53905789.",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "disk_free": "/dev/disk3s1s1   460Gi    13Gi    15Gi    47%    484k  154M    0%   /"
+    },
+    "after": {
+      "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+      "machine": "arm64",
+      "python": "3.14.3",
+      "loadavg": [
+        1.9033203125,
+        2.58447265625,
+        2.90478515625
+      ],
+      "started_at": "2026-11-19T03:00:21+00:00",
+      "top_cpu": [
+        {
+          "pid": "1338",
+          "pcpu": 52.2,
+          "etime": "01-11:33:05",
+          "comm": "/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_agent.app/Contents/MacOS/logioptionsplus_agent"
+        },
+        {
+          "pid": "770",
+          "pcpu": 26.7,
+          "etime": "01-11:33:14",
+          "comm": "/usr/libexec/trustd"
+        },
+        {
+          "pid": "1460",
+          "pcpu": 23.2,
+          "etime": "01-11:33:02",
+          "comm": "/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_logivoice.app/Contents/MacOS/logioptionsplus_logivoice"
+        },
+        {
+          "pid": "21493",
+          "pcpu": 10.8,
+          "etime": "01:06",
+          "comm": "/Users/haiyan-mini/lfm3bench/lfm3-pipelined-decode/apxinf-metal/target/release/apxinf-native-worker"
+        },
+        {
+          "pid": "21797",
+          "pcpu": 9.6,
+          "etime": "00:00",
+          "comm": "/opt/homebrew/bin/gh"
+        }
+      ],
+      "swapouts": "Swapouts:                                   53905789.",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "disk_free": "/dev/disk3s1s1   460Gi    13Gi    15Gi    47%    484k  154M    0%   /"
+    }
+  },
+  "corpus": {
+    "source": "generated",
+    "seed": 20261121,
+    "chars_per_token": 3.85,
+    "sha256": "80e48b1cdf8aec42d2f2b2d59c46e981f4fdef88a91085b314bb0d9f24421361",
+    "case_count": 4
+  },
+  "params": {
+    "temperature": 0.0,
+    "seed": 20261118,
+    "stream": true,
+    "segment": 2,
+    "warmup_requests": 1,
+    "timeout_s": 900.0
+  },
+  "cases": [
+    {
+      "id": "s2-c1024-g128-r0",
+      "target_tokens": 1024,
+      "max_tokens": 128,
+      "context": 1024,
+      "round": 0
+    },
+    {
+      "id": "s2-c4096-g128-r0",
+      "target_tokens": 4096,
+      "max_tokens": 128,
+      "context": 4096,
+      "round": 0
+    },
+    {
+      "id": "s2-c1024-g128-r1",
+      "target_tokens": 1024,
+      "max_tokens": 128,
+      "context": 1024,
+      "round": 1
+    },
+    {
+      "id": "s2-c4096-g128-r1",
+      "target_tokens": 4096,
+      "max_tokens": 128,
+      "context": 4096,
+      "round": 1
+    }
+  ],
+  "timing_primary": "engine",
+  "request_log": {
+    "path": "/Users/haiyan-mini/lfm3bench/lfm3-pipelined-decode/apxinf-metal/devlocal/engine-comparison-lfm3/apxinf-apxinf-sync-2-requests.jsonl",
+    "enabled": true,
+    "matched": 4,
+    "by_request_id": 4,
+    "by_order": 0
+  },
+  "requests": [
+    {
+      "case": "__warmup__",
+      "target_tokens": 128,
+      "max_tokens": 8,
+      "status": "ok",
+      "http_status": 200,
+      "client_ttft_ms": 1071.3998340070248,
+      "client_decode_ms": 0.0005829933797940612,
+      "client_wall_ms": 1071.4004170004046,
+      "client_headers_ms": 315.270209001028,
+      "client_close_ms": 2.879916995880194,
+      "prompt_tokens": 106,
+      "completion_tokens": 8,
+      "response_id": "chatcmpl-101896b2-98e0-4cc2-add5-5a970d2310e0",
+      "ttft_ms": 1071.3998340070248,
+      "ttft_basis": "client",
+      "decode_ms": 0.0005829933797940612,
+      "decode_tokens": 7,
+      "decode_basis": "client",
+      "decode_ms_per_token": 8.328476854200874e-05,
+      "prefill_tok_s": 98.93598695415236,
+      "decode_tok_s": 12006997.407882584,
+      "evidence": "{\"response_id\": \"chatcmpl-101896b2-98e0-4cc2-add5-5a970d2310e0\", \"completion_tokens\": 8, \"engine_source\": null, \"finish_reason\": null}",
+      "warmup": true
+    },
+    {
+      "case": "s2-c1024-g128-r0",
+      "target_tokens": 1024,
+      "max_tokens": 128,
+      "status": "ok",
+      "http_status": 200,
+      "client_wall_ms": 7826.502416995936,
+      "client_headers_ms": 2298.1411249929806,
+      "client_close_ms": 3.5404160007601604,
+      "prompt_tokens": 799,
+      "completion_tokens": 128,
+      "response_id": "chatcmpl-344738f9-8557-42f8-8734-b90afe7d6f4e",
+      "ttft_ms": 775.480417,
+      "ttft_basis": "engine",
+      "decode_ms": 4752.976500000001,
+      "decode_tokens": 127,
+      "decode_basis": "engine",
+      "decode_ms_per_token": 37.42501181102363,
+      "prefill_tok_s": 1030.3290482704735,
+      "decode_tok_s": 26.72009844778319,
+      "evidence": "{\"response_id\": \"chatcmpl-344738f9-8557-42f8-8734-b90afe7d6f4e\", \"completion_tokens\": 128, \"engine_source\": null, \"finish_reason\": null}",
+      "engine_prefill_ms": 775.480417,
+      "engine_decode_ms": 4752.976500000001,
+      "engine_decode_ms_per_token": 37.42501181102363,
+      "engine_decode_tokens": 128,
+      "engine_ttft_ms": 775.480417,
+      "engine_ledger_request_id": "344738f9-8557-42f8-8734-b90afe7d6f4e",
+      "engine_ledger_join": "request_id",
+      "engine_source": "apxinf.ledger",
+      "client_ttft_ms_observed": 7826.501999996253,
+      "client_decode_ms_observed": 0.0004169996827840805
+    },
+    {
+      "case": "s2-c4096-g128-r0",
+      "target_tokens": 4096,
+      "max_tokens": 128,
+      "status": "ok",
+      "http_status": 200,
+      "client_wall_ms": 16869.043250000686,
+      "client_headers_ms": 9147.311665990856,
+      "client_close_ms": 6.4974999986588955,
+      "prompt_tokens": 3147,
+      "completion_tokens": 128,
+      "response_id": "chatcmpl-87b509c2-d4af-4acb-8c92-d35414c9b8f0",
+      "ttft_ms": 2912.78975,
+      "ttft_basis": "engine",
+      "decode_ms": 4809.014375,
+      "decode_tokens": 127,
+      "decode_basis": "engine",
+      "decode_ms_per_token": 37.86625492125984,
+      "prefill_tok_s": 1080.40753713858,
+      "decode_tok_s": 26.40873786117556,
+      "evidence": "{\"response_id\": \"chatcmpl-87b509c2-d4af-4acb-8c92-d35414c9b8f0\", \"completion_tokens\": 128, \"engine_source\": null, \"finish_reason\": null}",
+      "engine_prefill_ms": 2912.78975,
+      "engine_decode_ms": 4809.014375,
+      "engine_decode_ms_per_token": 37.86625492125984,
+      "engine_decode_tokens": 128,
+      "engine_ttft_ms": 2912.78975,
+      "engine_ledger_request_id": "87b509c2-d4af-4acb-8c92-d35414c9b8f0",
+      "engine_ledger_join": "request_id",
+      "engine_source": "apxinf.ledger",
+      "client_ttft_ms_observed": 16869.042999998783,
+      "client_decode_ms_observed": 0.0002500019036233425
+    },
+    {
+      "case": "s2-c1024-g128-r1",
+      "target_tokens": 1024,
+      "max_tokens": 128,
+      "status": "ok",
+      "http_status": 200,
+      "client_wall_ms": 7880.133833998116,
+      "client_headers_ms": 2335.790166995139,
+      "client_close_ms": 3.1359580025309697,
+      "prompt_tokens": 801,
+      "completion_tokens": 128,
+      "response_id": "chatcmpl-f77e8d27-bdbc-45a1-ba37-2223eee57369",
+      "ttft_ms": 776.703375,
+      "ttft_basis": "engine",
+      "decode_ms": 4767.711833,
+      "decode_tokens": 127,
+      "decode_basis": "engine",
+      "decode_ms_per_token": 37.541038055118115,
+      "prefill_tok_s": 1031.281729656447,
+      "decode_tok_s": 26.63751595072545,
+      "evidence": "{\"response_id\": \"chatcmpl-f77e8d27-bdbc-45a1-ba37-2223eee57369\", \"completion_tokens\": 128, \"engine_source\": null, \"finish_reason\": null}",
+      "engine_prefill_ms": 776.703375,
+      "engine_decode_ms": 4767.711833,
+      "engine_decode_ms_per_token": 37.541038055118115,
+      "engine_decode_tokens": 128,
+      "engine_ttft_ms": 776.703375,
+      "engine_ledger_request_id": "f77e8d27-bdbc-45a1-ba37-2223eee57369",
+      "engine_ledger_join": "request_id",
+      "engine_source": "apxinf.ledger",
+      "client_ttft_ms_observed": 7880.133500002557,
+      "client_decode_ms_observed": 0.000333995558321476
+    },
+    {
+      "case": "s2-c4096-g128-r1",
+      "target_tokens": 4096,
+      "max_tokens": 128,
+      "status": "ok",
+      "http_status": 200,
+      "client_wall_ms": 16727.576541001326,
+      "client_headers_ms": 9057.080665996182,
+      "client_close_ms": 7.047874998534098,
+      "prompt_tokens": 3131,
+      "completion_tokens": 128,
+      "response_id": "chatcmpl-e6aca269-7cb3-4eaf-9a58-6822ca3e1410",
+      "ttft_ms": 2859.98275,
+      "ttft_basis": "engine",
+      "decode_ms": 4810.603791,
+      "decode_tokens": 127,
+      "decode_basis": "engine",
+      "decode_ms_per_token": 37.87877000787401,
+      "prefill_tok_s": 1094.7618477768792,
+      "decode_tok_s": 26.400012455318006,
+      "evidence": "{\"response_id\": \"chatcmpl-e6aca269-7cb3-4eaf-9a58-6822ca3e1410\", \"completion_tokens\": 128, \"engine_source\": null, \"finish_reason\": null}",
+      "engine_prefill_ms": 2859.98275,
+      "engine_decode_ms": 4810.603791,
+      "engine_decode_ms_per_token": 37.87877000787401,
+      "engine_decode_tokens": 128,
+      "engine_ttft_ms": 2859.98275,
+      "engine_ledger_request_id": "e6aca269-7cb3-4eaf-9a58-6822ca3e1410",
+      "engine_ledger_join": "request_id",
+      "engine_source": "apxinf.ledger",
+      "client_ttft_ms_observed": 16727.5762079953,
+      "client_decode_ms_observed": 0.00033300602808594704
+    }
+  ],
+  "evidence": {
+    "engaged": true,
+    "generated_requests": 4,
+    "response": "{\"response_id\": \"chatcmpl-344738f9-8557-42f8-8734-b90afe7d6f4e\", \"completion_tokens\": 128, \"engine_source\": null, \"finish_reason\": null}",
+    "log": {
+      "path": "/Users/haiyan-mini/lfm3bench/lfm3-pipelined-decode/apxinf-metal/devlocal/engine-comparison-lfm3/logs/apxinf-apxinf-sync-2-diag.jsonl",
+      "pattern": "request_settled",
+      "matched": true,
+      "line": "{\"event\":\"request_settled\",\"request_id\":\"e6aca269-7cb3-4eaf-9a58-6822ca3e1410\",\"status\":\"completed\",\"worker_status\":\"completed\",\"consumer_stop\":null,\"input_tokens\":3131,\"output_tokens\":128,\"elapsed_ms\":16732,\"worker_metrics\":{\"elapsed_ns\":7670586541,\"ttft_ns\":2859982750,\"peak_memory_bytes\":4111395228}}"
+    }
+  },
+  "failures": 0
+}

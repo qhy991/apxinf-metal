@@ -15,14 +15,25 @@ use super::{
     config::{LayerKind, Lfm3Config},
     weights::{LayerWeights, Mixer, Weights},
 };
-use crate::llm_trait::{LlmInput, LlmTrait, TextPreparationState, TextPreparationStatus};
-use apxinf_core::{Backend, Device, Error, Result, Tensor};
+use crate::llm_trait::{
+    LlmInput, LlmTrait, TextPreparationState, TextPreparationStatus, TokenSequence,
+};
+use crate::mlx_decode::{DecodeFinish, DeviceDecode, GreedySequence};
+use apxinf_core::{Backend, Device, Error, Result, Tensor, TokenSampler, TokenSamplingParams};
 use apxinf_loader::ModelConfig;
 use apxinf_mlx::{fusions::CausalDepthwiseConv, Array, MlxBackend, MlxDType, Stream};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 fn err(message: impl Into<String>) -> Error {
     Error::Other(message.into())
+}
+
+/// `APXINF_LFM3_DECODE_STAGES=1` splits every one-token step into host graph
+/// construction and device evaluation on stderr. Reaches the worker through
+/// the gateway's `--worker-env` forwarding (the supervisor clears the
+/// environment when it spawns the worker).
+fn decode_stages_enabled() -> bool {
+    std::env::var_os("APXINF_LFM3_DECODE_STAGES").is_some_and(|value| value == "1")
 }
 
 // Platform C math library, used only to generate the fixed rotary tables on the
@@ -154,6 +165,17 @@ pub struct Lfm3Model {
     capacity: usize,
     position: usize,
     invalid: Option<String>,
+    /// Per-step conv-window snapshot for the pipelined greedy path: the
+    /// lookahead step shifts the 13 sliding `[1, hidden, kernel-1]` windows,
+    /// and `finish_decode` must be able to move them back. MLX arrays are
+    /// immutable, so keeping the pre-step references is the rollback.
+    conv_snapshot: Option<Vec<Option<Array>>>,
+    stages: bool,
+    stage_seq: usize,
+    /// Test-only fault injection for T3: skip the conv restore in
+    /// `finish_decode` and prove the byte-level state check catches it.
+    #[cfg(test)]
+    disable_conv_restore: bool,
 }
 
 impl Lfm3Model {
@@ -190,9 +212,22 @@ impl Lfm3Model {
             capacity: 0,
             position: 0,
             invalid: None,
+            conv_snapshot: None,
+            stages: decode_stages_enabled(),
+            stage_seq: 0,
+            #[cfg(test)]
+            disable_conv_restore: false,
         };
         model.prepare(1, 0)?;
         Ok(model)
+    }
+
+    fn report_stage(&mut self, path: &str, build_ms: f64, eval_ms: f64) {
+        self.stage_seq += 1;
+        eprintln!(
+            "{{\"kind\":\"decode_stage\",\"impl\":\"metal_lfm3\",\"path\":\"{path}\",\"seq\":{},\"build_ms\":{build_ms:.4},\"eval_ms\":{eval_ms:.4}}}",
+            self.stage_seq,
+        );
     }
 
     pub fn position(&self) -> usize {
@@ -786,19 +821,23 @@ impl Lfm3Model {
         }
     }
 
-    fn execute_inner(&mut self, token_ids: &[u32], last_only: bool) -> Result<Tensor> {
-        let stream = self.backend.stream().clone();
-        let len = token_ids.len();
-        let start = self.position;
-        let end = start + len;
-        let ids: Vec<i32> = token_ids.iter().map(|&id| id as i32).collect();
-        let ids = Array::from_i32(&stream, &[len], &ids)?;
+    /// Build the step graph from device-resident ids and update the KV/conv
+    /// state references. Does not evaluate anything; the caller decides
+    /// whether the logits (whose evaluation covers every state array this
+    /// step produced) are pulled synchronously or by the pipelined driver.
+    fn build_graph(
+        &mut self,
+        ids: &Array,
+        start: usize,
+        len: usize,
+        last_only: bool,
+    ) -> Result<Array> {
         let mut x = self
             .weights
-            .embed(&ids)?
+            .embed(ids)?
             .reshape(&[1, len, self.config.hidden_size])?;
         // A prompt chunk evaluates every layer boundary (bounded peak memory);
-        // a single-token step keeps one graph and evaluates once below.
+        // a single-token step keeps one graph and evaluates once by the caller.
         let per_layer_eval = len > 1;
         for layer_idx in 0..self.config.num_hidden_layers {
             x = self
@@ -818,23 +857,131 @@ impl Lfm3Model {
             .map_err(|e| err(format!("head projection: {e}")))?
             .reshape(&[rows.shape()[1], self.config.vocab_size])
             .map_err(|e| err(format!("head reshape rows={:?}: {e}", rows.shape())))?;
-        let mut required: Vec<Array> = vec![logits.clone()];
-        if !per_layer_eval {
-            for state in &self.kv {
-                if let Some(kv) = state {
-                    required.push(kv.keys.clone());
-                    required.push(kv.values.clone());
-                }
-            }
-            for state in &self.conv {
-                if let Some(conv) = state {
-                    required.push(conv.clone());
-                }
+        Ok(logits)
+    }
+
+    /// The step's state arrays: evaluating these alongside the logits keeps
+    /// the single-token graph evaluated exactly once per step.
+    fn step_state_arrays(&self) -> Vec<Array> {
+        let mut required = Vec::new();
+        for state in &self.kv {
+            if let Some(kv) = state {
+                required.push(kv.keys.clone());
+                required.push(kv.values.clone());
             }
         }
+        for state in &self.conv {
+            if let Some(conv) = state {
+                required.push(conv.clone());
+            }
+        }
+        required
+    }
+
+    fn execute_inner(&mut self, token_ids: &[u32], last_only: bool) -> Result<Tensor> {
+        let stream = self.backend.stream().clone();
+        let len = token_ids.len();
+        let start = self.position;
+        let end = start + len;
+        let ids: Vec<i32> = token_ids.iter().map(|&id| id as i32).collect();
+        let ids = Array::from_i32(&stream, &[len], &ids)?;
+        // Stage attribution covers decode steps only (single-token forwards at
+        // a nonzero position); prefill builds/evaluates chunk-wise above.
+        let stages = self.stages && len == 1 && start > 0;
+        let build_started = stages.then(Instant::now);
+        let logits = self.build_graph(&ids, start, len, last_only)?;
+        let build_ms = build_started.map(|t| t.elapsed().as_secs_f64() * 1000.);
+        let mut required: Vec<Array> = vec![logits.clone()];
+        if len == 1 {
+            required.extend(self.step_state_arrays());
+        }
+        let eval_started = stages.then(Instant::now);
         stream.eval(&required)?;
+        let eval_ms = eval_started.map(|t| t.elapsed().as_secs_f64() * 1000.);
+        if let (Some(build_ms), Some(eval_ms)) = (build_ms, eval_ms) {
+            self.report_stage("sync", build_ms, eval_ms);
+        }
         self.position = end;
         self.backend.from_array(logits)
+    }
+
+    fn restore_conv_snapshot(&mut self) {
+        if let Some(snapshot) = self.conv_snapshot.take() {
+            self.conv = snapshot;
+        }
+    }
+}
+
+impl DeviceDecode for Lfm3Model {
+    fn stream(&self) -> &Stream {
+        self.backend.stream()
+    }
+
+    fn decode(&mut self, token: &Array) -> Result<Array> {
+        if self.invalid.is_some() || self.position >= self.capacity {
+            return Err(err("LFM3 decode requires valid prepared capacity"));
+        }
+        if token.shape() != [1] {
+            return Err(err(format!(
+                "LFM3 decode expects one device-resident token id, got {:?}",
+                token.shape()
+            )));
+        }
+        // The lookahead step may be discarded by `finish_decode`; the conv
+        // windows it shifts must move back, so keep the pre-step references.
+        self.conv_snapshot = Some(self.conv.clone());
+        let start = self.position;
+        let build_started = self.stages.then(Instant::now);
+        let logits = match self.build_graph(token, start, 1, true) {
+            Ok(logits) => logits,
+            Err(error) => {
+                self.invalid = Some(error.to_string());
+                return Err(error);
+            }
+        };
+        if let Some(build_ms) = build_started.map(|t| t.elapsed().as_secs_f64() * 1000.) {
+            self.report_stage("device", build_ms, 0.0);
+        }
+        self.position = start + 1;
+        Ok(logits)
+    }
+
+    fn finish_decode(&mut self, outcome: DecodeFinish) -> Result<()> {
+        if let Err(error) = self.backend.stream().synchronize() {
+            self.invalid = Some(error.to_string());
+            return Err(error);
+        }
+        match outcome {
+            DecodeFinish::PublishedPosition(position)
+                if self.invalid.is_none()
+                    && position <= self.position
+                    && self.position - position <= 1 =>
+            {
+                if self.position != position {
+                    // The discarded lookahead step wrote KV row `position`,
+                    // which the next write overwrites and attention never
+                    // reads past `[low, end)`. The conv windows, however,
+                    // slid: restore the snapshot taken before that step.
+                    #[cfg(test)]
+                    if !self.disable_conv_restore {
+                        self.restore_conv_snapshot();
+                    }
+                    #[cfg(not(test))]
+                    self.restore_conv_snapshot();
+                    self.position = position;
+                }
+                Ok(())
+            }
+            DecodeFinish::Invalidated => {
+                self.invalid
+                    .get_or_insert_with(|| "greedy request failed or was abandoned".into());
+                Ok(())
+            }
+            _ => {
+                self.invalid = Some("invalid LFM3 greedy rollback position".into());
+                Err(err("invalid LFM3 greedy rollback position"))
+            }
+        }
     }
 }
 
@@ -907,8 +1054,31 @@ impl LlmTrait for Lfm3Model {
     fn reset(&mut self) {
         self.kv = self.initial_kv.clone();
         self.conv = self.initial_conv.clone();
+        self.conv_snapshot = None;
         self.position = 0;
         self.invalid = None;
+    }
+
+    /// Greedy decode runs on the pipelined device sequence unless the
+    /// operator forces the legacy synchronous path with
+    /// `APXINF_MLX_SYNC_DECODE=1` (forwarded into the worker with the
+    /// gateway's `--worker-env`); anything but penalty-free greedy keeps the
+    /// shared synchronous sequence.
+    fn token_sequence<'a>(
+        &'a mut self,
+        first: Tensor,
+        sampler: Box<dyn TokenSampler>,
+        params: &TokenSamplingParams,
+        prompt_end: u32,
+    ) -> Result<Box<dyn TokenSequence + 'a>> {
+        if crate::mlx_decode::enabled(params) {
+            let first = self.backend.array(&first)?;
+            Ok(Box::new(GreedySequence::new(self, first, prompt_end)?))
+        } else {
+            Ok(Box::new(crate::llm_trait::SyncTokenSequence::new(
+                self, first, sampler, prompt_end,
+            )))
+        }
     }
 
     /// Drop everything the finished request owned: KV rows, conv history, the
@@ -927,6 +1097,7 @@ impl LlmTrait for Lfm3Model {
         self.capacity = 0;
         self.position = 0;
         self.invalid = None;
+        self.conv_snapshot = None;
         self.backend.stream().synchronize()
     }
 
@@ -936,6 +1107,7 @@ impl LlmTrait for Lfm3Model {
         self.backend.stream().synchronize()?;
         self.kv = self.initial_kv.clone();
         self.conv = self.initial_conv.clone();
+        self.conv_snapshot = None;
         self.position = 0;
         self.invalid = None;
         self.backend.stream().synchronize()
@@ -1031,6 +1203,380 @@ mod tests {
         // implementations must hand the caller those identical columns.
         assert_eq!(next.shape(), reference_next.shape());
         assert_eq!(next.to_f32_vec()?, reference_next.to_f32_vec()?);
+        Ok(())
+    }
+
+    // ---- Pipelined greedy decode acceptance tests (issue #122). Real ----
+    // checkpoint, real Metal: `APXINF_LFM3_TEST_MODEL=<snapshot dir> cargo
+    // test -p apxinf-model --features mlx,coreml metal_lfm3 -- --ignored
+    // --test-threads=1` under the shared Metal qualification lock. The tests
+    // mutate process env to select the schedule, so they must run
+    // single-threaded.
+
+    use crate::generation_config::GenerationOptions;
+    use crate::llm_trait::GenerationCancellation;
+
+    const SYNC_ENV: &str = "APXINF_MLX_SYNC_DECODE";
+    const NO_RESTORE_ENV: &str = "APXINF_LFM3_TEST_NO_CONV_RESTORE";
+
+    fn test_checkpoint() -> Result<std::path::PathBuf> {
+        std::env::var_os("APXINF_LFM3_TEST_MODEL")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| err("set APXINF_LFM3_TEST_MODEL to the LFM3 snapshot dir"))
+    }
+
+    fn load_checkpoint_model() -> Result<Lfm3Model> {
+        let path = test_checkpoint()?;
+        let json = std::fs::read_to_string(path.join("config.json"))
+            .map_err(|e| err(format!("cannot read LFM3 config: {e}")))?;
+        let config = Lfm3Config::from_json(&json)?;
+        let (tensors, _) = apxinf_loader::safetensors::load_native_path(&path)
+            .map_err(|e| err(format!("cannot load LFM3 checkpoint: {e}")))?;
+        let mut model = Lfm3Model::new(config, tensors, Arc::new(MlxBackend::new(0)?))?;
+        if std::env::var_os(NO_RESTORE_ENV).is_some() {
+            model.disable_conv_restore = true;
+        }
+        Ok(model)
+    }
+
+    fn pseudo_prompt(len: usize, seed: u64) -> Vec<u32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 33) as u32) % 120_000
+            })
+            .collect()
+    }
+
+    fn set_sync_schedule(on: bool) {
+        if on {
+            std::env::set_var(SYNC_ENV, "1");
+        } else {
+            std::env::remove_var(SYNC_ENV);
+        }
+    }
+
+    fn run_greedy(model: &mut Lfm3Model, prompt: &[u32], budget: usize) -> Result<Vec<u32>> {
+        let options = GenerationOptions::greedy(budget, None);
+        let output = model.generate_streaming_with_options(
+            crate::llm_trait::GenerationRequest {
+                input: LlmInput::text(prompt),
+                options: &options,
+            },
+            |_| {},
+        )?;
+        Ok(output.token_ids())
+    }
+
+    /// The production greedy rule (NaN/+inf/-inf normalisation, first-index
+    /// ties) applied to a forward's logits row.
+    fn greedy_from_logits(model: &Lfm3Model, logits: &Tensor) -> Result<u32> {
+        let array = model.backend.array(logits)?;
+        let (_feed, checked) = apxinf_mlx::greedy_token_arrays(&array)?;
+        let bytes = checked.to_bytes_ready()?;
+        let token = u32::from_ne_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| err("greedy token must contain one u32"))?,
+        );
+        if token == u32::MAX {
+            return Err(err("all token logits are invalid"));
+        }
+        Ok(token)
+    }
+
+    /// Byte snapshot of every attention layer's KV rows `[0, position)` and
+    /// every conv layer's window — the continuation state a request hands to
+    /// its sequel.
+    fn state_bytes(
+        model: &Lfm3Model,
+        position: usize,
+    ) -> Result<(Vec<Option<Vec<u8>>>, Vec<Option<Vec<u8>>>)> {
+        model.backend.stream().synchronize()?;
+        let kv = model
+            .kv
+            .iter()
+            .map(|state| {
+                state
+                    .as_ref()
+                    .map(|kv| -> Result<Vec<u8>> {
+                        let keys = kv
+                            .keys
+                            .slice_axis(2, 0, position)?
+                            .contiguous()?
+                            .to_bytes_ready()?;
+                        let values = kv
+                            .values
+                            .slice_axis(2, 0, position)?
+                            .contiguous()?
+                            .to_bytes_ready()?;
+                        let mut bytes = keys;
+                        bytes.extend_from_slice(&values);
+                        Ok(bytes)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let conv = model
+            .conv
+            .iter()
+            .map(|state| {
+                state
+                    .as_ref()
+                    .map(|array| array.contiguous()?.to_bytes_ready())
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((kv, conv))
+    }
+
+    /// Drive `take` pipelined reads with lookahead, then finish as the driver
+    /// does on an EOS break after `take` publishes: one step is rolled back.
+    fn drive_pipelined_prefix(
+        model: &mut Lfm3Model,
+        prompt: &[u32],
+        take: usize,
+    ) -> Result<Vec<u32>> {
+        let prompt_end = prompt.len() as u32;
+        let first = model.prefill(LlmInput::text(prompt))?;
+        let first = model.backend.array(&first)?;
+        let mut seq = Box::new(GreedySequence::new(model, first, prompt_end)?);
+        let mut published = Vec::with_capacity(take);
+        for _ in 0..take {
+            published.push(seq.next(true)?.token_id);
+        }
+        seq.finish(take)?;
+        Ok(published)
+    }
+
+    /// T1: pipelined and synchronous greedy emit identical token ids on every
+    /// prompt, at the full 128-token decode depth of the benchmark cell.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn t1_pipelined_greedy_matches_sync_token_for_token() -> Result<()> {
+        let prompts: Vec<Vec<u32>> = (0..4).map(|i| pseudo_prompt(24, 101 + i)).collect();
+        let mut model = load_checkpoint_model()?;
+        set_sync_schedule(true);
+        let mut expected = Vec::with_capacity(prompts.len());
+        for prompt in &prompts {
+            expected.push(run_greedy(&mut model, prompt, 128)?);
+        }
+        set_sync_schedule(false);
+        for (index, prompt) in prompts.iter().enumerate() {
+            let got = run_greedy(&mut model, prompt, 128)?;
+            assert_eq!(
+                got, expected[index],
+                "prompt {index}: pipelined greedy diverged from sync"
+            );
+        }
+        Ok(())
+    }
+
+    /// T2: EOS and budget edges return the same sequences as sync and land on
+    /// `position == P+N-1`. The first-token-EOS case is driven at the
+    /// sequence level so it is deterministic; cancel is driven through the
+    /// shared generation loop.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn t2_budget_eos_and_cancel_boundaries_match_sync() -> Result<()> {
+        let prompt = pseudo_prompt(16, 7);
+        let mut model = load_checkpoint_model()?;
+
+        // Budget exhaustion: 1 and 8 tokens, both schedules, same prompt.
+        for budget in [1usize, 8] {
+            set_sync_schedule(true);
+            let sync_ids = run_greedy(&mut model, &prompt, budget)?;
+            let sync_pos = model.position();
+            set_sync_schedule(false);
+            let pipe_ids = run_greedy(&mut model, &prompt, budget)?;
+            let pipe_pos = model.position();
+            assert_eq!(sync_ids, pipe_ids, "budget {budget}: published tokens");
+            assert_eq!(pipe_pos, sync_pos, "budget {budget}: final position");
+            assert_eq!(
+                sync_pos,
+                prompt.len() + sync_ids.len() - 1,
+                "budget {budget}: position must be P+N-1"
+            );
+        }
+
+        // First-token EOS: synthetic prefill logits whose argmax is EOS. The
+        // driver-side break after one publish must roll the lookahead step
+        // back, leaving exactly the prefill state (the sync outcome).
+        let prompt_end = prompt.len() as u32;
+        model.reset();
+        model.prefill(LlmInput::text(&prompt))?; // real prefill state; first logits unused
+        let mut values = vec![-1e30f32; model.config.vocab_size];
+        values[124_894] = 1.0; // any in-vocab id stands in for EOS here
+        let synthetic = Array::from_f32(model.backend.stream(), &[1, values.len()], &values)?;
+        let mut seq = Box::new(GreedySequence::new(&mut model, synthetic, prompt_end)?);
+        let token = seq.next(true)?;
+        assert_eq!(
+            token.token_id, 124_894,
+            "synthetic EOS must be the first token"
+        );
+        seq.finish(1)?;
+        assert_eq!(
+            model.position(),
+            prompt.len(),
+            "first-token EOS must roll back to the prefill position"
+        );
+        let (kv, conv) = state_bytes(&model, model.position())?;
+        // Sync reference for this scenario is prefill-only state.
+        model.reset();
+        model.prepare(prompt.len(), 0)?;
+        model.prefill(LlmInput::text(&prompt))?;
+        let (kv_ref, conv_ref) = state_bytes(&model, model.position())?;
+        assert_eq!(kv, kv_ref, "first-token EOS: KV must equal prefill state");
+        assert_eq!(
+            conv, conv_ref,
+            "first-token EOS: conv must equal prefill state"
+        );
+
+        // Cancel right after the first publish: the lookahead decode is
+        // discarded and both schedules agree on the published prefix.
+        set_sync_schedule(true);
+        let cancel_sync = GenerationCancellation::default();
+        let mut published_sync = Vec::new();
+        let options = GenerationOptions::greedy(16, None);
+        let cancel_flag = cancel_sync.clone();
+        model.generate_streaming_cancellable_dyn(
+            crate::llm_trait::GenerationRequest {
+                input: LlmInput::text(&prompt),
+                options: &options,
+            },
+            &cancel_sync,
+            &mut |token| {
+                published_sync.push(token.token_id);
+                cancel_flag.cancel();
+            },
+        )?;
+        let sync_pos = model.position();
+        set_sync_schedule(false);
+        let cancel_pipe = GenerationCancellation::default();
+        let mut published_pipe = Vec::new();
+        let cancel_flag = cancel_pipe.clone();
+        model.generate_streaming_cancellable_dyn(
+            crate::llm_trait::GenerationRequest {
+                input: LlmInput::text(&prompt),
+                options: &options,
+            },
+            &cancel_pipe,
+            &mut |token| {
+                published_pipe.push(token.token_id);
+                cancel_flag.cancel();
+            },
+        )?;
+        assert_eq!(published_pipe, published_sync, "cancel: published prefix");
+        assert_eq!(model.position(), sync_pos, "cancel: final position");
+        assert_eq!(
+            model.position(),
+            prompt.len() + published_pipe.len() - 1,
+            "cancel: position must be P+N-1"
+        );
+        Ok(())
+    }
+
+    /// T3: after a pipelined run whose lookahead step was rolled back, every
+    /// KV row `[0, position)` and all 13 conv windows are byte-identical to
+    /// the synchronous reference, and a 16-token continuation matches too.
+    /// The manual early stop makes the rollback deterministic.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn t3_pipelined_continuation_state_matches_sync_byte_for_byte() -> Result<()> {
+        let prompt = pseudo_prompt(24, 11);
+        let take = 12usize;
+        let mut pipe = load_checkpoint_model()?;
+
+        // Pipelined arm: `take` publishes plus one lookahead step, finished
+        // like an EOS break so the extra step is rolled back.
+        let published = drive_pipelined_prefix(&mut pipe, &prompt, take)?;
+        let position = pipe.position();
+        assert_eq!(
+            position,
+            prompt.len() + take - 1,
+            "rolled-back position must be P+N-1"
+        );
+        let (kv_pipe, conv_pipe) = state_bytes(&pipe, position)?;
+
+        // Continuation on the pipe arm, seeded with the last published token.
+        let mut cont_pipe = Vec::new();
+        let mut prev = published[take - 1];
+        for _ in 0..16 {
+            let logits = pipe.forward(&[prev], pipe.position() as u32)?;
+            prev = greedy_from_logits(&pipe, &logits)?;
+            cont_pipe.push(prev);
+        }
+
+        // Synchronous reference: prefill, then consume the same published
+        // trajectory for `take - 1` steps (the token read from the last
+        // legit logits is the continuation seed, not a consumed input).
+        let mut reference = load_checkpoint_model()?;
+        reference.prepare(prompt.len(), take + 16)?;
+        reference.prefill(LlmInput::text(&prompt))?;
+        for &token in &published[..take - 1] {
+            reference.forward(&[token], reference.position() as u32)?;
+        }
+        assert_eq!(reference.position(), position);
+        let (kv_ref, conv_ref) = state_bytes(&reference, position)?;
+        assert_eq!(
+            kv_pipe, kv_ref,
+            "KV rows [0, position) must match sync byte-for-byte"
+        );
+        assert_eq!(
+            conv_pipe, conv_ref,
+            "13 conv windows must match sync byte-for-byte after the rollback"
+        );
+
+        let mut cont_ref = Vec::new();
+        let mut prev = published[take - 1];
+        for _ in 0..16 {
+            let logits = reference.forward(&[prev], reference.position() as u32)?;
+            prev = greedy_from_logits(&reference, &logits)?;
+            cont_ref.push(prev);
+        }
+        assert_eq!(
+            cont_pipe, cont_ref,
+            "16-token continuation after the rollback must match sync"
+        );
+        Ok(())
+    }
+
+    /// T3's fault proof: with the conv restore disabled, the byte-level state
+    /// check fails. `APXINF_LFM3_TEST_NO_CONV_RESTORE=1 cargo test ...
+    /// t3_pipelined` makes the state equality in T3 fail — that output is the
+    /// PR evidence. This companion test pins the positive direction without
+    /// the env knob.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn t3_fault_injection_without_conv_restore_is_detected() -> Result<()> {
+        let prompt = pseudo_prompt(24, 11);
+        let take = 12usize;
+        let mut faulted = load_checkpoint_model()?;
+        faulted.disable_conv_restore = true;
+        drive_pipelined_prefix(&mut faulted, &prompt, take)?;
+        let (_, conv_faulted) = state_bytes(&faulted, faulted.position())?;
+
+        let mut reference = load_checkpoint_model()?;
+        reference.disable_conv_restore = false;
+        drive_pipelined_prefix(&mut reference, &prompt, take)?;
+        let (_, conv_reference) = state_bytes(&reference, reference.position())?;
+
+        assert_ne!(
+            conv_faulted, conv_reference,
+            "fault injection left the conv windows identical — the T3 state check would not catch the missing restore"
+        );
+        let diff = conv_faulted
+            .iter()
+            .zip(&conv_reference)
+            .filter(|(a, b)| a != b)
+            .count();
+        eprintln!(
+            "fault injection: {diff}/{} conv layers diverged after the skipped restore",
+            conv_reference.len()
+        );
         Ok(())
     }
 }

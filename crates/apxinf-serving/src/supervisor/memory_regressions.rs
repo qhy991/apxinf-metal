@@ -24,6 +24,7 @@ pub(super) fn configuration(memory_budget: u64, sequence_reservation: u64) -> Co
         sequence_reservation,
         host_pressure_policy: crate::host_pressure::HostPressurePolicy::Disabled,
         request_log: None,
+        worker_env: Vec::new(),
     }
 }
 

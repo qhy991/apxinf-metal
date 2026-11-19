@@ -1,0 +1,1 @@
+{"bytes":3457635448,"copy":{"ms_median":68.49535399999999,"gbps_median":50.47985368467474,"ms_p10":67.255291,"ms_p90":70.953375},"reduce":{"ms_median":34.357292,"gbps_median":100.63760112409327,"ms_p10":32.888584,"ms_p90":40.836999999999996},"lower_bound_ms_per_token_copy":68.49535399999999,"lower_bound_ms_per_token_reduce":34.357292}

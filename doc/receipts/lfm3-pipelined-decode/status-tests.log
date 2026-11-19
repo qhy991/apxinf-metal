@@ -1,0 +1,4 @@
+[03:15:04] T1/T2/T3 start
+[03:16:10] tests exit=0
+[03:17:14] fault-injection exit=101 (t3 state equality must FAIL here)
+[03:17:14] TESTS COMPLETE
