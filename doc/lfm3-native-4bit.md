@@ -133,7 +133,7 @@
 
 **结论：G4-speed PASS**：3.26–3.31× ≥ 2.5×；11.06–11.44 ≤ 12.39/12.71，4bit/llama = 0.89–0.92（快 8–11%）；A/A 全部 ≤3.5% ≤ 5%；G3 空臂检查 PASS。
 
-**QUEUE #8 完整五档仍待 G1′（质量门）**：G4-speed 通过，但 §5 判据要求两门都过才判 WIN；G1′ 结果见 round-57 STATUS 与本文件 §7 后续节（n=6 ⇒ INCONCLUSIVE，扩 ≥20 题重测中；4-bit 暂不设默认）。
+**QUEUE #8 完整五档**：G4-speed 通过，但 §5 判据要求两门都过才判 WIN；G1′ 结果见本文件 §7 后续节（n=6 ⇒ INCONCLUSIVE；n=20 扩测 ⇒ **PARTIAL 候选 −5.00pp（both）/ 0.00pp（either）** ⇒ 4-bit 保持 opt-in、暂不设默认）。
 
 ---
 
@@ -166,7 +166,40 @@
 
 **结论：G1′ INCONCLUSIVE（n=6）—— 质量门未测出可靠差异**：两口径 −16.67pp 是噪声内读数，不构成质量已劣化的证明；**4-bit 继续暂不设为原生默认（与 round-60 处置一致），保持 opt-in（`APXINF_LFM3_4BIT=1`）**，等 ≥20 题重测结论。速度窗的 3.26–3.31× 优势（round-58 本文件上节）已成立、不受影响（G4-speed PASS）。G1-diag（step-59 token 分叉 + FP16 scale 复现）本轮未跑，仍为诊断项。
 
-**下一动作（Lead 02:18 裁决）**：扩到 **≥20 题**（从冻结的 MBPP/HumanEval 池选，写死 suite sha256），每臂 **≥3 段**，同一协议；20 题下 solved 差仍 >10pp 且 A/A 干净 ⇒ 真 STOP；≤3pp ⇒ PASS；3–10pp ⇒ PARTIAL（4-bit opt-in）。PR #132 保持 open，标题/正文同步为「G1′ INCONCLUSIVE (n=6; expanding to ≥20)」。
+**下一动作（Lead 02:18 裁决）**：扩到 **≥20 题**（从冻结的 MBPP/HumanEval 池选，写死 suite sha256），每臂 **≥3 段**，同一协议；20 题下 solved 差仍 >10pp 且 A/A 干净 ⇒ 真 STOP；≤3pp ⇒ PASS；3–10pp ⇒ PARTIAL（4-bit opt-in）。PR #132 保持 open，标题/正文同步为「G1′ INCONCLUSIVE (n=6; expanding to ≥20)」。该扩测已于 round-65（2026-11-20 02:47–03:54 窗）完成，结果见下节。
+
+---
+
+### 2026-11-20 03:55 CST — G1′ 质量门判定：**PARTIAL（n=20，候选）**（§2 G1′ / §5；round-65 实测，Lead 02:18 裁决扩测结果）
+
+> 本节结果在 round-65 窗口（02:47:02–03:54:38，预登记修订 `f10cae5f` + suite v2 `82ebc66c` + window harness `8bf1db30` 之后）后回填。receipts：`~/lfm3-dig-run/window-4bit/g1prime/`（verdict：`g1prime-verdict.json`、6 段 result json、6 份 ledger）。
+
+**评测配置**：suite v2 = MBPP sanitized rows 0..19 + HumanEval/80 = **20 题**，**任务集 sha256 = `13a96e891bf484b86fd92dd04db8e0611c190709362e1c3e9a76366f6fc72910`（与 round-63 冻结值逐字一致，payload 冻结未破）**；ABBA 交错 3 段/臂（A-0/B-0/A-1/B-1/A-2/B-2），A=`native-4bit`（`APXINF_LFM3_4BIT=1`，模型 sha `96b021b3…`）、B=`native-bf16`（开关 unset，模型 sha `135922ca…`）；每臂 3 gateway × 20 题 × ≤3 retry；G3 banner/census/freshness 三件套全过（armed 臂 `native_4bit=true batch=1` + census `154/154`，BF16 臂 `native_4bit=false`，无空臂）；窗口前双 Metal 锁 fcntl 顺序等待 + `pmset displaysleepnow` + `caffeinate -si`；锁在 03:54:38 释放。
+
+**原始数字（per-segment solved count）**：
+
+| 臂 | seg | solved | solved ids |
+| ---|---| ---|---|
+| A（4-bit） | 0 | 4/20（20.0%） | `mbpp_0017`, `mbpp_0062`, `mbpp_0064`, `mbpp_0066` |
+| A（4-bit） | 1 | 3/20（15.0%） | `mbpp_0017`, `mbpp_0062`, `mbpp_0066` |
+| A（4-bit） | 2 | 5/20（25.0%） | `humaneval_0080`, `mbpp_0012`, `mbpp_0017`, `mbpp_0062`, `mbpp_0066` |
+| B（BF16） | 0 | 6/20（30.0%） | `humaneval_0080`, `mbpp_0012`, `mbpp_0017`, `mbpp_0062`, `mbpp_0064`, `mbpp_0066` |
+| B（BF16） | 1 | 5/20（25.0%） | `humaneval_0080`, `mbpp_0012`, `mbpp_0017`, `mbpp_0064`, `mbpp_0066` |
+| B（BF16） | 2 | 5/20（25.0%） | `mbpp_0012`, `mbpp_0017`, `mbpp_0062`, `mbpp_0064`, `mbpp_0066` |
+
+**汇总（两口径，`g1prime-verdict.json`）**：
+
+- both 口径（每任务 3 段都解出才算解出）：4-bit **3/20（15.0%）** vs BF16 **4/20（20.0%）**，**delta = −5.00pp**；
+- either 口径（任一段解出即算解出）：4-bit **6/20（30.0%）** vs BF16 **6/20（30.0%）**，**delta = 0.00pp**；
+- per-task disagreements：3/20 —— `humaneval_0080`（4bit 1/3 vs bf16 2/3，倾向 BF16）、`mbpp_0012`（1/3 vs 3/3，倾向 BF16）、`mbpp_0062`（3/3 vs 2/3，倾向 4-bit）；`mbpp_0017`、`mbpp_0066` 双方 3/3 一致全解，14 题双方 0/3 一致失败（有效分辨题仅 6/20）。
+
+**判据（§2 G1′，冻结）**：掉 ≤3pp ⇒ PASS；3–10pp ⇒ PARTIAL 候选；**>10pp ⇒ STOP（4-bit 不可设默认）**。
+
+**A/A caveat（如实记录，round-65 §103）**：两臂 3 段 spread 分别 10.00pp（4-bit）/ 5.00pp（BF16），**均 >5%（RUNNER §4）** ⇒ 按本项预登记口径 analyzer 报 **DISAGREE**、以逐任务表为 tiebreaker、**不自动 INVALID**（INVALID 仅限 G3 空臂 / G5 速度窗 A/A >5% / G4-shape 漂移）。较 n=6 窗（两臂各 16.67pp）spread 已减半但仍不「干净」；**结论强度：PARTIAL 候选，非精确 −5.00pp 点估计**；n=20、≤3 retry、480-token 上限下同臂 3 段仍差 1–2 题，要更稳需 ≥40 题或更多重复段，属 Lead 裁决。
+
+**结论：G1′ PARTIAL（n=20，候选）—— 不再支持 STOP**：both 口径 −5.00pp 落在 3–10pp 区间（PARTIAL），either 口径 0.00pp（PASS 级无差异）；扩测使 delta 从未扩 suite 时的 INCONCLUSIVE / 原 STOP −16.67pp 收敛到 −5.00pp / 0.00pp。按 §5 **PARTIAL ⇒ 默认 BF16，4-bit 保持 opt-in（`APXINF_LFM3_4BIT=1`），不设原生默认**，留 Lead 裁决是否接受 −5pp（both）质量代价换 3.26–3.31× 速度。G4-speed PASS（上上节）与 G1-diag 诊断项状态均不受影响。
+
+**机制 receipt（engine basis，round-65 §104，非本门判定字段）**：6 段 ledger `decode_ms_per_token` median —— 4-bit 10.935/10.949/11.010 ms/tok、BF16 36.366/36.438/36.211 ms/tok ⇒ 质量窗内速度优势复现 ~3.3×，与 G4-speed 一致。
 
 ---
 
