@@ -21,8 +21,8 @@ use crate::llm_trait::{
 use crate::mlx_decode::{DecodeFinish, DeviceDecode, GreedySequence};
 use apxinf_core::{Backend, Device, Error, Result, Tensor, TokenSampler, TokenSamplingParams};
 use apxinf_loader::ModelConfig;
-use apxinf_mlx::{fusions::CausalDepthwiseConv, Array, Compiled, MlxBackend, MlxDType, Stream};
-use std::{collections::HashMap, rc::Rc, sync::Arc, time::Instant};
+use apxinf_mlx::{fusions::CausalDepthwiseConv, Array, MlxBackend, MlxDType, Stream};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 fn err(message: impl Into<String>) -> Error {
     Error::Other(message.into())
@@ -34,14 +34,6 @@ fn err(message: impl Into<String>) -> Error {
 /// environment when it spawns the worker).
 fn decode_stages_enabled() -> bool {
     std::env::var_os("APXINF_LFM3_DECODE_STAGES").is_some_and(|value| value == "1")
-}
-
-/// `APXINF_LFM3_COMPILED_DECODE=1` routes the single-token pipelined device
-/// decode step through one exact-shape `Compiled` callable (no bucketing);
-/// unset keeps the eager `build_graph` path. Prefill and the synchronous
-/// `forward` stay eager. See `doc/lfm3-compiled-decode-step.md`.
-fn compiled_decode_enabled() -> bool {
-    std::env::var_os("APXINF_LFM3_COMPILED_DECODE").is_some_and(|value| value == "1")
 }
 
 // Platform C math library, used only to generate the fixed rotary tables on the
@@ -156,10 +148,9 @@ enum LayerState {
 pub struct Lfm3Model {
     config: Lfm3Config,
     backend: MlxBackend,
-    /// Shared with the compiled decode graph, which captures the weights.
-    weights: Rc<Weights>,
+    weights: Weights,
     /// Compiled `apxinf_causal_depthwise_conv` pipeline for the decode step.
-    causal_conv: Rc<CausalDepthwiseConv>,
+    causal_conv: CausalDepthwiseConv,
     kinds: Vec<LayerKind>,
     /// One dense row per attention layer, `[1, kv_heads, capacity, head_dim]`.
     initial_kv: Vec<Option<KvState>>,
@@ -181,14 +172,6 @@ pub struct Lfm3Model {
     conv_snapshot: Option<Vec<Option<Array>>>,
     stages: bool,
     stage_seq: usize,
-    /// Exact-shape compiled single-token decode step, built on demand in
-    /// `prepare` when `APXINF_LFM3_COMPILED_DECODE=1` (see
-    /// `doc/lfm3-compiled-decode-step.md`). `None` keeps the eager path.
-    compiled_step: Option<Compiled>,
-    /// Position at which the compiled step profile was prepared, or `None`
-    /// before the first compiled decode of the request. Kept to distinguish a
-    /// warm first call from later replays.
-    prepared_profile: Option<usize>,
     /// Test-only fault injection for T3: skip the conv restore in
     /// `finish_decode` and prove the byte-level state check catches it.
     #[cfg(test)]
@@ -208,8 +191,8 @@ impl Lfm3Model {
             .downcast_ref::<MlxBackend>()
             .ok_or_else(|| err("LFM3 native implementation requires an MLX backend"))?
             .clone();
-        let weights = Rc::new(Weights::load(&config, tensors, backend.stream())?);
-        let causal_conv = Rc::new(CausalDepthwiseConv::new(backend.stream())?);
+        let weights = Weights::load(&config, tensors, backend.stream())?;
+        let causal_conv = CausalDepthwiseConv::new(backend.stream())?;
         let kinds = config.layer_kinds()?;
         let layers = config.num_hidden_layers;
         let mut model = Self {
@@ -232,8 +215,6 @@ impl Lfm3Model {
             conv_snapshot: None,
             stages: decode_stages_enabled(),
             stage_seq: 0,
-            compiled_step: None,
-            prepared_profile: None,
             #[cfg(test)]
             disable_conv_restore: false,
         };
@@ -330,10 +311,6 @@ impl Lfm3Model {
         self.cos_sliding = Some(cos_sliding);
         self.sin_sliding = Some(sin_sliding);
         self.capacity = capacity;
-        // The compiled profile is exact-shape over the KV width and the rotary
-        // tables, so a changed capacity invalidates it.
-        self.compiled_step = None;
-        self.prepared_profile = None;
         Ok(())
     }
 
@@ -513,18 +490,6 @@ impl Lfm3Model {
     /// preserved reference and `crates/apxinf-mlx/native/causal_depthwise_conv.metal`
     /// for the kernel's contract.
     fn conv_step(&self, n: &Array, layer: &LayerWeights, state: &Array) -> Result<(Array, Array)> {
-        Self::conv_step_static(&*self.causal_conv, n, layer, state)
-    }
-
-    /// `conv_step` with the conv kernel as an explicit argument, so the same
-    /// body can be traced inside the compiled step closure (which cannot borrow
-    /// `&mut self`).
-    fn conv_step_static(
-        causal_conv: &CausalDepthwiseConv,
-        n: &Array,
-        layer: &LayerWeights,
-        state: &Array,
-    ) -> Result<(Array, Array)> {
         let Mixer::Conv {
             in_proj,
             out_proj,
@@ -543,7 +508,7 @@ impl Lfm3Model {
         // Build the window in the kernel's `[1, L, C]` layout instead of
         // concatenating `[1, hidden, kernel]` and transposing the copy.
         let window = Array::concat(&[&state.transpose(&[0, 2, 1])?, &z], 1)?;
-        let (conv, next) = fused_conv_window(causal_conv, &window, taps_bf16)?;
+        let (conv, next) = fused_conv_window(&self.causal_conv, &window, taps_bf16)?;
         let y = gate.mul(&conv)?;
         let op = out_proj.call(&y)?;
         Ok((op, next))
@@ -688,33 +653,11 @@ impl Lfm3Model {
         let heads = self.config.num_attention_heads;
         let eps = self.config.norm_eps;
         let dim = self.config.head_dim;
-        Self::attention_step_static_parts(n, layer, kind, kv, start, &cos, &sin, stream, heads, eps, dim)
-    }
-
-    /// `attention_step` with the RoPE slice and the shape constants passed in
-    /// explicitly, so the same body can be traced inside the compiled step
-    /// closure (which cannot read `self`).
-    #[allow(clippy::too_many_arguments)]
-    fn attention_step_static(
-        n: &Array,
-        layer: &LayerWeights,
-        kind: LayerKind,
-        kv: &KvState,
-        start: usize,
-        cos_table: &Array,
-        sin_table: &Array,
-    ) -> Result<(Array, KvState)> {
-        let dim = kv.keys.shape()[3];
-        let kv_heads = kv.keys.shape()[1];
-        let heads = kv_heads * 4;
-        let eps = 1e-5;
-        let cos = cos_table.slice_axis(0, start, start + 1)?.reshape(&[1, 1, 1, dim])?;
-        let sin = sin_table.slice_axis(0, start, start + 1)?.reshape(&[1, 1, 1, dim])?;
-        Self::attention_step_static_parts(n, layer, kind, kv, start, &cos, &sin, n.stream(), heads, eps, dim)
+        Self::attention_step_parts(n, layer, kind, kv, start, &cos, &sin, stream, heads, eps, dim)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn attention_step_static_parts(
+    fn attention_step_parts(
         n: &Array,
         layer: &LayerWeights,
         kind: LayerKind,
@@ -790,18 +733,13 @@ impl Lfm3Model {
     }
 
     /// Sandwich-norm residual composition shared by both branches.
-    fn mix_and_residual(&self, x: &Array, op: &Array, layer: &LayerWeights) -> Result<Array> {
-        Self::mix_and_residual_static(x, op, layer, self.config.norm_eps)
-    }
-
-    /// `mix_and_residual` with the epsilon as an argument, so the same body
-    /// can be traced inside the compiled step closure.
-    fn mix_and_residual_static(
+    fn mix_and_residual(
+        &self,
         x: &Array,
         op: &Array,
         layer: &LayerWeights,
-        eps: f32,
     ) -> Result<Array> {
+        let eps = self.config.norm_eps;
         let op = norm(op, &layer.post_operator_norm, eps)?;
         let hidden = x.add(&op)?;
         let ffn = norm(&hidden, &layer.ffn_norm, eps)?;
@@ -965,99 +903,6 @@ impl Lfm3Model {
         required
     }
 
-    /// Build the exact-shape compiled single-token decode step
-    /// (`doc/lfm3-compiled-decode-step.md`). Inputs are the token id, an
-    /// explicit position index and every mutable state array; outputs are the
-    /// logits followed by the updated states. The body is the same
-    /// `build_graph` recipe, captured once; weights, RoPE tables and the conv
-    /// kernel are borrowed through `Rc` so `&mut self` is not needed inside
-    /// the traced closure.
-    fn compile_decode_step(&self) -> Result<Compiled> {
-        let stream = self.backend.stream();
-        let configs = Rc::new(self.config.clone());
-        let weights = self.weights.clone();
-        let kinds = Rc::new(self.kinds.clone());
-        let causal_conv = self.causal_conv.clone();
-        let cos_full = Rc::new(self.cos_full.clone().ok_or_else(|| err("LFM3 rotary tables are not prepared"))?);
-        let sin_full = Rc::new(self.sin_full.clone().ok_or_else(|| err("LFM3 rotary tables are not prepared"))?);
-        let cos_sliding = Rc::new(self.cos_sliding.clone().ok_or_else(|| err("LFM3 rotary tables are not prepared"))?);
-        let sin_sliding = Rc::new(self.sin_sliding.clone().ok_or_else(|| err("LFM3 rotary tables are not prepared"))?);
-        let outputs = 1 + self.step_state_arrays().len();
-        Compiled::with_shapeless(stream, outputs, false, move |inputs| {
-            if inputs.len() < 3 {
-                return Err(err("compiled LFM3 step expects token, position and states"));
-            }
-            let ids = &inputs[0];
-            let position = inputs[1]
-                .to_u32_scalar()? as usize;
-            let states = &inputs[2..];
-            if ids.shape() != [1] {
-                return Err(err(format!("compiled LFM3 step token shape {:?}", ids.shape())));
-            }
-            let c = &configs;
-            let len = 1;
-            let mut x = weights
-                .embed(ids)?
-                .reshape(&[1, len, c.hidden_size])?;
-            let mut state_index = 0usize;
-            let mut updated = Vec::with_capacity(states.len());
-            for (layer_idx, kind) in kinds.iter().enumerate() {
-                let layer = &weights.layers[layer_idx];
-                let eps = c.norm_eps;
-                let n = norm(&x, &layer.operator_norm, eps)?;
-                let op = if kind.is_conv() {
-                    let state = states
-                        .get(state_index)
-                        .ok_or_else(|| err("compiled LFM3 step conv state missing"))?
-                        .clone();
-                    state_index += 1;
-                    let (op, next) = Lfm3Model::conv_step_static(&*causal_conv, &n, layer, &state)?;
-                    updated.push(next);
-                    op
-                } else {
-                    let keys = states
-                        .get(state_index)
-                        .ok_or_else(|| err("compiled LFM3 step KV keys missing"))?
-                        .clone();
-                    state_index += 1;
-                    let values = states
-                        .get(state_index)
-                        .ok_or_else(|| err("compiled LFM3 step KV values missing"))?
-                        .clone();
-                    state_index += 1;
-                    let kv = KvState { keys, values };
-                    let (cos, sin) = match kind {
-                        LayerKind::FullAttention => (&*cos_full, &*sin_full),
-                        LayerKind::SlidingAttention => (&*cos_sliding, &*sin_sliding),
-                        LayerKind::Conv => return Err(err("compiled LFM3 conv layer has no rotary embedding")),
-                    };
-                    let (op, next) = Lfm3Model::attention_step_static(&n, layer, *kind, &kv, position, cos, sin)?;
-                    updated.push(next.keys);
-                    updated.push(next.values);
-                    op
-                };
-                let hidden = Lfm3Model::mix_and_residual_static(&x, &op, layer, eps)?;
-                x = hidden;
-            }
-            let hidden = norm(&x, &weights.final_norm, c.norm_eps)?;
-            let rows = hidden.slice_axis(1, len - 1, len)?;
-            let logits = weights
-                .project(&rows)?
-                .reshape(&[rows.shape()[1], c.vocab_size])?;
-            if state_index != states.len() {
-                return Err(err(format!(
-                    "compiled LFM3 step state arity {} != inputs {}",
-                    state_index,
-                    states.len()
-                )));
-            }
-            let mut output = Vec::with_capacity(1 + updated.len());
-            output.push(logits);
-            output.extend(updated);
-            Ok(output)
-        })
-    }
-
     fn execute_inner(&mut self, token_ids: &[u32], last_only: bool) -> Result<Tensor> {
         let stream = self.backend.stream().clone();
         let len = token_ids.len();
@@ -1083,65 +928,6 @@ impl Lfm3Model {
         }
         self.position = end;
         self.backend.from_array(logits)
-    }
-
-    /// Run one pipelined decode step through the exact-shape `Compiled`
-    /// callable, publishing the returned state arrays into `self`. On the
-    /// first use in a request the step is warmed with `prepare_timed` (trace +
-    /// compile + Metal JIT + two evals); later calls replay the profile. Any
-    /// retracing fails loudly (the §5.2 hard gate) and invalidates the session.
-    fn decode_compiled(&mut self, token: &Array, start: usize) -> Result<Array> {
-        let states = self.step_state_arrays();
-        if self.compiled_step.is_none() {
-            self.compiled_step = Some(self.compile_decode_step()?);
-        }
-        let position = Array::from_i32(self.backend.stream(), &[1], &[start as i32])?;
-        let mut inputs = Vec::with_capacity(2 + states.len());
-        inputs.push(token.clone());
-        inputs.push(position);
-        inputs.extend(states);
-        if self.prepared_profile.is_none() {
-            let step = self.compiled_step
-                .as_ref()
-                .ok_or_else(|| err("compiled LFM3 step missing"))?;
-            let (_warm, _t1, _t2) = step.prepare_timed(&inputs)?;
-            self.prepared_profile = Some(start);
-        }
-        let step = self.compiled_step
-            .as_ref()
-            .ok_or_else(|| err("compiled LFM3 step missing"))?;
-        let output = step.call(&inputs)?;
-        let (logits, states) = output
-            .split_first()
-            .ok_or_else(|| err("compiled LFM3 step returned no logits"))?;
-        self.install_compiled_states(states)?;
-        Ok(logits.clone())
-    }
-
-    /// Publish the compiled step's state arrays in the same layer order the
-    /// eager path uses (KV keys/values per attention layer, then the conv
-    /// window per conv layer).
-    fn install_compiled_states(&mut self, states: &[Array]) -> Result<()> {
-        if states.len() != self.step_state_arrays().len() {
-            return Err(err(format!(
-                "compiled LFM3 step returned {} states, expected {}",
-                states.len(),
-                self.step_state_arrays().len()
-            )));
-        }
-        let mut index = 0usize;
-        for layer_idx in 0..self.config.num_hidden_layers {
-            if self.kinds[layer_idx].is_conv() {
-                self.conv[layer_idx] = Some(states[index].clone());
-                index += 1;
-            } else {
-                let keys = states[index].clone();
-                let values = states[index + 1].clone();
-                self.kv[layer_idx] = Some(KvState { keys, values });
-                index += 2;
-            }
-        }
-        Ok(())
     }
 
     fn restore_conv_snapshot(&mut self) {
@@ -1171,24 +957,11 @@ impl DeviceDecode for Lfm3Model {
         self.conv_snapshot = Some(self.conv.clone());
         let start = self.position;
         let build_started = self.stages.then(Instant::now);
-        let logits = if compiled_decode_enabled() {
-            match self.decode_compiled(token, start) {
-                Ok(logits) => logits,
-                Err(error) => {
-                    // A retracing or compile failure invalidates the session;
-                    // the caller's finish_decode will mark it and the request
-                    // fails loudly rather than falling back to eager.
-                    self.invalid = Some(error.to_string());
-                    return Err(error);
-                }
-            }
-        } else {
-            match self.build_graph(token, start, 1, true) {
-                Ok(logits) => logits,
-                Err(error) => {
-                    self.invalid = Some(error.to_string());
-                    return Err(error);
-                }
+        let logits = match self.build_graph(token, start, 1, true) {
+            Ok(logits) => logits,
+            Err(error) => {
+                self.invalid = Some(error.to_string());
+                return Err(error);
             }
         };
         if let Some(build_ms) = build_started.map(|t| t.elapsed().as_secs_f64() * 1000.) {
@@ -1309,9 +1082,6 @@ impl LlmTrait for Lfm3Model {
         self.conv_snapshot = None;
         self.position = 0;
         self.invalid = None;
-        // The compiled step is warmed against the request's first decode
-        // position; a new request (even at the same capacity) re-warms it.
-        self.prepared_profile = None;
     }
 
     /// Greedy decode runs on the pipelined device sequence unless the
@@ -1353,8 +1123,6 @@ impl LlmTrait for Lfm3Model {
         self.position = 0;
         self.invalid = None;
         self.conv_snapshot = None;
-        self.compiled_step = None;
-        self.prepared_profile = None;
         self.backend.stream().synchronize()
     }
 
@@ -1367,7 +1135,6 @@ impl LlmTrait for Lfm3Model {
         self.conv_snapshot = None;
         self.position = 0;
         self.invalid = None;
-        self.prepared_profile = None;
         self.backend.stream().synchronize()
     }
 
@@ -1476,7 +1243,6 @@ mod tests {
 
     const SYNC_ENV: &str = "APXINF_MLX_SYNC_DECODE";
     const NO_RESTORE_ENV: &str = "APXINF_LFM3_TEST_NO_CONV_RESTORE";
-    const COMPILED_ENV: &str = "APXINF_LFM3_COMPILED_DECODE";
 
     fn test_checkpoint() -> Result<std::path::PathBuf> {
         std::env::var_os("APXINF_LFM3_TEST_MODEL")
@@ -1515,14 +1281,6 @@ mod tests {
             std::env::set_var(SYNC_ENV, "1");
         } else {
             std::env::remove_var(SYNC_ENV);
-        }
-    }
-
-    fn set_compiled_decode(on: bool) {
-        if on {
-            std::env::set_var(COMPILED_ENV, "1");
-        } else {
-            std::env::remove_var(COMPILED_ENV);
         }
     }
 
@@ -1639,34 +1397,6 @@ mod tests {
                 "prompt {index}: pipelined greedy diverged from sync"
             );
         }
-        Ok(())
-    }
-
-    /// C1 (pre-registration §9): the compiled decode arm emits the same token
-    /// ids as the eager pipelined baseline on 4 prompts × 128 tokens — the
-    /// QUEUE #1 hard gate (§5.1). Default arm with the switch unset, then the
-    /// compiled arm with `APXINF_LFM3_COMPILED_DECODE=1`, both against the same
-    /// `Lfm3Model`.
-    #[test]
-    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
-    fn c1_compiled_greedy_matches_eager_pipelined_token_for_token() -> Result<()> {
-        let prompts: Vec<Vec<u32>> = (0..4).map(|i| pseudo_prompt(24, 101 + i)).collect();
-        let mut model = load_checkpoint_model()?;
-        set_sync_schedule(false);
-        set_compiled_decode(false);
-        let mut expected = Vec::with_capacity(prompts.len());
-        for prompt in &prompts {
-            expected.push(run_greedy(&mut model, prompt, 128)?);
-        }
-        set_compiled_decode(true);
-        for (index, prompt) in prompts.iter().enumerate() {
-            let got = run_greedy(&mut model, prompt, 128)?;
-            assert_eq!(
-                got, expected[index],
-                "prompt {index}: compiled decode diverged from eager pipelined greedy"
-            );
-        }
-        set_compiled_decode(false);
         Ok(())
     }
 
