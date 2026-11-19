@@ -1208,7 +1208,7 @@ mod tests {
 
     // ---- Pipelined greedy decode acceptance tests (issue #122). Real ----
     // checkpoint, real Metal: `APXINF_LFM3_TEST_MODEL=<snapshot dir> cargo
-    // test -p apxinf-model --features mlx metal_lfm3 -- --ignored
+    // test -p apxinf-model --features mlx,coreml metal_lfm3 -- --ignored
     // --test-threads=1` under the shared Metal qualification lock. The tests
     // mutate process env to select the schedule, so they must run
     // single-threaded.
@@ -1303,8 +1303,16 @@ mod tests {
                 state
                     .as_ref()
                     .map(|kv| -> Result<Vec<u8>> {
-                        let keys = kv.keys.slice_axis(2, 0, position)?.to_bytes_ready()?;
-                        let values = kv.values.slice_axis(2, 0, position)?.to_bytes_ready()?;
+                        let keys = kv
+                            .keys
+                            .slice_axis(2, 0, position)?
+                            .contiguous()?
+                            .to_bytes_ready()?;
+                        let values = kv
+                            .values
+                            .slice_axis(2, 0, position)?
+                            .contiguous()?
+                            .to_bytes_ready()?;
                         let mut bytes = keys;
                         bytes.extend_from_slice(&values);
                         Ok(bytes)
@@ -1318,7 +1326,7 @@ mod tests {
             .map(|state| {
                 state
                     .as_ref()
-                    .map(|array| array.to_bytes_ready())
+                    .map(|array| array.contiguous()?.to_bytes_ready())
                     .transpose()
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1398,6 +1406,7 @@ mod tests {
         // driver-side break after one publish must roll the lookahead step
         // back, leaving exactly the prefill state (the sync outcome).
         let prompt_end = prompt.len() as u32;
+        model.reset();
         model.prefill(LlmInput::text(&prompt))?; // real prefill state; first logits unused
         let mut values = vec![-1e30f32; model.config.vocab_size];
         values[124_894] = 1.0; // any in-vocab id stands in for EOS here
