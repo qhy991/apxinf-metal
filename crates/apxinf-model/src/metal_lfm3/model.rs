@@ -13,6 +13,7 @@
 
 use super::{
     config::{LayerKind, Lfm3Config},
+    kkernel::KKernel,
     weights::{LayerWeights, Mixer, Weights},
 };
 use crate::llm_trait::{
@@ -76,9 +77,10 @@ fn apply_rope(x: &Array, cos: &Array, sin: &Array, dim: usize) -> Result<Array> 
         .cast(x.dtype())
 }
 
-/// `silu(gate) * up` expressed exactly as the reference's `nn.silu(g) * u`.
-fn silu_mul(gate: &Array, up: &Array) -> Result<Array> {
-    gate.mul(&gate.sigmoid()?)?.mul(up)
+/// `silu(gate) * up` expressed exactly as the reference's `nn.silu(g) * u`,
+/// dispatched through the armed custom kernel when the switch is on.
+fn silu_mul(gate: &Array, up: &Array, kkernel: &KKernel) -> Result<Array> {
+    kkernel.silu_mul(gate, up)
 }
 
 /// Fused one-token depthwise convolution over a seven-column window.
@@ -176,6 +178,8 @@ pub struct Lfm3Model {
     /// `finish_decode` and prove the byte-level state check catches it.
     #[cfg(test)]
     disable_conv_restore: bool,
+    /// Decode-step custom kernels (QUEUE #2; inert unless `APXINF_LFM3_KKERNEL=1`).
+    kkernel: KKernel,
 }
 
 impl Lfm3Model {
@@ -193,6 +197,7 @@ impl Lfm3Model {
             .clone();
         let weights = Weights::load(&config, tensors, backend.stream())?;
         let causal_conv = CausalDepthwiseConv::new(backend.stream())?;
+        let kkernel = KKernel::new(backend.stream())?;
         let kinds = config.layer_kinds()?;
         let layers = config.num_hidden_layers;
         let mut model = Self {
@@ -200,6 +205,7 @@ impl Lfm3Model {
             backend,
             weights,
             causal_conv,
+            kkernel,
             kinds,
             initial_kv: vec![None; layers],
             kv: vec![None; layers],
@@ -745,7 +751,7 @@ impl Lfm3Model {
         let ffn = norm(&hidden, &layer.ffn_norm, eps)?;
         let gate = layer.w1.call(&ffn)?;
         let up = layer.w3.call(&ffn)?;
-        let activated = silu_mul(&gate, &up)?;
+        let activated = silu_mul(&gate, &up, &self.kkernel)?;
         let down = layer.w2.call(&activated)?;
         let down = norm(&down, &layer.post_ffn_norm, eps)?;
         hidden.add(&down)
@@ -876,12 +882,13 @@ impl Lfm3Model {
         } else {
             hidden
         };
+        let rows_shape = rows.shape().to_vec();
         let logits = self
             .weights
-            .project(&rows)
+            .project(&rows, &self.kkernel)
             .map_err(|e| err(format!("head projection: {e}")))?
-            .reshape(&[rows.shape()[1], self.config.vocab_size])
-            .map_err(|e| err(format!("head reshape rows={:?}: {e}", rows.shape())))?;
+            .reshape(&[rows_shape[1], self.config.vocab_size])
+            .map_err(|e| err(format!("head reshape rows={rows_shape:?}: {e}")))?;
         Ok(logits)
     }
 

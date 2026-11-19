@@ -8,6 +8,8 @@
 pub mod config;
 mod model;
 mod weights;
+mod kkernel;
+pub use kkernel::enabled as kkernel_enabled;
 pub use model::Lfm3Model;
 
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};

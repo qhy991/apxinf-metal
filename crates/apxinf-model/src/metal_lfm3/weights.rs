@@ -350,7 +350,7 @@ impl Weights {
         self.embedding.take(ids, 0)
     }
 
-    pub fn project(&self, x: &Array) -> Result<Array> {
-        x.matmul(&self.head)
+    pub fn project(&self, x: &Array, kkernel: &crate::metal_lfm3::kkernel::KKernel) -> Result<Array> {
+        kkernel.project(x, &self.head)
     }
 }

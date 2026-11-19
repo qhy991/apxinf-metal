@@ -525,11 +525,13 @@ fn run(args: Args) -> Result<()> {
     let sync_decode = std::env::var_os("APXINF_MLX_SYNC_DECODE").is_some_and(|v| v == "1");
     let decode_stages =
         std::env::var_os("APXINF_LFM3_DECODE_STAGES").is_some_and(|v| v == "1");
+    let kkernel = std::env::var_os("APXINF_LFM3_KKERNEL").is_some_and(|v| v == "1");
     eprintln!(
-        "decode_schedule={} overlaps_callbacks={} decode_stages={}",
+        "decode_schedule={} overlaps_callbacks={} decode_stages={} kkernel={}",
         if sync_decode { "sync" } else { "pipelined" },
         if sync_decode { "false" } else { "true" },
         if decode_stages { "true" } else { "false" },
+        if kkernel { "true" } else { "false" },
     );
     let prepared = profile == NativeProfile::Prepared;
     if prepared {
