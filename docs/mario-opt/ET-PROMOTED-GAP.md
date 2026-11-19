@@ -4,7 +4,7 @@ Source of truth for the EngineTailor (ET) side: `enginetailor/models/d3lite/engi
 `PROMOTED` (the only model in ET that declares a promoted point). apxinf side:
 `crates/apxinf-model/src/metal_d3_lite/` on `main`.
 
-## d3-lite: 4 of 6 promoted items are already ported
+## d3-lite: 6 of 6 promoted items are ported
 
 | ET option | ET promoted value | apxinf native | Status |
 |---|---|---|---|
@@ -12,10 +12,13 @@ Source of truth for the EngineTailor (ET) side: `enginetailor/models/d3lite/engi
 | `conv1d` | `apxinf` | `CausalDepthwiseConv`; `APXINF_D3_CONV1D=stock` restores the composed MLX `conv1d` | ✅ ported (PR #21) |
 | `rope` | `apxinf` | `HalfSplitRope`, FP32 angles, one rounding to the input dtype | ✅ ported (PR #12) |
 | `compile` | `model` | `Compiled::prepare` per admitted length, replay on every request | ✅ ported (PR #12) |
-| `gemm_dtype` | `f16` | BF16 only — the variant contract admits `auto`/`bf16`/`bf16-compiled` and **rejects f16** (`metal_d3_lite/mod.rs`) | ❌ missing (blocked by the variant contract, not by a kernel) |
-| `gdn_block` | `fused_prep` | the GDN operand chain runs as separate ops (conv, silu, q/k l2-norm, recurrence, gated norm, gate) | ❌ missing |
+| `gemm_dtype` | `f16` | `APXINF_D3_GEMM_DTYPE=f16` replaces every projection's BF16 weight with an F16 copy at load and runs `(x -> f16 @ W16 -> bf16)` (default `bf16`) | ✅ ported (`add41b11`) |
+| `gdn_block` | `fused_prep` | `GdnFusedPrep` runs the whole GDN operand chain (conv, silu, q/k l2-norm) as one kernel; `APXINF_D3_GDN_BLOCK` **defaults to `fused_prep`**, `separate` restores the split chain | ✅ ported (`add41b11`) |
 
-So the remaining migration surface for d3-lite is **two items**, not six.
+So the remaining migration surface for d3-lite is **zero items**: both open items below
+were closed by `add41b11` (f16 projection GEMM, fused GDN operand chain). The two
+sections that follow are kept as the history of *why* each was worth porting, and as
+the evidence a future re-verification needs.
 
 ### What that means for the "≈24 % gap"
 
@@ -24,14 +27,14 @@ The review's `EngineTailor promoted 2808 ms vs apxinf native 3693 ms` predates P
 suite with the same warm-up; the two numbers in the review were not taken at the same
 point in the port's history and are not a like-for-like pair.
 
-### The two open items, ordered by risk
+### The two formerly open items, and what closing them required
 
 1. **`gdn_block=fused_prep`** — in ET this runs the GDN operand chain as one kernel
-   (`gdn_fused_prep`). In apxinf it is 6–7 separate dispatches per GDN layer. The
+   (`gdn_fused_prep`). It used to be 6–7 separate dispatches per GDN layer here. The
    mechanism is proven on the ET side; the port needs a new Metal kernel and a parity
    pass on all 24 GDN layers (the 42-case gate plus the image path).
 2. **`gemm_dtype=f16`** — ET measured a roofline band of 0–7 % for F16 weight copies.
-   apxinf rejects the variant today, so the port also means extending the variant
+   apxinf rejected the variant until `add41b11`, so the port also meant extending the variant
    contract and its parity evidence. F16 changes accumulation rounding, so this one
    carries a real parity risk on the 0.0022 headroom of the Clef-style gates; for
    d3-lite the budget is wider (48-case receipt, 0.15 tolerance) but still needs proof.
@@ -41,6 +44,34 @@ point in the port's history and are not a like-for-like pair.
 ET declares no `PROMOTED` for `clef_flash`, `jev`, `minicpm`, `qwen3`, `flux`, `kimi` or
 `llama`; their wins live in campaign recipes rather than a promoted point. For those the
 migration is per-win, not per-config, and each needs its own evidence trail.
+
+### Which of those ET families apxinf does not have at all
+
+apxinf covers `metal_clef`, `metal_minicpm5`, `metal_qwen3`, `metal_qwen3_tts`,
+`metal_qwen_image`, `metal_d3_lite` and `metal_lfm3`. Three ET targets have **no apxinf
+family**, so their migration is a model onboarding, not a knob port:
+
+| ET target | apxinf family | note |
+|---|---|---|
+| `minicpm-ocr-jev-m1pro-bf16-v1` | none | ET has the eight-lane GDN core and the ANE path measured on this lane |
+| `qwen3-asr-17b-m2-bf16-offline-v1` | none (`apxinf-audio-serving` is a serving layer, not this model) | ET's lane is 49 STOP / 13 FAIL with zero admitted win; measure before porting |
+| `qwen35-4b-dlite-m4-bf16-v1` | none (`metal_d3_lite` is `vllm-sr/d3-lite`, a different model) | ET closed its M-switch direction; do not port that lever |
+
+**Do not port ET's M switch.** ET measured a caller-side `M<=15 / M>=16` path split that
+wins 20.5 % at `M=16` in isolation, then found the production decode verify forward issues
+`M=8` in every layer and every step (so the switch never fires, e2e gain 0 ms), and that at
+the prefill shapes it *would* fire, the split arm is 5.44 % slower. The direction is closed
+with a mechanism, not a measurement gap.
+
+### A constraint worth taking even though it is not an optimisation
+
+`CHUNK-VS-STEP-CONSTRAINT.md` records EngineTailor's finding that a multi-token forward is
+not the same computation as the same tokens stepped, by ≈ 2 BF16 ulp, because `M=1` and
+`M>1` dispatch to different matmul kernels. apxinf has the same split in its row-decode vs
+GEMM kernels, so the note applies to any chunked verification, prompt-lookup drafting or
+snapshot replay added to `metal_lfm3`. It is the most transferable item from ET's recent
+rounds: it cost ET a full round to attribute, and it invalidates a feature class outright
+rather than costing a percentage point.
 
 ## Recommended first move
 
