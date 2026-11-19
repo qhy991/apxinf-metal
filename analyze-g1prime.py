@@ -7,6 +7,10 @@ Reads run-g1prime.sh's 4 segment result files and prints:
   CELL  per-task solved-in-both / solved-in-either (ABBA robustness)
   G1'   solved-rate delta (4-bit vs BF16) and PASS / PARTIAL / STOP
 
+Segments are discovered from the files on disk (native-4bit-A has segs
+0,2,4,... and native-bf16-B has segs 1,3,5,...; see run-g1prime.sh), so
+2, 3 and 4 segments per arm analyze with the same code.
+
 Exit 0 if the analysis produced a verdict (PASS, PARTIAL or STOP are all
 valid G1' outcomes); exit 2 if any arm is missing a segment (window
 incomplete => no verdict).
@@ -16,7 +20,23 @@ import json
 import sys
 from pathlib import Path
 
+# hardcoded fallback; main() replaces this with discover_segs(res).
 SEGS = {"native-4bit-A": [0, 3], "native-bf16-B": [1, 2]}
+
+
+def discover_segs(res: Path) -> dict[str, list[int]] | None:
+    found: dict[str, list[int]] = {}
+    for arm in ("native-4bit-A", "native-bf16-B"):
+        segs = []
+        for p in res.glob(f"{arm}-seg*.json"):
+            try:
+                segs.append(int(p.stem.split("seg")[-1]))
+            except ValueError:
+                pass
+        found[arm] = sorted(segs)
+    if not all(found.values()) or len({len(s) for s in found.values()}) != 1:
+        return None   # an arm has no segments, or A/B segment counts differ
+    return found
 # gate: doc/lfm3-native-4bit.md §2 G1' / §5 verdicts
 PASS_MAX_DELTA_PP = 3.0
 STOP_DELTA_PP = 10.0
@@ -62,7 +82,17 @@ def rate(solved: int, n: int) -> float:
 
 
 def main() -> int:
+    global SEGS
     res = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+    segs = discover_segs(res)
+    if segs is None:
+        print("SEG discover failed: need >=1 %s-seg*.json per arm with equal "
+              "counts (got %s)" % ("native-4bit-A/native-bf16-B",
+                                    {p.name for p in res.glob("*-seg*.json")}))
+        return 2
+    SEGS = segs
+    print("SEGS %s" % " ".join("%s=%s" % (a, ",".join(map(str, s)))
+                                for a, s in SEGS.items()))
     docs: dict[str, list[dict]] = {}
     for arm, segs in SEGS.items():
         docs[arm] = []
@@ -105,24 +135,31 @@ def main() -> int:
             solved_segs = sum(1 for rec in receipts[arm] if tid in rec["solved_ids"])
             row[arm] = solved_segs
         per_task.append(row)
+        na, nb = len(SEGS["native-4bit-A"]), len(SEGS["native-bf16-B"])
+        # a task is in {solved in all segments, solved in none} on both
+        # arms, and both arms agree on which one it is; otherwise DISAGREE.
+        a_solved = row["native-4bit-A"] == na
+        b_solved = row["native-bf16-B"] == nb
+        agree = ((row["native-4bit-A"] in (0, na))
+                 and (row["native-bf16-B"] in (0, nb))
+                 and (a_solved == b_solved))
         print("CELL task=%s 4bit_solved_segs=%d/%d bf16_solved_segs=%d/%d => %s"
-              % (tid, row["native-4bit-A"], len(SEGS["native-4bit-A"]),
-                 row["native-bf16-B"], len(SEGS["native-bf16-B"]),
-                 "BOTH_AGREE" if {row["native-4bit-A"], row["native-bf16-B"]} <= {0, 2}
-                 else ("DISAGREE" if row["native-4bit-A"] != row["native-bf16-B"]
-                       else "BOTH_AGREE")))
+              % (tid, row["native-4bit-A"], na, row["native-bf16-B"], nb,
+                 "BOTH_AGREE" if agree else "DISAGREE"))
 
     n = len(ids)
-    # primary = per-request solved-in-both-segments (conservative); the
+    na, nb = len(SEGS["native-4bit-A"]), len(SEGS["native-bf16-B"])
+    # primary = per-request solved-in-every-segment (conservative); the
     # report also carries either-segment for the Arm-disagreement case.
-    a_both = sum(1 for r in per_task if r["native-4bit-A"] == 2)
-    b_both = sum(1 for r in per_task if r["native-bf16-B"] == 2)
+    # For the v1 2-segment window these are exactly the old == 2 semantics.
+    a_both = sum(1 for r in per_task if r["native-4bit-A"] == na)
+    b_both = sum(1 for r in per_task if r["native-bf16-B"] == nb)
     a_either = sum(1 for r in per_task if r["native-4bit-A"] >= 1)
     b_either = sum(1 for r in per_task if r["native-bf16-B"] >= 1)
     delta_both = rate(a_both, n) - rate(b_both, n)
     delta_either = rate(a_either, n) - rate(b_either, n)
     disagree = sum(1 for r in per_task
-                   if (r["native-4bit-A"] == 2) != (r["native-bf16-B"] == 2))
+                   if (r["native-4bit-A"] == na) != (r["native-bf16-B"] == nb))
     print("CELLSET n=%d" % n)
 
     worst = min(delta_both, delta_either)
@@ -153,6 +190,7 @@ def main() -> int:
     out = res / "g1prime-verdict.json"
     out.write_text(json.dumps({
         "gate": "G1'", "verdict": verdict, "n_tasks": n,
+        "segments_per_arm": {"4bit": na, "bf16": nb},
         "4bit_solved_both": a_both, "bf16_solved_both": b_both,
         "delta_both_pp": round(delta_both, 2),
         "4bit_solved_either": a_either, "bf16_solved_either": b_either,

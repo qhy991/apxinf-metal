@@ -4,26 +4,33 @@
 # 6-task code suite (MBPP rows 0..4 + HumanEval/80), via the audited
 # code_loop.py action template (model emits code; harness writes files
 # and runs pristine tests). ABBA to keep the served arm time-ordered
-# like the G4-speed window; each arm: 2 gateways, each replaying all 6
-# tasks once (segment = gateway instance).
+# like the G4-speed window; each arm: --segments gateway instances, each
+# replaying all tasks once (segment = gateway instance). Round-64 default:
+# 3 segments per arm on the 20-task suite (Lead 02:18: >=20 tasks, >=3
+# segments per arm).
 #
 # Gates: G3 effect proof (banner native_4bit, census 154/154, binary
 # freshness) — same helper as run-g4speed.sh; the gate itself is G1':
 # solved-rate delta <= 3pp PASS, 3-10pp PARTIAL candidate, >10pp STOP.
-# A/A here = solved-count consistency across the 2 segments per arm;
+# A/A here = solved-count consistency across the per-arm segments;
 # a disagreement is reported and the segment split is the tiebreaker
 # (each request is independent; no timing median is formed from it).
 #
 # Runs under both Metal locks, fcntl, in order, waited never stolen
-# (RUNNER 3). Usage: run-g1prime.sh [run_dir]  (default ~/lfm3-dig-run)
+# (RUNNER 3). Usage: run-g1prime.sh [run_dir] [segments_per_arm]
+#   (defaults: ~/lfm3-dig-run, 3; pass 2 to reproduce the n=6 ABBA shape)
 set -uo pipefail
 export PATH=$HOME/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin
 export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
 export MLX_ROOT=$HOME/mlx-sdk
 export DYLD_LIBRARY_PATH=$MLX_ROOT/lib
 RUN=${1:-$HOME/lfm3-dig-run}
+SEGS_PER_ARM=${2:-3}
 REPO=$RUN/wt
 RES=$RUN/window-4bit/g1prime
+if [[ "$SEGS_PER_ARM" != (2|3|4) ]]; then
+  echo "segments_per_arm must be 2, 3 or 4 (got $SEGS_PER_ARM)"; exit 4
+fi
 mkdir -p "$RES"
 CLOG=$RES/g1prime.log
 if grep -q "PHASE all_done\|PHASE aborted" "$CLOG" 2>/dev/null; then
@@ -31,15 +38,20 @@ if grep -q "PHASE all_done\|PHASE aborted" "$CLOG" 2>/dev/null; then
 fi
 
 SUITE=$RES/suite.json
-if [ ! -f "$SUITE" ]; then
-  echo "building suite (deterministic, offline) at $(date +%FT%T)" >> "$CLOG"
-  python3 $RUN/build-g1prime-suite.py \
+SUITE_K=$(( SEGS_PER_ARM == 2 ? 5 : 19 ))   # 6 tasks / 2 segs (v1); 20 tasks / >=3 segs (v2, Lead 02:18)
+echo "building suite (deterministic, offline, k=$SUITE_K) at $(date +%FT%T)" >> "$CLOG"
+python3 $RUN/build-g1prime-suite.py --force \
+    --k $SUITE_K \
     --mbpp-cache $HOME/ag2-datasets-cache/google-research-datasets__mbpp__sanitized__test.json \
     --ag2-suite $HOME/ag-run/suite/AG2-suite-v1.json \
     --out "$SUITE" >> "$CLOG" 2>&1 || { echo "suite build failed"; exit 4; }
-fi
 sha=$(shasum -a 256 "$SUITE" | cut -d' ' -f1)
-echo "suite sha256=$sha tasks=6" >> "$CLOG"
+ntasks=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))['tasks']))" "$SUITE")
+echo "suite sha256=$sha tasks=$ntasks k=$SUITE_K" >> "$CLOG"
+if (( ntasks < 20 )) && (( SEGS_PER_ARM >= 3 )); then
+  echo "G1' INVALID: >=3 segments requires the 20-task suite, got $ntasks" >> "$CLOG"
+  echo "PHASE aborted_suite_size" >> "$CLOG"; exit 101
+fi
 
 echo "PHASE locks_start $(date +%FT%T)" >> "$CLOG"
 python3 $RUN/hold_locks.py > $RES/locks.log 2>&1 </dev/null &
@@ -152,13 +164,29 @@ seg_arm() { # arm seg tag model_root expect_4bit [worker_env...]
   stop_gw
 }
 
-# ---- ABBA, 2 segments per arm ----
-# A = native-4bit (APXINF_LFM3_4BIT=1), B = native-bf16 (switch unset)
-echo "PHASE abba_start $(date +%FT%T)" >> "$CLOG"
-seg_arm native-4bit-A 0 A-0 "$MODEL4" true  --worker-env APXINF_LFM3_4BIT=1
-seg_arm native-bf16-B 1 B-1 "$SNAPSHOT" false
-seg_arm native-bf16-B 2 B-2 "$SNAPSHOT" false
-seg_arm native-4bit-A 3 A-3 "$MODEL4" true  --worker-env APXINF_LFM3_4BIT=1
+# ---- ABBA, $SEGS_PER_ARM segments per arm ----
+# A = native-4bit (APXINF_LFM3_4BIT=1), B = native-bf16 (switch unset).
+# For 3+ segments use A B A B ... (interleaved), ending with A when the
+# total is odd: time-order is still balanced and no arm gets all its
+# segments in one block.
+echo "PHASE abba_start segments_per_arm=$SEGS_PER_ARM at $(date +%FT%T)" >> "$CLOG"
+total=$(( SEGS_PER_ARM * 2 ))
+# Preserve (do not delete) any previous run's segment results: stale
+# native-*-seg*.json from a prior window would otherwise be picked up by
+# analyze-g1prime.py's file discovery and poison the verdict. Round-64.
+mkdir -p "$RES/prev"
+mv "$RES"/native-*-seg*.json(N) "$RES"/native-*-seg*.log(N) \
+   "$RES"/g1prime-verdict.json(N) "$RES"/apxinf-*-stdout.log(N) \
+   "$RES"/apxinf-*-requests.jsonl(N) "$RES"/apxinf-*-diag.jsonl(N) \
+   "$RES/prev/" 2>/dev/null || true
+for (( i = 0; i < total; i++ )); do
+  seg=$(( i / 2 ))
+  if (( i % 2 == 0 )); then
+    seg_arm native-4bit-A $seg A-$seg "$MODEL4" true  --worker-env APXINF_LFM3_4BIT=1
+  else
+    seg_arm native-bf16-B $seg B-$seg "$SNAPSHOT" false
+  fi
+done
 echo "PHASE abba_done $(date +%FT%T)" >> "$CLOG"
 
 # ---- G1' analysis (standalone file, no inline heredoc: round-55 bug 3) ----
