@@ -137,6 +137,35 @@
 
 ---
 
+### 2026-11-20 01:50 CST — G1′ 质量门判定：STOP（§2 G1′ / §5；round-57 实测）
+
+> 本节结果在 round-57 窗口（01:49:05–02:02:53，commit `7ab6ad5d` 之后）后回填。原 M4 运行 harness commit `b4ec75cb` + 修正 `7ab6ad5d`；receipts：`~/lfm3-dig-run/window-4bit/g1prime/`（verdict：`g1prime-verdict.json`，6 题 per-task 表、各臂 2 段 json、第 1 次作废运行 `round57-failed1/`）。
+
+**评测配置**：suite = MBPP sanitized rows 0..4 + HumanEval/80（`build-g1prime-suite.py` 离线生成并冻结 sha256），ABBA 2 段/臂，A=`native-4bit`（`APXINF_LFM3_4BIT=1`，模型 `~/lfm3-dig-run/4bit/` sha `96b021b3…`）、B=`native-bf16`（开关 unset，模型 `~/lfm3-spec/weights-local/LFM3-1.7B/` sha `135922ca…`）；每臂 2 gateway × 6 题 × ≤3 retry，PV-11 code_loop 模板（gold code 不进 prompt）。窗口前双 Metal 锁 fcntl 顺序等待 + `pmset displaysleepnow` + `caffeinate -si`；锁在 02:02:53 释放，全程锁内。
+
+**原始数字（per-segment solved count）**：
+
+| 臂 | seg | solved | solved ids | 备注 |
+| ---|---| ---|---| ---|
+| A（4-bit） | 0 | 2/6（33.3%） | `mbpp_0012`, `mbpp_0017` | |
+| A（4-bit） | 3 | 1/6（16.7%） | `mbpp_0017` | 与 seg0 不一致 ⇒ spread 16.67pp |
+| B（BF16） | 1 | 2/6（33.3%） | `mbpp_0012`, `mbpp_0017` | |
+| B（BF16） | 2 | 3/6（50.0%） | `humaneval_0080`, `mbpp_0012`, `mbpp_0017` | 与 seg1 不一致 ⇒ spread 16.67pp |
+
+**汇总（两口径，`g1prime-verdict.json`）**：
+
+- both 口径（每任务 2 段都解出才算解出）：4-bit **1/6（16.7%）** vs BF16 **2/6（33.3%）**，**delta = −16.67pp**；
+- either 口径（任一段解出即算解出）：4-bit **2/6（33.3%）** vs BF16 **3/6（50.0%）**，**delta = −16.67pp**；
+- per-task disagreements：1/6（`mbpp_0012`：4-bit 1/2 vs BF16 2/2，是唯一一题跨口径分歧；其余 5 题两口径结果相同）。
+
+**判据（§2 G1′，冻结）**：掉 ≤3pp ⇒ PASS；3–10pp ⇒ PARTIAL 候选；**>10pp ⇒ STOP（4-bit 不可设默认）**。
+
+**A/A caveat（如实记录，round-57 §59）**：两臂 2 段 solved 集合各自均不一致（spread 16.67pp > 5%）；按 RUNNER §4 严格口径本窗 A/A 不干净，但 G1′ 的 A/A 门在预登记中定义为「每臂 solved 集合一致」，analyzer 报告 DISAGREE 并以逐任务表为 tiebreaker，**不因 DISAGREE 自动判 INVALID**（INVALID 仅限 G3 空臂 / G5 速度窗 A/A >5% / G4-shape 漂移）。n=6、≤3 retry 下解谜率本身抖动极大（同臂同精度两段就差 1 题），故本结论强度是「**4-bit 质量风险信号 STOP（保守方向）**」，不是精确点估计。
+
+**结论：G1′ STOP —— 质量门不过**：两口径 −16.67pp 一致 > 10pp ⇒ **4-bit 不设为原生默认**。速度窗的 3.26–3.31× 优势（round-58 本文件上节）与本节质量结论合并 ⇒ 按 §5 两门不齐 ⇒ **QUEUE #8 整体：速度 PASS + 质量 STOP，4-bit 留 opt-in（`APXINF_LFM3_4BIT=1`）供 Lead 裁决**。G1-diag（step-59 token 分叉 + FP16 scale 复现）本轮未跑，仍为诊断项。
+
+---
+
 ## Gate（原文，供 PR 引用）
 
 > **G1-diag（诊断，非门）** 记录原生 4-bit vs Python lane 4-bit 首处分叉（已知 v12 prompt 0 step 59，lane=125020 vs native=25797）并尝试 FP16 scale 路径复现 lane（`q4_f16.rs`）；修好则升级回 G1 硬门，修不好记为已知引擎差，不判 INVALID。**G1′（质量门）** 同批 agent 任务（≥6 题）4-bit vs BF16 solved rate 掉 ≤3 点通过、>10 点停。**G4-speed（速度门）** ABBA ≥3 段/臂、A/A ≤5%、engine basis，4-bit vs BF16 ≥2.5× 且 ≤ llama Q4（12.39/12.71 ms/token）。**G3** banner `native_4bit` 字段缺失或二进制未重编译 ⇒ 空臂 INVALID。**G4-shape** 任何 shape 漂移（padded/bucketed/wider/拆 K/换读向）⇒ 实现不可用。**G5** A/A ≤ 5%（本 ticket 自有）。
