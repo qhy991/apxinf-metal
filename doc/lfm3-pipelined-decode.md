@@ -303,6 +303,35 @@ Logs: `doc/receipts/lfm3-pipelined-decode/tests.log` (+ `-fault-injection`).
    within-window pairing, which is why the pre-registered rule is defined on
    paired medians.
 
+
+### Lead independent verification (2026-11-19, re-computed from the committed receipts)
+
+Verified against `doc/receipts/lfm3-pipelined-decode/` without reusing the author's summary:
+
+| check | result |
+|---|---|
+| Pre-registration before any device run (R1) | `71cb94ea` is the first commit on the branch, ahead of every measurement artifact |
+| Same binary, two apxinf arms (R2) | all six raw files record `apxinf-serve` `c8cec3ea…`; only the switch differs |
+| Switch actually reached the worker (R3) | `logs/status.log`: `apxinf gateway up tag=apxinf-sync-* env=--worker-env APXINF_MLX_SYNC_DECODE=1` vs `tag=apxinf-pipe-* env=` — the banner in the parity diagnostics reads `decode_schedule=pipelined overlaps_callbacks=true` |
+| Token identity (R4) | `parity/verdict.json`: `all_token_streams_identical: true` over 4 prompts × 128 tokens |
+| A/A per arm per cell (R5) | re-computed from the raw files: worst spread 0.21 % (pipe), 0.95 % (sync), 0.74 % (llama); report agrees (≤ 0.5 %) |
+| T1/T2/T3 + fault proof (R6) | `tests.log` 5/5 pass; `tests-fault-injection.log` fails `t3_pipelined_continuation_state_matches_sync_byte_for_byte` with the conv-window assertion — the negative control the issue asked for |
+| Decomposition reconciliation (R7) | re-read `logs/decomposition.json`: 1030/1030 steps, `reconciliation_median_pct = 100.0` (build 0.263 + eval_wait 37.052 + sample 0.353 + callback 0.009) |
+
+**Treatment effect (the number that stands on its own):** `apxinf-sync` → `apxinf-pipe` is
+**37.15 → 36.07** and **37.53 → 36.40** ms/token, i.e. **−2.9 % / −3.0 %** (**+1.08 / +1.13 ms/token**
+recovered), measured with one binary and only the scheduling switch changed. That is the part the
+pre-registered gate was built to protect, and it is clean.
+
+**Reading of the WIN, stated plainly:** the in-window `llamacpp-f16` arm measured 37.87/38.12 ms/token
+while the *same* llama-server binary (`d635b19f…`) measured 36.42/36.67 in the certified
+`f16-20261118T211938Z` window — with prefill unchanged (748 → 752 ms, 2897 → 2924 ms), so the drift is
+decode-side only. Against the certified baseline, `apxinf-pipe` is **0.99× / 0.99×** of llama.cpp, i.e.
+**parity**, not a win; the 0.95× in this table is measured against an in-window llama that ran 3.8 %
+below its own certified baseline. Both statements are true and they should be quoted together:
+**WIN against the in-window pairing the pre-registered rule defines, parity against the certified
+cross-window baseline.** The treatment effect (−3 %) does not depend on which reading is used.
+
 ### Amendments
 
 **Amendment 2026-11-19 (operational only; no decision rule, threshold, gate,
