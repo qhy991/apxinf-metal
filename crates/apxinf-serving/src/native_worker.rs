@@ -509,6 +509,10 @@ fn read_commands(
 }
 
 fn run(args: Args) -> Result<()> {
+    // QUEUE #7 startup census: host-side `Instant` boundaries only, after the
+    // construction banner and before/around model construction. No decode path
+    // timing here — see doc/lfm3-queue7-preregister.md §4.
+    let census_started = Instant::now();
     let profile =
         NativeProfile::from_protocol(&args.protocol).ok_or("Unsupported native launch profile")?;
     if !(1..=16384).contains(&args.max_context)
@@ -541,6 +545,8 @@ fn run(args: Args) -> Result<()> {
         if prefill_fast { "true" } else { "false" },
         if native_4bit { "true" } else { "false" },
     );
+    // QUEUE #7: banner printed → identity/manifest work begins.
+    let host_identity_started = Instant::now();
     let prepared = profile == NativeProfile::Prepared;
     if prepared {
         if args.cache_limit_bytes.is_none_or(|v| v == 0 || v > args.memory_limit_bytes)
@@ -600,6 +606,7 @@ fn run(args: Args) -> Result<()> {
     };
     let execution_echo = execution.clone();
     let manifest = native_identity::manifest(&args.model, runtime.clone(), execution)?;
+    let model_load_started = Instant::now();
     let model_revision =
         contracts::canonical_identity_digest("apxinf-model-identity-v1", &manifest)?;
     let capabilities = json!({"text":true,"image":false,"greedy":true,"sampling":profile.sampling(),"token_events":true,
@@ -624,6 +631,8 @@ fn run(args: Args) -> Result<()> {
     } else {
         Some("bf16-compiled".to_string())
     };
+    // QUEUE #7: identity/manifest + memory-limit setup complete → model load.
+    let host_identity_ns = host_identity_started.elapsed().as_nanos() as u64;
     let mut model = AutoModel::load_model(
         Device::Metal(0),
         &args.model,
@@ -634,6 +643,9 @@ fn run(args: Args) -> Result<()> {
             ..Default::default()
         },
     )?;
+    // QUEUE #7: model load complete → tokenizer load.
+    let model_load_ns = model_load_started.elapsed().as_nanos() as u64;
+    let tokenizer_load_started = Instant::now();
     let tokenizer = Tokenizer::from_file(args.model.join("tokenizer.json"))?;
     let eos = model
         .generation_defaults()?
@@ -651,12 +663,18 @@ fn run(args: Args) -> Result<()> {
         let document = serde_json::from_slice(&std::fs::read(args.model.join("tokenizer.json"))?)?;
         qualify_tokenizer(&tokenizer, &document, &eos)?;
     }
+    // QUEUE #7: tokenizer load + EOS/qualification complete → synchronize +
+    // resident check + ready-frame construction.
+    let tokenizer_load_ns = tokenizer_load_started.elapsed().as_nanos() as u64;
+    let post_load_started = Instant::now();
     model.text_mut()?.backend().synchronize()?;
     apxinf_mlx::clear_cache()?;
     let resident = apxinf_mlx::memory_stats()?;
     if resident.active_bytes as u64 > args.memory_limit_bytes {
         return Err("Resident model exceeds memory limit".into());
     }
+    // QUEUE #7: post-load work complete → command loop / ready handshake.
+    let post_load_ns = post_load_started.elapsed().as_nanos() as u64;
     let (command_tx, commands) = mpsc::sync_channel(8);
     let (control_tx, controls) = mpsc::sync_channel(32);
     let fault = Arc::new(AtomicBool::new(false));
@@ -679,6 +697,13 @@ fn run(args: Args) -> Result<()> {
         "capabilities":capabilities,"limits":{"max_frame_bytes":contracts::MAX_FRAME_BYTES,"max_depth":contracts::MAX_DEPTH,"max_commands":contracts::MAX_COMMANDS},
         "model_path":args.model,"eos_token_ids":eos,"vocab_size":tokenizer.vocab_size(),"runtime":runtime,"memory":memory()?}).as_object().unwrap().clone());
     state.send(ready)?;
+    // QUEUE #7 G3: emitted once per cold start; the harness voids a run whose
+    // stderr lacks this line (empty-arm gate, doc §5 G3). Wall-clock total from
+    // run() entry to the ready frame leaving the outbox.
+    eprintln!("{}", json!({"event":"native_startup_census","model":args.model,
+        "host_identity_ns":host_identity_ns,"model_load_ns":model_load_ns,
+        "tokenizer_load_ns":tokenizer_load_ns,"post_load_ns":post_load_ns,
+        "ready_ns":census_started.elapsed().as_nanos() as u64}));
     let epoch = args.worker_epoch.clone();
     let protocol = args.protocol.clone();
     std::thread::spawn(move || {
@@ -710,8 +735,11 @@ fn run(args: Args) -> Result<()> {
                     continue;
                 }
                 if command["kind"] == "replay" {
+                    // QUEUE #7: queue-dispatch → replay entry; separates harness
+                    // HTTP turnaround from worker-side replay work (doc §4).
+                    let replay_started = Instant::now();
                     if let Err(failure) =
-                        replay(&mut state, &mut model, &args, &command, &execution_echo, &eos)
+                        replay(&mut state, &mut model, &args, &command, &execution_echo, &eos, replay_started)
                     {
                         state.reply(
                             &command,
@@ -908,7 +936,10 @@ fn replay(
     command: &Value,
     execution: &Value,
     eos: &[u32],
+    dispatch_started: Instant,
 ) -> Result<()> {
+    // QUEUE #7: replay command received from the queue → parse input fields.
+    let parse_started = Instant::now();
     let prompt: Vec<u32> = command["prompt_token_ids"]
         .as_array()
         .map(|values| values.iter().filter_map(Value::as_u64).map(|v| v as u32).collect())
@@ -928,6 +959,12 @@ fn replay(
     let steps = requested_steps
         .unwrap_or_else(|| target.len().saturating_sub(1).max(1))
         .min(args.max_output_tokens);
+    let prompt_parse_ns = parse_started.elapsed().as_nanos() as u64;
+    // QUEUE #7: validate + release prior request state + prewarm, then prefill.
+    // The prefill/decode timing below is pre-existing (`prefill_ms`,
+    // `decode_ms_per_token`) — this harness only adds the dispatch/setup
+    // decomposition, never retimes generation (doc §4 G2).
+    let setup_started = Instant::now();
     let text = model.text_mut()?;
     let backend = text
         .backend()
@@ -939,6 +976,9 @@ fn replay(
     text.release_request_state()?;
     text.reset();
     text.prewarm_decode(prompt.len(), steps + 1);
+    // QUEUE #7: dispatch → prewarm complete; everything below is the
+    // pre-existing prefill/decode timing (no new timers on that path).
+    let setup_ns = setup_started.elapsed().as_nanos() as u64;
     let started = Instant::now();
     let first = text.prefill(LlmInput::text(&prompt))?;
     let prefill_ms = started.elapsed().as_secs_f64() * 1e3;
@@ -995,6 +1035,11 @@ fn replay(
             "target_tokens": target.len(),
             "tokens_emitted": emitted,
             "emitted_token_ids": emitted_ids,
+            // QUEUE #7: worker-side replay setup decomposition (host Instant);
+            // prefill_ms / decode_ms_per_token remain the pre-existing
+            // generation timers (G2: no new timer on the decode path).
+            "setup_ns": {"dispatch_ns":dispatch_started.elapsed().as_nanos() as u64,
+                "parse_ns":prompt_parse_ns,"state_prewarm_ns":setup_ns},
             "prefill_ms": prefill_ms,
             "decode_ms_total": total,
             "decode_ms_per_token": {
