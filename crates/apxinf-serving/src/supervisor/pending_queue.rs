@@ -121,6 +121,50 @@ impl PendingQueue {
         }
     }
 
+    /// Receives up to `max` ready jobs in one scheduler turn. QUEUE #6's
+    /// pre-registration freezes the dispatch mechanism here: pop up to B jobs
+    /// "whose prompts are ready", preserving admission order so the
+    /// coordinator's later demux keeps per-request output channels aligned.
+    ///
+    /// Returns as soon as at least one job is ready (including a partial
+    /// batch) so a single warm request is never held waiting for siblings.
+    /// Parks while the open queue is empty, mirrors [`Self::recv`] on close,
+    /// and floors `max` at 1 so a misconfigured bound can never starve work.
+    pub(super) async fn recv_batch(&self, metrics: &Metrics, max: usize) -> Option<Vec<Job>> {
+        let bound = max.max(1);
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("The waiting queue lock is poisoned.");
+                let count = state.jobs.len().min(bound);
+                if count > 0 {
+                    let now = Instant::now();
+                    let mut batch = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let job = state
+                            .jobs
+                            .pop_front()
+                            .expect("A ready job must exist before the batch pop.");
+                        metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                        job.observation.queue_end(&metrics.observations, now);
+                        batch.push(job);
+                    }
+                    return Some(batch);
+                }
+                if state.closed {
+                    return None;
+                }
+                // A paused queue holds no work until the supervisor resumes it.
+            }
+            changed.await;
+        }
+    }
+
     pub(super) fn close(&self, metrics: &Metrics, timeout: Duration) {
         let mut state = self
             .state
@@ -367,6 +411,144 @@ mod tests {
         assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.cancelled.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn recv_batch_returns_up_to_max_in_fifo_order() {
+        let queue = PendingQueue::new(5);
+        let metrics = Metrics::default();
+        let timeout = Duration::from_secs(60);
+        // Keep every ticket alive: dropping the receiver closes the job's
+        // channels and sweep_locked would settle it as cancelled on the next
+        // push, draining the queue before recv_batch ever runs.
+        let mut tickets = Vec::new();
+        for index in 1..=5 {
+            let (job, ticket) = waiting_job(index, Instant::now());
+            queue.push(job, &metrics, timeout).unwrap();
+            tickets.push(ticket);
+        }
+
+        let first = queue.recv_batch(&metrics, 3).await.unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|job| job.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "00000000-0000-4000-8000-000000000001",
+                "00000000-0000-4000-8000-000000000002",
+                "00000000-0000-4000-8000-000000000003",
+            ],
+            "A batch must preserve admission order so per-request output demux stays aligned."
+        );
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 2);
+
+        let second = queue.recv_batch(&metrics, 8).await.unwrap();
+        assert_eq!(second.len(), 2, "recv_batch must not over-pop the queue.");
+        assert_eq!(
+            second
+                .iter()
+                .map(|job| job.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "00000000-0000-4000-8000-000000000004",
+                "00000000-0000-4000-8000-000000000005",
+            ]
+        );
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
+        drop(tickets);
+    }
+
+    #[tokio::test]
+    async fn recv_batch_floors_zero_max_to_one() {
+        let queue = PendingQueue::new(2);
+        let metrics = Metrics::default();
+        let timeout = Duration::from_secs(60);
+        // Tickets must stay alive for the whole test or sweep_locked will
+        // discard the queued job as a disconnected waiter.
+        let mut tickets = Vec::new();
+        for index in 1..=2 {
+            let (job, ticket) = waiting_job(index, Instant::now());
+            queue.push(job, &metrics, timeout).unwrap();
+            tickets.push(ticket);
+        }
+
+        let batch = queue.recv_batch(&metrics, 0).await.unwrap();
+        assert_eq!(
+            batch.len(),
+            1,
+            "A zero batch bound must degrade to one job, never starve the queue."
+        );
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 1);
+        drop(tickets);
+    }
+
+    #[tokio::test]
+    async fn recv_batch_drains_ready_jobs_then_returns_none_after_close() {
+        let queue = PendingQueue::new(2);
+        let metrics = Metrics::default();
+        let timeout = Duration::from_secs(60);
+        // Hold the tickets so the queue is not swept as disconnected waiters.
+        let mut tickets = Vec::new();
+        for index in 1..=2 {
+            let (job, ticket) = waiting_job(index, Instant::now());
+            queue.push(job, &metrics, timeout).unwrap();
+            tickets.push(ticket);
+        }
+
+        let batch = queue.recv_batch(&metrics, 8).await.unwrap();
+        assert_eq!(batch.len(), 2);
+        drop(tickets);
+        queue.close(&metrics, timeout);
+
+        assert!(
+            queue.recv_batch(&metrics, 8).await.is_none(),
+            "A closed, drained queue must end the dispatcher loop."
+        );
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn recv_batch_waits_while_open_then_wakes_for_admission() {
+        let queue = PendingQueue::new(1);
+        let metrics = Metrics::default();
+        let timeout = Duration::from_secs(60);
+        let receive = queue.recv_batch(&metrics, 4);
+        tokio::pin!(receive);
+        assert!(
+            futures_util::poll!(&mut receive).is_pending(),
+            "An open, empty queue must keep the dispatcher parked instead of spinning."
+        );
+        let (job, _ticket) = waiting_job(1, Instant::now());
+        queue.push(job, &metrics, timeout).unwrap();
+
+        let batch = tokio::time::timeout(Duration::from_secs(1), &mut receive)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn close_settles_waiters_with_worker_lost_instead_of_dispatching_them() {
+        let queue = PendingQueue::new(2);
+        let metrics = Metrics::default();
+        let timeout = Duration::from_secs(60);
+        let (job, ticket) = waiting_job(1, Instant::now());
+        queue.push(job, &metrics, timeout).unwrap();
+
+        // close() drains ready work with a synthetic failure before notifying,
+        // so a dispatcher blocked in recv_batch must observe None, not a stale
+        // job that the shutdown path already settled.
+        queue.close(&metrics, timeout);
+
+        assert!(queue.recv_batch(&metrics, 4).await.is_none());
+        let error = ticket.begin.await.unwrap().err().unwrap();
+        assert_eq!(error.code, "worker_lost");
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.failed.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
