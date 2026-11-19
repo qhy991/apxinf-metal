@@ -61,25 +61,56 @@ def main() -> int:
 
     mbpp = json.loads(Path(args.mbpp_cache).read_text())
     ag2 = json.loads(Path(args.ag2_suite).read_text())
-    # frozen payload hashes (M4 receipt, 2026-11-20 01:3x): the cache must
-    # produce byte-identical problem/test payloads or the window aborts
-    # (G3-class provenance check; gold `code` is never passed to the model)
+    # frozen payload hashes: 12-char prefixes of sha256(payload) per field,
+    # receipt M4 round-63 (v2, cache rows 0..19) and 2026-11-20 01:3x (v1
+    # ids, which are rows 107/109/207 of the same cache). The cache must
+    # produce byte-identical prompt/test/gold payloads or the builder
+    # aborts before any device run (G3-class provenance check). Gold `code`
+    # is never passed to the model — it is hashed here only to prove the
+    # test data itself did not change.
     FROZEN = {
+        # v1 selection receipt (cache rows 107, 109, 207) — kept so the
+        # ids named in the original FROZEN table stay verifiable.
         "mbpp_0235": {"prompt": "75c892922e8d", "test": "ba45e64c575d", "code": "40d775056ff0"},
         "mbpp_0238": {"prompt": "8c6e19543e5d", "test": "5eda047bdfc5", "code": "4ed2db6f13d5"},
         "mbpp_0426": {"prompt": "b8467fd4af28", "test": "217d890ea70b", "code": "7938814e3181"},
+        # v2 selection receipt: cache rows 0..19 (MBPP sanitized, task_id
+        # order as cached), payload sha256 prefixes 2026-11-20 round-63.
+        "mbpp_0011": {"prompt": "66e2a75428bc", "test": "a97090a5fc16", "code": "40106cf3ba07"},
+        "mbpp_0012": {"prompt": "e6e4d613a155", "test": "3368efbc1d59", "code": "fc8543a9fcf0"},
+        "mbpp_0014": {"prompt": "44f60de72740", "test": "b182f5aea4ec", "code": "6029b3f8b145"},
+        "mbpp_0016": {"prompt": "1cad3cce5762", "test": "bc7ab37f3d12", "code": "4f6d10d88e7c"},
+        "mbpp_0017": {"prompt": "68145d5728d7", "test": "58a6c0f0ca02", "code": "6bb82afd7280"},
+        "mbpp_0018": {"prompt": "46f190653aab", "test": "3143e73bb8ba", "code": "b89ddaa87a06"},
+        "mbpp_0019": {"prompt": "f3eb8d101b43", "test": "f7d05a06dac7", "code": "2c145ba10af6"},
+        "mbpp_0020": {"prompt": "f999caa6ab6f", "test": "f2de4d050e5a", "code": "05a06ba137a4"},
+        "mbpp_0056": {"prompt": "0d84a7799bfd", "test": "9a6d8ed66c18", "code": "4600a0dc8a60"},
+        "mbpp_0057": {"prompt": "88aa571abd41", "test": "d1ac9fba1249", "code": "65b7402d6f0f"},
+        "mbpp_0058": {"prompt": "b9f053523db9", "test": "e21fed340a1f", "code": "6edaef5c0c5f"},
+        "mbpp_0059": {"prompt": "36fd3c08213e", "test": "a90253d1c48b", "code": "03b30988161a"},
+        "mbpp_0061": {"prompt": "2b53edac3877", "test": "624bfb0b05ae", "code": "e22d3a5ae3f2"},
+        "mbpp_0062": {"prompt": "c9faaffce698", "test": "65b9aac63d19", "code": "b8517ec74d6c"},
+        "mbpp_0063": {"prompt": "5b2b5697e799", "test": "992780d1ff70", "code": "c53cbd17f68d"},
+        "mbpp_0064": {"prompt": "e284da0c44bd", "test": "0d1d7e91bfcc", "code": "f21994adb024"},
+        "mbpp_0065": {"prompt": "fd23b3499bc6", "test": "e31c0c446dcc", "code": "430f43c607da"},
+        "mbpp_0066": {"prompt": "ee0be487aea3", "test": "65c97e2d3359", "code": "719d4c184b2f"},
+        "mbpp_0067": {"prompt": "88f29f1082d7", "test": "6d7588b6ae13", "code": "37eed046df7a"},
+        "mbpp_0068": {"prompt": "f46e736ef355", "test": "69e9df285385", "code": "859b878caf56"},
     }
     tasks = mbpp_tasks(mbpp, args.k) + [humaneval_task(ag2, "humaneval_0080")]
-    if args.k == 5:
-        import hashlib
+    if args.k >= 5:
         rows = {f"mbpp_{r['task_id']:04d}": r for r in mbpp}
-        # selection above is cache rows 0..4 (task_id order); map the frozen
-        # ids to their cache rows and verify their gold/test hashes
+        # selection is cache rows 0..k-1 (task_id order); map every emitted
+        # id to its cache row and verify prompt/test/gold hashes. For k=5
+        # this is the v1 receipt above; for k=19 it pins all 19 v2 rows.
         cache_ids = [f"mbpp_{r['task_id']:04d}" for r in mbpp[:args.k]]
-        for tid, want in FROZEN.items():
-            if tid not in cache_ids:
-                continue
+        for tid in cache_ids:
+            want = FROZEN.get(tid)
+            if want is None:
+                raise SystemExit(f"NO_FROZEN_PAYLOAD for {tid} (add its M4 "
+                                 f"hash receipt before emitting it)")
             r = rows[tid]
+            import hashlib
             got = {
                 "prompt": hashlib.sha256(r["prompt"].encode()).hexdigest()[:12],
                 "test": hashlib.sha256(("\n".join(r["test_list"]) + "\n").encode()).hexdigest()[:12],
@@ -94,7 +125,7 @@ def main() -> int:
     for t in tasks:
         t["sha256"] = sha256(json.dumps(t, sort_keys=True, ensure_ascii=False))
     suite = {
-        "suite_version": "g1prime-v1",
+        "suite_version": "g1prime-v2" if args.k >= 19 else "g1prime-v1",
         "frozen_at": None,  # set by builder run time below
         "selection": {
             "rule": ("MBPP sanitized rows 0..%d (task_id order as cached) + "
