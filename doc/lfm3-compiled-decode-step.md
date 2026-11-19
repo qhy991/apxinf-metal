@@ -220,6 +220,35 @@ verdict rests only on within-window paired medians.
 
 ---
 
+## 2026-11-19 amendment — Relation to #115
+
+This section is appended (dated, as §"Status" allows) to answer the lead
+note's requirement that the ticket's relation to #115 be explicit, rather than
+appearing to re-open a door #115 already closed.
+
+What #115 measured (per the lead note): "整步编译 decode **+0.7%**（无收益）",
+with KV-position **bucketing** within ±2% of no-bucketing. That ticket closed
+the combination of whole-step `mx.compile` *together with* position bucketing
+as an optimization direction.
+
+What is being tested here: the **same whole-step `mx.compile` on top of the
+pipelined greedy schedule (#127), without bucketing** (`shapeless = false`,
+§11). This is a different hypothesis because the substrate changed: #127's
+pipeline already hides most of the step's host work behind the device's
+previous kernels, and the residual question (§"The question is specific") is
+whether a *per-step re-trace / intra-step launch gap* survives the pipeline
+(`P = sync − pipe` leaves ≈0.46–0.51 ms/token unexplained by the four host
+stages). Bucketing is explicitly not part of this arm: the retracing hard gate
+(§5.2) is what keeps that #115 ingredient out.
+
+This ticket therefore **cites #115's finding as the prior expectation** (per
+the lead note: expect PARITY or NEGATIVE, and if so record the five-level
+verdict with numbers and move to QUEUE item 2 without iterating the window).
+The one thing it adds over #115's record is the pipeline interaction and the
+gate-0 census (§8) that lets the verdict name which gap, if any, remains.
+
+---
+
 ## Results
 
 *(window pending — appended after the locked M4 run; only dated amendments to

@@ -8,6 +8,7 @@ use std::{
     path::Path,
     ptr::NonNull,
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -1201,6 +1202,8 @@ pub struct MetalKernel {
     stream: Stream,
     input_count: usize,
     output_count: usize,
+    /// Owns the `apx_mlx_metal_new` handle; only the last clone frees it.
+    shared: Arc<NonNull<c_void>>,
 }
 impl MetalKernel {
     /// Inputs are made row-contiguous before each launch.
@@ -1262,11 +1265,13 @@ impl MetalKernel {
                 &mut raw,
             )
         })?;
+        let raw = NonNull::new(raw).ok_or_else(|| error("null Metal kernel"))?;
         Ok(Self {
-            raw: NonNull::new(raw).ok_or_else(|| error("null Metal kernel"))?,
+            raw,
             stream: stream.clone(),
             input_count: inputs.len(),
             output_count: outputs.len(),
+            shared: Arc::new(raw),
         })
     }
     /// # Safety
@@ -1334,8 +1339,25 @@ impl MetalKernel {
         own_many(&self.stream, &mut out)
     }
 }
+// The raw handle owns an `mx::fast::CustomKernelFunction` (a `std::function`
+// over the compiled Metal source), so two clones must not both free it. The
+// shared wrapper is what lets the same dispatch object be captured by a
+// compiled graph and kept by the model.
+impl Clone for MetalKernel {
+    fn clone(&self) -> Self {
+        Self {
+            raw: self.raw,
+            stream: self.stream.clone(),
+            input_count: self.input_count,
+            output_count: self.output_count,
+            shared: self.shared.clone(),
+        }
+    }
+}
 impl Drop for MetalKernel {
     fn drop(&mut self) {
-        unsafe { ffi::apx_mlx_metal_free(self.raw.as_ptr()) }
+        if Arc::strong_count(&self.shared) == 1 {
+            unsafe { ffi::apx_mlx_metal_free(self.raw.as_ptr()) }
+        }
     }
 }

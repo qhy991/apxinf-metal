@@ -13,6 +13,7 @@ use apxinf_mlx::{Array, MlxDType, Stream};
 use std::collections::HashMap;
 
 /// One HF linear projection, kept as a canonical `[in, out]` view.
+#[derive(Clone)]
 pub(crate) struct Linear {
     canonical: Array,
 }
@@ -27,6 +28,7 @@ impl Linear {
 }
 
 /// The layer's non-residual operator: exactly one of the two branches exists.
+#[derive(Clone)]
 pub(crate) enum Mixer {
     Conv {
         in_proj: Linear,
@@ -51,6 +53,7 @@ pub(crate) enum Mixer {
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct LayerWeights {
     pub operator_norm: Array,
     pub ffn_norm: Array,
@@ -62,6 +65,7 @@ pub(crate) struct LayerWeights {
     pub mixer: Mixer,
 }
 
+#[derive(Clone)]
 pub(crate) struct Weights {
     /// Tied embedding/lm-head table: gather rows for input, transpose for logits.
     embedding: Array,
