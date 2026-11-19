@@ -85,3 +85,65 @@ chunked-prefill 分块调用 × layer 的图构建/launch 序列 + conv cache �
   引用其"未测量"事实，不继承"compiled 已死"框架；我们不用 Compiled。
 - #2（custom kernels）判定 **INVALID**（K3 token 门失败）；kkernel switch/K1–K4
   留分支作 receipt，**默认关、空臂、不影响 baseline**；本 ticket 不依赖其任何代码。
+
+## Results
+
+*(window pending — appended after the locked M4 run; only dated amendments to
+the pre-registration above may appear before the verdict.)*
+
+### 2026-11-19 19:45 Verdict — INVALID (§5.1 token gate)
+
+**Verdict: INVALID.** The P1 hard gate fired on prompt 1. No §8 census, no
+A/A window, and no prefill p50 (128/512/2048) measurement were run, so there
+are no ms/token numbers to report; none are fabricated.
+
+**What ran.** P1, P2 and P3 all executed on the M4 (`Apple M4`), double
+Metal lock held (acquired 19:45:04, released 19:45:59, `locks-p.log`),
+`APXINF_LFM3_TEST_MODEL=~/lfm3-spec/weights-local/LFM3-1.7B`, `--test-threads=1`,
+`run-p-tests.sh` (PID 90533; waiting for the lock since round 27).
+Exits: `p1=101 p2=0 p3=101`.
+
+- **P1 HARD GATE FAIL ⇒ INVALID.** `p1_fast_prefill_greedy_matches_baseline_token_for_token`
+  panicked at `model.rs:1944` on **prompt 1**: fast arm (left) = 128× `99` (a
+  single token repeated to degeneration), baseline arm (right) =
+  `82906, 8, 229, 25, 22, 229, 25, 22, …` repeating four-token loop. Test
+  runtime 35.44 s. This is exactly the §Gate.1 trigger ("one token differs ⇒
+  INVALID"). The armed arm was confirmed armed (`prefill_fast=true`, P2
+  proved the unset arm stays empty), so the gate fired on a live path, not an
+  empty arm.
+- **P2 PASS (empty-arm gate).** With `APXINF_LFM3_PREFILL_FAST` unset:
+  `prefill_fast_enabled()` false, model has no `prefill_fast` flag, and after
+  32 generated tokens `prefill_cache.is_none()` — the changed path dispatched
+  zero times. Test ok, 2.08 s.
+- **P3 FAIL (stale cache).** `p3_cached_second_prompt_matches_fresh_run`
+  panicked at `model.rs:2002` with **"P3: second prompt in-process diverged
+  from a fresh run — stale cache"**: warm model cache-hit arm (left) =
+  `33257, 989, 21, 26121, 73914, 63372, …` loop; fresh single run (right) =
+  `354, 426, 1211, 349, 11386, 59487, …`. This independently confirms the
+  implementation defect already flagged in round-25 audit note 1: the cached
+  graph's input ids are **not rebound** to the new prompt, so a same-shape
+  cache hit returns the previous prompt's logits.
+
+**Mechanism arithmetic.** No ms/token delta, because the armed arm never
+reached the census or timing window. Host-side graph-build vs eval split,
+per-kernel GB/s, and launch count: **机制未知 (never measured — INVALID at the
+token gate before any census)**. The byte budget is unchanged (3.4576 GB/token
+and the 34.36 ms/token roofline floor are untouched; this arm does not alter
+GPU kernels).
+
+**Why INVALID and not the other tiers.** §5 defines WIN/PARITY/PARTIAL/
+FALSIFIED against a *running, token-consistent* arm inside a clean A/A window.
+An arm that fails the token gate is §5.1 INVALID regardless of speed, and no
+window may be interpreted. P1 is the hard gate; P3's stale-cache failure is
+the root cause, not a separate verdict. Per the lead's standing instruction,
+do not iterate the first scheme further — the second scheme (merging adjacent
+elementwise kernels) is also gated on tokens and is not pursued here.
+
+**Disposition.** QUEUE #3 is closed as **INVALID**. The cache-last-prefill
+arm stays on the branch as the receipt (`APXINF_LFM3_PREFILL_FAST` switch,
+P1–P3 tests); it is off by default (empty-arm, P2 PASS) and does not affect
+the baseline path. No re-windowing of this arm is authorized. Proceed
+directly to **QUEUE #4 (self-selected, requires prior quantification)** in
+the next round: pre-register a candidate only after quantifying it (open
+leads include the still-unverified launch-gap drain from #127, INCONCLUSIVE
+QUEUE #1; kernel efficiency, INVALID QUEUE #2; prefill, this INVALID).
