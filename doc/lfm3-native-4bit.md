@@ -1,6 +1,6 @@
 # QUEUE #8 — 原生路径 4-bit 量化支持（Gate + Decision）
 
-预登记日期：2026-11-19 22:07 CST（`date` 实取）。本文件为 pre-registration：Gate 与 Decision 在任何设备运行前冻结；实现、测试、速度窗、质量评估分属后续轮次。
+预登记日期：2026-11-19 22:07 CST（`date` 实取）。**修订 2026-11-20 01:05 CST（`date` 实取），Lead 纠偏（2026-11-20 00:16）**：G1 跨引擎逐 token 硬门降级为诊断项 `G1-diag`，新增产品门 `G1′`（质量）与 `G4-speed`（速度）；修订先行 commit，设备运行（G4-speed 窗、G1′ 评测）在本 commit 之后。本文件为 pre-registration：Gate 与 Decision 在任何设备运行前冻结；实现、测试、速度窗、质量评估分属后续轮次。
 
 - 相关队列：QUEUE.md v2 第 8 项（Lead 决策 2026-11-19 22:01「4-bit 可以，最高价值杠杆」；Lead 修订 2026-11-19 22:05「M4 现场量化，不从 M1 拷」）。
 - 权威代码基座：`agent/lfm3-dig`，tip（本 commit 之前）`9f12e4d9`（QUEUE #6 预登记），base `feat/lfm3-metal`。
@@ -22,13 +22,14 @@
 ## 2. Gate（冻结；任一硬门触发即 INVALID，窗口数字不可解读）
 
 | # | 门 | 判据 | 失败后果 |
-|---|----|------|----------|
-| G1 | **同精度跨引擎 token 硬门** | 原生 4-bit（native engine）与 **Python lane 4-bit**（M1 上 python+mlx engine，同一份 4-bit 权重文件语义、同 prompt、同采样：贪心）在 4 prompts × 128 token 上**逐 token 相同**；逐 prompt 断言，记录第一处差异位置（prompt id / step index）与两侧 token id。无法解释差异（tiling / group 顺序 / nibble 序 / affine 符号）⇒ INVALID。 | INVALID，直接按 RUNNER §6 记录结论，不进速度窗。 |
-| G2 | 跨精度不设逐位门 | 4-bit vs BF16 贪心输出**必然**不同，用户已明确接受；本项不因 4-bit ≠ BF16 token 判 INVALID。质量以 solved rate 记录（见 §5）。 | 无（不是门）。 |
-| G3 | 空臂 / effect proof | worker banner `native_4bit=<true\|false>` 字段与 `APXINF_LFM3_4BIT=1` 同源；速度窗内 banner 必须含该字段且 armed 臂 `=true`。banner 缺失 / 二进制早于源码 mtime（未重新构建）⇒ 空臂陷阱，独立 INVALID（#4 教训）。 | INVALID（独立于 token）。 |
-| G4 | shape 不漂移 | 4-bit 臂的 forward 输出 shape / logits shape / KV 与 conv state 形状与 BF16 臂一致；不做 padded/bucketed/wider matmul，不拆 K，不改读向（#128 教训）。实现若被迫引入任一 shape 漂移 ⇒ 回退该实现，记录机制。 | 视情形 INVALID 或 FALSIFIED（token 门若已过则 FALSIFIED 机制记录）。 |
-| G5 | A/A ≤ 5% | 速度窗每臂每 cell 分段中位最坏 spread ≤ 5%；S1 短生成 cell（#121 A/A 5.02%）**不可引用**，须本 ticket 自有 A/A。超 ⇒ 窗口作废重跑。 | 窗口作废（重跑）；不取中位凑数。 |
-| G6 | 质量回落阈值 | 4-bit vs BF16 在同一批 agent 任务（MBPP/HumanEval 套）solved rate 差 > 10 个百分点 ⇒ 默认 BF16，4-bit 仅 opt-in（PARTIAL）。 | PARTIAL（速度达标也只 opt-in）。 |
+| ---|----|------|----------|
+| **G1-diag**（诊断项，**不再是硬门**，Lead 2026-11-20 00:16） | 同精度跨引擎 token 分叉取证 | 记录原生 4-bit 与 **Python lane 4-bit**（同 prompt、同权重文件语义、贪心）的**首处分叉位置**（已知：G1 v12 prompt 0 step 59，lane=125020 vs native=25797）；并**尝试用 FP16 scale 路径复现 lane**（lane 走私有 `packed_mode` FP16 scales，原生走 MLX 通用 `quantized_matmul` + 文件 BF16 scales；`apxinf-mlx` 已有 `q4_f16.rs`）。 | **修好 ⇒ 升级回硬门（G1 硬门恢复）**；修不好 ⇒ 记录为**已知引擎差**（机制：不同引擎舍入差，近平局 logit 翻转），**不判 INVALID、不阻断速度/质量门**。 |
+| **G1′**（**产品门：质量**，新增） | solved rate 回落 | 同一批 agent 任务（MBPP/HumanEval 套，**≥6 题**），4-bit vs BF16 的 **solved rate** 与**解出耗时**：solved rate 掉 **≤3 个百分点 ⇒ 通过**；**>10 个百分点 ⇒ 停**（3–10 点之间记数字并由 Lead 裁决）。 | ≤3 点：通过；3–10 点：PARTIAL 候选（4-bit opt-in）；>10 点：停，4-bit 不可默认。 |
+| **G4-speed**（**产品门：速度**，新增） | ABBA 速度 | ABBA、**≥3 段/臂**、A/A ≤5%、engine basis（`--engine-timings`；客户端计时因 #120 SSE 全缓冲不可用），三臂 `native-4bit` vs `native-bf16` vs `llamacpp-Q4_K_M`。判定：4-bit 相对 BF16 **≥2.5×** 且 **≤ llama Q4**（12.39/12.71 ms/token）⇒ **速度门通过**。 | 未达标记五档（速度 <1.5× ⇒ NEGATIVE；机制预测差 >15% ⇒ FALSIFIED；1.5–2.5× 且算不平 ⇒ INCONCLUSIVE），仍开 PR 作为"已测量实现"。 |
+| G2 | 跨精度不设逐位门 | 4-bit vs BF16 贪心输出**必然**不同，用户已明确接受；本项不因 4-bit ≠ BF16 token 判 INVALID。质量以 G1′ solved rate 记录。 | 无（不是门）。 |
+| G3 | 空臂 / effect proof | worker banner `native_4bit=<true\|false>` 字段与 `APXINF_LFM3_4BIT=1` 同源；速度窗内 banner 必须含该字段且 armed 臂 `=true`。banner 缺失 / 二进制早于源码 mtime（未重新构建）⇒ 空臂陷阱，独立 INVALID（#4 教训）。 | INVALID（独立于速度/质量）。 |
+| G4-shape | shape 不漂移（原 G4，改名避让 G4-speed） | 4-bit 臂的 forward 输出 shape / logits shape / KV 与 conv state 形状与 BF16 臂一致；不做 padded/bucketed/wider matmul，不拆 K，不改读向（#128 教训）。实现若被迫引入任一 shape 漂移 ⇒ 回退该实现，记录机制。 | 视情形 INVALID 或 FALSIFIED（速度门若已过则 FALSIFIED 机制记录）。 |
+| G5 | A/A ≤ 5% | G4-speed 窗每臂每 cell 分段中位最坏 spread ≤ 5%；S1 短生成 cell（#121 A/A 5.02%）**不可引用**，须本 ticket 自有 A/A。超 ⇒ 窗口作废重跑。 | 窗口作废（重跑）；不取中位凑数。 |
 
 ## 3. Decision（实现与推进路线；不可静默改）
 
@@ -57,9 +58,9 @@
 - A/A ≤ 5%（本 ticket 自有）；engine basis（`--engine-timings`，客户端计时因 #120 SSE 全缓冲不可用）。
 - 目标：**≥2.5× vs BF16** 且 **≤ llama.cpp Q4**。
 
-### 3.5 质量（速度窗过后）
+### 3.5 质量 = G1′ 产品门（Lead 修订：与速度门并列为交付门）
 
-- 同一批 agent 任务（MBPP/HumanEval 套）比 4-bit vs BF16 solved rate，记录差值与绝对值；>10 点 ⇒ G6 PARTIAL，4-bit opt-in。
+- 同一批 agent 任务（MBPP/HumanEval 套，≥6 题）比 4-bit vs BF16 solved rate 与解出耗时，记录差值与绝对值；≤3 点 ⇒ G1′ 通过；>10 点 ⇒ 停（4-bit 不默认）；Lead 批准先跑 G1′（不敏感于锁竞争，但 A/A 仍须干净）。
 
 ## 4. Cells / Order
 
@@ -67,14 +68,16 @@
 - 质量：MBPP / HumanEval 套，batch 与 prompt 规格与 #127 已有质量评测一致（引用已有 receipts 口径，不新发明）。
 - S1 decode-at-8 / #121 短生成 cell 不可用。
 
-## 5. 判据（冻结；五档 + INVALID）
+## 5. 判据（冻结；Lead 2026-11-20 00:16 修订）
 
-- **INVALID**：G1 token 不一致且无法解释 / G3 空臂 / G5 A/A > 5% 作废（重跑后仍超）。
-- **WIN**：G1 过 + A/A 净 + 速度 ≥2.5× vs BF16 且 ≤ llama Q4 ⇒ **4-bit 设为原生默认**（保留开关可回退 BF16；G6 质量 ≤10 点）。
-- **PARTIAL**：速度达标（≥2.5× 且 ≤ llama Q4）但 G6 质量差 >10 点 ⇒ 默认 BF16，4-bit opt-in。
+交付规则：**两门（G1′ 质量 + G4-speed 速度）都过 ⇒ 开 PR**（4-bit 默认可用 `APXINF_LFM3_4BIT=1` 打开，BF16 保持默认直到用户确认切换）；**任一不过 ⇒ 记录五档 + 数字，仍开 PR 作为"已测量实现"**。G1-diag 仅诊断，不再单独判 INVALID。
+
+- **WIN**：G4-speed 过（≥2.5× vs BF16 且 ≤ llama Q4）+ G1′ 过（solved rate 掉 ≤3 点）+ A/A 净 + G3 空臂检查净 ⇒ 建议 4-bit 为原生默认（BF16 仍默认直至用户确认），4-bit opt-in 就绪。
+- **PARTIAL**：G4-speed 过但 G1′ 掉 3–10 点 ⇒ 默认 BF16，4-bit opt-in。
 - **NEGATIVE**：速度 <1.5× ⇒ 机制未知，记录（字节账若仍对平则 roofline 归因问题）。
-- **FALSIFIED**：机制预测（0.973 GB ÷ 实测带宽）与实测速度差 >15% 且 token/A/A 干净 ⇒ 机制被否，记录算术。
-- **INCONCLUSIVE**：A/A 净 + token 净，但速度落在 <1.5× 与 ≥2.5× 之外（1.5–2.5×）且机制算术算不平，写"机制未知"。
+- **FALSIFIED**：机制预测（0.973 GB ÷ 实测带宽）与实测速度差 >15% 且 A/A 干净 ⇒ 机制被否，记录算术。
+- **INCONCLUSIVE**：A/A 净 + 速度落在 1.5–2.5× 且机制算术算不平，写"机制未知"。
+- **INVALID**（仅限）：G3 空臂 / G5 A/A > 5% 作废（重跑后仍超）/ G4-shape 漂移。**G1-diag 分叉不再判 INVALID**。
 
 ## 6. Relation / Receipts
 
@@ -111,7 +114,7 @@
 
 ## Gate（原文，供 PR 引用）
 
-> **G1** 原生 4-bit 与 Python lane 4-bit（同 prompt、同权重文件语义、贪心）在 4 prompts × 128 token 上逐 token 相同；任一 prompt 首处差异即 INVALID（可解释的 tiling/group/nibble/affine 符号差异记为机制，无法解释 ⇒ INVALID）。**G3** banner `native_4bit` 字段缺失或二进制未重编译 ⇒ 空臂 INVALID。**G4** 任何 shape 漂移（padded/bucketed/wider/拆 K/换读向）⇒ 实现不可用。**G5** A/A ≤ 5%（本 ticket 自有）。**G6** solved rate 差 >10 点 ⇒ PARTIAL（默认 BF16，4-bit opt-in）。
+> **G1-diag（诊断，非门）** 记录原生 4-bit vs Python lane 4-bit 首处分叉（已知 v12 prompt 0 step 59，lane=125020 vs native=25797）并尝试 FP16 scale 路径复现 lane（`q4_f16.rs`）；修好则升级回 G1 硬门，修不好记为已知引擎差，不判 INVALID。**G1′（质量门）** 同批 agent 任务（≥6 题）4-bit vs BF16 solved rate 掉 ≤3 点通过、>10 点停。**G4-speed（速度门）** ABBA ≥3 段/臂、A/A ≤5%、engine basis，4-bit vs BF16 ≥2.5× 且 ≤ llama Q4（12.39/12.71 ms/token）。**G3** banner `native_4bit` 字段缺失或二进制未重编译 ⇒ 空臂 INVALID。**G4-shape** 任何 shape 漂移（padded/bucketed/wider/拆 K/换读向）⇒ 实现不可用。**G5** A/A ≤ 5%（本 ticket 自有）。
 
 ## Decision（原文，供 PR 引用）
 
