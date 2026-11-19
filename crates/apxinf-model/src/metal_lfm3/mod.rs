@@ -10,7 +10,7 @@ mod model;
 mod weights;
 mod kkernel;
 pub use kkernel::enabled as kkernel_enabled;
-pub use model::{prefill_fast_enabled, Lfm3Model};
+pub use model::{decode_async_eval_enabled, prefill_fast_enabled, Lfm3Model};
 
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Backend, DType, Device, Error, Result};

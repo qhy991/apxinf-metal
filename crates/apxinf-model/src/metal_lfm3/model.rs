@@ -46,6 +46,16 @@ pub fn prefill_fast_enabled() -> bool {
     std::env::var_os("APXINF_LFM3_PREFILL_FAST").is_some_and(|value| value == "1")
 }
 
+/// `APXINF_LFM3_DECODE_ASYNC_EVAL=1` replaces the single-token step's blocking
+/// `Stream::eval` with `async_eval` + `synchronize` (QUEUE #4,
+/// `doc/lfm3-decode-eval-sync-split.md`): the same required arrays, stream and
+/// graph, only the host wait boundary moves. Same env source the worker banner
+/// reports; the model captures it once at construction so the unset arm keeps
+/// the blocking `eval` unchanged (empty-arm gate).
+pub fn decode_async_eval_enabled() -> bool {
+    std::env::var_os("APXINF_LFM3_DECODE_ASYNC_EVAL").is_some_and(|value| value == "1")
+}
+
 // Platform C math library, used only to generate the fixed rotary tables on the
 // host. Declared here instead of relying on Rust's `f32::sin`/`f32::cos`, which
 // are correctly rounded and therefore not bit-identical to the reference lane's
@@ -208,6 +218,11 @@ pub struct Lfm3Model {
     disable_conv_restore: bool,
     /// Decode-step custom kernels (QUEUE #2; inert unless `APXINF_LFM3_KKERNEL=1`).
     kkernel: KKernel,
+    /// QUEUE #4 probe: move the single-token step's host wait from inside
+    /// `Stream::eval` to an explicit `synchronize` after `async_eval`. Captured
+    /// once at construction from the same env the banner reports; when unset the
+    /// step keeps the blocking `eval` unchanged (empty-arm gate).
+    decode_async_eval: bool,
 }
 
 impl Lfm3Model {
@@ -233,7 +248,6 @@ impl Lfm3Model {
             backend,
             weights,
             causal_conv,
-            kkernel,
             kinds,
             initial_kv: vec![None; layers],
             kv: vec![None; layers],
@@ -251,6 +265,8 @@ impl Lfm3Model {
             stage_seq: 0,
             prefill_fast: prefill_fast_enabled(),
             prefill_cache: None,
+            kkernel,
+            decode_async_eval: decode_async_eval_enabled(),
             #[cfg(test)]
             disable_conv_restore: false,
         };
@@ -1033,7 +1049,15 @@ impl Lfm3Model {
         }
         let eval_started = stages.then(Instant::now);
         if !reuse {
-            stream.eval(&required)?;
+            if self.decode_async_eval && len == 1 && start > 0 {
+                // QUEUE #4 probe: identical required arrays/stream/graph as the
+                // blocking eval above, only the host wait moves out of MLX's
+                // eval path to an explicit synchronize immediately after.
+                stream.async_eval(&required)?;
+                stream.synchronize()?;
+            } else {
+                stream.eval(&required)?;
+            }
         }
         // A replayed cache is still valid for the same static key (its
         // snapshots are absolute-position state, independent of the prompt),
