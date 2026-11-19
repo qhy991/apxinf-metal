@@ -280,3 +280,61 @@ separate clean-up commit — it is not part of this ticket's decision.
 
 *(window pending — appended after the locked M4 run; only dated amendments to
 the pre-registration above may appear before the verdict.)*
+
+### 2026-11-19 17:58 Verdict — INVALID (§5.1 token gate)
+
+**Verdict: INVALID.** The K3 hard gate fired on the first prompt. No timing
+window, A/A, or census was run, so there are no ms/token numbers to report;
+none are fabricated.
+
+**What ran.** All four gates were executed on the M4 (`Apple M4`), double
+Metal lock held (acquired 17:57:22, released 17:58:03, `locks-k.log`),
+`APXINF_LFM3_TEST_MODEL=~/lfm3-spec/weights-local/LFM3-1.7B`, `--test-threads=1`,
+`run-k-tests.sh` (PID 67002). The silu kernel's `T` template fix (`cbecb9ae`,
+overlay `62eb2841…`) did its job: the Metal library compiled and both armed
+kernels **dispatched successfully** (K2/K3 now get past layer 0 — round 21's
+`utils.h:553` error is gone). Exits: `k1=101 k2=101 k3=101 k4=0`.
+
+- **K4 PASS (negative/positive controls).** Exact geometry
+  `[1,1,8]×[8,16]` and silu `[1,1,8]` dispatch and preserve shape; rank-2
+  `[1,16]`, K-mismatch `[1,1,8]×[7,16]`, F32 inputs, and silu shape mismatch
+  all return `Err`. The shape gate is load-bearing.
+- **K1 FAIL (logit-level).** `k=8 v=1`: custom `0.19260883` vs matmul
+  `0.19238281`, `max_abs_diff=2.260e-4`, `element_exact=0/1`. Same delta as
+  round 21. Per §9 K1 this is a §9 K1 amendment candidate (MLX's reduce order
+  differs from ascending-k serial accumulation) — **not** independently
+  invalidating; the hard gate is tokens.
+- **K2 FAIL (logit-level).** Fused silu_mul vs graph reference on the real
+  decode shape `[1,1,2048]`: `max_abs_diff=1.562e-2`, `element_exact=1113/2048`,
+  e.g. fused `0.4765625` vs graph `0.47851563`. Again an amendment candidate
+  under §9, not the hard gate.
+- **K3 HARD GATE FAIL ⇒ INVALID.** Armed arm (`lm_head_armed=true`,
+  `silu_mul_armed=true`, banner `kkernel=true` — the empty-arm gate held) vs
+  baseline, 4 prompts × 128 token, `--test-threads=1`. Prompt 0 diverged:
+  - armed: 128× `37179` (a single token repeated to degeneration)
+  - baseline: `20, 229, 1217, 24, …` repeating four-token loop
+  The first divergence is at the **first generated token**, i.e. in the armed
+  lm_head projection itself, not a downstream accumulation effect. This is
+  exactly the §5.1 INVALID trigger ("any greedy token differs ⇒ INVALID").
+
+**Mechanism arithmetic.** lm_head table 2048×128000 BF16 = 524,288,000 B
+(15.1% of the 3.4576 GB/token bytes; roofline floor 34.36 ms at 100.6 GB/s) —
+unchanged, the arm never timed. Launch count and effective GB/s: **机制未知
+(never measured — INVALID at the token gate before any census)**.
+
+**Why INVALID and not the other tiers.** §5 defines WIN/PARITY/PARTIAL/
+FALSIFIED against a *running, token-consistent* arm inside a clean A/A window.
+An arm that fails the token gate is §5.1 INVALID regardless of speed, and no
+window may be interpreted. K1/K2 deltas are consistent with the §9 K1
+amendment carve-out (logit-level reduction-order differences are expected and
+are judged only through the token gate), but the token gate itself failed, so
+the amendment question is moot — the arm does not proceed.
+
+**Disposition.** QUEUE #2 is closed as **INVALID**. The custom lm_head GEMV
+and fused silu_mul kernels dispatch and pass all shape/negative controls, but
+they do not preserve greedy tokens. Per RUNNER §1 item 5 and the lead's
+standing instruction, record the five-tier conclusion and **proceed directly
+to QUEUE #3 (short-prompt prefill 8–12% gap)** in the next round. The
+`APXINF_LFM3_KKERNEL` switch, kernels, and K1–K4 tests stay on the branch as
+the receipt; they are off by default (empty-arm) and do not affect the
+baseline path. No re-windowing of this arm is authorized.
