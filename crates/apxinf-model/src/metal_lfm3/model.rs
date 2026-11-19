@@ -46,16 +46,6 @@ pub fn prefill_fast_enabled() -> bool {
     std::env::var_os("APXINF_LFM3_PREFILL_FAST").is_some_and(|value| value == "1")
 }
 
-/// `APXINF_LFM3_DECODE_ASYNC_EVAL=1` replaces the single-token step's blocking
-/// `Stream::eval` with `async_eval` + `synchronize` (QUEUE #4,
-/// `doc/lfm3-decode-eval-sync-split.md`): the same required arrays, stream and
-/// graph, only the host wait boundary moves. Same env source the worker banner
-/// reports; the model captures it once at construction so the unset arm keeps
-/// the blocking `eval` unchanged (empty-arm gate).
-pub fn decode_async_eval_enabled() -> bool {
-    std::env::var_os("APXINF_LFM3_DECODE_ASYNC_EVAL").is_some_and(|value| value == "1")
-}
-
 // Platform C math library, used only to generate the fixed rotary tables on the
 // host. Declared here instead of relying on Rust's `f32::sin`/`f32::cos`, which
 // are correctly rounded and therefore not bit-identical to the reference lane's
@@ -218,17 +208,6 @@ pub struct Lfm3Model {
     disable_conv_restore: bool,
     /// Decode-step custom kernels (QUEUE #2; inert unless `APXINF_LFM3_KKERNEL=1`).
     kkernel: KKernel,
-    /// QUEUE #4 probe: move the single-token step's host wait from inside
-    /// `Stream::eval` to an explicit `synchronize` after `async_eval`. Captured
-    /// once at construction from the same env the banner reports; when unset the
-    /// step keeps the blocking `eval` unchanged (empty-arm gate).
-    decode_async_eval: bool,
-    /// QUEUE #4 E4 test seam: records the armed split's call order
-    /// (`"async_eval"` then `"synchronize"`) so the negative control can prove
-    /// the branch ran and ran in the right order. Empty on the baseline arm.
-    /// Test-only: no production state or cost.
-    #[cfg(test)]
-    test_split_trace: Vec<&'static str>,
 }
 
 impl Lfm3Model {
@@ -272,11 +251,8 @@ impl Lfm3Model {
             prefill_fast: prefill_fast_enabled(),
             prefill_cache: None,
             kkernel,
-            decode_async_eval: decode_async_eval_enabled(),
             #[cfg(test)]
             disable_conv_restore: false,
-            #[cfg(test)]
-            test_split_trace: Vec::new(),
         };
         model.prepare(1, 0)?;
         Ok(model)
@@ -1057,19 +1033,7 @@ impl Lfm3Model {
         }
         let eval_started = stages.then(Instant::now);
         if !reuse {
-            if self.decode_async_eval && len == 1 && start > 0 {
-                // QUEUE #4 probe: identical required arrays/stream/graph as the
-                // blocking eval above, only the host wait moves out of MLX's
-                // eval path to an explicit synchronize immediately after.
-                #[cfg(test)]
-                self.test_split_trace.push("async_eval");
-                stream.async_eval(&required)?;
-                #[cfg(test)]
-                self.test_split_trace.push("synchronize");
-                stream.synchronize()?;
-            } else {
-                stream.eval(&required)?;
-            }
+            stream.eval(&required)?;
         }
         // A replayed cache is still valid for the same static key (its
         // snapshots are absolute-position state, independent of the prompt),
@@ -1102,15 +1066,6 @@ impl Lfm3Model {
         if !on {
             self.prefill_cache = None;
         }
-    }
-
-    /// QUEUE #4 test toggle (E1/E3 harness): flip the async-eval split on an
-    /// already loaded model so both arms share one weight set; the env is
-    /// still reset at entry/exit so `decode_async_eval_enabled()` (banner
-    /// source) cannot be poisoned by a prior panicked test.
-    #[cfg(test)]
-    fn set_decode_async_eval(&mut self, on: bool) {
-        self.decode_async_eval = on;
     }
 }
 
@@ -1422,7 +1377,6 @@ mod tests {
     const NO_RESTORE_ENV: &str = "APXINF_LFM3_TEST_NO_CONV_RESTORE";
     const KKERNEL_ENV: &str = "APXINF_LFM3_KKERNEL";
     const PREFILL_FAST_ENV: &str = "APXINF_LFM3_PREFILL_FAST";
-    const DECODE_ASYNC_EVAL_ENV: &str = "APXINF_LFM3_DECODE_ASYNC_EVAL";
 
     fn test_checkpoint() -> Result<std::path::PathBuf> {
         std::env::var_os("APXINF_LFM3_TEST_MODEL")
@@ -1480,13 +1434,6 @@ mod tests {
         }
     }
 
-    fn set_decode_async_eval(on: bool) {
-        if on {
-            std::env::set_var(DECODE_ASYNC_EVAL_ENV, "1");
-        } else {
-            std::env::remove_var(DECODE_ASYNC_EVAL_ENV);
-        }
-    }
 
     fn run_greedy(model: &mut Lfm3Model, prompt: &[u32], budget: usize) -> Result<Vec<u32>> {
         let options = GenerationOptions::greedy(budget, None);
@@ -2078,313 +2025,4 @@ mod tests {
         Ok(())
     }
 
-    // ---- QUEUE #4 eval/sync split gates (doc/lfm3-decode-eval-sync-split.md
-    // §9). The split lives in `execute_inner`'s single-token eval, which only
-    // the **sync** schedule reaches (`SyncTokenSequence` → `forward` →
-    // `execute`); the pipelined `GreedySequence` builds the step graph through
-    // `DeviceDecode::decode` and never calls it. Every armed arm therefore
-    // forces `APXINF_MLX_SYNC_DECODE=1` and asserts `test_split_trace` fired —
-    // a token-equal result from a switch that never ran is the empty-arm trap,
-    // not a pass. The schedule/arm mismatch this implies for the measurement
-    // window is recorded in STATUS for lead adjudication.
-
-    /// E1 — the §5.1 token gate. Baseline (split off) and armed (split on)
-    /// must emit identical token ids for 4 prompts × 128 tokens under the sync
-    /// schedule, and the armed arm must have run `async_eval` → `synchronize`
-    /// on every decode step. Entry and exit both reset the env so a prior
-    /// panic cannot poison `decode_async_eval_enabled()` (banner source).
-    #[test]
-    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
-    fn e1_split_greedy_matches_baseline_token_for_token() -> Result<()> {
-        let prompts: Vec<Vec<u32>> = (0..4).map(|i| pseudo_prompt(24, 721 + i)).collect();
-        set_sync_schedule(true);
-        set_decode_async_eval(false);
-
-        let mut model = load_checkpoint_model()?;
-        model.set_decode_async_eval(false);
-        assert!(!model.decode_async_eval, "E1: baseline arm must start with the split off");
-        let mut expected = Vec::with_capacity(prompts.len());
-        for (index, prompt) in prompts.iter().enumerate() {
-            model.test_split_trace.clear();
-            expected.push(run_greedy(&mut model, prompt, 128)?);
-            assert!(
-                model.test_split_trace.is_empty(),
-                "E1 prompt {index}: baseline arm touched the split seam — blocking eval must stay the only path"
-            );
-        }
-
-        model.set_decode_async_eval(true);
-        assert!(model.decode_async_eval, "E1: armed toggle did not take");
-        for (index, prompt) in prompts.iter().enumerate() {
-            model.test_split_trace.clear();
-            let got = run_greedy(&mut model, prompt, 128)?;
-            let trace = &model.test_split_trace;
-            assert!(
-                !trace.is_empty() && trace.len() % 2 == 0,
-                "prompt {index}: armed arm never fired the eval/sync split — empty-arm (doc §Gate)"
-            );
-            for pair in trace.chunks(2) {
-                assert_eq!(
-                    pair,
-                    &["async_eval", "synchronize"][..],
-                    "prompt {index}: split call order must be async_eval then synchronize"
-                );
-            }
-            assert_eq!(
-                got, expected[index],
-                "prompt {index}: async-eval split diverged from baseline — INVALID (doc §Gate.1)"
-            );
-        }
-
-        model.set_decode_async_eval(false);
-        set_decode_async_eval(false);
-        set_sync_schedule(false);
-        Ok(())
-    }
-
-    /// E2 — budget and cancel edges (doc §9 E2) with the split armed: budgets
-    /// 1 and 8 and a cancel after the second publish must publish the same
-    /// prefix and land on the same position as baseline, and every armed arm
-    /// must have fired the seam. Cancel is after the **second** publish, not
-    /// the first the pre-registration names: under the sync schedule the first
-    /// decode forward — the only call that reaches the split — runs when
-    /// producing the second token, so cancel-after-first would publish only
-    /// prefill logits and never touch the mechanism.
-    #[test]
-    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
-    fn e2_budget_and_cancel_edges_match_with_split() -> Result<()> {
-        let prompt = pseudo_prompt(16, 741);
-        set_sync_schedule(true);
-        set_decode_async_eval(false);
-        let mut model = load_checkpoint_model()?;
-        model.set_decode_async_eval(false);
-
-        for budget in [1usize, 8] {
-            let baseline = run_greedy(&mut model, &prompt, budget)?;
-            let baseline_pos = model.position();
-            model.set_decode_async_eval(true);
-            model.test_split_trace.clear();
-            let armed = run_greedy(&mut model, &prompt, budget)?;
-            let armed_pos = model.position();
-            let fired = !model.test_split_trace.is_empty();
-            model.set_decode_async_eval(false);
-            if budget > 1 {
-                // Budget 1 publishes only prefill logits, so no decode forward
-                // runs and the seam cannot fire — token/position equality is
-                // the whole assertion for that edge.
-                assert!(fired, "E2 budget {budget}: split seam never fired");
-            }
-            assert_eq!(armed, baseline, "budget {budget}: published tokens");
-            assert_eq!(armed_pos, baseline_pos, "budget {budget}: final position");
-            assert_eq!(
-                armed_pos,
-                prompt.len() + armed.len() - 1,
-                "budget {budget}: position must be P+N-1"
-            );
-        }
-
-        // Cancel after the second publish (see doc comment): one decode
-        // forward has run, so the seam must have fired, and both arms publish
-        // the same prefix at the same position.
-        let options = GenerationOptions::greedy(16, None);
-        let cancel = GenerationCancellation::default();
-        let mut baseline_published = Vec::new();
-        let flag = cancel.clone();
-        model.generate_streaming_cancellable_dyn(
-            crate::llm_trait::GenerationRequest {
-                input: LlmInput::text(&prompt),
-                options: &options,
-            },
-            &cancel,
-            &mut |token| {
-                baseline_published.push(token.token_id);
-                if baseline_published.len() >= 2 {
-                    flag.cancel();
-                }
-            },
-        )?;
-        let baseline_pos = model.position();
-
-        model.set_decode_async_eval(true);
-        model.test_split_trace.clear();
-        let cancel = GenerationCancellation::default();
-        let mut armed_published = Vec::new();
-        let flag = cancel.clone();
-        model.generate_streaming_cancellable_dyn(
-            crate::llm_trait::GenerationRequest {
-                input: LlmInput::text(&prompt),
-                options: &options,
-            },
-            &cancel,
-            &mut |token| {
-                armed_published.push(token.token_id);
-                if armed_published.len() >= 2 {
-                    flag.cancel();
-                }
-            },
-        )?;
-        let armed_pos = model.position();
-        let fired = !model.test_split_trace.is_empty();
-        model.set_decode_async_eval(false);
-        assert!(fired, "E2 cancel: split seam never fired");
-        assert_eq!(armed_published, baseline_published, "cancel: published prefix");
-        assert_eq!(armed_pos, baseline_pos, "cancel: final position");
-        assert_eq!(
-            armed_pos,
-            prompt.len() + armed_published.len() - 1,
-            "cancel: position must be P+N-1"
-        );
-
-        set_decode_async_eval(false);
-        set_sync_schedule(false);
-        Ok(())
-    }
-
-    /// E3 — continuation state (doc §9 E3): after an armed sync run, every KV
-    /// row `[0, position)` and all conv windows are byte-identical to the
-    /// baseline run's, and a 16-token continuation matches token-for-token.
-    /// The sync schedule has no lookahead step to roll back, so the state the
-    /// split hands to a sequel is the committed request state itself.
-    #[test]
-    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
-    fn e3_continuation_state_matches_baseline_with_split() -> Result<()> {
-        let prompt = pseudo_prompt(24, 751);
-        let take = 12usize;
-        set_sync_schedule(true);
-        set_decode_async_eval(false);
-
-        let mut model = load_checkpoint_model()?;
-        model.set_decode_async_eval(false);
-        let baseline_ids = run_greedy(&mut model, &prompt, take)?;
-        let baseline_pos = model.position();
-        assert_eq!(
-            baseline_pos,
-            prompt.len() + take - 1,
-            "E3: baseline position must be P+N-1"
-        );
-        let (baseline_kv, baseline_conv) = state_bytes(&model, baseline_pos)?;
-        let mut baseline_cont = Vec::with_capacity(16);
-        let mut prev = baseline_ids[take - 1];
-        for _ in 0..16 {
-            let logits = model.forward(&[prev], model.position() as u32)?;
-            prev = greedy_from_logits(&model, &logits)?;
-            baseline_cont.push(prev);
-        }
-
-        model.set_decode_async_eval(true);
-        model.test_split_trace.clear();
-        let armed_ids = run_greedy(&mut model, &prompt, take)?;
-        let armed_pos = model.position();
-        let fired = !model.test_split_trace.is_empty();
-        assert!(fired, "E3: split seam never fired on the armed arm");
-        assert_eq!(armed_ids, baseline_ids, "E3: armed tokens diverged from baseline");
-        assert_eq!(armed_pos, baseline_pos, "E3: armed position diverged from baseline");
-        let (armed_kv, armed_conv) = state_bytes(&model, armed_pos)?;
-        assert_eq!(
-            armed_kv, baseline_kv,
-            "E3: KV rows [0, position) must match baseline byte-for-byte"
-        );
-        assert_eq!(
-            armed_conv, baseline_conv,
-            "E3: conv windows must match baseline byte-for-byte"
-        );
-        let mut armed_cont = Vec::with_capacity(16);
-        let mut prev = armed_ids[take - 1];
-        for _ in 0..16 {
-            let logits = model.forward(&[prev], model.position() as u32)?;
-            prev = greedy_from_logits(&model, &logits)?;
-            armed_cont.push(prev);
-        }
-        assert_eq!(
-            armed_cont, baseline_cont,
-            "E3: 16-token continuation after the armed run must match baseline"
-        );
-
-        model.set_decode_async_eval(false);
-        set_decode_async_eval(false);
-        set_sync_schedule(false);
-        Ok(())
-    }
-
-    /// E4 — empty-arm and ordering (doc §9 E4). Unset: the model captured the
-    /// split off, `decode_async_eval_enabled()` (banner source) is false, and
-    /// a full sync request leaves the seam untouched. Armed: every seam pair
-    /// is `async_eval` then `synchronize`, the `eval_calls` delta covers the
-    /// seam firings, and `trace_callbacks` is unchanged (same eager graph, no
-    /// compile). Finally, under the **pipelined** schedule the seam stays
-    /// empty even with the toggle on: the split lives in `execute_inner`,
-    /// which `GreedySequence`/`DeviceDecode` never calls — the executable
-    /// record of the schedule/arm mismatch noted in STATUS, which the window
-    /// must resolve (sync-schedule arms, or move the mechanism) before any
-    /// measurement is meaningful.
-    #[test]
-    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
-    fn e4_empty_arm_and_split_ordering() -> Result<()> {
-        set_sync_schedule(true);
-        set_decode_async_eval(false);
-        assert!(
-            !decode_async_eval_enabled(),
-            "E4: helper must report false when the env is unset"
-        );
-        let mut model = load_checkpoint_model()?;
-        assert!(
-            !model.decode_async_eval,
-            "E4: model captured the split while the env was unset"
-        );
-        assert!(model.test_split_trace.is_empty());
-
-        let prompt = pseudo_prompt(24, 731);
-        let ids = run_greedy(&mut model, &prompt, 32)?;
-        assert_eq!(ids.len(), 32, "E4: budget must be honoured");
-        assert!(
-            model.test_split_trace.is_empty(),
-            "E4: the split branch ran with the switch unset"
-        );
-
-        let stream = model.backend.stream().clone();
-        let before = stream.counters();
-        model.set_decode_async_eval(true);
-        model.test_split_trace.clear();
-        run_greedy(&mut model, &prompt, 32)?;
-        let after = stream.counters();
-        let trace = &model.test_split_trace;
-        assert!(!trace.is_empty(), "E4: armed sync arm never fired the split");
-        for pair in trace.chunks(2) {
-            assert_eq!(
-                pair,
-                &["async_eval", "synchronize"][..],
-                "E4: async_eval must be called before synchronize"
-            );
-        }
-        let firings = trace.len() / 2;
-        assert!(
-            after.eval_calls - before.eval_calls >= firings,
-            "E4: eval_calls delta ({}) is below the seam firings ({firings}) — counters and seam disagree",
-            after.eval_calls - before.eval_calls
-        );
-        assert_eq!(
-            after.trace_callbacks, before.trace_callbacks,
-            "E4: the split must not add trace callbacks (no compile)"
-        );
-        eprintln!(
-            "E4 armed: firings={firings} eval_calls_delta={} trace_callbacks_delta={}",
-            after.eval_calls - before.eval_calls,
-            after.trace_callbacks as isize - before.trace_callbacks as isize
-        );
-        model.set_decode_async_eval(false);
-
-        // Pipelined schedule: same toggle, but `execute_inner` is never
-        // reached, so the seam stays empty — the switch is a no-op there.
-        set_sync_schedule(false);
-        model.set_decode_async_eval(true);
-        model.test_split_trace.clear();
-        run_greedy(&mut model, &prompt, 32)?;
-        assert!(
-            model.test_split_trace.is_empty(),
-            "E4: pipelined path fired the execute_inner split — mechanism location changed; revisit the arm schedule"
-        );
-        model.set_decode_async_eval(false);
-        set_decode_async_eval(false);
-        Ok(())
-    }
 }
