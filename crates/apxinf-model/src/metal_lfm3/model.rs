@@ -1476,6 +1476,7 @@ mod tests {
 
     const SYNC_ENV: &str = "APXINF_MLX_SYNC_DECODE";
     const NO_RESTORE_ENV: &str = "APXINF_LFM3_TEST_NO_CONV_RESTORE";
+    const COMPILED_ENV: &str = "APXINF_LFM3_COMPILED_DECODE";
 
     fn test_checkpoint() -> Result<std::path::PathBuf> {
         std::env::var_os("APXINF_LFM3_TEST_MODEL")
@@ -1514,6 +1515,14 @@ mod tests {
             std::env::set_var(SYNC_ENV, "1");
         } else {
             std::env::remove_var(SYNC_ENV);
+        }
+    }
+
+    fn set_compiled_decode(on: bool) {
+        if on {
+            std::env::set_var(COMPILED_ENV, "1");
+        } else {
+            std::env::remove_var(COMPILED_ENV);
         }
     }
 
@@ -1630,6 +1639,34 @@ mod tests {
                 "prompt {index}: pipelined greedy diverged from sync"
             );
         }
+        Ok(())
+    }
+
+    /// C1 (pre-registration §9): the compiled decode arm emits the same token
+    /// ids as the eager pipelined baseline on 4 prompts × 128 tokens — the
+    /// QUEUE #1 hard gate (§5.1). Default arm with the switch unset, then the
+    /// compiled arm with `APXINF_LFM3_COMPILED_DECODE=1`, both against the same
+    /// `Lfm3Model`.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn c1_compiled_greedy_matches_eager_pipelined_token_for_token() -> Result<()> {
+        let prompts: Vec<Vec<u32>> = (0..4).map(|i| pseudo_prompt(24, 101 + i)).collect();
+        let mut model = load_checkpoint_model()?;
+        set_sync_schedule(false);
+        set_compiled_decode(false);
+        let mut expected = Vec::with_capacity(prompts.len());
+        for prompt in &prompts {
+            expected.push(run_greedy(&mut model, prompt, 128)?);
+        }
+        set_compiled_decode(true);
+        for (index, prompt) in prompts.iter().enumerate() {
+            let got = run_greedy(&mut model, prompt, 128)?;
+            assert_eq!(
+                got, expected[index],
+                "prompt {index}: compiled decode diverged from eager pipelined greedy"
+            );
+        }
+        set_compiled_decode(false);
         Ok(())
     }
 
