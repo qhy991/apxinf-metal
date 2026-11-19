@@ -81,13 +81,14 @@ pub(super) async fn cpu_worker(model: PathBuf) -> Result<(Worker, Value), String
 /// path. Production `start_inner` keeps `RestartPolicy::default()`: no attempt
 /// limit, 250ms doubling to a 30-second cap, so a real service keeps retrying.
 pub(super) fn cpu_service(ready: Value, timeout: Duration, capacity: usize) -> Arc<Service> {
-    cpu_service_with_completion(ready, timeout, capacity).0
+    cpu_service_with_completion(ready, timeout, capacity, 1).0
 }
 
 fn cpu_service_with_completion(
     ready: Value,
     timeout: Duration,
     capacity: usize,
+    batch_size: usize,
 ) -> (Arc<Service>, watch::Sender<Option<StopResult>>) {
     let (sender, stopped) = watch::channel(None);
     let service = Arc::new(Service {
@@ -106,7 +107,7 @@ fn cpu_service_with_completion(
         metrics: Metrics::default(),
         timeout,
         memory_budget: 4096,
-        batch_size: 1,
+        batch_size,
         restart: RestartPolicy::immediate(3),
         #[cfg(test)]
         unconfirmed_reaping: AtomicBool::new(false),
@@ -852,7 +853,8 @@ async fn preparation_grace_expiry_fences_without_a_second_public_terminal() {
 async fn wait_stopped_retains_ownership_after_a_public_preparation_deadline() {
     let model = CpuModel::new(json!({"prepare_delays_ms":[600]}));
     let (worker, ready) = cpu_worker(model.model()).await.unwrap();
-    let (service, completion) = cpu_service_with_completion(ready, Duration::from_millis(100), 2);
+    let (service, completion) =
+        cpu_service_with_completion(ready, Duration::from_millis(100), 2, 1);
     let path = model.model();
     let task = tokio::spawn(coordinate_and_report(
         worker,
@@ -900,7 +902,8 @@ async fn wait_stopped_retains_ownership_after_a_public_preparation_deadline() {
 
 #[tokio::test]
 async fn wait_stopped_reports_a_disappearing_completion_sender() {
-    let (service, completion) = cpu_service_with_completion(json!({}), Duration::from_secs(1), 1);
+    let (service, completion) =
+        cpu_service_with_completion(json!({}), Duration::from_secs(1), 1, 1);
     let stopped = service.wait_stopped();
     tokio::pin!(stopped);
     assert!(futures_util::poll!(&mut stopped).is_pending());
@@ -918,7 +921,8 @@ async fn wait_stopped_reports_a_disappearing_completion_sender() {
 async fn wait_stopped_owns_the_recovered_worker_after_a_fault() {
     let model = CpuModel::new(json!({}));
     let (mut worker, ready) = cpu_worker(model.model()).await.unwrap();
-    let (service, completion) = cpu_service_with_completion(ready, Duration::from_secs(1), 1);
+    let (service, completion) =
+        cpu_service_with_completion(ready, Duration::from_secs(1), 1, 1);
     worker.child.start_kill().unwrap();
     let path = model.model();
     let task = tokio::spawn(coordinate_and_report(
@@ -954,7 +958,8 @@ async fn wait_stopped_covers_a_replacement_that_is_still_loading() {
     let model = CpuModel::new(json!({}));
     let (mut worker, ready) = cpu_worker(model.model()).await.unwrap();
     worker.sent_commands = contracts::MAX_COMMANDS - REQUEST_COMMAND_ALLOWANCE + 1;
-    let (service, completion) = cpu_service_with_completion(ready, Duration::from_secs(3), 2);
+    let (service, completion) =
+        cpu_service_with_completion(ready, Duration::from_secs(3), 2, 1);
     let (started, started_rx) = oneshot::channel();
     let (resume, resume_rx) = oneshot::channel();
     let mut gate = Some((started, resume_rx));
@@ -1052,4 +1057,86 @@ fn shutdown_wins_over_concurrent_availability_publication() {
         assert!(service.queue.is_closed());
         assert!(!service.available.load(Ordering::Acquire));
     }
+}
+
+#[tokio::test]
+async fn batch_two_pops_two_pending_jobs_and_each_ticket_completes_in_fifo_order() {
+    let model = CpuModel::new(json!({}));
+    let (worker, ready) = cpu_worker(model.model()).await.unwrap();
+    let (service, _completion) =
+        cpu_service_with_completion(ready, Duration::from_secs(3), 4, 2);
+    let path = model.model();
+    let task = tokio::spawn(coordinate(worker, service.clone(), 1024, move || {
+        cpu_worker(path.clone())
+    }));
+
+    let mut first = request(false);
+    first.max_tokens = 2;
+    let mut second = request(false);
+    second.max_tokens = 2;
+    let mut first_ticket = service.enqueue(first).unwrap();
+    let mut second_ticket = service.enqueue(second).unwrap();
+    assert_eq!(service.metrics.queued.load(Ordering::Relaxed), 2);
+
+    let begin_a = tokio::spawn(async move { first_ticket.begin.await });
+    let begin_b = tokio::spawn(async move { second_ticket.begin.await });
+    let (begin_a, begin_b) = tokio::join!(begin_a, begin_b);
+    assert!(begin_a.unwrap().unwrap().is_ok());
+    assert!(begin_b.unwrap().unwrap().is_ok());
+
+    let settle_order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let drain = {
+        let settle_order = settle_order.clone();
+        move |mut output: mpsc::Receiver<Event>, label: &'static str| {
+            let settle_order = settle_order.clone();
+            tokio::spawn(async move {
+                let mut output_tokens = 0;
+                let mut received_done = false;
+                let mut received_part = false;
+                while let Some(event) = output.recv().await {
+                    match event {
+                        Event::Done { output_tokens: done, .. } => {
+                            output_tokens = done;
+                            received_done = true;
+                            settle_order.lock().unwrap().push(label);
+                            break;
+                        }
+                        Event::Part(_) => received_part = true,
+                        Event::Error(error) => {
+                            panic!("Generation failed: {} {}", error.code, error.message)
+                        }
+                        Event::Decision(_) => {
+                            panic!("A text request must not yield a decision event.")
+                        }
+                    }
+                }
+                assert!(
+                    received_done,
+                    "The public output channel must close after a terminal event."
+                );
+                assert!(received_part, "A generation must emit at least one part.");
+                assert_eq!(output_tokens, 2);
+            })
+        }
+    };
+    let (first_done, second_done) = tokio::join!(
+        drain(first_ticket.output, "first"),
+        drain(second_ticket.output, "second")
+    );
+    first_done.unwrap();
+    second_done.unwrap();
+    assert_eq!(
+        *settle_order.lock().unwrap(),
+        vec!["first", "second"],
+        "A popped batch must settle in admission order."
+    );
+
+    assert_eq!(service.metrics.queued.load(Ordering::Relaxed), 0);
+    assert_eq!(service.metrics.active.load(Ordering::Relaxed), 0);
+    assert_eq!(service.metrics.completed.load(Ordering::Relaxed), 2);
+    stop_coordinator(&service, task).await;
+    assert_eq!(
+        observed_metric(&service, "apxinf_cleanup_pending", "operation=\"generate\""),
+        0.0
+    );
 }

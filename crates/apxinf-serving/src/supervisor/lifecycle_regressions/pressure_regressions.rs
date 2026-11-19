@@ -229,7 +229,8 @@ async fn pressure_does_not_replace_existing_queue_cancellation_or_expiry() {
 async fn pressure_monitor_survives_shutdown_until_preparation_settles() {
     let model = CpuModel::new(json!({"prepare_delays_ms":[3300]}));
     let (worker, ready) = cpu_worker(model.model()).await.unwrap();
-    let (mut service, sender) = cpu_service_with_completion(ready, Duration::from_secs(8), 2);
+    let (mut service, sender) =
+        cpu_service_with_completion(ready, Duration::from_secs(8), 2, 1);
     let pressure = Arc::new(HostPressure::with_sensor(|| Ok(Pressure::Normal)));
     pressure.refresh();
     Arc::get_mut(&mut service).unwrap().host_pressure = pressure.clone();
