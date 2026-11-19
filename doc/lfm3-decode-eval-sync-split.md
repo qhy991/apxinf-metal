@@ -331,5 +331,52 @@ ticket's verdict rests only on within-window paired medians.
 
 ## Results
 
+### 2026-11-19 20:32 Amendment (dated, pre-window) — schedule split of the arms
+
+The §9 tests discovered that the probe's mechanism location and the
+measurement schedule do not coincide. Recorded here, pre-window, so the arms
+below are the ones §3's order actually names.
+
+**Facts (from commit `813c674d`'s tests, `e4_empty_arm_and_split_ordering`):**
+
+- The split lives in `execute_inner`'s single-token eval, which only the
+  **sync** schedule reaches (`SyncTokenSequence` → `forward` → `execute`).
+- The **pipelined** `GreedySequence` (the substrate the 0.46–0.51 ms residual
+  was measured on) builds each step via `DeviceDecode::decode`, which calls
+  `build_graph` and never `execute_inner`'s eval. With `=1` on the pipelined
+  schedule the seam stays empty: `async_eval` → `synchronize` is never
+  executed. This is by design, not a bug — `execute_inner` is the sync
+  reference's step function.
+
+**Consequence for §3's arms (this is the adjudication lead reserved):**
+
+§3's `A B B A A B` as written names two pipelined arms, but on the pipelined
+schedule the B arm is byte-identical to A (empty switch, zero dispatch) — an
+A/A ≈ 0 "measurement" that would report WIN/PARITY without the probe ever
+running (the empty-arm trap §1's effect proof exists to prevent). Therefore
+the window will **not** run the §3 order as written. It will run two separate
+sync-schedule windows instead:
+
+- **Window S** (mechanism window; decides the ticket): A = sync, split off;
+  B = sync, `APXINF_LFM3_DECODE_ASYNC_EVAL=1`. Order `A B B A A B`, S2
+  ctx 1024/4096 × 128 tok, `--engine-timings`. Decision rule §5/§6 unchanged;
+  **E = sync−async** on the schedule the decomposition that produced the
+  residual was measured on, which is what §11 already justified.
+- **Window P** (census only, no verdict): pipelined `apxinf-pipe` with the
+  switch unset, then `=1`, `eval_calls`/`trace_callbacks`/bytes deltas
+  recorded; expected outcome is the empty arm (`=1` ≡ unset, `test_split_trace`
+  empty, `StreamCounters` delta 0). Confirms §5.2's "the pipelined harvest is
+  not reachable by this switch" reading. The pre-registered 1.08/1.13 ms
+  `P = sync − pipe` residual itself is not re-measured here (#127 certified it).
+
+The switch affects only the sync path, so pipelined apxinf-pipe baseline
+numbers used as the external reference are unaffected (`=1` unset ⇒ empty
+arm ⇒ baseline).
+
+**Fallback:** if lead rejects splitting the window this way, the alternative is
+INCONCLUSIVE by §5.5 (the switch cannot move the boundary of the schedule the
+residual was measured on) — not a WIN/PARITY read from a no-op B arm. The
+§7 default rule (revert switch + banner, keep record) applies either way.
+
 *(window pending — appended after the locked M4 run; only dated amendments to
 the pre-registration above may appear before the verdict.)*
