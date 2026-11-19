@@ -133,11 +133,11 @@
 
 **结论：G4-speed PASS**：3.26–3.31× ≥ 2.5×；11.06–11.44 ≤ 12.39/12.71，4bit/llama = 0.89–0.92（快 8–11%）；A/A 全部 ≤3.5% ≤ 5%；G3 空臂检查 PASS。
 
-**QUEUE #8 完整五档仍待 G1′（质量门）**：G4-speed 通过，但 §5 判据要求两门都过才判 WIN；G1′ 结果见 round-57 STATUS 与本文件 §7 后续节（质量 STOP ⇒ 默认不设 4-bit）。
+**QUEUE #8 完整五档仍待 G1′（质量门）**：G4-speed 通过，但 §5 判据要求两门都过才判 WIN；G1′ 结果见 round-57 STATUS 与本文件 §7 后续节（n=6 ⇒ INCONCLUSIVE，扩 ≥20 题重测中；4-bit 暂不设默认）。
 
 ---
 
-### 2026-11-20 01:50 CST — G1′ 质量门判定：STOP（§2 G1′ / §5；round-57 实测）
+### 2026-11-20 01:50 CST — G1′ 质量门判定：**INCONCLUSIVE（n=6）**（§2 G1′ / §5；round-57 实测；**改判 2026-11-20 02:18 CST Lead 裁决**）
 
 > 本节结果在 round-57 窗口（01:49:05–02:02:53，commit `7ab6ad5d` 之后）后回填。原 M4 运行 harness commit `b4ec75cb` + 修正 `7ab6ad5d`；receipts：`~/lfm3-dig-run/window-4bit/g1prime/`（verdict：`g1prime-verdict.json`，6 题 per-task 表、各臂 2 段 json、第 1 次作废运行 `round57-failed1/`）。
 
@@ -160,9 +160,13 @@
 
 **判据（§2 G1′，冻结）**：掉 ≤3pp ⇒ PASS；3–10pp ⇒ PARTIAL 候选；**>10pp ⇒ STOP（4-bit 不可设默认）**。
 
-**A/A caveat（如实记录，round-57 §59）**：两臂 2 段 solved 集合各自均不一致（spread 16.67pp > 5%）；按 RUNNER §4 严格口径本窗 A/A 不干净，但 G1′ 的 A/A 门在预登记中定义为「每臂 solved 集合一致」，analyzer 报告 DISAGREE 并以逐任务表为 tiebreaker，**不因 DISAGREE 自动判 INVALID**（INVALID 仅限 G3 空臂 / G5 速度窗 A/A >5% / G4-shape 漂移）。n=6、≤3 retry 下解谜率本身抖动极大（同臂同精度两段就差 1 题），故本结论强度是「**4-bit 质量风险信号 STOP（保守方向）**」，不是精确点估计。
+**A/A caveat（如实记录，round-57 §59）**：两臂 2 段 solved 集合各自均不一致（spread 16.67pp > 5%）；按 RUNNER §4 严格口径本窗 A/A 不干净，但 G1′ 的 A/A 门在预登记中定义为「每臂 solved 集合一致」，analyzer 报告 DISAGREE 并以逐任务表为 tiebreaker，**不因 DISAGREE 自动判 INVALID**（INVALID 仅限 G3 空臂 / G5 速度窗 A/A >5% / G4-shape 漂移）。n=6、≤3 retry 下解谜率本身抖动极大（同臂同精度两段就差 1 题：A 臂 seg0 2/6 vs seg3 1/6、B 臂 seg1 2/6 vs seg2 3/6，各自 spread 16.67pp），与「两臂差值 16.67pp」**完全同量级**。
 
-**结论：G1′ STOP —— 质量门不过**：两口径 −16.67pp 一致 > 10pp ⇒ **4-bit 不设为原生默认**。速度窗的 3.26–3.31× 优势（round-58 本文件上节）与本节质量结论合并 ⇒ 按 §5 两门不齐 ⇒ **QUEUE #8 整体：速度 PASS + 质量 STOP，4-bit 留 opt-in（`APXINF_LFM3_4BIT=1`）供 Lead 裁决**。G1-diag（step-59 token 分叉 + FP16 scale 复现）本轮未跑，仍为诊断项。
+**改判（2026-11-20 02:18 CST，Lead 裁决，仅改结论标签、不改门）**：上述 A/A caveat 表明**同一臂同一精度两段之间的噪声与「两臂之差」同量级**，且 n=6、≤3 retry、480-token 上限可能截断解法 ⇒ 原判 STOP（质量不可接受已确立）**统计上站不住**，效应在噪声内。按裁决改判 **INCONCLUSIVE（样本不足）**；STOP 仅在扩到 ≥20 题且两臂 A/A 干净后若 solved 差仍 >10pp 时成立。**门（§2 G1′ 判据）保持冻结不变**：≤3pp ⇒ PASS；3–10pp ⇒ PARTIAL；>10pp ⇒ STOP。
+
+**结论：G1′ INCONCLUSIVE（n=6）—— 质量门未测出可靠差异**：两口径 −16.67pp 是噪声内读数，不构成质量已劣化的证明；**4-bit 继续暂不设为原生默认（与 round-60 处置一致），保持 opt-in（`APXINF_LFM3_4BIT=1`）**，等 ≥20 题重测结论。速度窗的 3.26–3.31× 优势（round-58 本文件上节）已成立、不受影响（G4-speed PASS）。G1-diag（step-59 token 分叉 + FP16 scale 复现）本轮未跑，仍为诊断项。
+
+**下一动作（Lead 02:18 裁决）**：扩到 **≥20 题**（从冻结的 MBPP/HumanEval 池选，写死 suite sha256），每臂 **≥3 段**，同一协议；20 题下 solved 差仍 >10pp 且 A/A 干净 ⇒ 真 STOP；≤3pp ⇒ PASS；3–10pp ⇒ PARTIAL（4-bit opt-in）。PR #132 保持 open，标题/正文同步为「G1′ INCONCLUSIVE (n=6; expanding to ≥20)」。
 
 ---
 
