@@ -256,11 +256,34 @@ the pre-registration above may appear before the verdict.)*
 
 ---
 
-## 2026-11-19 17:20 CST — Verdict: **FALSIFIED** (§7 revert branch; no timing window ran)
+## 2026-11-19 17:37 CST — Verdict: **INCONCLUSIVE** (amended per lead correction 17:31; supersedes the 17:20 FALSIFIED label)
 
-The ticket is closed with the code reverted, per the frozen §7 default rule
-("FALSIFIED/INVALID: the switch and its code are reverted, only this record
-remains"). The revert is commit `ddce3ffc` on branch `agent/lfm3-dig`.
+The 17:20 verdict of FALSIFIED was wrong and is withdrawn. An arm that never
+ran to a token result and never ran a timing window cannot be FALSIFIED
+(§5.4/§5.5 require "token-consistent and A/A-clean but mechanism disproved").
+Per §5.6 this ticket is **INCONCLUSIVE**. The lead's requested substance:
+
+- **This ticket produced no new mechanism evidence.** Nothing was measured on
+  this branch for this arm.
+- **#115's prior stands — but it is a prior, not this ticket's measurement**:
+  whole-step `mx.compile` on decode measured +0.7% (no benefit), buckets
+  within ±2%. No result of this ticket refutes or confirms it.
+- **The "launch-gap drain" hypothesis (≈0.46–0.51 ms/token unexplained by the
+  host four stages) is unverified** — neither refuted nor confirmed.
+- **Why no arm ran** (both causes true): (1) the compiled closure over the
+  decode step's 70 state inputs never reached a state that both compiled and
+  passed a C1-shaped harness — an integration defect beyond the one-line `?`
+  fix (`2512f50c`), reverted in round-14 → commit `ddce3ffc`; (2) M4's two
+  Metal locks were continuously held by an unrelated campaign
+  (`ef3_round.py`, PIDs 28706 → 34945 → 41663 → 48188), "等，不抢", so C1
+  itself, the §8 census, and the timing window never executed.
+- **The revert is retained** (`ddce3ffc`): code that never ran should not
+  merge; the reverted tree was compile-checked clean (0 errors).
+
+Mechanism arithmetic: no ms/token numbers exist for this arm, so none are
+invented. Gate census: launch count / trace_callbacks delta — **机制未知
+(never measured)**. Byte accounting unchanged (same `build_graph` body, no
+shape/weight change): 3.4576 GB/token ÷ 100.6 GB/s ⇒ 34.36 ms/token floor.
 
 ### What ran and what did not
 
@@ -283,15 +306,16 @@ remains"). The revert is commit `ddce3ffc` on branch `agent/lfm3-dig`.
 
 ### Basis of the verdict (mechanism arithmetic)
 
-Per discipline rule 5, no ms/token numbers exist for this arm, so none are
-invented. The FALSIFIED verdict rests on §7's revert branch, supported by two
-independent facts:
+No ms/token numbers exist for this arm (see the amended verdict above), so
+none are invented. Two facts explain why no arm ran, without being
+disguised as mechanism findings:
 
 1. **Prior measurement (#115)**: whole-step `mx.compile` on decode measured
    **+0.7% (no benefit)**, with and without position bucketing inside ±2%.
-   This ticket's only delta over #115 was the pipeline substrate (#127) and the
-   §8 census; neither was executed, so no new mechanism evidence was produced
-   and #115's prior stands unrefuted.
+   This ticket's only delta over #115 was the pipeline substrate (#127) and
+   the §8 census; neither was executed. That #115 prior therefore **still
+   stands, but as a prior** — this ticket neither refuted nor confirmed it,
+   and it is not evidence produced by this arm.
 2. **Unresolved integration defect**: the compiled arm's closure never reached
    a state that both compiled and passed the C1-shaped harness. The §5.2
    retracing hard gate was never exercised either — the no-bucketing property
@@ -300,7 +324,7 @@ independent facts:
 Gate census: **launch count / trace_callbacks delta — 机制未知 (never measured).
 Byte accounting unchanged (same `build_graph` body, no shape/weight change) —
 3.4576 GB/token against the 100.6 GB/s ceiling ⇒ 34.36 ms/token floor.**
-The §11 "no numerics change" property was preserved by the revert: `model.rs`
+The §11 "no numerics change" property is preserved by the revert: `model.rs`
 returns to the eager pipelined body, and the eager-vs-eager parity of the
 remaining branch is the only thing the deleted C1 would have shown.
 
@@ -317,7 +341,9 @@ remaining branch is the only thing the deleted C1 would have shown.
 
 ### Disposition
 
-QUEUE #1 is closed as FALSIFIED. Per the lead's round-15/17 instruction and
-discipline rule 7 ("被否就记录并进下一项"), the campaign proceeds directly to
-**QUEUE #2 — GPU-side kernel efficiency (shape-preserving lm_head +
-elementwise fusion)**, pre-registered in `doc/lfm3-lm-head-custom-kernel.md`.
+QUEUE #1 is closed as **INCONCLUSIVE (not measured)**. Per discipline rule 7
+("被否就记录并进下一项") the campaign proceeds directly to **QUEUE #2 —
+GPU-side kernel efficiency (shape-preserving lm_head + elementwise fusion)**,
+pre-registered in `doc/lfm3-lm-head-custom-kernel.md`. QUEUE #1's question
+(launch-gap drain ≈0.46–0.51 ms/token) remains open for a future item if a
+window ever becomes affordable; it is *not* settled by this record.

@@ -261,14 +261,18 @@ single-output reduction order the reference uses. §5.2 + §9 K4 are the
 load-bearing guards, and the token gate (§5.1 + §9 K3) is the actual hard
 gate, not the arithmetic.
 
-**QUEUE #1 (compiled decode) is FALSIFIED and reverted** (`ddce3ffc`) — see
-`doc/lfm3-compiled-decode-step.md` §Results. This ticket is independent of
-that revert: it changes *which kernels run inside the existing eager
-`build_graph`*, not how the step is traced or scheduled. The `Compiled`
-scaffolding left in the branch (see QUEUE #1 §"Residual branch state") is
-inert and not used by this arm; if a PR reviewer prefers, it may be stripped
-in the QUEUE #2 PR as a separate clean-up commit — it is not part of this
-ticket's decision.
+**QUEUE #1 (compiled decode) was never measured and its integration was
+reverted** (`ddce3ffc`) — verdict **INCONCLUSIVE (not measured)**, see
+`doc/lfm3-compiled-decode-step.md` §Results (amended per the lead's 17:31
+correction; the earlier FALSIFIED label is withdrawn). #115's prior (whole-step
+compile +0.7%) suggests low upside for whole-step compile and is cited here as
+a prior expectation, not as a result of QUEUE #1 — QUEUE #1's question
+(launch-gap drain) remains open. This ticket is independent of that revert: it
+changes *which kernels run inside the existing eager `build_graph`*, not how
+the step is traced or scheduled. The `Compiled` scaffolding left in the
+branch (see QUEUE #1 §"Residual branch state") is inert and not used by this
+arm; if a PR reviewer prefers, it may be stripped in the QUEUE #2 PR as a
+separate clean-up commit — it is not part of this ticket's decision.
 
 ---
 
