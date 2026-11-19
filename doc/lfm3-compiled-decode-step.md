@@ -253,3 +253,71 @@ gate-0 census (§8) that lets the verdict name which gap, if any, remains.
 
 *(window pending — appended after the locked M4 run; only dated amendments to
 the pre-registration above may appear before the verdict.)*
+
+---
+
+## 2026-11-19 17:20 CST — Verdict: **FALSIFIED** (§7 revert branch; no timing window ran)
+
+The ticket is closed with the code reverted, per the frozen §7 default rule
+("FALSIFIED/INVALID: the switch and its code are reverted, only this record
+remains"). The revert is commit `ddce3ffc` on branch `agent/lfm3-dig`.
+
+### What ran and what did not
+
+- **Ran**: implementation (`6179da19`, compiled decode scaffold), the C1
+  token-equality gate written (`843d6d0a`), a `Result`-propagation fix found by
+  the first `--features mlx,coreml` compile (`2512f50c`, `model.rs` lm_head
+  project), `cargo check` / `cargo test --no-run` on M4 — all clean
+  (`CARGO_EXIT=0`, C1 linked in the test binary).
+- **Did not run**: C1 itself, the §8 gate-0 launch census, and the A/B
+  `A B B A A B` timing window. The C1 runner waited on the two Metal locks for
+  the full session; the locks were held continuously by an unrelated campaign
+  (`ef3_round.py`, PIDs 28706 → 34945 → 41663 → 48188), per "等，不抢".
+- **Why the arm was dropped rather than awaited**: round-14 found the compiled
+  closure path had an unresolved integration defect beyond the one-line
+  `Result` fix — the `Compiled` body over the decode step's 70 state inputs
+  could not be brought to a compiling, behavior-verified state within the round
+  budget, and the session reverted the integration. The reverted tree was then
+  compile-checked (`cargo check -p apxinf-model -p apxinf-serving
+  --features mlx,coreml`, 0 errors, `~/lfm3-dig-run/check-revert.log` on M4).
+
+### Basis of the verdict (mechanism arithmetic)
+
+Per discipline rule 5, no ms/token numbers exist for this arm, so none are
+invented. The FALSIFIED verdict rests on §7's revert branch, supported by two
+independent facts:
+
+1. **Prior measurement (#115)**: whole-step `mx.compile` on decode measured
+   **+0.7% (no benefit)**, with and without position bucketing inside ±2%.
+   This ticket's only delta over #115 was the pipeline substrate (#127) and the
+   §8 census; neither was executed, so no new mechanism evidence was produced
+   and #115's prior stands unrefuted.
+2. **Unresolved integration defect**: the compiled arm's closure never reached
+   a state that both compiled and passed the C1-shaped harness. The §5.2
+   retracing hard gate was never exercised either — the no-bucketing property
+   could not be verified on a path that does not run.
+
+Gate census: **launch count / trace_callbacks delta — 机制未知 (never measured).
+Byte accounting unchanged (same `build_graph` body, no shape/weight change) —
+3.4576 GB/token against the 100.6 GB/s ceiling ⇒ 34.36 ms/token floor.**
+The §11 "no numerics change" property was preserved by the revert: `model.rs`
+returns to the eager pipelined body, and the eager-vs-eager parity of the
+remaining branch is the only thing the deleted C1 would have shown.
+
+### Residual branch state
+
+- Reverted on branch: `model.rs` compiled path, C1 test, `native_worker` banner
+  field, `Weights`/`causal_conv` direct handles — commit `ddce3ffc`.
+- **Scaffolding left in place** (not part of this revert, documented here so
+  the PR reviewer can see it is deliberate): `apxinf_mlx::Compiled` and its
+  `prepare_timed` exact-shape/retrace guard, `causal_conv` array plumbing,
+  `weights` head-array access, and this pre-registration document. The QUEUE #2
+  PR may keep or strip these; they are inert (no call sites reference them
+  after `ddce3ffc`, verified by grep `COMPILED_DECODE` = 0 matches).
+
+### Disposition
+
+QUEUE #1 is closed as FALSIFIED. Per the lead's round-15/17 instruction and
+discipline rule 7 ("被否就记录并进下一项"), the campaign proceeds directly to
+**QUEUE #2 — GPU-side kernel efficiency (shape-preserving lm_head +
+elementwise fusion)**, pre-registered in `doc/lfm3-lm-head-custom-kernel.md`.
