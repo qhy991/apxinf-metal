@@ -147,7 +147,7 @@ seg_arm() { # arm seg tag model_root expect_4bit [worker_env...]
     --gateway http://127.0.0.1:8099 --model LFM3-1.7B \
     --request-log "$RES/apxinf-$tag-requests.jsonl" \
     --out "$RES/$arm-seg$seg.json" \
-    --retries 3 --max-tokens 1024 --timeout 300 >> "$RES/$arm-seg$seg.log" 2>&1
+    --retries 3 --max-tokens 480 --timeout 300 >> "$RES/$arm-seg$seg.log" 2>&1
   echo "seg arm=$arm seg=$seg exit=$? at $(date +%FT%T)" >> "$CLOG"
   stop_gw
 }

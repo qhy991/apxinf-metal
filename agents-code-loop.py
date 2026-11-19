@@ -49,6 +49,11 @@ def ask(gateway: str, model: str, prompt: str, max_tokens: int, timeout: int) ->
     if proc.returncode != 0:
         raise RuntimeError("gateway call failed: %s" % proc.stderr[-300:])
     doc = json.loads(proc.stdout)
+    if "choices" not in doc:
+        # Gateway errors (e.g. max_tokens over the deployment limit) are
+        # {"type":"error","error":{...}}; surface the body instead of a
+        # KeyError with no context (round-57 seg-0 failure diagnosis).
+        raise RuntimeError("gateway returned an error: %s" % proc.stdout[:400])
     return doc["choices"][0]["message"].get("content") or ""
 
 
