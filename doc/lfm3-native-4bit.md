@@ -84,6 +84,31 @@
 
 ---
 
+## 7. Results
+
+### 2026-11-19 23:39 CST — G1 v12 判定：INVALID（§2 G1 / §5；速度窗未开）
+
+**背景（v11 为何作废）**：G1 第一版（v5–v11）两侧各返回 128 × `0`，是 vacuous pass，根因为官方 HF 4-bit 副本在 M4 上 99%+ 字节全零（594 tensor 中 590 个 payload 全零），两臂读的是同一份残缺文件。round-46 判 v11 INVALID 但根因在文件、不在实现。
+
+**本轮动作（仅换权重根，同 harness）**：`MODEL4`（native 侧）与 `LANE_DIR`（lane 侧）同时改指 **`~/lfm3-dig-run/4bit/`**——round-44 在 M4 现场 `mx.quantize(group_size=64, bits=4, mode="affine")` 产物（973,082,900 B，sha256 `96b021b3…`，594/594 tensor payload 非零，lane sanity 已跑出真实文本）。v12 harness 追加 vacuous-pass 守卫（常量序列 / 全零通道 ⇒ 直接 INVALID），旧 official-root harness 备份于 `~/lfm3-dig-run/g1/run-g1.v11-official-root.sh`。
+
+**Effect proof（G3）三件套全部成立**：banner `decode_schedule=… native_4bit=true`（与 `APXINF_LFM3_4BIT=1` 同源）；census `quantized_triples=154/154`；binary freshness（overlay 树 `find crates -newer worker` = 空，`apxinf-serve` sha256 `c8cec3ea…`）。双 Metal 锁 fcntl 顺序等待、等不抢，全程锁内；进程清理干净，锁已释放。
+
+**门结果：G1 硬门 FAIL ⇒ INVALID**（预登记 §2 G1 / §5：token 不一致且无法解释 ⇒ INVALID，不进速度窗）：
+
+- replay 通道，prompt = "What is the capital of France?"，16 prompt tokens，128 decode steps。两侧前 59 个生成 token **逐 token 相同**（非退化，v12 守卫通过）。
+- **first mismatch：step 59**（1-based；注意 `/v1/replay` 数组含 prefill argmax 头，runner 日志原始报告 step=60 即 array index 60 = 去头后 step 59）。两侧 context `[41176, 88050, 124900, 124895]` 相同：lane = `125020`，native = `25797`。此后 128 步中 67 处不同；lane 序列 uniq=75，native uniq=55。
+- 序列 sha256（array 含头）：lane `d632913f…`，native `26f9af37…`。
+- 前 16 个 id 两侧完全一致：`[597, 4695, 20589, 34, 496, 2992, 355, 278, 5205, 302, 3980, 8022, 969, 355, 267, 90139]`。
+
+**机制算术 / speed signature（仅作 receipt，不作判定依据）**：原生臂 request log `decode_ms_per_token=11.51`（prefill 52.1 ms，128 tok），lane 自报 `step_ms=11.98`——与 0.973 GB ÷ 100.6 GB/s = **9.67 ms/token floor** 量级吻合，说明速度真实；但 G1 在此之前已失败，**不进 ABBA 速度窗**。per-kernel GB/s 与 launch 数：**机制未知（未 census）**。
+
+**机制未知的解释（如实写，不编造）**：两臂读同一份权重文件、同一 quant 格式（lane `packed_mode=True, packed_tensors=153, packed_bytes=972,232,704`），前 59 token 相同 ⇒ 输入/权重语义一致；但通用 `quantized_matmul`（MLX affine qmm / BM64 路径）在两个 ABI 上的**归约顺序/tiling**未能逐 token 对齐（`apxinf-mlx` SDK 0.32.x vs lane venv 0.31.2，二者 libmlx ABI 不同，step_ms 亦不同：11.51 vs 11.98）。首个分歧落点、group 内归约序的精确定位：**机制未知，未测量**。按冻结规则，无法解释的跨引擎 token 差异即 INVALID，不强行归因。
+
+**Disposition**：QUEUE #8 G1 硬门失败 ⇒ **本方向 INVALID，不进速度窗（ABBA）、不进质量评测、不开 PR**。原生 4-bit 量化 Linear 实现（commit `0bdbb05e`）保留在 `agent/lfm3-dig` 分支作 receipt，默认 `APXINF_LFM3_4BIT` unset 时路径零改动；是否清理剥离不属本轮。下一步按 RUNNER §1-5 / §7 记录后进 **QUEUE #7（自选：不触碰生成路径数值的方向）**。
+
+---
+
 ## Gate（原文，供 PR 引用）
 
 > **G1** 原生 4-bit 与 Python lane 4-bit（同 prompt、同权重文件语义、贪心）在 4 prompts × 128 token 上逐 token 相同；任一 prompt 首处差异即 INVALID（可解释的 tiling/group/nibble/affine 符号差异记为机制，无法解释 ⇒ INVALID）。**G3** banner `native_4bit` 字段缺失或二进制未重编译 ⇒ 空臂 INVALID。**G4** 任何 shape 漂移（padded/bucketed/wider/拆 K/换读向）⇒ 实现不可用。**G5** A/A ≤ 5%（本 ticket 自有）。**G6** solved rate 差 >10 点 ⇒ PARTIAL（默认 BF16，4-bit opt-in）。
