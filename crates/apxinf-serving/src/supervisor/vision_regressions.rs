@@ -129,6 +129,7 @@ fn service() -> Service {
         metrics: Metrics::default(),
         timeout: Duration::from_secs(5),
         memory_budget: 4194304,
+        batch_size: 1,
         restart: RestartPolicy::immediate(3),
         #[cfg(test)]
         unconfirmed_reaping: AtomicBool::new(false),

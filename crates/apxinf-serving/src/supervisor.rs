@@ -610,6 +610,10 @@ pub struct Service {
     pub metrics: Metrics,
     pub timeout: Duration,
     pub memory_budget: u64,
+    /// QUEUE #6 dispatcher pop bound. Resolved from the worker's declared
+    /// environment, so the advertised banner batch and the pop width cannot
+    /// drift apart even though the launch clears the worker's environment.
+    batch_size: usize,
     restart: RestartPolicy,
     /// Test hook that forces the unconfirmed-reaping branch of `fence_worker`.
     #[cfg(test)]
@@ -1395,6 +1399,7 @@ async fn start_inner(
         metrics: Metrics::default(),
         timeout: config.timeout,
         memory_budget: config.memory_budget,
+        batch_size: queue_batch_size(&config),
         restart: RestartPolicy::default(),
         #[cfg(test)]
         unconfirmed_reaping: AtomicBool::new(false),
@@ -1767,7 +1772,7 @@ where
                 }
             }
         }
-        let job = tokio::select! {
+        let jobs = tokio::select! {
             biased;
             frame = worker.frames.recv() => {
                 let result = match frame {
@@ -1803,81 +1808,92 @@ where
                 let _ = job.reply.send(result);
                 continue;
             }
-            job = shared.queue.recv(&shared.metrics) => match job {
-                Some(job) => job,
+            jobs = shared.queue.recv_batch(&shared.metrics, shared.batch_size) => match jobs {
+                Some(jobs) => jobs,
                 None => break,
             },
         };
-        let mut job = job;
-        // Only this coordinator sends commands; rotation precedes every queue receive.
-        debug_assert!(!worker.requires_rotation());
-        if let Some(error) = unstarted_error(&job, shared.timeout) {
-            job.observation
-                .settled(&shared.metrics.observations, Instant::now());
-            finish_before_execution(&mut job, &shared, error);
-            continue;
-        }
-        if let Err(error) = shared.check_host_pressure(true) {
-            job.observation
-                .settled(&shared.metrics.observations, Instant::now());
-            finish_before_execution(&mut job, &shared, error);
-            continue;
-        }
-        if worker.protocol == contracts::NATIVE_PREPARED_PROTOCOL {
-            if let Err(error) = shared.require_request_capacity(sequence_reservation) {
+        // QUEUE #6: the dispatcher pops up to B jobs in one scheduler turn.
+        // Execution is still serial in admission order — the same graph the
+        // previous single-pop path ran — so the B=1 path is unchanged and the
+        // popped jobs' output demux stays aligned with their own channels.
+        for mut job in jobs {
+            // Only this coordinator sends commands; rotation precedes every queue receive.
+            debug_assert!(!worker.requires_rotation());
+            if let Some(error) = unstarted_error(&job, shared.timeout) {
                 job.observation
                     .settled(&shared.metrics.observations, Instant::now());
                 finish_before_execution(&mut job, &shared, error);
                 continue;
             }
-        }
-        shared
-            .metrics
-            .queue_ns
-            .fetch_add(job.ingress.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        shared.metrics.active.store(1, Ordering::Relaxed);
-        shared
-            .metrics
-            .reserved_bytes
-            .store(sequence_reservation, Ordering::Relaxed);
-        let observation = job.observation.clone();
-        let result = if matches!(job.workload, Workload::Decision(_)) {
-            decision::execute_decision(&mut worker, &shared, job, shared.timeout).await
-        } else {
-            execute(&mut worker, &shared, job, shared.timeout).await
-        };
-        if let Err(failure) = result {
-            if !failure.reported {
-                shared.metrics.failed.fetch_add(1, Ordering::Relaxed);
-                observation.public_terminal(
-                    &shared.metrics.observations,
-                    Outcome::Failed,
-                    Instant::now(),
-                );
+            if let Err(error) = shared.check_host_pressure(true) {
+                job.observation
+                    .settled(&shared.metrics.observations, Instant::now());
+                finish_before_execution(&mut job, &shared, error);
+                continue;
             }
-            pending_recovery = Some(observation);
-            let follow_up = fence_and_recover(
-                &mut worker,
-                &shared,
-                failure.error,
-                &mut launch,
-                &mut backoff,
-                &mut pending_recovery,
-                &mut fault,
-            )
-            .await;
-            match follow_up {
-                FaultFollowUp::Continue => continue,
-                FaultFollowUp::Stop => break,
-                FaultFollowUp::Unreaped => {
-                    abandoned = true;
-                    break;
+            if worker.protocol == contracts::NATIVE_PREPARED_PROTOCOL {
+                if let Err(error) = shared.require_request_capacity(sequence_reservation) {
+                    job.observation
+                        .settled(&shared.metrics.observations, Instant::now());
+                    finish_before_execution(&mut job, &shared, error);
+                    continue;
                 }
             }
+            shared
+                .metrics
+                .queue_ns
+                .fetch_add(job.ingress.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            shared.metrics.active.store(1, Ordering::Relaxed);
+            shared
+                .metrics
+                .reserved_bytes
+                .store(sequence_reservation, Ordering::Relaxed);
+            let observation = job.observation.clone();
+            let result = if matches!(job.workload, Workload::Decision(_)) {
+                decision::execute_decision(&mut worker, &shared, job, shared.timeout).await
+            } else {
+                execute(&mut worker, &shared, job, shared.timeout).await
+            };
+            if let Err(failure) = result {
+                if !failure.reported {
+                    shared.metrics.failed.fetch_add(1, Ordering::Relaxed);
+                    observation.public_terminal(
+                        &shared.metrics.observations,
+                        Outcome::Failed,
+                        Instant::now(),
+                    );
+                }
+                pending_recovery = Some(observation);
+                let follow_up = fence_and_recover(
+                    &mut worker,
+                    &shared,
+                    failure.error,
+                    &mut launch,
+                    &mut backoff,
+                    &mut pending_recovery,
+                    &mut fault,
+                )
+                .await;
+                match follow_up {
+                    FaultFollowUp::Continue => continue,
+                    FaultFollowUp::Stop => {
+                        // The unexecuted jobs were popped and their queue_end
+                        // already recorded, but their public channels are
+                        // still open: drain them as shutdown failures.
+                        shared.queue.close(&shared.metrics, shared.timeout);
+                        break;
+                    }
+                    FaultFollowUp::Unreaped => {
+                        abandoned = true;
+                        break;
+                    }
+                }
+            }
+            shared.metrics.active.store(0, Ordering::Relaxed);
+            shared.metrics.reserved_bytes.store(0, Ordering::Relaxed);
+            observation.settled(&shared.metrics.observations, Instant::now());
         }
-        shared.metrics.active.store(0, Ordering::Relaxed);
-        shared.metrics.reserved_bytes.store(0, Ordering::Relaxed);
-        observation.settled(&shared.metrics.observations, Instant::now());
     }
     if abandoned {
         // The faulted process was never confirmed dead: keep its unresolved
@@ -1890,6 +1906,22 @@ where
     shared.metrics.active.store(0, Ordering::Relaxed);
     shared.metrics.reserved_bytes.store(0, Ordering::Relaxed);
     fault.map_or(Ok(()), Err)
+}
+
+/// QUEUE #6: dispatcher pop bound. Mirrors the native worker's
+/// `APXINF_LFM3_BATCH` resolution (unset, non-numeric or zero ⇒ 1) so a
+/// launch without the declared switch cannot silently widen the pop window.
+/// The worker's environment is cleared at launch, so the switch is read from
+/// the declared `--worker-env` entries — the only source that reaches the
+/// worker's banner.
+fn queue_batch_size(config: &Config) -> usize {
+    config
+        .worker_env
+        .iter()
+        .find(|(key, _)| key == "APXINF_LFM3_BATCH")
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .filter(|batch| *batch >= 1)
+        .unwrap_or(1)
 }
 
 /// Fences the service after the configured restart budget is exhausted.
@@ -3198,6 +3230,7 @@ fn gateway_test_service_capabilities(
         metrics: Metrics::default(),
         timeout: Duration::from_secs(1),
         memory_budget: 1024,
+        batch_size: 1,
         restart: RestartPolicy::immediate(3),
         #[cfg(test)]
         unconfirmed_reaping: AtomicBool::new(false),
@@ -3242,6 +3275,7 @@ mod lifecycle_tests {
             metrics: Metrics::default(),
             timeout: Duration::from_secs(1),
             memory_budget: 1024,
+            batch_size: 1,
             restart: RestartPolicy::immediate(3),
             #[cfg(test)]
             unconfirmed_reaping: AtomicBool::new(false),

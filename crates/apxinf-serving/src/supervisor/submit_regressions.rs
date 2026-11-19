@@ -139,6 +139,7 @@ sys.stdin.buffer.readline()
         metrics: Metrics::default(),
         timeout,
         memory_budget: 4096,
+        batch_size: 1,
         restart: RestartPolicy::immediate(3),
         #[cfg(test)]
         unconfirmed_reaping: AtomicBool::new(false),
