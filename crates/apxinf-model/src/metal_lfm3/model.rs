@@ -2103,15 +2103,15 @@ mod tests {
         let mut model = load_checkpoint_model()?;
         model.set_decode_async_eval(false);
         assert!(!model.decode_async_eval, "E1: baseline arm must start with the split off");
-        model.test_split_trace.clear();
         let mut expected = Vec::with_capacity(prompts.len());
-        for prompt in &prompts {
+        for (index, prompt) in prompts.iter().enumerate() {
+            model.test_split_trace.clear();
             expected.push(run_greedy(&mut model, prompt, 128)?);
+            assert!(
+                model.test_split_trace.is_empty(),
+                "E1 prompt {index}: baseline arm touched the split seam — blocking eval must stay the only path"
+            );
         }
-        assert!(
-            model.test_split_trace.is_empty(),
-            "E1: baseline arm touched the split seam — blocking eval must stay the only path"
-        );
 
         model.set_decode_async_eval(true);
         assert!(model.decode_async_eval, "E1: armed toggle did not take");
@@ -2365,6 +2365,11 @@ mod tests {
         assert_eq!(
             after.trace_callbacks, before.trace_callbacks,
             "E4: the split must not add trace callbacks (no compile)"
+        );
+        eprintln!(
+            "E4 armed: firings={firings} eval_calls_delta={} trace_callbacks_delta={}",
+            after.eval_calls - before.eval_calls,
+            after.trace_callbacks as isize - before.trace_callbacks as isize
         );
         model.set_decode_async_eval(false);
 
