@@ -82,6 +82,15 @@ C. 记录要求：每个 harness 的调用命令行、版本/commit、任务集 
 - **数字（仅供 Lead 看方向，不进判定）**：MMLU 4bit 4/10 vs bf16 2/10（delta=+2q；**MMLU 的 +2q 源于 bf16 3 题 unparsed（idx461/8889/9237）而非答错，是解析率差，非精度差**；两臂都 parsed 的 7 题答案全同 flip=0/7）；GSM8K 4bit 1/10 vs bf16 1/10（delta=0q，但按上条 caveat 数字无效）。速度 engine basis：4bit median 10.74 ms/tok vs bf16 36.06 ⇒ 3.36×，与 G4-speed PASS 3.3× 一致。A/A：单段，spread=0.00（退化、无意义）。
 - **待 Lead 拍板（bug-2，改冻结值，本轮未动）**：GSM8K `max_tokens` 64 → 256（或改 prompt 让它在 64 内给答案）。`max_tokens=64` 是 Lead 10:20 Gate 冻结值，**本 worker 无权单方面改**；改口径须 Lead 批准后另起一轮 + 重开窗。
 
-**最终 MMLU/GSM8K accuracy、delta、flip rate、verdict：待上述两点处理后回填。**
+**round-99 analyzer 复跑（2026-11-20 11:18，不占锁不动设备，复用 round-97 segment json；修好的 `analyze-knowledge-eval.py` scp 到 M4 `$RUN/scripts/` 后第二次复跑 EXIT=0，`knowledge-verdict.json` 正常落盘）：**
 
-（其他测量结果：待填）
+- **本轮复跑中当场修复两个连带 bug**（round-98 只修了 ACC 打印行，verdict json 落盘与 flip 拼接仍在，commit `8a77d0cd`，1 file +3/−3）：
+  - **bug-1b**：`analyze-knowledge-eval.py:515/518` `knowledge-verdict.json` 的 accuracy 块仍读 `a_m["mmlu"]["n"]` / `a_g["mmlu"]["n"]`（`aggregate()` 无此键，只有 `n_per_seg`）⇒ SMOKE 行已打印但 json 写到一半崩溃、verdict 文件未生成 ⇒ 改读 `n_per_seg`（只改读键，判定逻辑未动）；
+  - **bug-1c（单段形 flip 分母恒为 0）**：`per_item()` 对 `docs[arm][0]` 播种 `parsed_ok=False` 硬编码，只有 `docs[arm][1:]` 才翻 `True` ⇒ `segs_per_arm=1`（Lead 10:52 默认冒烟形）时两臂所有 parsed 题被排除，`FLIP denom=0`（round-97 手算 MMLU flip=0/7、GSM8K flip=2/10 与 analyzer denom=0 矛盾即此因）⇒ 首段播种改 `bool(r.get("parsed_ok"))`，多段后续段仍按原逻辑覆盖。
+- **verdict 数字（`knowledge-verdict.json` 实产，engine basis 速度沿用 round-97 实取）**：
+  - **MMLU**：4bit **40.0%（4/10，parsed 9，unparsed 1=idx461）** vs bf16 **20.0%（2/10，parsed 7，unparsed 3=idx461/8889/9237）** ⇒ delta=**+20.00pp = +2 题**（对 4bit 有利，但**差值源于解析率非精度**：两臂都 parsed 的 7 题答案全同，flip=**0/7 = 0.0%**；unparsed_4bit=2（8889/9237，4bit 解析出 A 判对、bf16 没出答案）、unparsed_both=1（461）、unparsed_bf16=0）⇒ **SMOKE_GREY**（差 2 题灰区）；
+  - **GSM8K**：4bit **10.0%（1/10）** vs bf16 **10.0%（1/10）** ⇒ delta=**0.00pp = 0 题**；flip=**2/10 = 20.0%**（idx154/837：4bit 3 vs bf16 16；4bit 200 vs bf16 400，两者都错）⇒ **SMOKE_OK** —— **但全部数字带 P1 caveat（20/20 `cause=length`、64 token 截断处中间量，accuracy 无效，见上文逐字）**；
+  - **整体**：`KNOWLEDGE_SMOKE_VERDICT SMOKE_GREY`（两数据集取最差档）；`KNOWLEDGE_PREREG_READING PASS（secondary，delta_mmlu=+20.00pp / delta_gsm8k=0.00pp）`；A/A 单段退化 spread=0.00（无意义）；request errors=0。
+- **Lead 10:52 ①冒烟回答（可交付版）**：MMLU 口径有效 —— parsed 口径零 flip（0/7），4bit 不差于 bf16（解析率反而更高），"精度差得大不大"的答案是**没差**；GSM8K 名义 delta=0 题但口径无效，**须 Lead 拍板 bug-2（`max_tokens` 64→256）后重开窗才可判**。按 Lead 10:52 判定"差 ≤1 题 ⇒ 大方向没问题"：MMLU 灰区来自解析率、GSM8K 无效 ⇒ 本轮结论 = **MMLU 大方向没问题，GSM8K 待 bug-2**。
+
+**待 Lead 拍板（bug-2，同上，仍未动）**：GSM8K `max_tokens` 64 → 256。批准后另起一轮 + 重开冒烟窗（Lead 10:52 设备时间 1–2 分钟仍满足），再回填最终 verdict。在批准前，本 doc 不给最终五档/主力判定 —— campaign 既有状态不变：G4-speed PASS 3.3× + G1′ PARTIAL n=20 ⇒ **4-bit opt-in、BF16 默认**。
