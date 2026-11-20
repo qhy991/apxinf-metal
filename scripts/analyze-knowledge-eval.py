@@ -434,7 +434,7 @@ def run_analyze(args) -> int:
             for r in docs[arm][0]["results"]:
                 if r["dataset"] == ds:
                     merged[r["idx"]] = {"idx": r["idx"], "parsed": r.get("parsed"),
-                                         "parsed_ok": False}
+                                         "parsed_ok": bool(r.get("parsed_ok"))}
             for d in docs[arm][1:]:
                 for r in d["results"]:
                     if r["dataset"] == ds and r.get("parsed_ok"):
@@ -512,10 +512,10 @@ def run_analyze(args) -> int:
                              "delta_gsm8k_pp": round(delta_g, 2)},
         "accuracy": {"mmlu": {"4bit": a_m["mmlu"]["acc_pct"], "bf16": a_g["mmlu"]["acc_pct"],
                               "delta_pp": round(delta_m, 2),
-                              "4bit_n": a_m["mmlu"]["n"], "bf16_n": a_g["mmlu"]["n"]},
+                              "4bit_n": a_m["mmlu"]["n_per_seg"], "bf16_n": a_g["mmlu"]["n_per_seg"]},
                      "gsm8k": {"4bit": a_m["gsm8k"]["acc_pct"], "bf16": a_g["gsm8k"]["acc_pct"],
                                "delta_pp": round(delta_g, 2),
-                               "4bit_n": a_m["gsm8k"]["n"], "bf16_n": a_g["gsm8k"]["n"]}},
+                               "4bit_n": a_m["gsm8k"]["n_per_seg"], "bf16_n": a_g["gsm8k"]["n_per_seg"]}},
         "flip_rate": flips,
         "a_a": {arm: {"mmlu": agg[arm]["mmlu"]["spread_pp"], "gsm8k": agg[arm]["gsm8k"]["spread_pp"]}
                 for arm in agg},
