@@ -57,10 +57,21 @@ C. 记录要求：每个 harness 的调用命令行、版本/commit、任务集 
 
 ## 5. 冻结前置校验（开窗前必须全部命中，否则 abort 不动设备）
 
-- 数据集文件 sha256：`mmlu-test.parquet` = （抽样轮实取填入）、`gsm8k-test.parquet` = （抽样轮实取填入）；
-- 样本 id 序列 sha256 / 样本文件 sha256：见抽样轮 commit；
-- 抽样 seed：MMLU = **20261120**、GSM8K = **20261121**（本 doc 冻结）；
-- 样本数：MMLU = **500**、GSM8K = **200**（本 doc 冻结）。
+**抽样轮实取（round-95，2026-11-20 10:25 CST，M1，`python3 -I` + mini-swe-agent venv pyarrow 26.0.1，产物 `samples/`，receipt `samples/knowledge-samples.json`）：**
+
+- 数据集文件 sha256：
+  - `mmlu-test.parquet` = `74a41822ce7d3def56e1682f958469c04642a5336a5ce912fa375fdb90fb25d7`（14,042 行）；
+  - `gsm8k-test.parquet` = `ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59`（1,319 行）；
+- 样本文件 sha256：
+  - `samples/mmlu-500.jsonl` = `dbb9d807cf276b722e0f9ab40998878a8675e2fff1b7696c965dda58515d8eda`（500 行，57 subjects，quota 全表见 receipt）；
+  - `samples/gsm8k-200.jsonl` = `1ce79a9f4d7bf1b280fe0de308bb12e67d3cb015c316fb6ed737965850f98519`（200 行，id 升序）；
+- 样本 id 序列 sha256：
+  - MMLU `samples/mmlu-500.ids.json` = `011104644a9f092eb62c941af44c9da683ba344bba2112e311ecdbc12f707fa6`；
+  - GSM8K `samples/gsm8k-200.ids.json` = `88243d86aaa248c74e2ce386c3e5a29f1b0511620254dca0d8c172016a4b9da0`；
+- 抽样 seed：MMLU = **20261120**（逐 subject `random.Random(...).sample`，subject 字典序消费流）、GSM8K = **20261121**（`sample(range(1319), 200)` 后升序）；
+- 样本数：MMLU = **500**（配额 `floor(500×n_s/14042)` + subject 字典序回补余数，sum=500 已校验）、GSM8K = **200**；
+- 产物写死一次：`samples/mmlu-500.jsonl`、`samples/gsm8k-200.jsonl` 及 ids、receipt 均为 write-once，内容不同则 `FROZEN_SAMPLE_MISMATCH` abort（重跑须 `--force`，作废此前窗口）；
+- gold 不进 prompt 自检：GSM8K 按数值字段 grep prompt = **7 题命中**（7/200，纯算术巧合，gold 不来自模型输入；MMLU gold 为 A–D 字母，模板本身含字母不适用 grep）。
 
 ## 6. 结果（测量后回填）
 
