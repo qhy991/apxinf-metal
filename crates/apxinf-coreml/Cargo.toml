@@ -21,3 +21,7 @@ cc = "1"
 [[example]]
 name = "sdpa_probe"
 required-features = ["native"]
+
+[[example]]
+name = "lfm3_mlp_probe"
+required-features = ["native"]

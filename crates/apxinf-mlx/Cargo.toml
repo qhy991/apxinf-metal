@@ -16,3 +16,7 @@ cc = "1"
 [[example]]
 name = "qmm_bm64_probe"
 required-features = ["native"]
+
+[[example]]
+name = "lfm3_mlp_gpu_probe"
+required-features = ["native"]
