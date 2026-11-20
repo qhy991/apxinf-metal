@@ -163,9 +163,10 @@ fn linear(
     output: usize,
     stream: &Stream,
     use_4bit: bool,
+    gemv: Option<apxinf_mlx::q4_gemv::SharedQ4GemvBf16>,
 ) -> Result<Linear> {
     if use_4bit {
-        if let Some(q4) = super::q4::take(map, name, input, output, stream)? {
+        if let Some(q4) = super::q4::take(map, name, input, output, stream, gemv.clone())? {
             return Ok(Linear::Q4(q4));
         }
     }
@@ -196,6 +197,16 @@ impl Weights {
         let kv = config.num_key_value_heads * config.head_dim;
         // The default (unset) arm never looks for quantized keys.
         let use_4bit = super::q4::enabled();
+        // Fused M=1 GEMV (issue #142 follow-up): one shared install per model,
+        // armed only with `APXINF_LFM3_Q4_GEMV=1`; kernels compile per distinct
+        // K at first launch, so nothing is paid when the switch is off.
+        let gemv = if use_4bit && super::q4::gemv_enabled() {
+            Some(std::rc::Rc::new(apxinf_mlx::q4_gemv::Q4GemvBf16::new(
+                stream,
+            )?))
+        } else {
+            None
+        };
         let mut quantized_layers = 0usize;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
@@ -215,6 +226,7 @@ impl Weights {
                 config.intermediate_size,
                 stream,
                 use_4bit,
+                gemv.clone(),
             )?;
             let w3 = linear(
                 &mut map,
@@ -223,6 +235,7 @@ impl Weights {
                 config.intermediate_size,
                 stream,
                 use_4bit,
+                gemv.clone(),
             )?;
             let w2 = linear(
                 &mut map,
@@ -231,6 +244,7 @@ impl Weights {
                 h,
                 stream,
                 use_4bit,
+                gemv.clone(),
             )?;
             let mixer = if kind.is_conv() {
                 // The depthwise tap table is stored as `[C, 1, K]` in the
@@ -262,6 +276,7 @@ impl Weights {
                     3 * h,
                     stream,
                     use_4bit,
+                    gemv.clone(),
                 )?;
                 let out_proj = linear(
                     &mut map,
@@ -270,6 +285,7 @@ impl Weights {
                     h,
                     stream,
                     use_4bit,
+                    gemv.clone(),
                 )?;
                 for linear in [&w1, &w3, &w2, &in_proj, &out_proj] {
                     quantized_layers += usize::from(matches!(linear, Linear::Q4(_)));
@@ -293,6 +309,7 @@ impl Weights {
                     q_in,
                     stream,
                     use_4bit,
+                    gemv.clone(),
                 )?;
                 let k = linear(
                     &mut map,
@@ -301,6 +318,7 @@ impl Weights {
                     kv,
                     stream,
                     use_4bit,
+                    gemv.clone(),
                 )?;
                 let v = linear(
                     &mut map,
@@ -309,6 +327,7 @@ impl Weights {
                     kv,
                     stream,
                     use_4bit,
+                    gemv.clone(),
                 )?;
                 let o = linear(
                     &mut map,
@@ -317,6 +336,7 @@ impl Weights {
                     h,
                     stream,
                     use_4bit,
+                    gemv.clone(),
                 )?;
                 let gate = linear(
                     &mut map,
@@ -325,6 +345,7 @@ impl Weights {
                     config.num_attention_heads,
                     stream,
                     use_4bit,
+                    gemv.clone(),
                 )?;
                 for linear in [&w1, &w3, &w2, &q, &k, &v, &o, &gate] {
                     quantized_layers += usize::from(matches!(linear, Linear::Q4(_)));
@@ -382,6 +403,7 @@ impl Weights {
                 h,
                 config.vocab_size,
                 stream,
+                gemv.clone(),
             )? {
                 Embedding::Q4(q4)
             } else {

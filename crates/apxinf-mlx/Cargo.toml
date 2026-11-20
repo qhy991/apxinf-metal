@@ -16,3 +16,7 @@ cc = "1"
 [[example]]
 name = "qmm_bm64_probe"
 required-features = ["native"]
+
+[[example]]
+name = "q4_gemv_probe"
+required-features = ["native"]

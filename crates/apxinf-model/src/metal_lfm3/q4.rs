@@ -19,6 +19,14 @@ pub fn enabled() -> bool {
     std::env::var_os("APXINF_LFM3_4BIT").is_some_and(|v| v == "1")
 }
 
+/// `true` when the worker also arms the fused M=1 GEMV (issue #142 follow-up;
+/// pre-registration `doc/lfm3-q4-gemv-preregister.md`). Same env source as the
+/// worker banner field `q4_gemv` (empty-arm gate); only meaningful with
+/// [`enabled`] armed.
+pub fn gemv_enabled() -> bool {
+    std::env::var_os("APXINF_LFM3_Q4_GEMV").is_some_and(|v| v == "1")
+}
+
 /// A group-64 affine 4-bit projection: packed `[out, in/8]` U32 weight and
 /// BF16 `[out, in/64]` scales/biases. Dequantized value `(q - bias) * scale`.
 #[derive(Clone)]
@@ -26,17 +34,36 @@ pub struct Q4 {
     weight: Array,
     scales: Array,
     biases: Array,
+    /// Fused M=1 GEMV (issue #142 follow-up): present only when the worker
+    /// armed `APXINF_LFM3_Q4_GEMV=1`; one shared install per model.
+    gemv: Option<apxinf_mlx::q4_gemv::SharedQ4GemvBf16>,
 }
 
 impl Q4 {
     /// `nn.QuantizedLinear` without bias: `x [.., in] @ W^T -> [.., out]`.
+    /// M=1 decode steps take the fused register-dequant GEMV when armed and
+    /// eligible; every other shape keeps MLX `quantized_matmul`.
     pub fn apply(&self, x: &Array) -> Result<Array> {
+        if let Some(gemv) = &self.gemv {
+            if apxinf_mlx::q4_gemv::Q4GemvBf16::eligible(
+                x,
+                &self.weight,
+                &self.scales,
+                &self.biases,
+            ) {
+                return gemv.call(x, &self.weight, &self.scales, &self.biases);
+            }
+        }
         x.quantized_matmul(&self.weight, &self.scales, &self.biases, true, 64, 4)
     }
 
     /// The packed/scale/bias arrays to warm at load (uploaded bytes).
     pub fn arrays(&self) -> [Array; 3] {
-        [self.weight.clone(), self.scales.clone(), self.biases.clone()]
+        [
+            self.weight.clone(),
+            self.scales.clone(),
+            self.biases.clone(),
+        ]
     }
 
     /// Gather `ids` rows of the tied table and dequantize only those rows to
@@ -97,13 +124,15 @@ fn take_array(
 /// `model.layers.0.feed_forward.w1.weight`) if and only if all three
 /// tensors are present with the expected shapes. `None` means "not
 /// quantized, use the BF16 path" — the map is left untouched so the BF16
-/// loader produces the normal error for a partial triple.
+/// loader produces the normal error for a partial triple. `gemv` is the
+/// shared fused-GEMV install, present only when `APXINF_LFM3_Q4_GEMV=1`.
 pub fn take(
     map: &mut HashMap<String, Tensor>,
     logical: &str,
     input: usize,
     output: usize,
     stream: &Stream,
+    gemv: Option<apxinf_mlx::q4_gemv::SharedQ4GemvBf16>,
 ) -> Result<Option<Q4>> {
     let stem = logical.trim_end_matches(".weight");
     let parts = ["weight", "scales", "biases"];
@@ -121,11 +150,30 @@ pub fn take(
         return Ok(None);
     }
     Ok(Some(Q4 {
-        weight: take_array(map, &format!("{stem}.weight"), MlxDType::U32, &[output, input / 8], stream)?
-            .expect("triple completeness checked above"),
-        scales: take_array(map, &format!("{stem}.scales"), MlxDType::BF16, &[output, input / 64], stream)?
-            .expect("triple completeness checked above"),
-        biases: take_array(map, &format!("{stem}.biases"), MlxDType::BF16, &[output, input / 64], stream)?
-            .expect("triple completeness checked above"),
+        weight: take_array(
+            map,
+            &format!("{stem}.weight"),
+            MlxDType::U32,
+            &[output, input / 8],
+            stream,
+        )?
+        .expect("triple completeness checked above"),
+        scales: take_array(
+            map,
+            &format!("{stem}.scales"),
+            MlxDType::BF16,
+            &[output, input / 64],
+            stream,
+        )?
+        .expect("triple completeness checked above"),
+        biases: take_array(
+            map,
+            &format!("{stem}.biases"),
+            MlxDType::BF16,
+            &[output, input / 64],
+            stream,
+        )?
+        .expect("triple completeness checked above"),
+        gemv: gemv.clone(),
     }))
 }
