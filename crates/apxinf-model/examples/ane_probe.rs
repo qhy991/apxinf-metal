@@ -641,7 +641,8 @@ mod native {
             }
             other => return Err(err(format!("unknown mode {other:?}"))),
         };
-        let text = serde_json::to_string(&payload)?;
+        let text = serde_json::to_string(&payload)
+            .map_err(|error| err(format!("serde_json: {error}")))?;
         if let Some(path) = out {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
@@ -687,18 +688,22 @@ mod native {
         fn new_buffer(&self, length: usize, options: MTLResourceOptions) -> metal::Buffer {
             self.0.new_buffer(length as u64, options)
         }
+        fn new_compute_pipeline_state_with_function(
+            &self,
+            function: &metal::FunctionRef,
+        ) -> Result<ComputePipelineState> {
+            self.0
+                .new_compute_pipeline_state_with_function(function)
+                .map_err(|error| err(format!("pipeline: {error}")))
+        }
     }
 
     trait SharedEventExt {
         fn signal_value(&self, value: u64);
-        fn signaled_value(&self) -> u64;
     }
     impl SharedEventExt for SharedEvent {
         fn signal_value(&self, value: u64) {
             self.set_signaled_value(value);
-        }
-        fn signaled_value(&self) -> u64 {
-            SharedEvent::signaled_value(self)
         }
     }
 
@@ -716,12 +721,12 @@ mod native {
 fn main() {
     if let Err(error) = native::run() {
         eprintln!("ane_probe: {error:?}");
-        process::exit(1);
+        std::process::exit(1);
     }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn main() {
     eprintln!("ane_probe requires Apple Silicon macOS");
-    process::exit(1);
+    std::process::exit(1);
 }
