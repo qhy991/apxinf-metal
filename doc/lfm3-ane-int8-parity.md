@@ -1,0 +1,157 @@
+# LFM3 的 INT8 精度代价：真实权重 + 真实激活下 ANE INT8 vs GPU BF16 的 MLP 输出误差（只测量，不移植）
+
+预登记时间：**2026-11-20 23:20 CST**（commit 先于任何 ANE 设备运行；本 doc 的 §3 Gate、§4 Decision、§5 五档判定在测量后**不许改**）。
+测量主机：**M4 Mac mini（Mac16,10，16 GiB），macOS 27.0.1**，`main` @ `61c82285`。
+
+**来源**：issue #150（owner 派单，@enginetailor 执行）；owner 2026-11-20 14:53 的补充实测与对
+本棒要求的更新（[comment](https://github.com/qhy991/apxinf-metal/issues/150#issuecomment-7042627924)）。
+**承接**：#145 / #146 / #148 / #149（ANE MLP 吞吐 WIN，ρ = 2.88 / 2.60 / 2.46 on M4，**合成权重**）。
+
+**人工约束（owner 原文）**：
+1. 不移植、不改运行时：只加探针或扩展现有两个 example。
+2. 预登记先于设备（写死 relerr 判据）。
+3. 必须报 BF16 自比噪声底。
+4. owner 更新后的判据：`relL2` 不是判据，**贪心 token 一致性才是**；并要在 **clef 的精确 CoreML
+   路径**上复现他的 numpy 近似（中位 1.72%）；若 token 不一致，写明替代方案（FP16 ANE / 缩小
+   share）并给出 **FP16 的吞吐预算**。
+
+---
+
+## 0. 事实基座（引用，非本轮测量）
+
+| 事实 | 出处 |
+|---|---|
+| clef MLP 的 ANE 程序：gate/up 为 per-row 对称 INT8 1×1 conv；SiLU 用 `0.5v(1+tanh(v/2))`；gate/up 各自按行最大值归一后相乘；down 为 K-split INT8 conv；512-token tile；`factor_cap` 限幅 | `crates/apxinf-model/src/metal_clef/ane.rs` |
+| ANE 侧 `y` 必须乘 `gate_scale × up_scale` 才还原成 MLP 输出（FP32 合并） | `crates/apxinf-mlx/native/ane_tile_merge.metal` |
+| LFM3-1.7B：hidden 2048、intermediate 7680、24 层（13 conv / 6 full / 5 sliding）、BF16 | 本地 checkpoint `config.json` |
+| owner 的 numpy 近似：全部 24 层真实 `w1/w3/w2`、真实 embedding 行、INT8 per-row 对称，**relL2 中位 1.72% / p90 2.03% / 最大 2.11%**；f32 数值底 0.000165% | issue #150 comment 7042627924 |
+| ANE INT8 吞吐（合成权重）：M4 上 ρ = 2.88 / 2.60 / 2.46（T=128/512/2048，S=7680） | #146 / #148 / #149 |
+
+**真实权重**：`/Users/haiyan-mini/Agent4Kernel/lfm3-bf16`（BF16 safetensors，3.2 GB，
+`model.layers.{i}.feed_forward.w{1,3}: [7680,2048]`、`w2: [2048,7680]`）。
+**真实激活**：同一 checkpoint 的 MLX BF16 引擎（外部 lane 运行时，只读使用，见 §7）在一条
+固定真实 prompt 上 prefill 512 token 后、各目标层的 `ffn_norm` 输出 `[512, 2048]`。
+
+---
+
+## 1. 假设与 falsifier
+
+**H1（量级复现）**：在 clef 的精确 CoreML 路径上（INT8 per-row + tanh-SiLU + gate/up 归一 +
+down K-split + 512 tile），真实权重 + 真实激活的 MLP 输出误差落在 owner numpy 近似的量级
+（relL2 1–2.5%），不是 BF16 噪声底量级。
+
+**H2（下游可用性）**：该量级的扰动在 **部署列份额**（S=5632/7680）上不改变贪心输出：
+同一 prompt、4 条真实问题、64 个贪心 token，BF16 与 INT8 的 token 序列完全相同。
+
+**falsifier（owner 更新版）**：若部署份额的贪心 token 出现不一致 ⇒ INT8 ANE 这条路**不能按
+`ρ ≈ 2.5` 兑现**，必须给出 FP16 ANE / 更小 share 的替代预算，并停工。
+
+---
+
+## 2. 测什么（冻结配置）
+
+### 2.1 ANE 臂（`apxinf-coreml` 探针）
+
+逐层（`L = {0, 4, 11, 22}`，覆盖 conv / sliding-attention / conv / full-attention 四种上下文）
+构建 clef 的 `program()` 的逐算子复刻，形状 `H=2048`、`T=512`（clef 的 TILE），列份额
+`S ∈ {7680, 5632}`：
+
+- `S=7680`：整个 MLP 的中间维在 ANE 上（最坏情形；`parts=2`，`width=3840`）。
+- `S=5632`：部署份额（ρ≈2.5 时的 `s* = ρ/(1+ρ)` 附近；`parts=2`，`width=2816`）。
+
+权重按 clef 的 `int8_per_row` 量化：`scale = f16(max|w| / 127)`，`q = rint(w/scale)` clamp 到
+`[-127,127]`；down 按 clef 的 `DOWN_PART=4096` 切分；`factor_cap` 按真实权重算（`FACTOR_SCALE=16`
+上限、`DOWN_ABS_SUM_LIMIT=8192`）。输出 `y`、`gate_scale`、`up_scale`，另加一个仅探针使用的
+`a`（归一后的 SwiGLU 乘积）用于"silu·mul 之后"的误差。
+
+**FP16 对照臂**（`S=7680`）：同一链条，权重用 FP16 常量的 1×1 conv（clef 的 neuron-split FP16
+写法），用于回答"若 INT8 不行，FP16 ANE 的精度是否够"。
+
+### 2.2 GPU 臂（`apxinf-mlx` 探针）
+
+同一层、同一真实权重、同一真实激活，MLX 的部署链 `gate/up matmul → silu·mul → down matmul`：
+- **BF16** 权重与激活（#121 认证基线的引擎口径），输出 `y_bf16` 与 `silu(g)*u` 中间量；
+- **F32** 同一批权重（数值底对照），输出 `y_f32` / `h_f32`。
+
+### 2.3 误差指标（每层 × 每臂）
+
+- `relerr`（相对 L2）：`||y_ane - y_gpu||_2 / ||y_gpu||_2`。
+- `max|Δ|`、`RMS(Δ)`、`cos(y_ane, y_gpu)`。
+- **silu·mul 之后**：`h_ane = a * gate_scale * up_scale` 对 `h_gpu = silu(g)*u` 的 relL2。
+- BF16 自比噪声底（三项，全部报）：
+  - N1：BF16 链跑两遍的差（确定性）；
+  - N2：BF16 链 vs F32 链（同一批 BF16 权重）——"BF16 引擎口径"的舍入底；
+  - N3：F32 链 vs FP64 链（numpy）——数值底（对账 owner 的 0.000165%）。
+- INT8 量化底（N4）：F32 链用 INT8 per-row 反量化权重 vs F32 链原权重——对账 owner 的 1.72%。
+- 引擎链误差（N5）：ANE INT8 输出 vs INT8 反量化 F32 链——归因给 tanh-SiLU/归一/FP16 引擎算术。
+
+### 2.4 吞吐（只服务 FP16 预算）
+
+同一探针在同一窗口内报 ANE 每层 512-token 的 `predict` 中位 ms（warmup 3 + 20 次），
+`T=2048` 以 4×512 顺序 predict 表示（#146 的部署形态）；GPU BF16 的 ms 由既有
+`lfm3_mlp_gpu_probe` 在同窗口复跑 `S=7680` 的 T=512/2048 得到。
+`ρ = ANE TMAC/s ÷ GPU BF16 TFLOP/s`，`R_max = f·ρ/(1+ρ)`，`f=0.73`（#146 冻结值）。
+
+---
+
+## 3. Gate（冻结）
+
+> **G0 预登记先行**：本节与 §4/§5 的 commit 先于任何 ANE 设备运行。
+> **G1 双锁 + ANE 独占**：测量窗口持有 `/tmp/enginetailor-metal.lock` → `~/.cache/enginetailor/metal-measure.lock`（POSIX flock，等不抢）；窗口前后各做一次 `ps` 扫描，不得存在其他可能用 ANE 的进程。本机无 sudo、powermetrics 不可用。
+> **G2 placement 取证**：每个 ANE cell 的 `load_with_placement` 必须显示全部 conv op preferred = NeuralEngine；否则该 cell INVALID。
+> **G3 A/A 稳定性**：完整精度矩阵跑两遍；每层 relL2 两窗相对差 ≤5% 为有效，>5% 重跑一次仍超 ⇒ 该层 INCONCLUSIVE。
+> **G4 不移植（按构造）**：diff 只允许 `doc/`、两个 crate 的 `examples/` 新探针、`Cargo.toml` 的 `[[example]]` 注册、`devlocal/` receipts。不得触碰 `metal_lfm3` 或任何库代码。
+> **G5 证据齐全**：原始 JSON / 原始输出二进制 / placement / A/A / ps 扫描 / token 序列全部落 `devlocal/lfm3-ane-int8-parity/`。
+> **G6 仿真保真（token 判据的前提）**：token 一致性用"逐行 INT8 反量化 + clef 归一链"的数值仿真实现在 BF16 引擎内；仿真输出与同层 ANE 实测输出的 relL2 必须 ≤ 0.25 ×（该层 ANE-vs-GPU relL2），否则 token 判据 INCONCLUSIVE（不能拿仿真代替引擎）。
+
+---
+
+## 4. 贪心 token 一致性（冻结）
+
+- **模型**：同一 BF16 引擎（外部 lane 运行时，只读引用，不改其代码；脚本在 `devlocal/`）。
+- **prompt**：4 条真实问题（下文 P1–P4），按 lane 的 ChatML 模板 + BOS 124894；贪心；最多 64 个新 token；遇 EOS 124900 停。**token 序列逐位比较**，报首个分歧位置与分歧率。
+- **四臂**（同一进程、同一 tokenizer、同一权重来源）：
+  - **A0**：BF16（基线）；
+  - **A1**：全部 24 层 MLP 的 `w1/w3/w2` 全部 7680 列做 per-row INT8 量化并反量化（clef 形状），MLP 在 **F32** 里按 clef 链（tanh-SiLU + gate/up 归一 + 反归一）计算，结果 cast 回 BF16 后进残差；
+  - **A2**：**部署份额** —— 每层列 `[2048, 7680)`（5632 列）走 A1 的 INT8 链，`[0, 2048)` 保持 BF16；两半按列相加；
+  - **A3**：FP16 权重（`f32→f16→f32`）全列，F32 链，结果 cast 回 BF16（FP16 ANE 的权重精度上界）。
+- 冻结判据：**A2 与 A0 的 4×64 token 完全一致** = 部署份额可用；A1 全一致 = 全份额也可用；A3 用于替代方案。
+
+---
+
+## 5. 五档判定（冻结）
+
+前提：G0–G6 全过。否则落到 INCONCLUSIVE / INVALID。
+
+| 判定 | 条件 |
+|---|---|
+| **PASS** | A2 与 A0 完全一致 **且** A1 与 A0 完全一致 ⇒ INT8 ANE 在 1.7% 量级下仍保 token，方向继续 |
+| **PASS-SHARE** | A2 完全一致、A1 有分歧 ⇒ INT8 只在 ≤5632/7680 列份额下可用；写清份额上限，不需要 FP16 |
+| **FAIL** | A2 出现分歧 ⇒ 部署份额不可用；给 FP16 ANE 的吞吐预算（§2.4）与 A3 的 token 结果，并停（不移植） |
+| **INCONCLUSIVE** | 锁/独占/placement/A-A/G6 任一不满足，或关键 cell 缺失 |
+| **INVALID** | G4 越界（碰了库代码 / metal_lfm3），或探针没有测到所声称的链条（空臂） |
+
+**与 #150 原文判据的关系（明确写出，不悄悄改）**：原文"relerr 在 BF16 噪声底 2 倍以内 ⇒ 可接受；
+显著更大 ⇒ 量化 ANE 走不通并停"在 owner 14:53 的更新里被显式取代——**relL2 不作为判据，token
+一致性才是**。本棒仍完整报 relL2 与噪声底（作为机制证据），但五档判定只由 §4/§5 的 token 结果驱动；
+若 owner 仍想按原文判据执行，本表的 relL2 列可直接查出结论（预期显著大于噪声底）。
+
+---
+
+## 6. Results（测量后填写；本节以上全部冻结）
+
+_待填。_
+
+## 7. 外部工具（只读，不改）
+
+- lane 运行时（`lfm3-lane`）位于 `/Users/haiyan-mini/lfm3-lane`，用于两件只读的事：
+  抓真实 `ffn_norm` 激活、跑贪心 token。它的 revision 与脚本 sha256 落 receipts。
+- 本票的 maintained 交付物只有：本 doc + 两个探针 example（+ `Cargo.toml` 的 example 注册）。
+
+## 8. 局限（先写死）
+
+1. 只测 4 层（{0,4,11,22}）× 3 个 ANE 臂，不是全部 24 层；层选择覆盖四种上下文，但层间分布未全扫。
+2. 单条 512-token prompt 的激活；不同 prompt 的激活幅值会变，per-row 量化误差与激活无关（权重侧），但 FP16 引擎算术与归一链的误差与激活有关。
+3. token 一致性是 **64 token 的贪心**（4 prompt），不是长程/多采样；长上下文与采样解码不在本棒。
+4. ANE 路径是 clef 配方的逐算子复刻（同一 CoreML 图），但 LFM3 的部署图若改变 tile/份额/融合，数字需重测。
+5. 仿真不是引擎：G6 只保证仿真误差 ≤ 0.25× 被测误差，不保证 token 序列与真 ANE 逐位相同（真 ANE 的 token 级验证需移植后做）。
