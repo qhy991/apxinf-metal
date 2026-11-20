@@ -29,11 +29,17 @@
 - 4-bit 臂与 BF16 臂同二进制：`APXINF_LFM3_4BIT` 经 `--worker-env` 传入，不进 supervisor 进程环境（round-71 同口径）。
 - 墙钟口径（Lead 10:14 注记 #120）：主用 **code_loop 进程墙钟**（含所有轮次，不受 SSE 缓冲影响）；并行记引擎侧 `decode_ms_per_token × completion_tokens` 汇总作 cross-check，两者都写进 receipt。
 
-## 4. Cells / Order
+## 4. Cells / Order（实现轮冻结 2026-11-20 10:2x CST）
 
-- ABBA 顺序 A B B A，A = `native-4bit`（`APXINF_LFM3_4BIT=1`）、B = `native-bf16`（unset）；每臂 2 段，共 4 段。
-- 题集 ≥12（实现轮冻结具体 id 与 suite sha256，写进本文件 §5 再 commit，之后才允许开窗）。
+- ABBA 顺序 A B B A，A = `native-4bit`（`APXINF_LFM3_4BIT=1`）、B = `native-bf16`（unset）；每臂 2 段，共 4 段（≥12 题要求满足：20 题 ≥ 12）。
+- **题集冻结**：复用 `g1prime-v2` 20 题 suite（`build-g1prime-suite.py --k 19`），**不扩不改**：
+  - ids：`mbpp_0011,0012,0014,0016,0017,0018,0019,0020,0056,0057,0058,0059,0061,0062,0063,0064,0065,0066,0067`（19 MBPP sanitized cache rows 0..19）+ `humaneval_0080`；
+  - **task-set sha256 = `13a96e891bf484b86fd92dd04db8e0611c190709362e1c3e9a76366f6fc72910`**（M4 `python3 -I` builder 实取，= round-63 §86 / round-65 §97 冻结值，payload 冻结未破）；id 序列 sha = `31157e868ae01230386f484daef0703c63ec637d0f229dddbabd77a3b49242d6`；
+  - M4 构建运行 **2026-11-20 10:2x**（`--force --k 19`，builder 0 error，`/tmp/g1p-primary-suite.json`）。开窗前 `run` 必须重建并校验该 sha，不符 ⇒ abort（G3 类 provenance 门）。
+- **「多轮」语义（实现轮决策，写死）**：采用 **code_loop retry 轮次即为多轮**（P1 的「多轮任务」指 `code-loop.py` 每题 ≤3 retry 的多轮交互：attempt 1 首解 + 失败后带 test feedback 的 attempt 2/3），**不另加 multi-turn 任务模板**。理由：① 不新发明（RUNNER §3 / doc §3）；② 现有 suite payload（含 sha）已被 G1′ n=20 窗验证，改模板会破冻结；③ 每题 attempts ≥1 即覆盖「多轮」语义下 4-bit 臂是否在 retry 轮次退化（这是 3.3× decode 加速是否转化为 agent 层 P2 的核心）。receipt：`native-*-seg*.json` 每题含 `attempt_count` + 各 attempt `wall_s`/`timing`。
 - 双 Metal 锁 fcntl 顺序等待（`/tmp/enginetailor-metal.lock` → `~/.cache/enginetailor/metal-measure.lock`），等不抢。
 
 ## 5. Results（待填；设备运行后回填原始数字 + 判定）
+
+- suite 题集 sha 已冻结（见 §4）：`13a96e891bf484b86fd92dd04db8e0611c190709362e1c3e9a76366f6fc72910`。开窗前 build 校验必须命中，否则 abort 不动设备。
 
