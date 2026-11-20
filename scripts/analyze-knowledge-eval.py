@@ -471,12 +471,12 @@ def run_analyze(args) -> int:
     n_mmlu = a_m["mmlu"]["n_per_seg"]
     n_gsm = a_g["gsm8k"]["n_per_seg"]
     print("ACC dataset=mmlu 4bit=%.1f%% (%d/%d parsed %d unparsed) bf16=%.1f%% (%d/%d parsed %d unparsed) delta=%.2fpp"
-          % (a_m["mmlu"]["acc_pct"], a_m["mmlu"]["correct"], a_m["mmlu"]["n"], a_m["mmlu"]["unparsed"],
-             a_g["mmlu"]["acc_pct"], a_g["mmlu"]["correct"], a_g["mmlu"]["n"], a_g["mmlu"]["unparsed"],
+          % (a_m["mmlu"]["acc_pct"], a_m["mmlu"]["correct"], a_m["mmlu"]["n_per_seg"], a_m["mmlu"]["unparsed"],
+             a_g["mmlu"]["acc_pct"], a_g["mmlu"]["correct"], a_g["mmlu"]["n_per_seg"], a_g["mmlu"]["unparsed"],
              a_m["mmlu"]["acc_pct"] - a_g["mmlu"]["acc_pct"]))
     print("ACC dataset=gsm8k 4bit=%.1f%% (%d/%d parsed %d unparsed) bf16=%.1f%% (%d/%d parsed %d unparsed) delta=%.2fpp"
-          % (a_m["gsm8k"]["acc_pct"], a_m["gsm8k"]["correct"], a_m["gsm8k"]["n"], a_m["gsm8k"]["unparsed"],
-             a_g["gsm8k"]["acc_pct"], a_g["gsm8k"]["correct"], a_g["gsm8k"]["n"], a_g["gsm8k"]["unparsed"],
+          % (a_m["gsm8k"]["acc_pct"], a_m["gsm8k"]["correct"], a_m["gsm8k"]["n_per_seg"], a_m["gsm8k"]["unparsed"],
+             a_g["gsm8k"]["acc_pct"], a_g["gsm8k"]["correct"], a_g["gsm8k"]["n_per_seg"], a_g["gsm8k"]["unparsed"],
              a_m["gsm8k"]["acc_pct"] - a_g["gsm8k"]["acc_pct"]))
 
     # smoke verdict (Lead 10:52)

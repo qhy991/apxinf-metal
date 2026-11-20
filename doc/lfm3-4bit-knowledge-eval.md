@@ -75,4 +75,13 @@ C. 记录要求：每个 harness 的调用命令行、版本/commit、任务集 
 
 ## 6. 结果（测量后回填）
 
-（待填）
+**round-97 冒烟窗（2026-11-20 11:08–11:10，n_mmlu=10 / n_gsm8k=10，seg=1/臂，A=native-4bit → B=native-bf16）—— 中间态，尚无有效 verdict，原因如下：**
+
+- **analyzer 崩溃已修（round-98 离线）**：`analyze` 在 ACC 打印行用 `agg[arm][ds]["n"]`，但 `aggregate()` 返回的是 `["n_per_seg"]` ⇒ `KeyError: 'n'`、`knowledge-verdict.json` 未生成、`SMOKE_*` verdict 未产出。修复 = 该 4 处改读 `n_per_seg`（round-97 §293 口径）。**本轮未重跑窗**，下一轮 analyzer 复跑既有 segment json 即可出 verdict（不占锁、不动设备）。
+- **GSM8K 口径 P1 caveat（逐字，round-97 §290，结论待 Lead 拍板）**：GSM8K **20/20 请求 `cause=length`、`completion_tokens=64`** —— 模型在 64 token 截断处尚未算出答案（reply_tail 全为推理过程），`extract_gsm8k` 取到的"末位数字"是**截断瞬间的中间量**（如 idx154 解析出 3，实际是每学期 3 课 × 周数没算完；idx974 碰巧 5=gold）。**因此 64-token 下的 GSM8K accuracy 数字无效**；MMLU 无此问题（答案短，finish=length 是回嘴继续写，答案已在前缀）。
+- **数字（仅供 Lead 看方向，不进判定）**：MMLU 4bit 4/10 vs bf16 2/10（delta=+2q；**MMLU 的 +2q 源于 bf16 3 题 unparsed（idx461/8889/9237）而非答错，是解析率差，非精度差**；两臂都 parsed 的 7 题答案全同 flip=0/7）；GSM8K 4bit 1/10 vs bf16 1/10（delta=0q，但按上条 caveat 数字无效）。速度 engine basis：4bit median 10.74 ms/tok vs bf16 36.06 ⇒ 3.36×，与 G4-speed PASS 3.3× 一致。A/A：单段，spread=0.00（退化、无意义）。
+- **待 Lead 拍板（bug-2，改冻结值，本轮未动）**：GSM8K `max_tokens` 64 → 256（或改 prompt 让它在 64 内给答案）。`max_tokens=64` 是 Lead 10:20 Gate 冻结值，**本 worker 无权单方面改**；改口径须 Lead 批准后另起一轮 + 重开窗。
+
+**最终 MMLU/GSM8K accuracy、delta、flip rate、verdict：待上述两点处理后回填。**
+
+（其他测量结果：待填）
