@@ -296,7 +296,64 @@ paired medians.
 
 ## Results
 
-*(appended after the window; verdict + mechanism arithmetic + receipts)*
+### Verdict — **PARITY, NOT-WORTH** (2026-11-20 09:37 CST; arithmetic
+receipt, **unmeasured** — no timing window was or will be run on this tree)
+
+Lead ruling 09:31 (in `STATUS.md`) closes this ticket: QUEUE #6收口为
+**NOT-WORTH**. The verdict tier per §5 is **PARITY** (speedup 1.00× at
+every B, i.e. < 1.2×), recorded as an arithmetic receipt and explicitly
+**not** as a measurement (Lead item 2: 不要冒充实测).
+
+**Mechanism arithmetic (§A/§B, frozen numbers, B = 1/2/4/8):**
+
+| arm | bytes per step-group producing B tokens | speedup vs B1 |
+| --- | --- | --- |
+| shipped serial loop (S = 0) | `B · 3.4576 GB` | **1.000×** at every B |
+| `Weights::project` only stacked (S = 0.524 GB) | `(T−S)·B + S` | 1.082× / 1.128× / **1.153×** (B=2/4/8) |
+| S required for ≥ 1.5× (§4 falsifier) | — | 2.305 GB / 1.537 GB / **1.317 GB** (B=2/4/8) |
+
+At every B the shipped tree reads `B × 3.4576 GB` per B tokens — identical
+to B sequential B=1 runs ⇒ 1.00× by construction; §5 PARITY (≤1.2×),
+never WIN (≥1.5×). Even stacking only `lm_head` (15.16% of weights)
+tops out at **1.153×** at B=8, still PARITY. Reaching the falsifier gate
+needs a true batched forward over conv/attention/MLP Linear weights
+(mechanism (b), ≥38.1% of bytes shared at B=8).
+
+**Effect proof / advertisement:** after commit `4a75f007` the production
+`/readyz` answers `"batching": false` in all cases — `batched_forward` is
+hardcoded false, three-conjunct fail-closed gate locked by tests. §6.3
+effect proof is satisfied (no over-claim): the batched forward does not
+exist, so nothing advertises it. Banner field `batch=<B>` (commit
+`723bc73b`) still reports the dispatcher pop bound; census `154/154` etc.
+are unchanged from #132 and are receipts only, not proof of a batched
+forward.
+
+**Hard gates:** §6.1 token gate (batch-vs-B1 greedy) **not run — by
+design**: Amendment 1 §B proves no window can produce WIN, so no lock was
+taken to confirm a known 1.00×; §6.2 shape/accumulation audit — no
+batched kernel was added, so no new reduction order to audit (B=1 graph
+identical by construction, §71 §143); §6.3 effect proof — production
+always false (above); §6.4 A/A — N/A (no window).
+
+**Why NOT-WORTH (Lead 09:31, recorded here):**
+1. The campaign's acceptance workload (agent end-to-end) is batch=1
+   serial ⇒ batch throughput does not improve the acceptance metric.
+2. The only path to WIN (mechanism (b)) changes conv/attention batch
+   geometry = "改形状" class, which this campaign has had blocked by the
+   token gate five times (#2, #3, #4, #128, G1-diag). A window plus
+   hundreds of lines buys a metric that does not move the acceptance
+   number.
+
+**Receipts:** arithmetic in §A/§B of this file (Amendment 1, commit
+`463ff50d`); fail-closed gate implementation and tests (commit
+`4a75f007`, `cargo test -p apxinf-serving --lib` 270 passed / 0 failed);
+branch `agent/lfm3-dig-batch` commits `119091b6`..`4a75f007` (7 commits,
+local, not merged — kept as receipt per Lead item 4). **No M4 window,
+no Metal lock, no device run for this ticket** (double lock remains
+FREE since round-65 03:54:38). Per §7 a non-WIN verdict reverts the
+batched path; the revert is deferred: Lead item 4 says keep the branch
+as receipt and do not merge — the base `feat/lfm3-metal` never received
+the dispatcher, so no production revert is needed.
 
 ---
 
