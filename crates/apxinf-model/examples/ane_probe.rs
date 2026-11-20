@@ -26,6 +26,7 @@
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod native {
+    use std::process;
     use apxinf_core::{Error, Result};
     use apxinf_coreml::{
         ComputeDeviceKind, ComputeUnits, Operand, Package, ProgramBuilder, ProgramCache,
@@ -36,7 +37,6 @@ mod native {
     use std::env;
     use std::fs;
     use std::path::PathBuf;
-    use std::process;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -272,7 +272,7 @@ mod native {
             stream.synchronize()?;
             reduce_ms.push(start.elapsed().as_secs_f64() * 1e3);
         }
-        let copy_med = median(©_ms);
+        let copy_med = median(&copy_ms);
         let reduce_med = median(&reduce_ms);
         let copy_gbps = ARRAY_BYTES as f64 / (copy_med / 1e3) / 1e9;
         let reduce_gbps = ARRAY_BYTES as f64 / (reduce_med / 1e3) / 1e9;
@@ -282,7 +282,7 @@ mod native {
             "reps": reps,
             "copy_ms": copy_ms,
             "copy_ms_median": copy_med,
-            "copy_spread": spread(©_ms),
+            "copy_spread": spread(&copy_ms),
             "copy_gbps": copy_gbps,
             "reduce_ms": reduce_ms,
             "reduce_ms_median": reduce_med,
@@ -423,6 +423,7 @@ mod native {
             "reps": reps,
             "predict_ms": predict_ms,
             "predict_ms_median": med,
+            "matmul_ms_median": med,
             "predict_spread": spread(&predict_ms),
             "macs": macs,
             "tmacs": macs / (med / 1e3) / 1e12,
@@ -449,7 +450,7 @@ mod native {
     fn run_event(reps: usize, rounds: usize) -> Result<Value> {
         let device = MetalDevice::system_default().ok_or_else(|| err("no Metal device"))?;
         let event = device.new_shared_event();
-        let queue = device.new_command_queue().ok_or_else(|| err("no command queue"))?;
+        let queue = device.new_command_queue();
         // Minimal GPU workload so the wait has a real command buffer.
         let library = device
             .new_library_with_source(
@@ -461,25 +462,9 @@ mod native {
             .get_function("noop", None)
             .map_err(|error| err(format!("get_function: {error:?}")))?;
         let pipeline = device
-            .new_compute_pipeline_state_with_function(&function)
+            .new_compute_pipeline_state_with_function(function.as_ref())
             .map_err(|error| err(format!("pipeline: {error:?}")))?;
         let out = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
-
-        let wait_gpu = |signal_value: u64| -> Result<()> {
-            let command_buffer = queue
-                .new_command_buffer()
-                .ok_or_else(|| err("no command buffer"))?;
-            command_buffer.encode_wait(event.as_ref(), signal_value);
-            let encoder = command_buffer
-                .new_compute_command_encoder()
-                .ok_or_else(|| err("no encoder"))?;
-            encoder.set_compute_pipeline_state(&pipeline);
-            encoder.set_buffer(0, Some(out.as_ref()), 0);
-            encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
-            encoder.end_encoding();
-            command_buffer.commit();
-            Ok(())
-        };
 
         // Build the ANE eval once (same conv as T2 so the placement facts
         // are the same package; its predict is the "empty/minimal ANE eval"
@@ -493,10 +478,32 @@ mod native {
             model.predict(&feed, &want)?;
         }
 
+        // Round-119: `event.signaled_value()` is set by the host, so
+        // polling it does NOT prove the GPU-side wait completed. We keep a
+        // reference to the committed wait command buffer and drain it with
+        // `wait_until_completed()` after signalling; that is the honest
+        // "GPU side waited" half of the round-trip.
+        fn enqueue_wait<'q>(
+            queue: &'q CommandQueue,
+            event: &SharedEvent,
+            value: u64,
+            pipeline: &ComputePipelineState,
+            buffer: &metal::Buffer,
+        ) -> Result<&'q metal::CommandBufferRef> {
+            let command_buffer = queue.new_command_buffer();
+            command_buffer.encode_wait(event, value);
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(buffer.as_ref()), 0);
+            encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+            encoder.end_encoding();
+            command_buffer.commit();
+            Ok(command_buffer)
+        }
         let mut single_ms = Vec::with_capacity(reps);
         let mut counter: u64 = 0;
         for _ in 0..reps {
-            wait_gpu(counter)?;
+            let cb = enqueue_wait(&queue, &event, counter, &pipeline, &out)?;
             let start = Instant::now();
             let out = model.predict(&feed, &want)?;
             if out.is_empty() {
@@ -504,27 +511,22 @@ mod native {
             }
             counter += 1;
             event.signal_value(counter);
-            // Drain the GPU wait so the next round starts from a settled
-            // event; this is the "GPU side waited" half of the round-trip.
-            while event.signaled_value() < counter {
-                thread::yield_now();
-            }
+            // Wait for the GPU-side buffer to actually observe the signal.
+            cb.wait_until_completed();
             single_ms.push(start.elapsed().as_secs_f64() * 1e3);
         }
 
         let mut rounds_ms = Vec::new();
         let start_all = Instant::now();
         for _ in 0..rounds {
-            wait_gpu(counter)?;
+            let cb = enqueue_wait(&queue, &event, counter, &pipeline, &out)?;
             let out = model.predict(&feed, &want)?;
             if out.is_empty() {
                 return Err(err("ANE eval returned no output"));
             }
             counter += 1;
             event.signal_value(counter);
-            while event.signaled_value() < counter {
-                thread::yield_now();
-            }
+            cb.wait_until_completed();
         }
         rounds_ms.push(start_all.elapsed().as_secs_f64() * 1e3);
 
@@ -650,14 +652,16 @@ mod native {
         Ok(())
     }
 
-    // ---- Metal shared-event imports (objc2-metal via the metal crate) ----
+    // ---- Metal shared-event primitives (round-119: use the `metal` crate's
+    // own objc wrappers; objc2-metal's generated snake_case names never
+    // matched this file and `ProtocolObject` casting was broken, which made
+    // the original T3 block un-compilable. metal 0.33 already exposes
+    // signaled_value/set_signaled_value on SharedEventRef and
+    // encode_wait_for_event on CommandBufferRef; event semantics are
+    // identical. objc2-metal stays in dev-deps for future tracing work. ----
     use metal::{
-        CompileOptions, CommandBufferRef, CommandEncoderRef, CommandQueue, ComputeCommandEncoderRef,
-        ComputePipelineState, Device, Library, MTLResourceOptions, MTLSize, SharedEvent,
-    };
-    use objc2_metal::{
-        MTLDevice as _, MTLCommandQueue as _, MTLCommandBuffer as _, MTLComputeCommandEncoder as _,
-        MTLComputePipelineState as _, MTLLibrary as _, MTLSharedEvent as _,
+        CompileOptions, CommandQueue, ComputePipelineState, Device, Library,
+        MTLResourceOptions, MTLSize, SharedEvent,
     };
 
     struct MetalDevice(Device);
@@ -668,7 +672,7 @@ mod native {
         fn new_shared_event(&self) -> SharedEvent {
             self.0.new_shared_event()
         }
-        fn new_command_queue(&self) -> Option<CommandQueue> {
+        fn new_command_queue(&self) -> CommandQueue {
             self.0.new_command_queue()
         }
         fn new_library_with_source(
@@ -681,7 +685,7 @@ mod native {
                 .map_err(|error| err(format!("library: {error:?}")))
         }
         fn new_buffer(&self, length: usize, options: MTLResourceOptions) -> metal::Buffer {
-            self.0.new_buffer(length, options)
+            self.0.new_buffer(length as u64, options)
         }
     }
 
@@ -691,26 +695,21 @@ mod native {
     }
     impl SharedEventExt for SharedEvent {
         fn signal_value(&self, value: u64) {
-            unsafe { objc2_metal::MTLSharedEvent::set_signaled_value(self, value) }
+            self.set_signaled_value(value);
         }
         fn signaled_value(&self) -> u64 {
-            unsafe { objc2_metal::MTLSharedEvent::signaled_value(self) }
+            SharedEvent::signaled_value(self)
         }
     }
 
     trait CommandBufferExt {
         fn encode_wait(&self, event: &SharedEvent, value: u64);
     }
-    impl CommandBufferExt for CommandBufferRef {
+    impl CommandBufferExt for metal::CommandBufferRef {
         fn encode_wait(&self, event: &SharedEvent, value: u64) {
-            unsafe { objc2_metal::MTLCommandBuffer::encode_wait_for_event(self, event, value) }
+            self.encode_wait_for_event(event, value);
         }
     }
-
-    // The metal crate's typed wrappers are used above; silence unused-import
-    // warnings for the trait re-exports that objc2-metal requires in scope.
-    #[allow(unused_imports)]
-    use {CommandEncoderRef, ComputeCommandEncoderRef, ComputePipelineState};
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
