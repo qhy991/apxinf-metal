@@ -25,3 +25,7 @@ required-features = ["native"]
 [[example]]
 name = "lfm3_mlp_probe"
 required-features = ["native"]
+
+[[example]]
+name = "lfm3_mlp_parity_probe"
+required-features = ["native"]
