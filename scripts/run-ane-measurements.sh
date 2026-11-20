@@ -60,6 +60,7 @@ fi
 
 g3_fail() { # msg, exit code
   echo "G3 INVALID: $1" >> "$CLOG"
+  echo "G3 DIAG PATH=$PATH hostname=$(/bin/hostname 2>&1) sysctl_bin=$(/usr/bin/command -v sysctl 2>&1)" >> "$CLOG"
   echo "PHASE aborted_g3" >> "$CLOG"
   exit $2
 }
@@ -103,8 +104,8 @@ caffeinate -si & CAFF_PID=$!
 LLAMA_SHA=$(shasum -a 256 "$LLAMA_BIN" | cut -d' ' -f1)
 LLAMA_MSHA=$(shasum -a 256 "$LLAMA_Q4" | cut -d' ' -f1)
 PROBE_SHA=$(shasum -a 256 "$PROBE" | cut -d' ' -f1)
-HW=$(sysctl -n machdep.cpu.brand_string)
-[[ "$HW" == *M4* ]] || g3_fail_101 "machine gate: expected Apple M4, got $HW"
+HW=$(/usr/sbin/sysctl -n machdep.cpu.brand_string 2>&1); SYSCTL_RC=$?
+[[ $SYSCTL_RC -eq 0 && "$HW" == *M4* ]] || g3_fail_101 "machine gate: expected Apple M4, got '$HW' (sysctl_rc=$SYSCTL_RC)"
 {
   echo "machine: $HW"
   echo "probe_bin: $PROBE sha=$PROBE_SHA"
