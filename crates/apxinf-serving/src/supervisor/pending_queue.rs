@@ -96,6 +96,7 @@ impl PendingQueue {
         Self::sweep_locked(&mut state, metrics, timeout);
     }
 
+    #[cfg(test)]
     pub(super) async fn recv(&self, metrics: &Metrics) -> Option<Job> {
         loop {
             let changed = self.changed.notified();

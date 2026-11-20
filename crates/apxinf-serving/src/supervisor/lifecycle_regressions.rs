@@ -1074,8 +1074,8 @@ async fn batch_two_pops_two_pending_jobs_and_each_ticket_completes_in_fifo_order
     first.max_tokens = 2;
     let mut second = request(false);
     second.max_tokens = 2;
-    let mut first_ticket = service.enqueue(first).unwrap();
-    let mut second_ticket = service.enqueue(second).unwrap();
+    let first_ticket = service.enqueue(first).unwrap();
+    let second_ticket = service.enqueue(second).unwrap();
     assert_eq!(service.metrics.queued.load(Ordering::Relaxed), 2);
 
     let begin_a = tokio::spawn(async move { first_ticket.begin.await });
