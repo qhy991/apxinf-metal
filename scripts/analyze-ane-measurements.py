@@ -109,27 +109,36 @@ def cell_values(payload, field):
 
 
 def load_llama_t1(res):
-    """Parse T1 llama request ledgers into batch -> ms/token values."""
+    """Parse T1 llama receipts into batch -> engine-basis ms/token values.
+
+    The request ledger (ane-w1-llama-requests.jsonl) is empty: bench_engines.sh
+    does not populate it for this protocol. The real data is in the raw bench
+    receipts raw/t1-B{b}-s2-*.json, per-request engine_decode_ms /
+    engine_decode_tokens (engine basis, from llama-server --timings parsing).
+    Warmup cases are skipped (their timing includes cold start).
+    """
     out = {}
-    for path in sorted(res.glob("ane-w1-llama-requests.jsonl")):
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                batch = row.get("batch") or row.get("arm")
-                if isinstance(batch, str):
-                    m = re.search(r"(\d+)", batch)
-                    batch = int(m.group(1)) if m else None
-                if not isinstance(batch, int):
-                    continue
-                mspt = row.get("decode_ms_per_token") or row.get("ms_per_token")
-                if isinstance(mspt, (int, float)) and mspt > 0:
-                    out.setdefault(batch, []).append(float(mspt))
+    for path in sorted((res / "raw").glob("t1-B*-s2-*.json")):
+        m = re.search(r"t1-B(\d+)-", path.name)
+        if not m:
+            continue
+        batch = int(m.group(1))
+        try:
+            payload = read_json(path)
+        except Exception:
+            continue
+        requests = payload.get("requests") or []
+        for row in requests:
+            if not isinstance(row, dict):
+                continue
+            if row.get("case") == "__warmup__":
+                continue
+            if row.get("status") not in (None, "ok"):
+                continue
+            toks = row.get("engine_decode_tokens") or 0
+            ms = row.get("engine_decode_ms") or 0
+            if isinstance(toks, (int, float)) and isinstance(ms, (int, float)) and toks > 0:
+                out.setdefault(batch, []).append(float(ms) / float(toks))
     return out
 
 

@@ -175,7 +175,7 @@ w2_status=0
 case "$WINDOW" in
   w1)
     # ---- A0: same-window streaming probe (bytes + bandwidth denominator) ----
-    probe_arm A0-stream --gpu --reps "$A0_REPS" || w1_status=1
+    probe_arm A0-stream gpu --reps "$A0_REPS" || w1_status=1
     # ---- T1: llama.cpp batch decode, engine basis, 4 batch values ----
     start_llama || { stop_llama; g3_fail_104 "llama-server did not become ready"; }
     for b in "${T1_BATCHES[@]}"; do
@@ -183,9 +183,9 @@ case "$WINDOW" in
     done
     stop_llama
     # ---- T2: GPU / ANE / GPU+ANE concurrency ----
-    probe_arm T2-gpu --gpu --reps "$T2_REPS" || w1_status=1
-    probe_arm T2-ane --ane-bw --reps "$T2_REPS" || w1_status=1
-    probe_arm T2-both --both --reps "$T2_REPS" || w1_status=1
+    probe_arm T2-gpu gpu --reps "$T2_REPS" || w1_status=1
+    probe_arm T2-ane ane-bw --reps "$T2_REPS" || w1_status=1
+    probe_arm T2-both both --reps "$T2_REPS" || w1_status=1
     ;;
   w2)
     # ---- T4 first (as frozen), with placement facts for effect proof ----
