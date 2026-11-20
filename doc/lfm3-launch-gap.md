@@ -243,3 +243,30 @@ rests only on within-window paired medians.
   fusion/simplification passes (not to a body bug), one dated amendment may
   retry once with a no-fuse compile mode exposed through the FFI; a C1
   failure with any other attribution is INVALID and stands.
+
+---
+
+### 2026-11-20 12:15 Amendment (dated, pre-window) — census instrument correction
+
+Reading `crates/apxinf-mlx/src/array.rs` before building the arm shows
+`StreamCounters.trace_callbacks` increments **only** in the `Compiled`
+trace callback (one per trace/retrace), not per eager op — the dig QUEUE
+#1 doc's "baseline accumulates trace_callbacks per step" was wrong about
+this counter. Corrected §8 census:
+
+- **Retrace gate (the load-bearing one)**: baseline arm `trace_callbacks`
+  delta = 0 across the whole census request (no `Compiled` exists);
+  armed arm = exactly the number of regions (13 conv + 2×11 attention +
+  1 head = **36**) after the warm-up step, then **delta 0** across every
+  later step and across a second request (per-position, per-request
+  profile reuse — §5.2's direct observable).
+- **Eager host-submission count**: no counter exists in `StreamCounters`
+  (`uploads_bytes`, `downloads_bytes`, `eval_calls`, `trace_callbacks`
+  only). Reported as a **static estimate from the code** (baseline ≈700
+  ops/step from the build-graph recipe; armed ≈ 11×12 + 13 + 2 ≈ 148
+  eager ops + 36 compiled calls/step) and labelled "静态估计" rather than
+  measured; kernel launches stay "机制未知" unless an MLX/Metal counter
+  appears. §8's decision logic does not depend on this estimate.
+- **`eval_calls` / byte counters**: armed arm must show no extra
+  evaluation boundary per step vs baseline beyond the one-time warm-up
+  evals (prepare_timed's two evals per region on the first step only).

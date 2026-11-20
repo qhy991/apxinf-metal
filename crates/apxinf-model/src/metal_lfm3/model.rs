@@ -22,8 +22,8 @@ use crate::llm_trait::{
 use crate::mlx_decode::{DecodeFinish, DeviceDecode, GreedySequence};
 use apxinf_core::{Backend, Device, Error, Result, Tensor, TokenSampler, TokenSamplingParams};
 use apxinf_loader::ModelConfig;
-use apxinf_mlx::{fusions::CausalDepthwiseConv, Array, MlxBackend, MlxDType, Stream};
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use apxinf_mlx::{fusions::CausalDepthwiseConv, Array, Compiled, MlxBackend, MlxDType, Stream};
+use std::{collections::HashMap, rc::Rc, sync::Arc, time::Instant};
 
 fn err(message: impl Into<String>) -> Error {
     Error::Other(message.into())
@@ -35,6 +35,15 @@ fn err(message: impl Into<String>) -> Error {
 /// environment when it spawns the worker).
 fn decode_stages_enabled() -> bool {
     std::env::var_os("APXINF_LFM3_DECODE_STAGES").is_some_and(|value| value == "1")
+}
+
+/// `APXINF_LFM3_COMPILED_DECODE=1` routes the single-token pipelined device
+/// decode step through exact-shape `Compiled` regions (sdpa window stays
+/// eager); unset keeps the fully eager `build_graph` path. Read dynamically
+/// (like the schedule switch) so the token gate can flip arms on one model.
+/// See `doc/lfm3-launch-gap.md`.
+fn compiled_decode_enabled() -> bool {
+    std::env::var_os("APXINF_LFM3_COMPILED_DECODE").is_some_and(|value| value == "1")
 }
 
 /// `APXINF_LFM3_PREFILL_FAST=1` reuses the last prefill graph for a repeated
@@ -173,12 +182,35 @@ struct PrefillCache {
     states: Vec<LayerState>,
 }
 
+/// Exact-shape compiled regions of the single-token decode step
+/// (`doc/lfm3-launch-gap.md`). Built lazily on the first compiled decode step
+/// of a process; every region's shapes are position- and capacity-free, so
+/// one profile serves all steps, contexts, and requests. `warm` marks the
+/// first step, which prepares each region with `prepare_timed` (trace +
+/// compile + retrace guard) instead of plain `call`.
+struct CompiledRegions {
+    per_layer: Vec<LayerRegions>,
+    head: Compiled,
+    warm: bool,
+}
+
+enum LayerRegions {
+    /// `(x, conv_state) -> (x_out, next_state)`: norm + conv_step +
+    /// mix_and_residual.
+    Conv(Compiled),
+    /// `pre: (x, cos_row, sin_row) -> (n, q, k, v)`; `post:
+    /// (x, n, attention) -> x_out`. The position-shaped window (KV write +
+    /// slice + sdpa) stays eager between them.
+    Attention { pre: Compiled, post: Compiled },
+}
+
 pub struct Lfm3Model {
     config: Lfm3Config,
     backend: MlxBackend,
-    weights: Weights,
+    /// Shared with the compiled decode regions, which capture the weights.
+    weights: Rc<Weights>,
     /// Compiled `apxinf_causal_depthwise_conv` pipeline for the decode step.
-    causal_conv: CausalDepthwiseConv,
+    causal_conv: Rc<CausalDepthwiseConv>,
     kinds: Vec<LayerKind>,
     /// One dense row per attention layer, `[1, kv_heads, capacity, head_dim]`.
     initial_kv: Vec<Option<KvState>>,
@@ -200,6 +232,9 @@ pub struct Lfm3Model {
     conv_snapshot: Option<Vec<Option<Array>>>,
     stages: bool,
     stage_seq: usize,
+    /// Compiled decode-step regions (`doc/lfm3-launch-gap.md`), built on the
+    /// first step of an armed run and reused for the process lifetime.
+    compiled_regions: Option<Box<CompiledRegions>>,
     /// QUEUE #3 prefill fast arm, captured once at construction from the same
     /// env the banner reports (`prefill_fast_enabled`). When unset the model
     /// never builds or touches a cached prefill graph (empty-arm gate).
@@ -227,8 +262,8 @@ impl Lfm3Model {
             .downcast_ref::<MlxBackend>()
             .ok_or_else(|| err("LFM3 native implementation requires an MLX backend"))?
             .clone();
-        let weights = Weights::load(&config, tensors, backend.stream())?;
-        let causal_conv = CausalDepthwiseConv::new(backend.stream())?;
+        let weights = Rc::new(Weights::load(&config, tensors, backend.stream())?);
+        let causal_conv = Rc::new(CausalDepthwiseConv::new(backend.stream())?);
         let kinds = config.layer_kinds()?;
         let layers = config.num_hidden_layers;
         let mut model = Self {
@@ -251,6 +286,7 @@ impl Lfm3Model {
             conv_snapshot: None,
             stages: decode_stages_enabled(),
             stage_seq: 0,
+            compiled_regions: None,
             prefill_fast: prefill_fast_enabled(),
             prefill_cache: None,
             #[cfg(test)]
@@ -525,6 +561,18 @@ impl Lfm3Model {
     /// preserved reference and `crates/apxinf-mlx/native/causal_depthwise_conv.metal`
     /// for the kernel's contract.
     fn conv_step(&self, n: &Array, layer: &LayerWeights, state: &Array) -> Result<(Array, Array)> {
+        Self::conv_step_static(&self.causal_conv, n, layer, state)
+    }
+
+    /// `conv_step` with the conv kernel as an explicit argument, so the same
+    /// body can be traced inside a compiled region closure (which cannot
+    /// borrow `self`).
+    fn conv_step_static(
+        causal_conv: &CausalDepthwiseConv,
+        n: &Array,
+        layer: &LayerWeights,
+        state: &Array,
+    ) -> Result<(Array, Array)> {
         let Mixer::Conv {
             in_proj,
             out_proj,
@@ -543,7 +591,7 @@ impl Lfm3Model {
         // Build the window in the kernel's `[1, L, C]` layout instead of
         // concatenating `[1, hidden, kernel]` and transposing the copy.
         let window = Array::concat(&[&state.transpose(&[0, 2, 1])?, &z], 1)?;
-        let (conv, next) = fused_conv_window(&self.causal_conv, &window, taps_bf16)?;
+        let (conv, next) = fused_conv_window(causal_conv, &window, taps_bf16)?;
         let y = gate.mul(&conv)?;
         let op = out_proj.call(&y)?;
         Ok((op, next))
@@ -774,7 +822,17 @@ impl Lfm3Model {
         op: &Array,
         layer: &LayerWeights,
     ) -> Result<Array> {
-        let eps = self.config.norm_eps;
+        Self::mix_and_residual_static(x, op, layer, self.config.norm_eps)
+    }
+
+    /// `mix_and_residual` with the epsilon as an argument, so the same body
+    /// can be traced inside a compiled region closure.
+    fn mix_and_residual_static(
+        x: &Array,
+        op: &Array,
+        layer: &LayerWeights,
+        eps: f32,
+    ) -> Result<Array> {
         let op = norm(op, &layer.post_operator_norm, eps)?;
         let hidden = x.add(&op)?;
         let ffn = norm(&hidden, &layer.ffn_norm, eps)?;
@@ -784,6 +842,256 @@ impl Lfm3Model {
         let down = layer.w2.call(&activated)?;
         let down = norm(&down, &layer.post_ffn_norm, eps)?;
         hidden.add(&down)
+    }
+
+    // ---- Compiled-subgraph decode step (doc/lfm3-launch-gap.md). ----
+    // Every body below is the existing eager code with its context passed
+    // explicitly; the closures capture the weights through `Rc` so they can
+    // be `Fn` + `'static`. No compiled region sees a position- or
+    // capacity-shaped array: position enters the attention layers only
+    // through the eagerly sliced `cos`/`sin` rows and the eager KV window.
+
+    /// Attention `pre` region: operator norm, q/k/v projections, q/k norms,
+    /// and RoPE. Returns `(n, q, k, v)` with q `[1, heads, 1, dim]` and k/v
+    /// `[1, kv_heads, 1, dim]`; `n` is passed on for the output gate.
+    fn attention_pre_static(
+        weights: &Weights,
+        layer_idx: usize,
+        heads: usize,
+        kv_heads: usize,
+        dim: usize,
+        eps: f32,
+        x: &Array,
+        cos: &Array,
+        sin: &Array,
+    ) -> Result<(Array, Array, Array, Array)> {
+        let layer = &weights.layers[layer_idx];
+        let Mixer::Attention {
+            q: q_proj,
+            k: k_proj,
+            v: v_proj,
+            q_norm,
+            k_norm,
+            ..
+        } = &layer.mixer
+        else {
+            return Err(err("LFM3 attention layer has a conv weight plan"));
+        };
+        let n = norm(x, &layer.operator_norm, eps)?;
+        let q = q_proj.call(&n)?.reshape(&[1, 1, heads, dim])?;
+        let q = norm(&q, q_norm, eps)?.transpose(&[0, 2, 1, 3])?;
+        let k = k_proj.call(&n)?.reshape(&[1, 1, kv_heads, dim])?;
+        let k = norm(&k, k_norm, eps)?.transpose(&[0, 2, 1, 3])?;
+        let v = v_proj
+            .call(&n)?
+            .reshape(&[1, 1, kv_heads, dim])?
+            .transpose(&[0, 2, 1, 3])?;
+        let q = apply_rope(&q, cos, sin, dim)?;
+        let k = apply_rope(&k, cos, sin, dim)?;
+        Ok((n, q, k, v))
+    }
+
+    /// Attention `post` region: sigmoid output gate, gated merge, o_proj, and
+    /// the residual/FFN tail.
+    fn attention_post_static(
+        weights: &Weights,
+        layer_idx: usize,
+        heads: usize,
+        dim: usize,
+        eps: f32,
+        x: &Array,
+        n: &Array,
+        attention: &Array,
+    ) -> Result<Array> {
+        let layer = &weights.layers[layer_idx];
+        let Mixer::Attention {
+            o: o_proj, gate, ..
+        } = &layer.mixer
+        else {
+            return Err(err("LFM3 attention layer has a conv weight plan"));
+        };
+        let gate = gate.call(n)?.sigmoid()?.transpose(&[0, 2, 1])?;
+        let gated = attention.mul(&gate.reshape(&[1, heads, 1, 1])?)?;
+        let merged = gated
+            .transpose(&[0, 2, 1, 3])?
+            .reshape(&[1, 1, heads * dim])?;
+        let op = o_proj.call(&merged)?;
+        Self::mix_and_residual_static(x, &op, layer, eps)
+    }
+
+    /// Conv region: operator norm, fused conv step (also the next window),
+    /// and the residual/FFN tail.
+    fn conv_region_static(
+        causal_conv: &CausalDepthwiseConv,
+        weights: &Weights,
+        layer_idx: usize,
+        eps: f32,
+        x: &Array,
+        state: &Array,
+    ) -> Result<(Array, Array)> {
+        let layer = &weights.layers[layer_idx];
+        let n = norm(x, &layer.operator_norm, eps)?;
+        let (op, next) = Self::conv_step_static(causal_conv, &n, layer, state)?;
+        let x_out = Self::mix_and_residual_static(x, &op, layer, eps)?;
+        Ok((x_out, next))
+    }
+
+    /// Final head region: final norm, last row, lm_head projection.
+    fn head_static(weights: &Weights, eps: f32, vocab: usize, x: &Array) -> Result<Array> {
+        let hidden = norm(x, &weights.final_norm, eps)?;
+        let rows = hidden.slice_axis(1, 0, 1)?;
+        weights.project(&rows)?.reshape(&[1, vocab])
+    }
+
+    /// Build the exact-shape `Compiled` regions of the decode step
+    /// (`doc/lfm3-launch-gap.md` §1). The bodies are traced from the same
+    /// functions the eager path runs; a single profile serves every position
+    /// and context length because no region's shapes depend on either.
+    fn compile_decode_regions(&self) -> Result<CompiledRegions> {
+        let stream = self.backend.stream();
+        let eps = self.config.norm_eps;
+        let (heads, kv_heads, dim, vocab) = (
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            self.config.vocab_size,
+        );
+        let mut per_layer = Vec::with_capacity(self.config.num_hidden_layers);
+        for (layer_idx, kind) in self.kinds.iter().enumerate() {
+            if kind.is_conv() {
+                let weights = self.weights.clone();
+                let causal_conv = self.causal_conv.clone();
+                let compiled = Compiled::new(stream, 2, move |inputs| {
+                    let (x, state) = (&inputs[0], &inputs[1]);
+                    let (x_out, next) = Lfm3Model::conv_region_static(
+                        &causal_conv,
+                        &weights,
+                        layer_idx,
+                        eps,
+                        x,
+                        state,
+                    )?;
+                    Ok(vec![x_out, next])
+                })?;
+                per_layer.push(LayerRegions::Conv(compiled));
+            } else {
+                let weights = self.weights.clone();
+                let pre = Compiled::new(stream, 4, move |inputs| {
+                    let (x, cos, sin) = (&inputs[0], &inputs[1], &inputs[2]);
+                    let (n, q, k, v) = Lfm3Model::attention_pre_static(
+                        &weights, layer_idx, heads, kv_heads, dim, eps, x, cos, sin,
+                    )?;
+                    Ok(vec![n, q, k, v])
+                })?;
+                let weights = self.weights.clone();
+                let post = Compiled::new(stream, 1, move |inputs| {
+                    let (x, n, attention) = (&inputs[0], &inputs[1], &inputs[2]);
+                    Ok(vec![Lfm3Model::attention_post_static(
+                        &weights, layer_idx, heads, dim, eps, x, n, attention,
+                    )?])
+                })?;
+                per_layer.push(LayerRegions::Attention { pre, post });
+            }
+        }
+        let weights = self.weights.clone();
+        let head = Compiled::new(stream, 1, move |inputs| {
+            Ok(vec![Lfm3Model::head_static(&weights, eps, vocab, &inputs[0])?])
+        })?;
+        Ok(CompiledRegions {
+            per_layer,
+            head,
+            warm: true,
+        })
+    }
+
+    /// Run one pipelined decode step through the compiled regions, with the
+    /// position-shaped remainder (KV write, window slice, sdpa) eager — the
+    /// verbatim tail of `attention_step_parts`. The first compiled step of a
+    /// process prepares every region with `prepare_timed` (trace + compile +
+    /// the no-retrace guard); later steps replay.
+    fn decode_compiled(&mut self, token: &Array, start: usize) -> Result<Array> {
+        if q4::enabled() {
+            return Err(err(
+                "LFM3 compiled decode is not registered for the 4-bit arm; unset one of APXINF_LFM3_COMPILED_DECODE / APXINF_LFM3_4BIT",
+            ));
+        }
+        if self.compiled_regions.is_none() {
+            self.compiled_regions = Some(Box::new(self.compile_decode_regions()?));
+        }
+        // Taken out of `self` so the loop below can mutate the live state
+        // slots; put back before returning (an error invalidates the model,
+        // after which the regions are rebuilt on the next armed run).
+        let mut regions = self
+            .compiled_regions
+            .take()
+            .ok_or_else(|| err("compiled LFM3 regions missing"))?;
+        let warm = regions.warm;
+        let run = |compiled: &Compiled, inputs: &[Array]| -> Result<Vec<Array>> {
+            if warm {
+                compiled.prepare_timed(inputs).map(|(output, _, _)| output)
+            } else {
+                compiled.call(inputs)
+            }
+        };
+        let result = (|| {
+            let stream = self.backend.stream().clone();
+            let scale = (self.config.head_dim as f64).powf(-0.5) as f32;
+            let mut x = self
+                .weights
+                .embed(token)?
+                .reshape(&[1, 1, self.config.hidden_size])?;
+            for layer_idx in 0..self.config.num_hidden_layers {
+                match &regions.per_layer[layer_idx] {
+                    LayerRegions::Conv(compiled) => {
+                        let state = self.conv[layer_idx]
+                            .clone()
+                            .ok_or_else(|| err("LFM3 conv state is missing"))?;
+                        let outputs = run(compiled, &[x.clone(), state])?;
+                        x = outputs[0].clone();
+                        self.conv[layer_idx] = Some(outputs[1].clone());
+                    }
+                    LayerRegions::Attention { pre, post } => {
+                        let kv = self.kv[layer_idx]
+                            .clone()
+                            .ok_or_else(|| err("LFM3 KV state is missing"))?;
+                        let kind = self.kinds[layer_idx];
+                        let (cos, sin) = self
+                            .cos_sin(kind, start, 1)
+                            .map_err(|e| err(format!("rope slice start={start}: {e}")))?;
+                        let pre_outputs = run(pre, &[x.clone(), cos, sin])?;
+                        let n = pre_outputs[0].clone();
+                        let q = pre_outputs[1].clone();
+                        let k = pre_outputs[2].clone();
+                        let v = pre_outputs[3].clone();
+                        let index = Array::from_i32(&stream, &[1], &[start as i32])?;
+                        let keys = kv.keys.slice_update(&k, &index, &[2])?;
+                        let values = kv.values.slice_update(&v, &index, &[2])?;
+                        let end = start + 1;
+                        // Sliding attention reads exactly the 256 positions
+                        // before `end` (same constant as `attention_step_parts`).
+                        let low = match kind {
+                            LayerKind::SlidingAttention => end.saturating_sub(256),
+                            _ => 0,
+                        };
+                        let attention = q.sdpa(
+                            &keys.slice_axis(2, low, end)?,
+                            &values.slice_axis(2, low, end)?,
+                            scale,
+                            false,
+                            None,
+                        )?;
+                        let post_outputs = run(post, &[x.clone(), n, attention])?;
+                        x = post_outputs[0].clone();
+                        self.kv[layer_idx] = Some(KvState { keys, values });
+                    }
+                }
+            }
+            let logits = run(&regions.head, &[x])?;
+            Ok(logits[0].clone())
+        })();
+        regions.warm = false;
+        self.compiled_regions = Some(regions);
+        result
     }
 
     /// Build and evaluate one layer. `None` means a single-token step whose
@@ -1102,7 +1410,11 @@ impl DeviceDecode for Lfm3Model {
         self.conv_snapshot = Some(self.conv.clone());
         let start = self.position;
         let build_started = self.stages.then(Instant::now);
-        let logits = match self.build_graph(token, start, 1, true) {
+        let logits = match if compiled_decode_enabled() {
+            self.decode_compiled(token, start)
+        } else {
+            self.build_graph(token, start, 1, true)
+        } {
             Ok(logits) => logits,
             Err(error) => {
                 self.invalid = Some(error.to_string());
@@ -1812,6 +2124,274 @@ mod tests {
         let ids = run_greedy(&mut model, &prompt, 32)?;
         assert_eq!(ids.len(), 32, "P2: budget must be honoured");
         assert!(model.prefill_cache.is_none(), "P2: empty-arm — a cached prefill graph was built with the switch off");
+        Ok(())
+    }
+
+    const COMPILED_ENV: &str = "APXINF_LFM3_COMPILED_DECODE";
+
+    fn set_compiled_decode(on: bool) {
+        if on {
+            std::env::set_var(COMPILED_ENV, "1");
+        } else {
+            std::env::remove_var(COMPILED_ENV);
+        }
+    }
+
+    /// The compiled step's region count for this model: one per conv layer,
+    /// two per attention layer, one head (doc/lfm3-launch-gap.md §1).
+    fn compiled_region_count(model: &Lfm3Model) -> usize {
+        let convs = model.kinds.iter().filter(|kind| kind.is_conv()).count();
+        convs + 2 * (model.kinds.len() - convs) + 1
+    }
+
+    /// C1 (pre-registration §9): the compiled decode arm emits the same token
+    /// ids as the eager pipelined baseline on 4 prompts × 128 tokens — the
+    /// §5.1 hard gate. The §5.2 retrace gate is asserted through the same
+    /// window: the armed arm traces exactly one profile per region on its
+    /// first request and then never retraces across positions or requests,
+    /// while the baseline arm never traces at all (see the 12:15 amendment
+    /// for what `trace_callbacks` actually counts).
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn c1_compiled_greedy_matches_eager_pipelined_token_for_token() -> Result<()> {
+        let prompts: Vec<Vec<u32>> = (0..4).map(|i| pseudo_prompt(24, 101 + i)).collect();
+        set_compiled_decode(false);
+        let mut model = load_checkpoint_model()?;
+        let stream = model.backend.stream().clone();
+        let mut expected = Vec::with_capacity(prompts.len());
+        for prompt in &prompts {
+            expected.push(run_greedy(&mut model, prompt, 128)?);
+        }
+        assert_eq!(
+            stream.counters().trace_callbacks,
+            0,
+            "baseline arm must never trace a compiled region"
+        );
+
+        let regions = compiled_region_count(&model);
+        set_compiled_decode(true);
+        for (index, prompt) in prompts.iter().enumerate() {
+            let before = stream.counters().trace_callbacks;
+            let got = run_greedy(&mut model, prompt, 128)?;
+            let delta = stream.counters().trace_callbacks - before;
+            assert_eq!(
+                got, expected[index],
+                "prompt {index}: compiled decode diverged from eager pipelined greedy"
+            );
+            if index == 0 {
+                assert_eq!(
+                    delta, regions,
+                    "first armed request: exactly one trace per region ({regions})"
+                );
+            } else {
+                assert_eq!(
+                    delta, 0,
+                    "armed request {index}: a retrace broke the no-retrace gate"
+                );
+            }
+        }
+        set_compiled_decode(false);
+        Ok(())
+    }
+
+    /// C2 (pre-registration §9): budget/EOS/cancel edges on the compiled arm
+    /// match the synchronous reference exactly (same scenarios as T2, with
+    /// the compiled step standing in for the eager pipelined step).
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn c2_compiled_budget_eos_and_cancel_boundaries_match_sync() -> Result<()> {
+        let prompt = pseudo_prompt(16, 7);
+        set_compiled_decode(false);
+        let mut model = load_checkpoint_model()?;
+
+        // Budget exhaustion: 1 and 8 tokens, sync vs compiled, same prompt.
+        for budget in [1usize, 8] {
+            set_sync_schedule(true);
+            let sync_ids = run_greedy(&mut model, &prompt, budget)?;
+            let sync_pos = model.position();
+            set_sync_schedule(false);
+            set_compiled_decode(true);
+            let compiled_ids = run_greedy(&mut model, &prompt, budget)?;
+            let compiled_pos = model.position();
+            set_compiled_decode(false);
+            assert_eq!(sync_ids, compiled_ids, "budget {budget}: published tokens");
+            assert_eq!(compiled_pos, sync_pos, "budget {budget}: final position");
+            assert_eq!(
+                sync_pos,
+                prompt.len() + sync_ids.len() - 1,
+                "budget {budget}: position must be P+N-1"
+            );
+        }
+
+        // First-token EOS on the compiled arm: the driver-side break after
+        // one publish must roll the lookahead step back to the prefill state.
+        let prompt_end = prompt.len() as u32;
+        set_compiled_decode(true);
+        model.reset();
+        model.prefill(LlmInput::text(&prompt))?;
+        let mut values = vec![-1e30f32; model.config.vocab_size];
+        values[124_894] = 1.0;
+        let synthetic = Array::from_f32(model.backend.stream(), &[1, values.len()], &values)?;
+        let mut seq = Box::new(GreedySequence::new(&mut model, synthetic, prompt_end)?);
+        let token = seq.next(true)?;
+        assert_eq!(token.token_id, 124_894, "synthetic EOS must be the first token");
+        seq.finish(1)?;
+        set_compiled_decode(false);
+        assert_eq!(
+            model.position(),
+            prompt.len(),
+            "first-token EOS must roll back to the prefill position"
+        );
+        let (kv, conv) = state_bytes(&model, model.position())?;
+        model.reset();
+        model.prepare(prompt.len(), 0)?;
+        model.prefill(LlmInput::text(&prompt))?;
+        let (kv_ref, conv_ref) = state_bytes(&model, model.position())?;
+        assert_eq!(kv, kv_ref, "first-token EOS: KV must equal prefill state");
+        assert_eq!(conv, conv_ref, "first-token EOS: conv must equal prefill state");
+
+        // Cancel right after the first publish: the lookahead decode is
+        // discarded and both arms agree on the published prefix.
+        let options = GenerationOptions::greedy(16, None);
+        set_sync_schedule(true);
+        let cancel_sync = GenerationCancellation::default();
+        let mut published_sync = Vec::new();
+        let cancel_flag = cancel_sync.clone();
+        model.generate_streaming_cancellable_dyn(
+            crate::llm_trait::GenerationRequest {
+                input: LlmInput::text(&prompt),
+                options: &options,
+            },
+            &cancel_sync,
+            &mut |token| {
+                published_sync.push(token.token_id);
+                cancel_flag.cancel();
+            },
+        )?;
+        let sync_pos = model.position();
+        set_sync_schedule(false);
+        set_compiled_decode(true);
+        let cancel_compiled = GenerationCancellation::default();
+        let mut published_compiled = Vec::new();
+        let cancel_flag = cancel_compiled.clone();
+        model.generate_streaming_cancellable_dyn(
+            crate::llm_trait::GenerationRequest {
+                input: LlmInput::text(&prompt),
+                options: &options,
+            },
+            &cancel_compiled,
+            &mut |token| {
+                published_compiled.push(token.token_id);
+                cancel_flag.cancel();
+            },
+        )?;
+        set_compiled_decode(false);
+        assert_eq!(published_compiled, published_sync, "cancel: published prefix");
+        assert_eq!(model.position(), sync_pos, "cancel: final position");
+        assert_eq!(
+            model.position(),
+            prompt.len() + published_compiled.len() - 1,
+            "cancel: position must be P+N-1"
+        );
+        Ok(())
+    }
+
+    /// C3 (pre-registration §9): after a compiled-arm run whose lookahead
+    /// step was rolled back, every KV row `[0, position)` and all conv
+    /// windows are byte-identical to the synchronous reference, and a
+    /// 16-token continuation matches (same shape as T3, compiled arm
+    /// standing in for the eager pipelined step).
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn c3_compiled_continuation_state_matches_sync_byte_for_byte() -> Result<()> {
+        let prompt = pseudo_prompt(24, 11);
+        let take = 12usize;
+        set_compiled_decode(true);
+        let mut compiled = load_checkpoint_model()?;
+        let published = drive_pipelined_prefix(&mut compiled, &prompt, take)?;
+        set_compiled_decode(false);
+        let position = compiled.position();
+        assert_eq!(
+            position,
+            prompt.len() + take - 1,
+            "rolled-back position must be P+N-1"
+        );
+        let (kv_compiled, conv_compiled) = state_bytes(&compiled, position)?;
+
+        let mut cont_compiled = Vec::new();
+        let mut prev = published[take - 1];
+        for _ in 0..16 {
+            let logits = compiled.forward(&[prev], compiled.position() as u32)?;
+            prev = greedy_from_logits(&compiled, &logits)?;
+            cont_compiled.push(prev);
+        }
+
+        let mut reference = load_checkpoint_model()?;
+        reference.prepare(prompt.len(), take + 16)?;
+        reference.prefill(LlmInput::text(&prompt))?;
+        for &token in &published[..take - 1] {
+            reference.forward(&[token], reference.position() as u32)?;
+        }
+        assert_eq!(reference.position(), position);
+        let (kv_ref, conv_ref) = state_bytes(&reference, position)?;
+        assert_eq!(
+            kv_compiled, kv_ref,
+            "KV rows [0, position) must match sync byte-for-byte"
+        );
+        assert_eq!(
+            conv_compiled, conv_ref,
+            "conv windows must match sync byte-for-byte after the rollback"
+        );
+
+        let mut cont_ref = Vec::new();
+        let mut prev = published[take - 1];
+        for _ in 0..16 {
+            let logits = reference.forward(&[prev], reference.position() as u32)?;
+            prev = greedy_from_logits(&reference, &logits)?;
+            cont_ref.push(prev);
+        }
+        assert_eq!(
+            cont_compiled, cont_ref,
+            "16-token continuation after the rollback must match sync"
+        );
+        Ok(())
+    }
+
+    /// C4 (pre-registration §9, negative control): a shape-mismatched call to
+    /// a prepared `Compiled` either retraces (visible in `trace_callbacks` —
+    /// the observable C1's flat-delta assertions rely on) or errors loudly.
+    /// Either outcome proves the no-retrace property is load-bearing and
+    /// observable; a silent success with a flat counter would invalidate
+    /// the census.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock"]
+    fn c4_compiled_shape_mismatch_retraces_or_fails_loudly() -> Result<()> {
+        let stream = Stream::metal(0)?;
+        let compiled = Compiled::new(&stream, 1, |inputs| Ok(vec![inputs[0].mul(&inputs[1])?]))?;
+        let a4 = Array::from_f32(&stream, &[4], &[1., 2., 3., 4.])?;
+        compiled.prepare_timed(&[a4.clone(), a4.clone()])?;
+        let before = stream.counters().trace_callbacks;
+        let a8 = Array::from_f32(&stream, &[8], &[1., 2., 3., 4., 5., 6., 7., 8.])?;
+        match compiled.call(&[a8.clone(), a8.clone()]) {
+            Ok(_) => {
+                let delta = stream.counters().trace_callbacks - before;
+                assert!(
+                    delta > 0,
+                    "shape-mismatched call retraced nothing and did not fail — the retrace observable is broken"
+                );
+            }
+            Err(error) => {
+                eprintln!("shape-mismatched call failed loudly (acceptable): {error}");
+            }
+        }
+        // A shape-matched replay retraces nothing.
+        let before = stream.counters().trace_callbacks;
+        let _ = compiled.call(&[a4.clone(), a4.clone()])?;
+        assert_eq!(
+            stream.counters().trace_callbacks - before,
+            0,
+            "shape-matched replay must not retrace"
+        );
         Ok(())
     }
 

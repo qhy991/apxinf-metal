@@ -547,17 +547,23 @@ fn run(args: Args) -> Result<()> {
     // truthfully reports whether the worker was launched with the switch
     // (empty-arm gate — an unset switch must print false, not claim a run).
     let native_4bit = std::env::var_os("APXINF_LFM3_4BIT").is_some_and(|v| v == "1");
+    // Launch-gap harvest (doc/lfm3-launch-gap.md §1): same env source as
+    // `compiled_decode_enabled()`, so an armed segment without
+    // `decode_compiled=true` is void (the empty-arm trap).
+    let decode_compiled =
+        std::env::var_os("APXINF_LFM3_COMPILED_DECODE").is_some_and(|v| v == "1");
     // QUEUE #6: the same env source the dispatcher will read. Unset or invalid
     // resolves to 1 so the empty-arm baseline can never claim a batched run;
     // the banner's `batch=<B>` field is the §6.3 effect proof for a window.
     let batch = batch_size();
     eprintln!(
-        "decode_schedule={} overlaps_callbacks={} decode_stages={} prefill_fast={} native_4bit={} batch={}",
+        "decode_schedule={} overlaps_callbacks={} decode_stages={} prefill_fast={} native_4bit={} decode_compiled={} batch={}",
         if sync_decode { "sync" } else { "pipelined" },
         if sync_decode { "false" } else { "true" },
         if decode_stages { "true" } else { "false" },
         if prefill_fast { "true" } else { "false" },
         if native_4bit { "true" } else { "false" },
+        if decode_compiled { "true" } else { "false" },
         batch,
     );
     // QUEUE #7: banner printed → identity/manifest work begins.
