@@ -26,7 +26,7 @@
 #   103 WINDOW BLOCKED (probe binary not built / not executable)
 #   104 WINDOW INVALID (llama server failed to become ready, or T1 request error)
 set -uo pipefail
-export PATH=$HOME/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin
+export PATH=$HOME/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
 export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
 export MLX_ROOT=$HOME/mlx-sdk
 export DYLD_LIBRARY_PATH=$MLX_ROOT/lib
