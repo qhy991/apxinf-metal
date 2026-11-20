@@ -160,12 +160,16 @@ out = {"bytes": N, "warmup": WARMUP, "rounds": ROUNDS, "device": str(mx.default_
        "mlx_version": md.version("mlx"), "copy": [], "reduce": []}
 
 def timed(fn, rounds, bucket):
+    # MLX submits GPU work asynchronously; the host clock must be fenced by an
+    # explicit synchronize on both sides or it only measures launch cost
+    # (round-110 INVALID: a 0.002 ms "1 GiB" window implying 1.7e6 GB/s).
     for _ in range(WARMUP):
-        fn(); mx.eval()
+        mx.synchronize(); fn(); mx.eval()
     for _ in range(rounds):
         mx.clear_cache()
+        mx.synchronize()
         t0 = time.perf_counter()
-        fn(); mx.eval()
+        fn(); mx.eval(); mx.synchronize()
         out[bucket].append({"ms": (time.perf_counter() - t0) * 1e3})
 
 timed(lambda: mx.add(a, b, stream=mx.gpu), ROUNDS, "copy")   # read 2x1GiB, write 1GiB
@@ -192,12 +196,27 @@ def run_a1(res: Path) -> dict:
         _dump(res, "a1-error.json", {"stderr": proc.stderr[-4000:], "rc": proc.returncode})
         raise RuntimeError(f"A1 failed: {proc.stderr[-500:]!r}")
     payload = json.loads(proc.stdout.strip().splitlines()[-1])
-    payload["valid"] = payload["copy_spread_frac"] <= 0.05 and payload["reduce_spread_frac"] <= 0.05
+    # Dimension sanity: an un-synchronised host window only measures async launch
+    # cost, which inflates GB/s into the millions (round-110 INVALID). M1 Pro
+    # LPDDR5 peaks far below 500 GB/s, so any reading above that is physically
+    # impossible and the cell is void regardless of its spread.
+    BW_SANITY_GBPS = 500.0
+    sanity = (payload["copy_median_gbps"] <= BW_SANITY_GBPS
+              and payload["reduce_median_gbps"] <= BW_SANITY_GBPS)
+    payload["bw_sanity_ok"] = sanity
+    payload["valid"] = (sanity
+                        and payload["copy_spread_frac"] <= 0.05
+                        and payload["reduce_spread_frac"] <= 0.05)
+    if not sanity:
+        payload["invalid_reason"] = (
+            f"bandwidth exceeds physical sanity bound {BW_SANITY_GBPS} GB/s "
+            f"(copy={payload['copy_median_gbps']}, reduce={payload['reduce_median_gbps']})")
     _dump(res, "a1.json", payload)
     _log(res, f"A1 copy_median_gbps={payload['copy_median_gbps']:.2f} "
               f"spread_frac={payload['copy_spread_frac']:.4f} "
               f"reduce_median_gbps={payload['reduce_median_gbps']:.2f} "
-              f"spread_frac={payload['reduce_spread_frac']:.4f} valid={payload['valid']}")
+              f"spread_frac={payload['reduce_spread_frac']:.4f} "
+              f"bw_sanity_ok={sanity} valid={payload['valid']}")
     return payload
 
 
@@ -218,38 +237,33 @@ a = p.parse_args()
 
 import mlx.core as mx
 from mlx_lm.utils import load_model, load_tokenizer
+from mlx_lm.models.cache import make_prompt_cache
 import importlib.metadata as md
 
-tok = load_tokenizer(Path(a.model))
-# txids = [int(x) for x in Path(a.token_ids).read_text().split(",")]
-# print(json.dumps({"backend":"mlx-lm load_model","model":a.model,"tx":len(txids)}), file=sys.stderr)
-# model = load_model(Path(a.model), lazy=True)
-# logits = model(mx.array([txids]))
-# mx.eval(logits)
-# next_id = int(mx.argmax(logits[0, -1]).item())
-# steps = []
-# for _ in range(a.steps):
-#     t0 = time.perf_counter()
-#     logits = model(mx.array([[next_id]]))
-#     mx.eval(logits)
-#     steps.append((time.perf_counter() - t0) * 1e3)
-#     next_id = int(mx.argmax(logits[0, -1]).item())
-# print(json.dumps({"step_ms": steps, "median": statistics.median(steps)}))
-# (chunk kept in history for audit; active path below)
-model = load_model(Path(a.model), lazy=True)
+# trust_remote_code: the LFM3 snapshot ships its own tokenizer; without it the
+# transformers backend refuses the custom code prompt.
+tok = load_tokenizer(Path(a.model), {"trust_remote_code": True})
+model, _ = load_model(Path(a.model), lazy=True)
 txids = [int(x) for x in Path(a.token_ids).read_text().split(",")]
-logits = model(mx.array([txids]))
+# Pre-fill the KV cache with the whole prompt. The previous implementation
+# recomputed the full prefix on every step (no cache), so the reference arm's
+# step_ms climbed with ctx and could not be compared with the lane's steady-state
+# decode ledger (round-110 INVALID).
+cache = make_prompt_cache(model)
+logits = model(mx.array([txids]), cache=cache)
 mx.eval(logits)
 next_id = int(mx.argmax(logits[0, -1]).item())
 steps = []
 for _ in range(a.steps):
+    mx.synchronize()
     t0 = time.perf_counter()
-    logits = model(mx.array([[next_id]]))
-    mx.eval(logits)
+    logits = model(mx.array([[next_id]]), cache=cache)
+    mx.eval(logits); mx.synchronize()
     steps.append((time.perf_counter() - t0) * 1e3)
     next_id = int(mx.argmax(logits[0, -1]).item())
 print(json.dumps({"step_ms": steps, "median": statistics.median(steps),
-                  "mlx": md.version("mlx"), "backend": "mlx_lm.load_model"}))
+                  "mlx": md.version("mlx"), "backend": "mlx_lm.load_model",
+                  "cache_tokens": len(txids)}))
 """
 
 
@@ -263,30 +277,34 @@ p.add_argument("--chunk", type=int, default=512)
 a = p.parse_args()
 import mlx.core as mx
 from mlx_lm.utils import load_model, load_tokenizer
+from mlx_lm.models.cache import make_prompt_cache
 import importlib.metadata as md
-tok = load_tokenizer(Path(a.model))
-model = load_model(Path(a.model), lazy=True)
+tok = load_tokenizer(Path(a.model), {"trust_remote_code": True})
+model, _ = load_model(Path(a.model), lazy=True)
 txids = [int(x) for x in sys.stdin.read().split(",") if x.strip()]
 if not txids:
     print(json.dumps({"error": "no tokens"})); sys.exit(3)
+cache = make_prompt_cache(model)
 logits = None
-# chunked prefill: feed the full prompt in fixed-size windows; each call's argmax
-# is the token the model would emit after that window; final argmax is the
-# steady-state seed. No cross-prompt cache state.
+# chunked prefill into a persistent KV cache: each window appends to the cache
+# instead of recomputing the prefix, so the final argmax is the steady-state
+# seed after the full prompt and decode steps stay O(1) per token (round-110).
 for start in range(0, len(txids), a.chunk):
     chunk = txids[start:start + a.chunk]
-    logits = model(mx.array([chunk]))
+    logits = model(mx.array([chunk]), cache=cache)
     mx.eval(logits)
 next_id = int(mx.argmax(logits[0, -1]).item())
 steps = []
 for _ in range(a.steps):
+    mx.synchronize()
     t0 = time.perf_counter()
-    logits = model(mx.array([[next_id]]))
-    mx.eval(logits)
+    logits = model(mx.array([[next_id]]), cache=cache)
+    mx.eval(logits); mx.synchronize()
     steps.append((time.perf_counter() - t0) * 1e3)
     next_id = int(mx.argmax(logits[0, -1]).item())
 print(json.dumps({"step_ms": steps, "median": statistics.median(steps),
-                  "mlx": md.version("mlx"), "backend": "mlx_lm.load_model"}))
+                  "mlx": md.version("mlx"), "backend": "mlx_lm.load_model",
+                  "cache_tokens": len(txids)}))
 """
 
 
@@ -455,7 +473,10 @@ def run_a2(res: Path, ctxs: tuple[int, ...]) -> dict:
     if not lx_model.is_dir():
         lx_model = None
     for ctx in ctxs:
-        n_fill = max(16, ctx - 64)  # reserve room for the template wrapper
+        # Reserve GEN tokens of headroom plus the ChatML wrapper (measured:
+        # ~15-30 tokens for system+user+ round-110 32k prompt reached 32732 and
+        # exceeded the 32768 max-context once GEN=128 was decoded).
+        n_fill = max(16, ctx - GEN - 64)
         for rep in range(REPEATS):
             ids = _filler_tokens(res, n_fill + 8)
             tx = _txfile(res, f"ctx{ctx}-r{rep}", ids)
@@ -554,7 +575,7 @@ def run_a3(res: Path) -> dict:
             trace_dir.mkdir(exist_ok=True)
             cmd = ["/usr/bin/xctrace", "record", "--template", "Metal System Trace",
                    "--output", str(trace_path), "--time-limit", "60s",
-                   "--attach", str(lane.proc.pid), "--non-interactive"]
+                   "--attach", str(lane.proc.pid), "--no-prompt"]
             # xctrace attach needs the target alive and (usually) a host that
             # allows task_for_pid; if it fails we fall back below.
             proc = subprocess.Popen(cmd, stdout=(res / "a3-xctrace.log").open("w"),
@@ -651,9 +672,11 @@ PREFILL_AB_SRC = r"""
 import argparse, json, statistics, sys, time
 from pathlib import Path
 p = argparse.ArgumentParser()
+p.add_argument("--root", required=True)
 p.add_argument("--model", required=True); p.add_argument("--quant", required=True)
 p.add_argument("--tokens", required=True); p.add_argument("--repeats", type=int, default=3)
 a = p.parse_args()
+sys.path.insert(0, a.root)
 import mlx.core as mx
 from enginetailor.models.lfm3.runtime import Engine
 ids = [int(x) for x in Path(a.tokens).read_text().split(",") if x]
@@ -679,7 +702,8 @@ def run_prefill_ab(res: Path, tokens_n: int = 2048) -> dict:
     rows = {}
     for tag, model, quant in (("packed4", PACKED4, "packed4"), ("bf16", BF16, "none")):
         proc = _run([str(LANE_VENV / "bin/python"), "-I", "-c", PREFILL_AB_SRC,
-                     "--model", str(model), "--quant", quant, "--tokens", str(tx),
+                     "--root", str(ENGINE_ROOT), "--model", str(model),
+                     "--quant", quant, "--tokens", str(tx),
                      "--repeats", str(REPEATS)], env=env, timeout=1200)
         (res / f"prefill-{tag}-stderr.log").open("w").write(proc.stderr[-3000:])
         payload = None
@@ -788,11 +812,21 @@ def run_window(res: Path, ctxs: tuple[int, ...]) -> int:
             "started": _now(), "machine": machine, "ctxs": list(ctxs),
             "duration_s": time.time() - t0, "results": results,
         })
+        # A step that completed without raising can still return invalid data
+        # (error-free-but-invalid: round-110 reported OUTCOME COMPLETE + exit 0
+        # while all four results had valid=False). Judge on valid, not only on
+        # the exception path.
         failures = [name for name, row in results.items() if row.get("error")]
-        if failures:
-            _log(res, f"OUTCOME: INVALID_PARTIAL failed={failures}")
+        invalid = [name for name, row in results.items()
+                   if not row.get("error") and row.get("valid") is not True]
+        if failures or invalid:
+            if failures and invalid:
+                note = f"failed={failures} invalid={invalid}"
+            else:
+                note = f"failed={failures}" if failures else f"invalid={invalid}"
+            _log(res, f"OUTCOME: INVALID_PARTIAL {note}")
             _log(res, f"window done duration_s={time.time() - t0:.1f}")
-            return 102  # WINDOW_PARTIAL: a partial window must not exit 0.
+            return 102  # WINDOW_PARTIAL: a partial/invalid window must not exit 0.
         _log(res, f"OUTCOME: COMPLETE")
         _log(res, f"window done duration_s={time.time() - t0:.1f}")
         return 0
