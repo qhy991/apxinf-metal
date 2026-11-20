@@ -4,6 +4,35 @@ Date: 2026-11-20. Host: M4 (Mac16,10), 16 GiB. Model: LFM3-1.7B BF16 snapshot
 (flattened local copy, no `parts/`). Binary: `apxinf-serve` + `apxinf-native-worker`,
 release, built from `feat/lfm3-q4-decode`.
 
+## CORRECTION (2026-11-20, after PR #144)
+
+**The mechanism section below is wrong and is kept only as history.** PR #144
+measured the same fused kernel properly and found:
+
+- MLX's M=1 `quantized_matmul` is **already a fused qmv** (register dequantise),
+  so this receipt's premise -- that the kernel removes a dequantise step -- does
+  not hold;
+- end-to-end the fused kernel is **9.2% SLOWER**, not faster: +38% on ffn.w2
+  (K=7680), **-10% on lm_head (N=128000)**, and slightly behind on the K=2048
+  family that carries ~81% of the bytes;
+- QUEUE #8 already measured qmm at **87.7% of roofline** on M4 (11.1 vs a 9.67 ms
+  floor), consistent with there having never been room here;
+- the token gate fails 1 of 3 greedy prompts (BF16-ulp boundary flips).
+
+**What survives:** the parity result. The A/B below compared the fused GEMV
+against **BF16 dense**, not against `quantized_matmul`; on that comparison both
+arms sit at 37.7 ms/token, and that remains a true statement.
+
+**What was wrong:** the sentence claiming the kernel "removes
+quantized_matmul's dequantise overhead (43.0-44.2 -> 37.7)". That 43.0 -> 37.7
+change was **the measurement method** (60 tokens with thinking noise versus 200
+tokens with a closed thinking block), not the kernel. Comparing across those two
+methods was the error, and the correct comparison (#144's) finds the opposite
+sign.
+
+**Do not reuse this kernel.** #144 carries the measured, token-gated, opt-in
+implementation and the roofline evidence.
+
 ## Method
 
 Client wall via `/v1/chat/completions`, one prompt, `max_tokens=200`,
