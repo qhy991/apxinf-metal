@@ -532,3 +532,27 @@ fn python_kv_options_clamp_the_offset_to_the_launch_context() {
     config.quantized_kv_start = 2_000;
     assert_eq!(python_kv_options(&config), Some((8, 2_000)));
 }
+
+#[test]
+fn queue_batch_size_fails_closed_on_unarmed_or_over_ceiling_values() {
+    let mut config = configuration(4 * 1024 * 1024, 1024);
+    assert_eq!(queue_batch_size(&config), 1, "unset must stay at the baseline");
+    for (value, expected) in [
+        ("1", 1),
+        ("2", 2),
+        ("4", 4),
+        ("8", 8),
+        ("9", 1),
+        ("0", 1),
+        ("abc", 1),
+    ] {
+        config.worker_env = vec![("APXINF_LFM3_BATCH".into(), value.into())];
+        assert_eq!(
+            queue_batch_size(&config),
+            expected,
+            "APXINF_LFM3_BATCH={value} must resolve to {expected}"
+        );
+    }
+    config.worker_env = vec![("APXINF_MLX_SYNC_DECODE".into(), "1".into())];
+    assert_eq!(queue_batch_size(&config), 1, "an unrelated key must not widen the pop bound");
+}

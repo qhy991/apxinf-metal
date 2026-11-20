@@ -18,6 +18,9 @@ MAX_DEPTH = 16
 MAX_COMMANDS = 10_000
 MAX_PROMPT_TOKENS = 131_072
 MAX_OUTPUT_TOKENS = 65_536
+# KEEP IN SYNC with contracts.rs::MAX_ACTIVE_SEQUENCES (QUEUE #6): the
+# largest batch size the wire contract accepts (pre-registered B = 1/2/4/8).
+MAX_ACTIVE_SEQUENCES = 8
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -328,7 +331,8 @@ def _capabilities(value: Any, native: bool = False, sampled: bool = False) -> No
         _require(type(value[name]) is bool and value[name] is expected, "unsupported serial capability")
     cancellation = {"token_or_prefill_chunk"} if sampled else ({"end_prefill_or_token", "token_or_prefill_chunk"} if native else {"token", "token_or_prefill_chunk"})
     _enum(value["cancel_granularity"], cancellation)
-    _int(value["max_active_sequences"], 1, 1)
+    # KEEP IN SYNC with contracts.rs::MAX_ACTIVE_SEQUENCES.
+    _int(value["max_active_sequences"], 1, MAX_ACTIVE_SEQUENCES)
     context_limit = (16384 if value["cancel_granularity"] == "token_or_prefill_chunk" else 4096) if native else MAX_PROMPT_TOKENS
     _int(value["max_context"], 1, context_limit)
     _int(value["max_output_tokens"], 0, MAX_OUTPUT_TOKENS)

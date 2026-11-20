@@ -32,6 +32,11 @@ pub const MAX_DEPTH: usize = 16;
 pub const MAX_COMMANDS: u64 = 10_000;
 pub const MAX_PROMPT_TOKENS: u64 = 131_072;
 pub const MAX_OUTPUT_TOKENS: u64 = 65_536;
+/// QUEUE #6: largest batch size the wire contract accepts. Mirrors the
+/// pre-registered cells (B = 1/2/4/8) so a worker cannot claim a wider
+/// dispatch window than the campaign certifies; the Python mirror in
+/// `apxinf.serving.contracts` must keep this value in sync.
+pub const MAX_ACTIVE_SEQUENCES: u64 = 8;
 pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const BASE: &[&str] = &["protocol", "kind", "worker_epoch"];
 const COMMAND: &[&str] = &["protocol", "kind", "worker_epoch", "command_id"];
@@ -431,7 +436,7 @@ fn capabilities(value: &Value, native: bool, sampled: bool) -> Result<()> {
             &["token", "token_or_prefill_chunk"]
         },
     )?;
-    integer(&value["max_active_sequences"], 1, 1)?;
+    integer(&value["max_active_sequences"], 1, MAX_ACTIVE_SEQUENCES)?;
     integer(
         &value["max_context"],
         1,

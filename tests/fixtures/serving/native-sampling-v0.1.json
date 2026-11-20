@@ -98,7 +98,7 @@
     {"name": "sampling_capability_boolean", "template": "ready", "set": {"/capabilities/sampling": 1}, "refresh_identity": true, "valid": false},
     {"name": "sampled_requires_chunk_cancel", "template": "ready", "set": {"/capabilities/cancel_granularity": "end_prefill_or_token"}, "refresh_identity": true, "valid": false},
     {"name": "sampled_context_bounded", "template": "ready", "set": {"/capabilities/max_context": 16385}, "refresh_identity": true, "valid": false},
-    {"name": "sampled_requires_serial_capacity", "template": "ready", "set": {"/capabilities/max_active_sequences": 2}, "refresh_identity": true, "valid": false},
+    {"name": "batch_capacity_advertised", "template": "ready", "set": {"/capabilities/max_active_sequences": 2}, "refresh_identity": true, "valid": true},
     {"name": "native_kind_required", "template": "ready", "set": {"/runtime/kind": "python"}, "refresh_identity": true, "valid": false},
     {"name": "native_version_required", "template": "ready", "set": {"/runtime/mlx": "0.31.3", "/model_manifest/runtime/mlx": "0.31.3"}, "refresh_identity": true, "valid": false},
     {"name": "native_executable_digest_required", "template": "ready", "set": {"/runtime/executable_sha256": "invalid", "/model_manifest/runtime/executable_sha256": "invalid"}, "refresh_identity": true, "valid": false},

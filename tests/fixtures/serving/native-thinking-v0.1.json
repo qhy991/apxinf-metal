@@ -124,7 +124,7 @@
     {"name": "sampling_capability_required", "template": "ready", "set": {"/capabilities/sampling": false}, "refresh_identity": true, "valid": false},
     {"name": "chunk_cancel_required", "template": "ready", "set": {"/capabilities/cancel_granularity": "end_prefill_or_token"}, "refresh_identity": true, "valid": false},
     {"name": "native_context_limit", "template": "ready", "set": {"/capabilities/max_context": 16385}, "refresh_identity": true, "valid": false},
-    {"name": "serial_capacity_required", "template": "ready", "set": {"/capabilities/max_active_sequences": 2}, "refresh_identity": true, "valid": false},
+    {"name": "batch_capacity_advertised", "template": "ready", "set": {"/capabilities/max_active_sequences": 2}, "refresh_identity": true, "valid": true},
     {"name": "runtime_identity_mismatch", "template": "ready", "set": {"/runtime/metal_library_sha256": "5555555555555555555555555555555555555555555555555555555555555555"}, "valid": false},
     {"name": "old_sampled_rejects_thinking_identity", "template": "ready", "set": {"/protocol": "apxinf-worker/2.2"}, "valid": false},
     {"name": "old_native_rejects_thinking_ready", "template": "ready", "set": {"/protocol": "apxinf-worker/2.1"}, "valid": false},

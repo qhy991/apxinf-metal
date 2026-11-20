@@ -326,7 +326,7 @@ async fn ready(State(service): State<Arc<Service>>) -> Response {
         crate::output::OutputProfile::MiniCpm5 => "minicpm5_xml",
         crate::output::OutputProfile::Qwen => "qwen_xml_or_json",
     };
-    let mut body = json!({"ready":status==StatusCode::OK,"worker_available":worker_available,"host_pressure":host_pressure,"model":service.model_id,"worker":service.ready_snapshot(),"profile":public_profile(&service),"public_capabilities":{"anthropic_messages":true,"openai_chat_completions":true,"tools":tools,"tool_choice":["auto","none"],"thinking":false,"sampling":sampled,"images":false,"sessions":false,"batching":false,"prompt_cache":false,"output_effort":"advisory_only"}});
+    let mut body = json!({"ready":status==StatusCode::OK,"worker_available":worker_available,"host_pressure":host_pressure,"model":service.model_id,"worker":service.ready_snapshot(),"profile":public_profile(&service),"public_capabilities":{"anthropic_messages":true,"openai_chat_completions":true,"tools":tools,"tool_choice":["auto","none"],"thinking":false,"sampling":sampled,"images":false,"sessions":false,"batching":service.batching_enabled(),"prompt_cache":false,"output_effort":"advisory_only"}});
     if service.image_enabled() {
         body["public_capabilities"]["images"] = json!(true);
         body["public_capabilities"]["image_input_restriction"] =
@@ -1512,6 +1512,31 @@ mod tests {
         assert_eq!(body["public_capabilities"]["tools"], "minicpm5_xml");
         assert_eq!(body["public_capabilities"]["thinking"], false);
         service.shutdown();
+    }
+
+    #[tokio::test]
+    async fn readiness_advertises_batching_only_when_both_sides_agree() {
+        let (service, _) = crate::supervisor::gateway_test_service_with_batch(2, 2);
+        let response = ready(State(service.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 10000).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["public_capabilities"]["batching"], true);
+        service.shutdown();
+
+        for (batch, advertised) in [(2, 1), (1, 1)] {
+            let (service, _) = crate::supervisor::gateway_test_service_with_batch(batch, advertised);
+            let response = ready(State(service.clone())).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 10000).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["public_capabilities"]["batching"],
+                false,
+                "batch={batch} advertised={advertised} must stay fail-closed"
+            );
+            service.shutdown();
+        }
     }
 
     #[tokio::test]

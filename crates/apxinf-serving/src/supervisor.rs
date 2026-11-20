@@ -652,6 +652,15 @@ impl Service {
         self.ready["protocol"] == contracts::VISION_PROTOCOL
     }
 
+    /// QUEUE #6: whether the gateway may advertise batched admission. True
+    /// only when the declared pop bound and the worker's own `max_active_sequences`
+    /// agree on a value above 1; vision, Clef and python workers still advertise
+    /// 1, so an over-declared switch cannot claim batching.
+    pub(crate) fn batching_enabled(&self) -> bool {
+        self.batch_size > 1
+            && self.ready["capabilities"]["max_active_sequences"] == self.batch_size as u64
+    }
+
     /// Run one forced-decode replay and return the worker's result frame.
     ///
     /// Replay shares the single worker lane, so it is serialized with chat
@@ -1909,18 +1918,18 @@ where
 }
 
 /// QUEUE #6: dispatcher pop bound. Mirrors the native worker's
-/// `APXINF_LFM3_BATCH` resolution (unset, non-numeric or zero ⇒ 1) so a
-/// launch without the declared switch cannot silently widen the pop window.
-/// The worker's environment is cleared at launch, so the switch is read from
-/// the declared `--worker-env` entries — the only source that reaches the
-/// worker's banner.
+/// `APXINF_LFM3_BATCH` resolution (unset, non-numeric, zero or above the
+/// pre-registered ceiling ⇒ 1) so a launch without the declared switch cannot
+/// silently widen the pop window. The worker's environment is cleared at
+/// launch, so the switch is read from the declared `--worker-env` entries —
+/// the only source that reaches the worker's banner.
 fn queue_batch_size(config: &Config) -> usize {
     config
         .worker_env
         .iter()
         .find(|(key, _)| key == "APXINF_LFM3_BATCH")
         .and_then(|(_, value)| value.parse::<usize>().ok())
-        .filter(|batch| *batch >= 1)
+        .filter(|batch| (1..=contracts::MAX_ACTIVE_SEQUENCES as usize).contains(batch))
         .unwrap_or(1)
 }
 
@@ -3179,6 +3188,7 @@ fn gateway_test_service_config(
         pressure,
         protocol,
         json!({"max_context":4096,"max_output_tokens":1024}),
+        1,
     )
 }
 
@@ -3190,6 +3200,23 @@ pub(crate) fn gateway_test_service_with_max_output(
         Arc::new(HostPressure::new(HostPressurePolicy::Disabled)),
         PROTOCOL,
         json!({"max_context":4096,"max_output_tokens":max_output}),
+        1,
+    )
+}
+
+/// QUEUE #6: a native test service whose declared pop bound and worker
+/// `max_active_sequences` can be set independently, so gateway tests can
+/// exercise both the agreeing and the fail-closed disagreement cases.
+#[cfg(test)]
+pub(crate) fn gateway_test_service_with_batch(
+    batch_size: usize,
+    max_active_sequences: u64,
+) -> (Arc<Service>, mpsc::UnboundedReceiver<Request>) {
+    gateway_test_service_capabilities(
+        Arc::new(HostPressure::new(HostPressurePolicy::Disabled)),
+        contracts::NATIVE_PROTOCOL,
+        json!({"max_context":4096,"max_output_tokens":1024,"max_active_sequences":max_active_sequences}),
+        batch_size,
     )
 }
 
@@ -3198,6 +3225,7 @@ fn gateway_test_service_capabilities(
     pressure: Arc<HostPressure>,
     protocol: &str,
     mut capabilities: Value,
+    batch_size: usize,
 ) -> (Arc<Service>, mpsc::UnboundedReceiver<Request>) {
     let (observed, requests) = mpsc::unbounded_channel();
     if protocol == contracts::VISION_PROTOCOL {
@@ -3230,7 +3258,7 @@ fn gateway_test_service_capabilities(
         metrics: Metrics::default(),
         timeout: Duration::from_secs(1),
         memory_budget: 1024,
-        batch_size: 1,
+        batch_size,
         restart: RestartPolicy::immediate(3),
         #[cfg(test)]
         unconfirmed_reaping: AtomicBool::new(false),

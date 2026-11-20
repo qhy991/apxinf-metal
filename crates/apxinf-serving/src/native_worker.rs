@@ -445,15 +445,15 @@ fn error(code: &str, message: &str) -> Value {
     json!({"code":code,"message":message,"scope":"request","state_validity":"none"})
 }
 
-/// QUEUE #6: batch size armed by `APXINF_LFM3_BATCH`. Unset, non-numeric or
-/// zero resolve to 1 (the single-request baseline), so an empty-arm launch
-/// never claims a batched run. Called once at construction; the banner and the
-/// dispatcher must use this same source.
+/// QUEUE #6: batch size armed by `APXINF_LFM3_BATCH`. Unset, non-numeric,
+/// zero or a value above the pre-registered ceiling (8) resolve to 1, so an
+/// empty-arm launch never claims a batched run and the banner, the dispatcher
+/// pop bound and `max_active_sequences` cannot drift apart.
 fn batch_size() -> usize {
     std::env::var("APXINF_LFM3_BATCH")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .filter(|batch| *batch >= 1)
+        .filter(|batch| (1..=contracts::MAX_ACTIVE_SEQUENCES as usize).contains(batch))
         .unwrap_or(1)
 }
 
@@ -625,7 +625,7 @@ fn run(args: Args) -> Result<()> {
     let model_revision =
         contracts::canonical_identity_digest("apxinf-model-identity-v1", &manifest)?;
     let capabilities = json!({"text":true,"image":false,"greedy":true,"sampling":profile.sampling(),"token_events":true,
-        "cancel_granularity":"token_or_prefill_chunk","max_active_sequences":1,"max_context":args.max_context,
+        "cancel_granularity":"token_or_prefill_chunk","max_active_sequences":batch,"max_context":args.max_context,
         "max_output_tokens":args.max_output_tokens,"exact_append":false,"state_schema":"none"});
     let capability_revision =
         contracts::canonical_identity_digest("apxinf-capability-v1", &capabilities)?;
@@ -1500,7 +1500,15 @@ mod tests {
             1,
             "An unset switch must stay on the single-request baseline (empty-arm gate)."
         );
-        for (value, expected) in [("1", 1), ("2", 2), ("4", 4), ("8", 8), ("0", 1), ("abc", 1)] {
+        for (value, expected) in [
+            ("1", 1),
+            ("2", 2),
+            ("4", 4),
+            ("8", 8),
+            ("9", 1),
+            ("0", 1),
+            ("abc", 1),
+        ] {
             std::env::set_var(BATCH_ENV, value);
             assert_eq!(
                 batch_size(),

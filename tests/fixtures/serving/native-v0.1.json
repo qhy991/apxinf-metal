@@ -23,6 +23,9 @@
     {"name": "earlier native profile", "set": {"/capabilities/cancel_granularity": "end_prefill_or_token", "/capabilities/max_context": 4096}, "valid": true},
     {"name": "earlier native context overflow", "set": {"/capabilities/cancel_granularity": "end_prefill_or_token", "/capabilities/max_context": 4097}, "valid": false},
     {"name": "unsupported cancellation claim", "set": {"/capabilities/cancel_granularity": "token"}, "valid": false},
-    {"name": "unqualified sampling", "set": {"/capabilities/sampling": true}, "valid": false}
+    {"name": "unqualified sampling", "set": {"/capabilities/sampling": true}, "valid": false},
+    {"name": "batch capacity boundary", "set": {"/capabilities/max_active_sequences": 8}, "valid": true},
+    {"name": "batch capacity below range", "set": {"/capabilities/max_active_sequences": 0}, "valid": false},
+    {"name": "batch capacity above ceiling", "set": {"/capabilities/max_active_sequences": 9}, "valid": false}
   ]
 }
