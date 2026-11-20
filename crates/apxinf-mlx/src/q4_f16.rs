@@ -184,6 +184,81 @@ impl Q4TransposeDecode {
 /// BF16 scales and biases `[N, K / 64]`) into row-major FP16 `[N, K]`, one
 /// packed word per thread: `scale * q + bias` in FP16 with the scale and bias
 /// rounded to FP16 first, the expression of MLX `dequantize` with FP16 scales.
+/// Fused affine-Q4 (group 64) GEMV for M=1 decode: `x` BF16 `[1, K]`, packed
+/// weight U32 `[N, K/8]`, BF16 `scales`/`biases` `[N, K/64]` -> BF16 `[1, N]`.
+/// The weights are dequantised in registers, so no `[N, K]` expansion is ever
+/// materialised; the row width is a compile-time constant because the Metal
+/// source substitutes it.
+pub struct Q4GemvBf16 {
+    kernel: MetalKernel,
+    k: usize,
+}
+
+impl Q4GemvBf16 {
+    pub fn new(stream: &Stream, k: usize) -> Result<Self> {
+        if k == 0 || k % 2048 != 0 {
+            return Err(Error::Contract("Q4 GEMV row width must be a positive multiple of 2048"));
+        }
+        let source = include_str!("../native/q4_gemv_bf16.metal")
+            .replace("K_PLACEHOLDER", &k.to_string());
+        Ok(Self {
+            kernel: MetalKernel::new(
+                stream,
+                "apxinf_q4g64_gemv_bf16",
+                &["x", "weight", "scales", "biases"],
+                &["out"],
+                &source,
+                "",
+            )?,
+            k,
+        })
+    }
+
+    pub fn call(
+        &self,
+        x: &Array,
+        weight: &Array,
+        scales: &Array,
+        biases: &Array,
+    ) -> Result<Array> {
+        let k = self.k;
+        let [one, kx] = *x.shape() else {
+            return Err(Error::Contract("Q4 GEMV input must be rank 2"));
+        };
+        let [rows, words] = *weight.shape() else {
+            return Err(Error::Contract("Q4 GEMV weight must be rank 2"));
+        };
+        if one != 1 || kx != k {
+            return Err(Error::Contract("Q4 GEMV input must be [1, K]"));
+        }
+        if words * 8 != k {
+            return Err(Error::Contract("Q4 GEMV packed width must be K/8"));
+        }
+        if weight.dtype() != MlxDType::U32
+            || [scales, biases]
+                .iter()
+                .any(|a| a.shape() != [rows, k / 64] || a.dtype() != MlxDType::BF16)
+        {
+            return Err(Error::Contract(
+                "Q4 GEMV requires U32 [N, K/8] with BF16 [N, K/64] scales and biases",
+            ));
+        }
+        check_index_extent(rows, k, u32::MAX as usize, "Q4 GEMV index exceeds u32")?;
+        // SAFETY: one 32-lane threadgroup per output row `r < N`; lane reads groups
+        // `lane + 32 t < K/64`, words `8 g .. 8 g + 8 < K/8` and inputs `64 g .. 64 g + 64 < K`.
+        let out = unsafe {
+            self.kernel.call(
+                &[x.clone(), weight.clone(), scales.clone(), biases.clone()],
+                &[(&[1, rows], MlxDType::BF16)],
+                [32, rows, 1],
+                [32, 1, 1],
+                &[],
+            )?
+        };
+        Ok(out.into_iter().next().unwrap())
+    }
+}
+
 pub struct Q4RowDecodeF16 {
     kernel: MetalKernel,
 }

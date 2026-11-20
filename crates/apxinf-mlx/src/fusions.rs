@@ -14,7 +14,7 @@ pub use crate::mpp_epilogues::{
 pub use crate::mpp_gemm::MppBf16GemmNt;
 pub use crate::mpp_f16_gemm::{MppF16Gemm, SplitMppF16Gemm};
 pub use crate::q4_f16::{
-    padded_rows, F16Gemm, PadRowsF16, Q4DecodeArithmetic, Q4RowDecodeF16, Q4TransposeDecode,
+    padded_rows, F16Gemm, PadRowsF16, Q4DecodeArithmetic, Q4GemvBf16, Q4RowDecodeF16, Q4TransposeDecode,
     SplitF16Gemm,
 };
 pub use crate::bf16_qk_table_rope::Bf16QkTableRope;

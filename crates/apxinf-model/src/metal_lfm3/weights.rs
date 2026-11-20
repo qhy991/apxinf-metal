@@ -18,6 +18,8 @@ struct Quantized {
     scales: Array,
     biases: Array,
     bits: i32,
+    /// Fused M=1 GEMV for this projection's row width, built once at load.
+    gemv: Option<apxinf_mlx::fusions::Q4GemvBf16>,
 }
 
 impl Quantized {
@@ -31,11 +33,17 @@ impl Quantized {
         hf_weight
             .stream()
             .eval(&[packed.clone(), scales.clone(), biases.clone()])?;
+        // The fused GEMV substitutes K into the Metal source, so it is built
+        // once per shape; a width the kernel cannot take falls back to the
+        // generic quantized matmul at call time.
+        let k = packed.shape().last().copied().unwrap_or(0) * 8;
+        let gemv = apxinf_mlx::fusions::Q4GemvBf16::new(&hf_weight.stream(), k).ok();
         Ok(Self {
             packed,
             scales,
             biases,
             bits,
+            gemv,
         })
     }
 }
@@ -51,6 +59,12 @@ impl Linear {
         match self {
             Linear::Dense(canonical) => x.matmul(canonical),
             Linear::Quantized(q) => {
+                if let Some(gemv) = q.gemv.as_ref() {
+                    let shape = x.shape();
+                    if shape.len() == 2 && shape[0] == 1 {
+                        return gemv.call(x, &q.packed, &q.scales, &q.biases);
+                    }
+                }
                 x.quantized_matmul(&q.packed, &q.scales, &q.biases, true, 64, q.bits)
             }
         }
