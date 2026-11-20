@@ -147,6 +147,7 @@ def _mlx_version(venv: Path) -> str:
 # --------------------------------------------------------------------------- #
 
 A1_SRC = r"""
+import importlib.metadata as md
 import json, statistics, sys, time
 import mlx.core as mx
 
@@ -156,7 +157,7 @@ a = mx.random.uniform(shape=(N // 4,), dtype=mx.float32)
 b = mx.random.uniform(shape=(N // 4,), dtype=mx.float32)
 mx.eval(a, b)
 out = {"bytes": N, "warmup": WARMUP, "rounds": ROUNDS, "device": str(mx.default_device()),
-       "mlx_version": __import__("importlib").metadata.version("mlx"), "copy": [], "reduce": []}
+       "mlx_version": md.version("mlx"), "copy": [], "reduce": []}
 
 def timed(fn, rounds, bucket):
     for _ in range(WARMUP):
@@ -395,17 +396,31 @@ class LaneWorker:
             self.proc.kill()
 
 
+# Top-level python3 (the harness interpreter) does not have tokenizers; the
+# lane venv does. Tokenization therefore runs in a lane-venv subprocess, which
+# keeps the harness driver free of any third-party tokenizer import (round-108
+# A2/A3/prefill all crashed on ModuleNotFoundError at the top level).
+_FILLER_SRC = r"""
+import json, sys
+from tokenizers import Tokenizer
+
+tok = Tokenizer.from_file(sys.argv[1])
+text = ("The sky is blue. " * (int(sys.argv[2]) // 3 + 1)).strip()
+ids = tok.encode(text).ids
+# Avoid EOS in the middle of the prompt (would trip decode-time stop logic
+# only in the reference arm; lane worker uses eos_token_ids on output).
+ids = [int(t) for t in ids if int(t) != 124900]
+print(json.dumps(ids[:int(sys.argv[2])]))
+"""
+
+
 def _filler_tokens(tx_path: Path, count: int) -> list[int]:
     """Deterministic token list from the lane tokenizer, no model needed."""
-    from tokenizers import Tokenizer
-
-    tok = Tokenizer.from_file(str(PACKED4 / "tokenizer.json"))
-    text = ("The sky is blue. " * (count // 3 + 1)).strip()
-    ids = tok.encode(text).ids
-    # Avoid EOS in the middle of the prompt (would trip decode-time stop logic
-    # only in the reference arm; lane worker uses eos_token_ids on output).
-    ids = [int(t) for t in ids if int(t) != 124900]
-    return ids[:count]
+    proc = _run([str(LANE_VENV / "bin/python"), "-I", "-c", _FILLER_SRC,
+                 str(PACKED4 / "tokenizer.json"), str(count)], timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError(f"filler tokenization failed: {proc.stderr[-400:]!r}")
+    return [int(x) for x in json.loads(proc.stdout.strip().splitlines()[-1])]
 
 
 def _txfile(res: Path, name: str, ids: list[int]) -> Path:
@@ -577,7 +592,6 @@ sys.path.insert(0, a.root)
 import mlx.core as mx
 from enginetailor.models.lfm3.runtime import Engine
 from enginetailor.models.lfm3 import contract
-from tokenizers import Tokenizer
 
 ids = [int(x) for x in Path(__import__('os').environ["A3_TOKENS"]).read_text().split(",") if x]
 eng = Engine(root=__import__('os').environ["A3_MODEL"], dtype="bfloat16", quant="packed4")
@@ -774,6 +788,12 @@ def run_window(res: Path, ctxs: tuple[int, ...]) -> int:
             "started": _now(), "machine": machine, "ctxs": list(ctxs),
             "duration_s": time.time() - t0, "results": results,
         })
+        failures = [name for name, row in results.items() if row.get("error")]
+        if failures:
+            _log(res, f"OUTCOME: INVALID_PARTIAL failed={failures}")
+            _log(res, f"window done duration_s={time.time() - t0:.1f}")
+            return 102  # WINDOW_PARTIAL: a partial window must not exit 0.
+        _log(res, f"OUTCOME: COMPLETE")
         _log(res, f"window done duration_s={time.time() - t0:.1f}")
         return 0
     finally:
