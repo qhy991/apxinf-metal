@@ -5,9 +5,16 @@
 Receipts：`devlocal/lfm3-ane-mlp/`（4 个测量 pass 的原始 JSON、`window.log`、三次进程扫描、
 `analysis4.txt` 四窗对账、`final.txt` 判定表、探针脚本）。
 
-**判定：WIN** —— 在 LFM3 的 MLP 形状上，ANE（CoreML INT8，clef 配方）吞吐为 GPU（MLX BF16）的
+**判定：WIN —— 适用硬件 M1 Pro，M4 待测。** 在 LFM3 的 MLP 形状上，ANE（CoreML INT8，clef 配方）吞吐为 GPU（MLX BF16）的
 **2.0–2.3 倍**（ρ 栏 0.40），三点 T 的隐含 prefill 回收 **44.6%–46.4%**（栏 12%），
 即便按 clef 实测兑现率对折（×0.5）也仍有 **~22%**，覆盖 8–12% 缺口。
+
+> **硬件适用范围（owner 要求写入，2026-11-20）**：本 WIN 的全部数字来自 M1 Pro
+> （MacBookPro18,3）。M4 的 ANE 与 M1 Pro 的 ANE 不是同一代（core 数、每周期 MAC、
+> INT8 路径都可能不同），45.7% 在 M4 上可能高也可能低。**在 M4 复跑确认之前，不得拿
+> 这些数字直接在 M4 上做移植决定。** M4 判定规则（owner 定）：复跑后 ρ ≥ 2.0 ⇒ 才谈移植；
+> ρ < 1.2 ⇒ 方向在目标硬件上不成立，记录并关闭；中间按预登记 §6 的冻结表判。
+> 复跑方法见 §7 runbook。
 
 ---
 
@@ -89,11 +96,39 @@ R ≈ 22–23%，仍 ≥ 缺口上限 12% 的 1.8 倍。
 
 ## 6. 结论与下一步（移植前提，**本棒不做**）
 
-**WIN。** ANE 在 LFM3 MLP 形状上持续吞吐 ~2× GPU，隐含回收 3.7× 于缺口上限。
-移植棒的前置清单（供接力同伴/owner 参考，非本棒承诺）：
+**WIN（M1 Pro 本地）。** ANE 在 LFM3 MLP 形状上持续吞吐 ~2× GPU，隐含回收 3.7× 于缺口上限。
+**下一步不是移植，是把同一套探针在 M4 上复跑确认**（owner 2026-11-20 裁定）：
 
-1. **#144 packed 4-bit 合入**（ANE 权重从 Q4 checkpoint 在 host 量化 —— clef 已验证的路径）。
-2. **M4 复跑本探针**（同二进制、同冻结门槛；M4 才是 8–12% 缺口的对账机）。
+1. **M4 复跑本探针**（同二进制、同冻结 gates —— §7 runbook 一条命令链）。
+   判定规则：ρ ≥ 2.0 ⇒ 才谈移植；ρ < 1.2 ⇒ 方向在目标硬件关闭并记录；中间按预登记冻结表。
+2. **#144 packed 4-bit 合入**（ANE 权重从 Q4 checkpoint 在 host 量化 —— clef 已验证的路径）。
 3. INT8 质量门：对 Q4 权重量化到 INT8 的 token 一致性（#130 硬门）。
 4. 端到端兑现率：24 层 dispatch + GPU 部分和 + 争抢下的实测回收（预期打折，§3 已按 ×0.5 估）。
 5. 冷启动首请求影响（§4）。
+
+## 7. M4 复跑 runbook
+
+探针已在 `main`（≥ `24a42d58`，PR #146）。在 M4 上（需 MLX C++ SDK 与 macOS SDK，
+与 #130 测量纪律相同环境）：
+
+```sh
+export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+export MLX_ROOT=<本机 MLX SDK 路径>          # M1 Pro 上是 ~/apxinf-runtime/mlx-sdk
+export DYLD_LIBRARY_PATH=$MLX_ROOT/lib
+cargo build --release -p apxinf-coreml --features native --example lfm3_mlp_probe \
+                    -p apxinf-mlx     --features native --example lfm3_mlp_gpu_probe
+
+# 持双 Metal 锁（flock，等不抢；无锁机制时至少确认无其他 ANE/GPU lane 在跑），
+# 每个探针跑两遍（A/A），进程扫描证明 ANE 独占：
+export APXINF_LFM3_PROBE_CACHE=<cache 目录>
+./target/release/examples/lfm3_mlp_probe     ane-A.json   # 再跑一遍存 ane-B.json
+./target/release/examples/lfm3_mlp_gpu_probe gpu-A.json   # 再跑一遍存 gpu-B.json
+```
+
+- 判定用 `devlocal/lfm3-ane-mlp/scripts/final.py` 的同一套公式（MACs = 3·T·2048·S；
+  ρ = gpu_ms/ane_ms；R 按预登记 §3，f = 0.73）。
+- A/A 规则同 G3：逐 cell 中位比 ≤5%；首窗首 cell 的冷启动惩罚（§4）若在 M4 复现，
+  同样取持续 pass 对（机制对账，不许取中位凑）。
+- placement 必须全 conv 链落 NeuralEngine（G2 原样适用）。
+- **判定规则（owner）**：三点 T 的 ρ(S=7680) 全 ≥ 2.0 ⇒ M4 确认，才进入移植讨论；
+  任一点 ρ < 1.2 ⇒ 方向在目标硬件上不成立，记录关闭；中间按预登记 §6 冻结表判。
