@@ -69,3 +69,41 @@ Gate（Lead 11:05，逐字）：
   已实测，见 STATUS Lead 11:05）。
 - 9 段 × (apxinf 起服务 ~数 s + 2 cells × 256 tok)；llama 起服务带加载更慢。
   预估锁内 ≤10 min（实测以 ledger 为准）。
+
+## 5. 测量结果（round-103，2026-11-20 11:42–11:49 M4）
+
+窗口：11:42:36–11:49:07，锁内 ~391s（符合预登记 ≤10 min）；`ANALYZE_EXIT=0`、
+`OUTCOME: VALID`；双锁 11:49:24 复核 FREE、无残留进程。9 段全部 exit=0、failures=0、
+无 request error；顺序 A B C C B A A B C 按冻结 doc §2 执行，每段 `--corpus-seed
+20261130+seg` 独立。
+
+**G3 效果证明（9/9 段命中）**：`apxinf-serve=7f11e798…`、`worker=42a4fe23…`（A/B 同二进制）、
+`llama-server=d635b19f…`、Q4_K_M gguf `3793e1e6…`；A 臂 banner `native_4bit=true` +
+census `quantized_triples=154/154`（seg 0/3/6）；B 臂 banner `native_4bit=false`、env 为空
+（不传任何 worker-env，防空臂）；C 臂 `engine_source=['llama.cpp.timings']` 3/3 命中，
+A/B 臂 `engine_source=['apxinf.ledger']`。
+
+**速度数字（ms/token，engine basis，每 cell n=6 = 3 段 × repeats 2）**：
+
+| 臂 | ctx1024（median，A/A） | ctx4096（median，A/A） |
+| --- | --- | --- |
+| A native-4bit | **10.9850**（1.31%） | **11.3751**（1.30%） |
+| B native-bf16 | 36.4235（1.03%） | 36.7605（0.30%） |
+| C llamacpp Q4_K_M | 13.7977（3.31%） | 14.1385（3.51%） |
+
+A/A 全部 ≤5%（最坏 3.51%，无窗口作废，RUNNER §4）。
+
+**冻结判定（§3 三档，逐字）**：A/C = **0.7961**（ctx1024）、**0.8045**（ctx4096），两 cell
+均 ≤0.95 ⇒ **4-bit same-window CONFIRMED faster than llama Q4（快 ≥5%）**，实际快
+20.4% / 19.6%。B/A in-window sanity = 3.32× / 3.23×（与 G4-speed PASS 3.3× 一致；
+仅 sanity，不进 ticket 判定）。"被推翻"档（>1.00）未触发：之前跨窗证据（−8%～−11%）
+的幅度被**低估**，同窗下差距更大（−20%）。
+
+**机制算术**：A 臂 0.973 GB ÷ 10.99 ms = 88.5 GB/s（1024）/ 85.5 GB/s（4096），对
+100.6 GB/s streaming 峰值 η≈88%/85%。C 臂 Q4_K_M 混合精度权重 >0.973 GB 且无 dequant
+融合，故同量级下比值差距来自 kernel/调度效率。
+
+**Receipts**：`M4:~/lfm3-dig-run/window-4bit/vs-llama/`（`vs-llama.log`、`raw/` 9 文件、
+`logs/`、`locks.log`、`vs-llama-requests.jsonl`、`vs-llama-diag.jsonl`）。
+**Harness**：`scripts/run-4bit-vs-llama.sh` + `scripts/analyze-4bit-vs-llama.py`
+（commit `151187c0`）。
