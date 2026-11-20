@@ -1514,25 +1514,40 @@ mod tests {
         service.shutdown();
     }
 
-    #[tokio::test]
-    async fn readiness_advertises_batching_only_when_both_sides_agree() {
-        let (service, _) = crate::supervisor::gateway_test_service_with_batch(2, 2);
-        let response = ready(State(service.clone())).await;
+    async fn batching_bit(service: Arc<Service>) -> bool {
+        let response = ready(State(service)).await;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), 10000).await.unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["public_capabilities"]["batching"], true);
+        body["public_capabilities"]["batching"].as_bool().unwrap()
+    }
+
+    #[tokio::test]
+    async fn readiness_advertises_batching_only_when_batched_forward_and_both_sides_agree() {
+        // QUEUE #6 Amendment §D option 2: on the shipped tree no batched
+        // forward exists, so even a pop bound and worker capability that agree
+        // on 2 must stay fail-closed rather than claim capacity.
+        for (batch, advertised) in [(2, 2), (2, 1), (1, 1)] {
+            let (service, _) =
+                crate::supervisor::gateway_test_service_with_batch(batch, advertised, false);
+            assert!(
+                !batching_bit(service.clone()).await,
+                "batch={batch} advertised={advertised} with no batched forward must stay fail-closed"
+            );
+            service.shutdown();
+        }
+
+        // With a batched forward armed, the two-sided agreement gate is
+        // load-bearing: perfect agreement advertises, disagreement does not.
+        let (service, _) = crate::supervisor::gateway_test_service_with_batch(2, 2, true);
+        assert!(batching_bit(service.clone()).await);
         service.shutdown();
 
         for (batch, advertised) in [(2, 1), (1, 1)] {
-            let (service, _) = crate::supervisor::gateway_test_service_with_batch(batch, advertised);
-            let response = ready(State(service.clone())).await;
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(response.into_body(), 10000).await.unwrap();
-            let body: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(
-                body["public_capabilities"]["batching"],
-                false,
+            let (service, _) =
+                crate::supervisor::gateway_test_service_with_batch(batch, advertised, true);
+            assert!(
+                !batching_bit(service.clone()).await,
                 "batch={batch} advertised={advertised} must stay fail-closed"
             );
             service.shutdown();

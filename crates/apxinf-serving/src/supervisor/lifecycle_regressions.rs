@@ -108,6 +108,7 @@ fn cpu_service_with_completion(
         timeout,
         memory_budget: 4096,
         batch_size,
+        batched_forward: false,
         restart: RestartPolicy::immediate(3),
         #[cfg(test)]
         unconfirmed_reaping: AtomicBool::new(false),
@@ -697,6 +698,7 @@ sys.stdin.readline()
             timeout: Duration::from_millis(150),
             memory_budget: 1024,
             batch_size: 1,
+            batched_forward: false,
             restart: RestartPolicy::immediate(3),
             #[cfg(test)]
             unconfirmed_reaping: AtomicBool::new(false),

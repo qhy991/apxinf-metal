@@ -70,6 +70,7 @@ fn request_fixture(timeout: Duration) -> (Service, Job, Ticket) {
         timeout,
         memory_budget: 4096,
         batch_size: 1,
+        batched_forward: false,
         restart: RestartPolicy::immediate(3),
         #[cfg(test)]
         unconfirmed_reaping: AtomicBool::new(false),

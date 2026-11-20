@@ -614,6 +614,12 @@ pub struct Service {
     /// environment, so the advertised banner batch and the pop width cannot
     /// drift apart even though the launch clears the worker's environment.
     batch_size: usize,
+    /// QUEUE #6 Amendment §D option (2): whether a batched forward actually
+    /// exists. Hardcoded `false` on the production path because the shipped
+    /// dispatcher is a serial pop window (mechanism (a) with per-request
+    /// weight re-reads), so `/readyz` must not claim batched capacity until
+    /// mechanism (b) lands. Tests set it to prove the gate is load-bearing.
+    batched_forward: bool,
     restart: RestartPolicy,
     /// Test hook that forces the unconfirmed-reaping branch of `fence_worker`.
     #[cfg(test)]
@@ -653,11 +659,14 @@ impl Service {
     }
 
     /// QUEUE #6: whether the gateway may advertise batched admission. True
-    /// only when the declared pop bound and the worker's own `max_active_sequences`
-    /// agree on a value above 1; vision, Clef and python workers still advertise
-    /// 1, so an over-declared switch cannot claim batching.
+    /// only when all three agree: a batched forward exists, the declared pop
+    /// bound exceeds 1, and the worker's own `max_active_sequences` matches it.
+    /// The first conjunct is hardwired false until mechanism (b) exists, so the
+    /// serial pop window can never over-claim; vision, Clef and python workers
+    /// still advertise 1, so an over-declared switch cannot either.
     pub(crate) fn batching_enabled(&self) -> bool {
-        self.batch_size > 1
+        self.batched_forward
+            && self.batch_size > 1
             && self.ready["capabilities"]["max_active_sequences"] == self.batch_size as u64
     }
 
@@ -1409,6 +1418,8 @@ async fn start_inner(
         timeout: config.timeout,
         memory_budget: config.memory_budget,
         batch_size: queue_batch_size(&config),
+        // No batched forward ships yet: `/readyz` stays fail-closed (Amendment §D option 2).
+        batched_forward: false,
         restart: RestartPolicy::default(),
         #[cfg(test)]
         unconfirmed_reaping: AtomicBool::new(false),
@@ -3189,6 +3200,7 @@ fn gateway_test_service_config(
         protocol,
         json!({"max_context":4096,"max_output_tokens":1024}),
         1,
+        false,
     )
 }
 
@@ -3201,22 +3213,26 @@ pub(crate) fn gateway_test_service_with_max_output(
         PROTOCOL,
         json!({"max_context":4096,"max_output_tokens":max_output}),
         1,
+        false,
     )
 }
 
-/// QUEUE #6: a native test service whose declared pop bound and worker
-/// `max_active_sequences` can be set independently, so gateway tests can
-/// exercise both the agreeing and the fail-closed disagreement cases.
+/// QUEUE #6: a native test service whose declared pop bound, worker
+/// `max_active_sequences` and batched-forward availability can be set
+/// independently, so gateway tests can exercise the agreeing case and every
+/// fail-closed disagreement.
 #[cfg(test)]
 pub(crate) fn gateway_test_service_with_batch(
     batch_size: usize,
     max_active_sequences: u64,
+    batched_forward: bool,
 ) -> (Arc<Service>, mpsc::UnboundedReceiver<Request>) {
     gateway_test_service_capabilities(
         Arc::new(HostPressure::new(HostPressurePolicy::Disabled)),
         contracts::NATIVE_PROTOCOL,
         json!({"max_context":4096,"max_output_tokens":1024,"max_active_sequences":max_active_sequences}),
         batch_size,
+        batched_forward,
     )
 }
 
@@ -3226,6 +3242,7 @@ fn gateway_test_service_capabilities(
     protocol: &str,
     mut capabilities: Value,
     batch_size: usize,
+    batched_forward: bool,
 ) -> (Arc<Service>, mpsc::UnboundedReceiver<Request>) {
     let (observed, requests) = mpsc::unbounded_channel();
     if protocol == contracts::VISION_PROTOCOL {
@@ -3259,6 +3276,7 @@ fn gateway_test_service_capabilities(
         timeout: Duration::from_secs(1),
         memory_budget: 1024,
         batch_size,
+        batched_forward,
         restart: RestartPolicy::immediate(3),
         #[cfg(test)]
         unconfirmed_reaping: AtomicBool::new(false),
@@ -3304,6 +3322,7 @@ mod lifecycle_tests {
             timeout: Duration::from_secs(1),
             memory_budget: 1024,
             batch_size: 1,
+            batched_forward: false,
             restart: RestartPolicy::immediate(3),
             #[cfg(test)]
             unconfirmed_reaping: AtomicBool::new(false),
