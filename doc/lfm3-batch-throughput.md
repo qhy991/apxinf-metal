@@ -297,3 +297,116 @@ paired medians.
 ## Results
 
 *(appended after the window; verdict + mechanism arithmetic + receipts)*
+
+---
+
+## Amendment 1 — 2026-11-20 09:25 CST (appended after 5 implementation
+commits on `agent/lfm3-dig-batch`, before any device run)
+
+This is a dated, append-only amendment under the Status line above. It
+changes **no gate, no threshold and no decision rule** (Lead 02:18 ruling:
+不得事后改判据). It records two things that reading the shipped
+implementation revealed before any lock is taken.
+
+### A. Shipped state is mechanism (a) — a serial dispatch window
+
+Branch `agent/lfm3-dig-batch` commits `119091b6`, `99dec877`, `11485985`,
+`3883dc11`, `8e2349e5` (5 commits, local, not pushed) implement:
+
+- `PendingQueue::recv_batch(&metrics, max)` pops up to `max` ready jobs in
+  one lock acquisition, FIFO, partial-batch eager return.
+- The coordinate loop (`supervisor.rs:1820`) awaits `recv_batch(&metrics,
+  shared.batch_size)` and then runs `for mut job in jobs` — **serial**,
+  admission order, through the unchanged single-request `execute()`.
+- No `execute_batch`, no stacked-row forward, no `Weights::project`
+  batched call, no per-request interleave. Each request still performs a
+  full per-token weight read in its own `execute()`.
+
+This is exactly the pre-registered option (a) ("keep the existing kernels,
+iterate B times") except that the pre-registered (a) assumed one
+**batched weight read** amortised across the B iterations. The shipped
+loop re-reads all weights once **per request**, so total weight traffic
+per B tokens is `B × 3.4576 GB` — the same as B sequential B1 runs.
+
+### B. Mechanism arithmetic — current code cannot reach the WIN gate
+
+Let `T = 3.4576 GB` (BF16 weights), `B` = batch size. Bytes read per
+step-group producing B tokens:
+
+```
+shipped serial loop:      B · T              ⇒ speedup = B·T / B·T          = 1.00×
+one shared S of weights:  (T − S)·B + S      ⇒ speedup = B·T / ((T−S)·B + S)
+```
+
+| S stacked | B=2 | B=4 | B=8 |
+| --- | --- | --- | --- |
+| S = 0 (shipped) | 1.000× | 1.000× | 1.000× |
+| S = `Weights::project` only (0.524 GB = 15.16%) | 1.082× | 1.128× | 1.153× |
+| S needed for ≥1.5× | 2.305 GB (66.7%) | 1.537 GB (44.4%) | 1.317 GB (38.1%) |
+
+`Weights::project` (lm_head) is `128000 × 2048 × 2 = 0.524 GB`, 15.16%
+of `T`. Stacking only that matmul at B=8 yields **1.153× — PARITY under
+§5 (< 1.2×)**, not WIN. Reaching the §4 falsifier gate of 1.5× requires
+stacking ≥1.317 GB (38.1%) at B=8, i.e. the conv, attention and MLP
+Linear weights too — which is **mechanism (b), a true batched forward
+with shape-preserving per-row accumulation**, not the shipped option (a).
+
+⇒ **No timing window, token gate or Gate-0 census on the current code can
+produce a WIN verdict.** The best attainable outcome from the shipped
+tree is PARITY (if the token gate passes) or FALSIFIED (if §5's "byte
+model predicted ≥1.5×" condition is read as the §3 shared-byte roofline,
+which it is). Spending a locked M4 window to confirm a foregone ~1.0×
+would contradict the Lead's repeated ordering corrections (01:01 / 04:31 /
+08:18).
+
+### C. Effect-proof / capability advertisement gap
+
+Commit `8e2349e5` added `Service::batching_enabled()` and
+`gateway.rs:329` now advertises `"batching":true` whenever `batch_size > 1`
+**and** the worker declares `max_active_sequences == batch_size`. The
+coordinate loop is still serial, and `supervisor` never uses
+`max_active_sequences` for admission. So the gateway currently advertises
+a capacity feature the implementation does not deliver. §165 of STATUS
+already logged this as a "广告与执行不一致窗口"; this amendment freezes
+it into the pre-registration record so the next decision is explicit.
+
+Under the §6 effect-proof rule, an armed `batch=B` segment must prove the
+switch is **active and doing batched work** — not merely that the banner
+field is present. Until a batched forward exists, `batching: true` is a
+claim the tree cannot support. Fixing this fail-closed (advertise only
+when a batched forward is compiled/armed) is an implementation step, not
+a measurement step.
+
+### D. Decision — no gate or threshold changes; three options for Lead
+
+Frozen, unchanged from above: §4 falsifier (≥1.5×), §6.1 token gate,
+§6.3 effect proof, §4 A/A ≤5%, all five verdict tiers.
+
+Current code status: **implements mechanism (a) dispatcher but with
+per-request weight re-reads ⇒ 1.00× by construction; cannot reach WIN.**
+
+Options (one per round, Lead to pick):
+
+1. **Implement mechanism (b)** — a batched forward that stacks B rows
+   through conv, attention and MLP with audited shape-preserving per-row
+   accumulation; then run the §6.1 token gate (B1 oracle, 4 prompts × 128
+   tokens, entry/exit clear env) **before** any timing window. This is
+   the only option that can reach WIN. Risk: QUEUE #5's lesson applies —
+   any per-row reduction-order change ⇒ INVALID regardless of speed.
+2. **Fix the advertisement fail-closed** — make `batching: true` require
+   proof of a batched forward (e.g. a `batch_exec=true` capability or
+   arm the gateway bit only when `batch_size > 1` **and** the model
+   declares a batched entry). Small, surgical, no device, restores
+   honesty of `/readyz`. Does not advance the WIN gate.
+3. **Run Gate-0 census + token gate on current serial code to record a
+   PARITY receipt** — legitimate under §5 PARITY (token passes, A/A
+   clean, <1.2× every B), and gives a real receipt instead of an
+   arithmetic prediction. Cost: a locked M4 window to confirm 1.0×, and
+   a PR whose outcome is non-WIN ⇒ §7 reverts the dispatcher, banner
+   field and `max_active_sequences` advertisement.
+
+**Recommendation:** (1), because it is the only path to WIN and the
+token gate is required before any window anyway; do (2) first if the
+Lead wants `/readyz` honesty restored immediately, since it is a
+prerequisite for (1)'s effect-proof banner. Do not run a timing window
+on the shipped tree: it measures 1.0× by construction.
