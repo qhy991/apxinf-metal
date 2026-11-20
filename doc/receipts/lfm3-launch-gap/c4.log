@@ -1,0 +1,3019 @@
+    Blocking waiting for file lock on package cache
+warning: field `max_seq_len` is never read
+  --> crates/apxinf-core/src/kv_cache.rs:37:5
+   |
+33 | pub struct CpuKVCache {
+   |            ---------- field in this struct
+...
+37 |     max_seq_len: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `apxinf-core` (lib) generated 1 warning
+warning: apxinf-mlx@0.1.0: In file included from native/bridge.cpp:2:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/mlx.h:5:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/array.h:11:
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/allocator.h:39:36: warning: unused parameter 'ptr' [-Wunused-parameter]
+warning: apxinf-mlx@0.1.0:    39 |   virtual Buffer make_buffer(void* ptr, size_t size) {
+warning: apxinf-mlx@0.1.0:       |                                    ^
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/allocator.h:39:48: warning: unused parameter 'size' [-Wunused-parameter]
+warning: apxinf-mlx@0.1.0:    39 |   virtual Buffer make_buffer(void* ptr, size_t size) {
+warning: apxinf-mlx@0.1.0:       |                                                ^
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/allocator.h:42:31: warning: unused parameter 'buffer' [-Wunused-parameter]
+warning: apxinf-mlx@0.1.0:    42 |   virtual void release(Buffer buffer) {}
+warning: apxinf-mlx@0.1.0:       |                               ^
+warning: apxinf-mlx@0.1.0: In file included from native/bridge.cpp:2:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/mlx.h:5:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/array.h:13:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/dtype.h:9:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/types/complex.h:5:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/types/half_types.h:32:
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/types/bf16.h:29:3: warning: definition of implicit copy assignment operator for '_MLX_BFloat16' is deprecated because it has a user-declared copy constructor [-Wdeprecated-copy]
+warning: apxinf-mlx@0.1.0:    29 |   _MLX_BFloat16(_MLX_BFloat16 const&) = default;
+warning: apxinf-mlx@0.1.0:       |   ^
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/types/bf16.h:38:19: note: in implicit copy assignment operator for 'mlx::core::_MLX_BFloat16' first required here
+warning: apxinf-mlx@0.1.0:    38 |     return (*this = _MLX_BFloat16(x));
+warning: apxinf-mlx@0.1.0:       |                   ^
+warning: apxinf-mlx@0.1.0: 4 warnings generated.
+warning: field `out` is never read
+  --> crates/apxinf-mlx/src/quantized.rs:14:5
+   |
+ 9 | pub struct Quantized {
+   |            --------- field in this struct
+...
+14 |     out: usize,
+   |     ^^^
+   |
+   = note: `Quantized` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `apxinf-mlx` (lib) generated 1 warning
+warning: use of deprecated function `libc::mach_host_self`: Use the `mach2` crate instead
+   --> crates/apxinf-model/src/metal_qwen_image/weights.rs:757:19
+    |
+757 |             libc::mach_host_self(),
+    |                   ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `allow_online_tune`
+  --> crates/apxinf-model/src/accelerator.rs:21:5
+   |
+21 |     allow_online_tune: bool,
+   |     ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_allow_online_tune`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `recipe_cache_dir`
+  --> crates/apxinf-model/src/accelerator.rs:22:5
+   |
+22 |     recipe_cache_dir: Option<String>,
+   |     ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_recipe_cache_dir`
+
+warning: variable does not need to be mutable
+   --> crates/apxinf-model/src/metal_qwen3/model.rs:600:13
+    |
+600 |         let mut x = self
+    |             ----^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable `else` clause
+   --> crates/apxinf-model/src/metal_qwen_image/text_kv_cache.rs:474:70
+    |
+468 | /         let [start, end] = <[u64; 2]>::try_from(
+469 | |             offsets
+470 | |                 .iter()
+471 | |                 .map(|value| value.as_u64().unwrap_or(u64::MAX))
+...   |
+474 | |         .map_err(|_| fail(format!("{name} data_offsets malformed")))?
+    | |                                                                     -^
+    | |_____________________________________________________________________|
+    |                                                                       assigning to binding pattern will always succeed
+    |
+    = note: this pattern always matches, so the else clause is unreachable
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: field `weight` is never read
+  --> crates/apxinf-model/src/d3/weights/host.rs:19:16
+   |
+18 | pub struct D3ReadoutWeights {
+   |            ---------------- field in this struct
+19 |     pub(crate) weight: Tensor,
+   |                ^^^^^^
+   |
+   = note: `D3ReadoutWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `transpose_2d` is never used
+  --> crates/apxinf-model/src/d3/weights/host.rs:97:15
+   |
+97 | pub(super) fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
+   |               ^^^^^^^^^^^^
+
+warning: field `0` is never read
+   --> crates/apxinf-model/src/metal_qwen_image/weights.rs:825:14
+    |
+825 |     Disabled(PrefetchGate),
+    |     -------- ^^^^^^^^^^^^
+    |     |
+    |     field in this variant
+    |
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+    |
+825 -     Disabled(PrefetchGate),
+825 +     Disabled(()),
+    |
+
+warning: function `concat_host_2d` is never used
+ --> crates/apxinf-model/src/pi05/weights/packing.rs:3:24
+  |
+3 | pub(in crate::pi05) fn concat_host_2d(tensors: &[&Tensor]) -> Result<Tensor> {
+  |                        ^^^^^^^^^^^^^^
+
+warning: struct `Bf16DeviceLayerNorm` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:11:12
+   |
+11 | pub struct Bf16DeviceLayerNorm {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Bf16DeviceVisionBlock` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:17:12
+   |
+17 | pub struct Bf16DeviceVisionBlock {
+   |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Bf16DeviceLanguageLayer` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:27:12
+   |
+27 | pub struct Bf16DeviceLanguageLayer {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `VisionPatchEmbeddingF32` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:44:12
+   |
+44 | pub struct VisionPatchEmbeddingF32 {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `StaticBf16Pi0FastWeights` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:53:12
+   |
+53 | pub struct StaticBf16Pi0FastWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `from_host` is never used
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:67:12
+   |
+66 | impl StaticBf16Pi0FastWeights {
+   | ----------------------------- associated function in this implementation
+67 |     pub fn from_host(
+   |            ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:111:19
+    |
+110 | impl VisionPatchEmbeddingF32 {
+    | ---------------------------- associated function in this implementation
+111 |     pub(super) fn from_host(
+    |                   ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:129:19
+    |
+128 | impl Bf16DeviceLayerNorm {
+    | ------------------------ associated function in this implementation
+129 |     pub(super) fn from_host(weights: &LayerNormWeights, backend: &dyn Backend) -> Result<Self> {
+    |                   ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:138:8
+    |
+137 | impl Bf16DeviceVisionBlock {
+    | -------------------------- associated function in this implementation
+138 |     fn from_host(weights: &VisionBlockWeights, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:151:8
+    |
+150 | impl Bf16DeviceLanguageLayer {
+    | ---------------------------- associated function in this implementation
+151 |     fn from_host(weights: &LanguageLayerWeights, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^
+
+warning: struct `LinearView` is never constructed
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:183:19
+    |
+183 | pub(super) struct LinearView;
+    |                   ^^^^^^^^^^
+
+warning: associated function `columns` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:186:19
+    |
+185 | impl LinearView {
+    | --------------- associated function in this implementation
+186 |     pub(super) fn columns(tensor: &Tensor, columns: &[usize]) -> Result<super::LinearWeights> {
+    |                   ^^^^^^^
+
+warning: struct `Fp8DeviceVisionBlock` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:16:12
+   |
+16 | pub struct Fp8DeviceVisionBlock {
+   |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Fp8DeviceLanguageLayer` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:26:12
+   |
+26 | pub struct Fp8DeviceLanguageLayer {
+   |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `StaticFp8Pi0FastWeights` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:36:12
+   |
+36 | pub struct StaticFp8Pi0FastWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `from_host` is never used
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:53:12
+   |
+52 | impl StaticFp8Pi0FastWeights {
+   | ---------------------------- associated function in this implementation
+53 |     pub fn from_host(
+   |            ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:94:8
+   |
+93 | impl Fp8DeviceVisionBlock {
+   | ------------------------- associated function in this implementation
+94 |     fn from_host(weights: &VisionBlockWeights, backend: &dyn Backend) -> Result<Self> {
+   |        ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:107:8
+    |
+106 | impl Fp8DeviceLanguageLayer {
+    | --------------------------- associated function in this implementation
+107 |     fn from_host(weights: &LanguageLayerWeights, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^
+
+warning: `apxinf-model` (lib) generated 27 warnings (run `cargo fix --lib -p apxinf-model` to apply 3 suggestions)
+warning: unused import: `Shape`
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:13:43
+   |
+13 | use apxinf_core::{Backend, Error, Result, Shape, Tensor};
+   |                                           ^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `WallossTextConfig`
+  --> crates/apxinf-model/src/walloss/mod.rs:35:40
+   |
+35 | pub(crate) use config::{WallossConfig, WallossTextConfig, WallossVisionConfig};
+   |                                        ^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `allow_cached_residual_layer_norm`
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:242:5
+    |
+242 |     allow_cached_residual_layer_norm: bool,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_allow_cached_residual_layer_norm`
+
+warning: fields `weight` and `bias` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:34:9
+   |
+33 | pub struct Gr00tLayerNormWeights {
+   |            --------------------- fields in this struct
+34 |     pub weight: Tensor,
+   |         ^^^^^^
+35 |     pub bias: Tensor,
+   |         ^^^^
+   |
+   = note: `Gr00tLayerNormWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `input` and `output` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:40:9
+   |
+39 | pub struct Gr00tCategoryMlpWeights {
+   |            ----------------------- fields in this struct
+40 |     pub input: Gr00tCategoryLinearWeights,
+   |         ^^^^^
+41 |     pub output: Gr00tCategoryLinearWeights,
+   |         ^^^^^^
+   |
+   = note: `Gr00tCategoryMlpWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: struct `Gr00tMlpWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:45:12
+   |
+45 | pub struct Gr00tMlpWeights {
+   |            ^^^^^^^^^^^^^^^
+
+warning: struct `Gr00tActionEncoderWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:51:12
+   |
+51 | pub struct Gr00tActionEncoderWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Gr00tEmbodimentWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:61:12
+   |
+61 | pub struct Gr00tEmbodimentWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `query`, `key`, `value`, and `output` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:69:9
+   |
+68 | pub struct Gr00tAttentionWeights {
+   |            --------------------- fields in this struct
+69 |     pub query: Gr00tLinearWeights,
+   |         ^^^^^
+70 |     pub key: Gr00tLinearWeights,
+   |         ^^^
+71 |     pub value: Gr00tLinearWeights,
+   |         ^^^^^
+72 |     pub output: Gr00tLinearWeights,
+   |         ^^^^^^
+   |
+   = note: `Gr00tAttentionWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `input` and `output` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:77:9
+   |
+76 | pub struct Gr00tFeedForwardWeights {
+   |            ----------------------- fields in this struct
+77 |     pub input: Gr00tLinearWeights,
+   |         ^^^^^
+78 |     pub output: Gr00tLinearWeights,
+   |         ^^^^^^
+   |
+   = note: `Gr00tFeedForwardWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `adaptive_norm`, `attention`, and `feed_forward` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:84:9
+   |
+82 | pub struct Gr00tDitBlockWeights {
+   |            -------------------- fields in this struct
+83 |     /// `SiLU(timestep_embedding) -> [scale, shift]`.
+84 |     pub adaptive_norm: Gr00tLinearWeights,
+   |         ^^^^^^^^^^^^^
+85 |     pub attention: Gr00tAttentionWeights,
+   |         ^^^^^^^^^
+86 |     pub feed_forward: Gr00tFeedForwardWeights,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `Gr00tDitBlockWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `attention_norm`, `attention`, `feed_forward_norm`, and `feed_forward` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:91:9
+   |
+90 | pub struct Gr00tVlSelfAttentionBlockWeights {
+   |            -------------------------------- fields in this struct
+91 |     pub attention_norm: Gr00tLayerNormWeights,
+   |         ^^^^^^^^^^^^^^
+92 |     pub attention: Gr00tAttentionWeights,
+   |         ^^^^^^^^^
+93 |     pub feed_forward_norm: Gr00tLayerNormWeights,
+   |         ^^^^^^^^^^^^^^^^^
+94 |     pub feed_forward: Gr00tFeedForwardWeights,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `Gr00tVlSelfAttentionBlockWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: multiple fields are never read
+   --> crates/apxinf-model/src/gr00t/action_weights.rs:100:9
+    |
+ 99 | pub struct Gr00tActionHeadWeights {
+    |            ---------------------- fields in this struct
+100 |     pub state_encoder: Gr00tCategoryMlpWeights,
+    |         ^^^^^^^^^^^^^
+101 |     pub action_encoder_input: Gr00tCategoryLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^^^^
+102 |     pub action_encoder_time: Gr00tCategoryLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^^^
+103 |     pub action_encoder_output: Gr00tCategoryLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^^^^^
+104 |     pub action_decoder: Gr00tCategoryMlpWeights,
+    |         ^^^^^^^^^^^^^^
+105 |     pub position_embedding: Option<Tensor>,
+    |         ^^^^^^^^^^^^^^^^^^
+106 |     pub backbone_layer_norm: Option<Gr00tLayerNormWeights>,
+    |         ^^^^^^^^^^^^^^^^^^^
+107 |     pub vl_self_attention: Vec<Gr00tVlSelfAttentionBlockWeights>,
+    |         ^^^^^^^^^^^^^^^^^
+108 |     pub timestep_input: Gr00tLinearWeights,
+    |         ^^^^^^^^^^^^^^
+109 |     pub timestep_output: Gr00tLinearWeights,
+    |         ^^^^^^^^^^^^^^^
+110 |     pub dit_blocks: Vec<Gr00tDitBlockWeights>,
+    |         ^^^^^^^^^^
+...
+113 |     pub output_modulation: Gr00tLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^
+114 |     pub output_projection: Gr00tLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^
+    |
+    = note: `Gr00tActionHeadWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `select_category_mlp` is never used
+   --> crates/apxinf-model/src/gr00t/action_weights.rs:274:15
+    |
+274 | pub(super) fn select_category_mlp(
+    |               ^^^^^^^^^^^^^^^^^^^
+
+warning: fields `intermediate_size`, `max_position_embeddings`, and `rms_norm_eps` are never read
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:17:9
+   |
+15 | pub struct Qwen3VLTextConfig {
+   |            ----------------- fields in this struct
+16 |     pub hidden_size: usize,
+17 |     pub intermediate_size: usize,
+   |         ^^^^^^^^^^^^^^^^^
+...
+23 |     pub max_position_embeddings: usize,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^
+24 |     pub rms_norm_eps: f32,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `Qwen3VLTextConfig` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: multiple fields are never read
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:34:9
+   |
+33 | pub struct Qwen3VLVisionConfig {
+   |            ------------------- fields in this struct
+34 |     pub depth: usize,
+   |         ^^^^^
+35 |     pub hidden_size: usize,
+   |         ^^^^^^^^^^^
+36 |     pub intermediate_size: usize,
+   |         ^^^^^^^^^^^^^^^^^
+37 |     pub num_heads: usize,
+   |         ^^^^^^^^^
+38 |     pub head_dim: usize,
+   |         ^^^^^^^^
+39 |     pub patch_size: usize,
+   |         ^^^^^^^^^^
+40 |     pub temporal_patch_size: usize,
+   |         ^^^^^^^^^^^^^^^^^^^
+41 |     pub in_channels: usize,
+   |         ^^^^^^^^^^^
+42 |     pub spatial_merge_size: usize,
+   |         ^^^^^^^^^^^^^^^^^^
+43 |     pub num_position_embeddings: usize,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^
+44 |     pub out_hidden_size: usize,
+   |         ^^^^^^^^^^^^^^^
+45 |     /// Which 3 of the `depth` vision blocks feed the deepstack mergers.
+46 |     pub deepstack_visual_indexes: Vec<usize>,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `Qwen3VLVisionConfig` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: method `head_dim` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:50:12
+   |
+49 | impl Qwen3VLVisionConfig {
+   | ------------------------ method in this implementation
+50 |     pub fn head_dim(&self) -> usize {
+   |            ^^^^^^^^
+
+warning: field `vision` is never read
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:64:9
+   |
+62 | pub struct Qwen3VLConfig {
+   |            ------------- field in this struct
+63 |     pub text: Qwen3VLTextConfig,
+64 |     pub vision: Qwen3VLVisionConfig,
+   |         ^^^^^^
+   |
+   = note: `Qwen3VLConfig` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: associated function `from_json_file` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:70:12
+   |
+68 | impl Qwen3VLConfig {
+   | ------------------ associated function in this implementation
+69 |     /// Parse from a HuggingFace `config.json` file.
+70 |     pub fn from_json_file(path: &Path) -> Result<Self> {
+   |            ^^^^^^^^^^^^^^
+
+warning: struct `VisionOutput` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:24:12
+   |
+24 | pub struct VisionOutput {
+   |            ^^^^^^^^^^^^
+
+warning: type alias `VisionMatmul` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:33:17
+   |
+33 | pub(crate) type VisionMatmul<'a> = dyn Fn(&str, &Tensor, &Tensor) -> Result<Tensor> + 'a;
+   |                 ^^^^^^^^^^^^
+
+warning: type alias `VisionNormMatmul` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:34:17
+   |
+34 | pub(crate) type VisionNormMatmul<'a> =
+   |                 ^^^^^^^^^^^^^^^^
+
+warning: type alias `VisionBiasGelu` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:36:17
+   |
+36 | pub(crate) type VisionBiasGelu<'a> = dyn Fn(&str, &Tensor, &Tensor) -> Result<Tensor> + 'a;
+   |                 ^^^^^^^^^^^^^^
+
+warning: type alias `VisionConcatQuant` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:37:17
+   |
+37 | pub(crate) type VisionConcatQuant<'a> =
+   |                 ^^^^^^^^^^^^^^^^^
+
+warning: type alias `VisionSegmentedAttention` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:39:17
+   |
+39 | pub(crate) type VisionSegmentedAttention<'a> =
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `VisionResidualNormMatmul` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:41:17
+   |
+41 | pub(crate) type VisionResidualNormMatmul<'a> = dyn Fn(&str, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor, f32, &Tensor) -> Result<(Te...
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `VisionBiasResidual` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:43:17
+   |
+43 | pub(crate) type VisionBiasResidual<'a> =
+   |                 ^^^^^^^^^^^^^^^^^^
+
+warning: function `add_bias` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:58:4
+   |
+58 | fn add_bias(b: &dyn Backend, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
+   |    ^^^^^^^^
+
+warning: function `layer_norm` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:73:4
+   |
+73 | fn layer_norm(
+   |    ^^^^^^^^^^
+
+warning: function `vision_attention` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:94:4
+   |
+94 | fn vision_attention(
+   |    ^^^^^^^^^^^^^^^^
+
+warning: struct `PreparedVisionPositions` is never constructed
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:128:19
+    |
+128 | pub(crate) struct PreparedVisionPositions {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `prepare_positions` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:137:15
+    |
+137 | pub(crate) fn prepare_positions(
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: function `forward_with_prepared_positions_and_matmul` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:185:15
+    |
+185 | pub(crate) fn forward_with_prepared_positions_and_matmul(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `forward_impl` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:225:4
+    |
+225 | fn forward_impl(
+    |    ^^^^^^^^^^^^
+
+warning: function `vision_matmul` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:615:4
+    |
+615 | fn vision_matmul(
+    |    ^^^^^^^^^^^^^
+
+warning: function `prepare_position_embeddings` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:628:15
+    |
+628 | pub(crate) fn prepare_position_embeddings(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `merge_primary` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:645:4
+    |
+645 | fn merge_primary(
+    |    ^^^^^^^^^^^^^
+
+warning: function `merge_deepstack` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:666:4
+    |
+666 | fn merge_deepstack(
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `apply_bias_gelu` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:704:4
+    |
+704 | fn apply_bias_gelu(b: &dyn Backend, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `vision_bias_gelu` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:722:4
+    |
+722 | fn vision_bias_gelu(
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `apply_bias_residual` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:735:4
+    |
+735 | fn apply_bias_residual(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `vision_bias_residual` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:764:4
+    |
+764 | fn vision_bias_residual(
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `apply_bias_residual_layer_norm` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:779:4
+    |
+779 | fn apply_bias_residual_layer_norm(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `slice_and_reshape` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:850:4
+    |
+850 | fn slice_and_reshape(
+    |    ^^^^^^^^^^^^^^^^^
+
+warning: function `split_vision_qkv` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:891:4
+    |
+891 | fn split_vision_qkv(
+    |    ^^^^^^^^^^^^^^^^
+
+warning: enum `PreparedVisionPositionBuffer` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:935:6
+    |
+935 | enum PreparedVisionPositionBuffer {
+    |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `prepare_vision_position_ids` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:952:4
+    |
+952 | fn prepare_vision_position_ids(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `apply_vision_rope_pair` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:975:4
+    |
+975 | fn apply_vision_rope_pair(
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `segmented_vision_sdpa` is never used
+    --> crates/apxinf-model/src/gr00t/backbone/vision.rs:1022:4
+     |
+1022 | fn segmented_vision_sdpa(
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `compute_pos_embeds` is never used
+    --> crates/apxinf-model/src/gr00t/backbone/vision.rs:1233:4
+     |
+1233 | fn compute_pos_embeds(
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLVisionWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:15:12
+   |
+15 | pub struct Qwen3VLVisionWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLVisionBlock` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:27:12
+   |
+27 | pub struct Qwen3VLVisionBlock {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLMerger` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:46:12
+   |
+46 | pub struct Qwen3VLMerger {
+   |            ^^^^^^^^^^^^^
+
+warning: associated functions `from_map` and `take_from_map` are never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:59:12
+   |
+58 | impl Qwen3VLVisionWeights {
+   | ------------------------- associated functions in this implementation
+59 |     pub fn from_map(cfg: &Qwen3VLConfig, mut tensors: HashMap<String, Tensor>) -> Result<Self> {
+   |            ^^^^^^^^
+...
+64 |     pub(crate) fn take_from_map(
+   |                   ^^^^^^^^^^^^^
+
+warning: function `load_merger` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:141:4
+    |
+141 | fn load_merger(
+    |    ^^^^^^^^^^^
+
+warning: function `reshape_5d_to_2d` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:162:4
+    |
+162 | fn reshape_5d_to_2d(t: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `reshape_linear_weight` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:196:4
+    |
+196 | fn reshape_linear_weight(t: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `transpose_2d` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:200:4
+    |
+200 | fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^
+
+warning: function `transfer_vision_weights` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:237:8
+    |
+237 | pub fn transfer_vision_weights(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLTextWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/weights.rs:15:12
+   |
+15 | pub struct Qwen3VLTextWeights {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLLayer` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/weights.rs:23:12
+   |
+23 | pub struct Qwen3VLLayer {
+   |            ^^^^^^^^^^^^
+
+warning: associated function `take_from_map` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/weights.rs:51:19
+   |
+46 | impl Qwen3VLTextWeights {
+   | ----------------------- associated function in this implementation
+...
+51 |     pub(crate) fn take_from_map(
+   |                   ^^^^^^^^^^^^^
+
+warning: function `transfer_weights` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/weights.rs:101:15
+    |
+101 | pub(crate) fn transfer_weights(
+    |               ^^^^^^^^^^^^^^^^
+
+warning: function `transpose_2d` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/weights.rs:136:4
+    |
+136 | fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^
+
+warning: associated function `from_json_file` is never used
+   --> crates/apxinf-model/src/gr00t/config.rs:230:12
+    |
+229 | impl Gr00tConfig {
+    | ---------------- associated function in this implementation
+230 |     pub fn from_json_file(path: &Path) -> Result<Self> {
+    |            ^^^^^^^^^^^^^^
+
+warning: struct `Gr00tWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/weights.rs:20:12
+   |
+20 | pub struct Gr00tWeights {
+   |            ^^^^^^^^^^^^
+
+warning: associated functions `from_safetensors` and `from_map` are never used
+  --> crates/apxinf-model/src/gr00t/weights.rs:29:12
+   |
+26 | impl Gr00tWeights {
+   | ----------------- associated functions in this implementation
+...
+29 |     pub fn from_safetensors(
+   |            ^^^^^^^^^^^^^^^^
+...
+42 |     pub fn from_map(
+   |            ^^^^^^^^
+
+warning: function `load_backbone_config` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:101:8
+    |
+101 | pub fn load_backbone_config(
+    |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `validate_backbone_config` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:116:4
+    |
+116 | fn validate_backbone_config(config: &Gr00tConfig, backbone: &Qwen3VLConfig) -> Result<()> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `validate_backbone_weights` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:188:4
+    |
+188 | fn validate_backbone_weights(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `validate_merger` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:394:4
+    |
+394 | fn validate_merger(
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `checked_mul` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:441:4
+    |
+441 | fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize> {
+    |    ^^^^^^^^^^^
+
+warning: associated function `from_json_file` is never used
+   --> crates/apxinf-model/src/walloss/config.rs:148:12
+    |
+147 | impl WallossConfig {
+    | ------------------ associated function in this implementation
+148 |     pub fn from_json_file(path: &Path) -> Result<Self> {
+    |            ^^^^^^^^^^^^^^
+
+warning: struct `WallossWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:23:12
+   |
+23 | pub struct WallossWeights {
+   |            ^^^^^^^^^^^^^^
+
+warning: struct `WallossLayerWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:32:12
+   |
+32 | pub struct WallossLayerWeights {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `WallossVisionWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:46:12
+   |
+46 | pub struct WallossVisionWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `WallossVisionBlockWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:57:12
+   |
+57 | pub struct WallossVisionBlockWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `WallossActionWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:70:12
+   |
+70 | pub struct WallossActionWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `from_safetensors`, `from_map`, and `to_bf16_device` are never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:80:12
+    |
+ 79 | impl WallossWeights {
+    | ------------------- associated items in this implementation
+ 80 |     pub fn from_safetensors(config: &mut WallossConfig, path: &Path) -> Result<Self> {
+    |            ^^^^^^^^^^^^^^^^
+...
+ 86 |     pub fn from_map(
+    |            ^^^^^^^^
+...
+163 |     pub fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |            ^^^^^^^^^^^^^^
+
+warning: method `to_bf16_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:184:8
+    |
+183 | impl WallossLayerWeights {
+    | ------------------------ method in this implementation
+184 |     fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^^^^^^
+
+warning: method `to_bf16_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:198:8
+    |
+197 | impl WallossVisionWeights {
+    | ------------------------- method in this implementation
+198 |     fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^^^^^^
+
+warning: method `to_bf16_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:216:8
+    |
+215 | impl WallossVisionBlockWeights {
+    | ------------------------------ method in this implementation
+216 |     fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^^^^^^
+
+warning: method `to_bf16_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:270:19
+    |
+269 | impl WallossActionWeights {
+    | ------------------------- method in this implementation
+270 |     pub(super) fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |                   ^^^^^^^^^^^^^^
+
+warning: function `bf16_to_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:285:15
+    |
+285 | pub(super) fn bf16_to_device(tensor: &Tensor, backend: &dyn Backend) -> Result<Tensor> {
+    |               ^^^^^^^^^^^^^^
+
+warning: function `load_layer` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:299:4
+    |
+299 | fn load_layer(
+    |    ^^^^^^^^^^
+
+warning: function `load_vision` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:365:4
+    |
+365 | fn load_vision(
+    |    ^^^^^^^^^^^
+
+warning: function `load_action` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:410:4
+    |
+410 | fn load_action(
+    |    ^^^^^^^^^^^
+
+warning: function `take` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:481:4
+    |
+481 | fn take(tensors: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
+    |    ^^^^
+
+warning: function `flatten_and_transpose` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:507:4
+    |
+507 | fn flatten_and_transpose(tensor: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `transpose_2d` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:526:4
+    |
+526 | fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^
+
+warning: function `split_columns` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:557:4
+    |
+557 | fn split_columns(tensor: &Tensor, first_columns: usize) -> Result<(Tensor, Tensor)> {
+    |    ^^^^^^^^^^^^^
+
+warning: function `to_bf16` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:602:4
+    |
+602 | fn to_bf16(tensor: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^
+
+warning: `apxinf-model` (lib test) generated 118 warnings (26 duplicates) (run `cargo fix --lib -p apxinf-model --tests` to apply 3 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 51.04s
+     Running unittests src/lib.rs (target/debug/deps/apxinf_model-c9e47585fb24871f)
+
+running 1 test
+test metal_lfm3::model::tests::c4_compiled_shape_mismatch_retraces_or_fails_loudly ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 344 filtered out; finished in 0.04s
+
+     Running tests/decision_api_compat.rs (target/debug/deps/decision_api_compat-d06e01a3ea4ebcae)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/model_family_boundaries.rs (target/debug/deps/model_family_boundaries-52d8c2ea5cb8cdc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/qwen_drive_loading.rs (target/debug/deps/qwen_drive_loading-43c5ef278ddde0ee)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/unified_llm_input.rs (target/debug/deps/unified_llm_input-78bec0f4019634b7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+warning: field `max_seq_len` is never read
+  --> crates/apxinf-core/src/kv_cache.rs:37:5
+   |
+33 | pub struct CpuKVCache {
+   |            ---------- field in this struct
+...
+37 |     max_seq_len: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `apxinf-core` (lib) generated 1 warning
+warning: apxinf-mlx@0.1.0: In file included from native/bridge.cpp:2:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/mlx.h:5:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/array.h:11:
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/allocator.h:39:36: warning: unused parameter 'ptr' [-Wunused-parameter]
+warning: apxinf-mlx@0.1.0:    39 |   virtual Buffer make_buffer(void* ptr, size_t size) {
+warning: apxinf-mlx@0.1.0:       |                                    ^
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/allocator.h:39:48: warning: unused parameter 'size' [-Wunused-parameter]
+warning: apxinf-mlx@0.1.0:    39 |   virtual Buffer make_buffer(void* ptr, size_t size) {
+warning: apxinf-mlx@0.1.0:       |                                                ^
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/allocator.h:42:31: warning: unused parameter 'buffer' [-Wunused-parameter]
+warning: apxinf-mlx@0.1.0:    42 |   virtual void release(Buffer buffer) {}
+warning: apxinf-mlx@0.1.0:       |                               ^
+warning: apxinf-mlx@0.1.0: In file included from native/bridge.cpp:2:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/mlx.h:5:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/array.h:13:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/dtype.h:9:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/types/complex.h:5:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/types/half_types.h:32:
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/types/bf16.h:29:3: warning: definition of implicit copy assignment operator for '_MLX_BFloat16' is deprecated because it has a user-declared copy constructor [-Wdeprecated-copy]
+warning: apxinf-mlx@0.1.0:    29 |   _MLX_BFloat16(_MLX_BFloat16 const&) = default;
+warning: apxinf-mlx@0.1.0:       |   ^
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/types/bf16.h:38:19: note: in implicit copy assignment operator for 'mlx::core::_MLX_BFloat16' first required here
+warning: apxinf-mlx@0.1.0:    38 |     return (*this = _MLX_BFloat16(x));
+warning: apxinf-mlx@0.1.0:       |                   ^
+warning: apxinf-mlx@0.1.0: 4 warnings generated.
+warning: field `out` is never read
+  --> crates/apxinf-mlx/src/quantized.rs:14:5
+   |
+ 9 | pub struct Quantized {
+   |            --------- field in this struct
+...
+14 |     out: usize,
+   |     ^^^
+   |
+   = note: `Quantized` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `apxinf-mlx` (lib) generated 1 warning
+warning: use of deprecated function `libc::mach_host_self`: Use the `mach2` crate instead
+   --> crates/apxinf-model/src/metal_qwen_image/weights.rs:757:19
+    |
+757 |             libc::mach_host_self(),
+    |                   ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `allow_online_tune`
+  --> crates/apxinf-model/src/accelerator.rs:21:5
+   |
+21 |     allow_online_tune: bool,
+   |     ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_allow_online_tune`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `recipe_cache_dir`
+  --> crates/apxinf-model/src/accelerator.rs:22:5
+   |
+22 |     recipe_cache_dir: Option<String>,
+   |     ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_recipe_cache_dir`
+
+warning: variable does not need to be mutable
+   --> crates/apxinf-model/src/metal_qwen3/model.rs:600:13
+    |
+600 |         let mut x = self
+    |             ----^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable `else` clause
+   --> crates/apxinf-model/src/metal_qwen_image/text_kv_cache.rs:474:70
+    |
+468 | /         let [start, end] = <[u64; 2]>::try_from(
+469 | |             offsets
+470 | |                 .iter()
+471 | |                 .map(|value| value.as_u64().unwrap_or(u64::MAX))
+...   |
+474 | |         .map_err(|_| fail(format!("{name} data_offsets malformed")))?
+    | |                                                                     -^
+    | |_____________________________________________________________________|
+    |                                                                       assigning to binding pattern will always succeed
+    |
+    = note: this pattern always matches, so the else clause is unreachable
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: field `weight` is never read
+  --> crates/apxinf-model/src/d3/weights/host.rs:19:16
+   |
+18 | pub struct D3ReadoutWeights {
+   |            ---------------- field in this struct
+19 |     pub(crate) weight: Tensor,
+   |                ^^^^^^
+   |
+   = note: `D3ReadoutWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `transpose_2d` is never used
+  --> crates/apxinf-model/src/d3/weights/host.rs:97:15
+   |
+97 | pub(super) fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
+   |               ^^^^^^^^^^^^
+
+warning: field `0` is never read
+   --> crates/apxinf-model/src/metal_qwen_image/weights.rs:825:14
+    |
+825 |     Disabled(PrefetchGate),
+    |     -------- ^^^^^^^^^^^^
+    |     |
+    |     field in this variant
+    |
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+    |
+825 -     Disabled(PrefetchGate),
+825 +     Disabled(()),
+    |
+
+warning: function `concat_host_2d` is never used
+ --> crates/apxinf-model/src/pi05/weights/packing.rs:3:24
+  |
+3 | pub(in crate::pi05) fn concat_host_2d(tensors: &[&Tensor]) -> Result<Tensor> {
+  |                        ^^^^^^^^^^^^^^
+
+warning: struct `Bf16DeviceLayerNorm` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:11:12
+   |
+11 | pub struct Bf16DeviceLayerNorm {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Bf16DeviceVisionBlock` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:17:12
+   |
+17 | pub struct Bf16DeviceVisionBlock {
+   |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Bf16DeviceLanguageLayer` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:27:12
+   |
+27 | pub struct Bf16DeviceLanguageLayer {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `VisionPatchEmbeddingF32` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:44:12
+   |
+44 | pub struct VisionPatchEmbeddingF32 {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `StaticBf16Pi0FastWeights` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:53:12
+   |
+53 | pub struct StaticBf16Pi0FastWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `from_host` is never used
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:67:12
+   |
+66 | impl StaticBf16Pi0FastWeights {
+   | ----------------------------- associated function in this implementation
+67 |     pub fn from_host(
+   |            ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:111:19
+    |
+110 | impl VisionPatchEmbeddingF32 {
+    | ---------------------------- associated function in this implementation
+111 |     pub(super) fn from_host(
+    |                   ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:129:19
+    |
+128 | impl Bf16DeviceLayerNorm {
+    | ------------------------ associated function in this implementation
+129 |     pub(super) fn from_host(weights: &LayerNormWeights, backend: &dyn Backend) -> Result<Self> {
+    |                   ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:138:8
+    |
+137 | impl Bf16DeviceVisionBlock {
+    | -------------------------- associated function in this implementation
+138 |     fn from_host(weights: &VisionBlockWeights, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:151:8
+    |
+150 | impl Bf16DeviceLanguageLayer {
+    | ---------------------------- associated function in this implementation
+151 |     fn from_host(weights: &LanguageLayerWeights, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^
+
+warning: struct `LinearView` is never constructed
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:183:19
+    |
+183 | pub(super) struct LinearView;
+    |                   ^^^^^^^^^^
+
+warning: associated function `columns` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:186:19
+    |
+185 | impl LinearView {
+    | --------------- associated function in this implementation
+186 |     pub(super) fn columns(tensor: &Tensor, columns: &[usize]) -> Result<super::LinearWeights> {
+    |                   ^^^^^^^
+
+warning: struct `Fp8DeviceVisionBlock` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:16:12
+   |
+16 | pub struct Fp8DeviceVisionBlock {
+   |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Fp8DeviceLanguageLayer` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:26:12
+   |
+26 | pub struct Fp8DeviceLanguageLayer {
+   |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `StaticFp8Pi0FastWeights` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:36:12
+   |
+36 | pub struct StaticFp8Pi0FastWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `from_host` is never used
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:53:12
+   |
+52 | impl StaticFp8Pi0FastWeights {
+   | ---------------------------- associated function in this implementation
+53 |     pub fn from_host(
+   |            ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:94:8
+   |
+93 | impl Fp8DeviceVisionBlock {
+   | ------------------------- associated function in this implementation
+94 |     fn from_host(weights: &VisionBlockWeights, backend: &dyn Backend) -> Result<Self> {
+   |        ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:107:8
+    |
+106 | impl Fp8DeviceLanguageLayer {
+    | --------------------------- associated function in this implementation
+107 |     fn from_host(weights: &LanguageLayerWeights, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^
+
+warning: `apxinf-model` (lib) generated 27 warnings (run `cargo fix --lib -p apxinf-model` to apply 3 suggestions)
+warning: unused import: `Shape`
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:13:43
+   |
+13 | use apxinf_core::{Backend, Error, Result, Shape, Tensor};
+   |                                           ^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `WallossTextConfig`
+  --> crates/apxinf-model/src/walloss/mod.rs:35:40
+   |
+35 | pub(crate) use config::{WallossConfig, WallossTextConfig, WallossVisionConfig};
+   |                                        ^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `allow_cached_residual_layer_norm`
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:242:5
+    |
+242 |     allow_cached_residual_layer_norm: bool,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_allow_cached_residual_layer_norm`
+
+warning: fields `weight` and `bias` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:34:9
+   |
+33 | pub struct Gr00tLayerNormWeights {
+   |            --------------------- fields in this struct
+34 |     pub weight: Tensor,
+   |         ^^^^^^
+35 |     pub bias: Tensor,
+   |         ^^^^
+   |
+   = note: `Gr00tLayerNormWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `input` and `output` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:40:9
+   |
+39 | pub struct Gr00tCategoryMlpWeights {
+   |            ----------------------- fields in this struct
+40 |     pub input: Gr00tCategoryLinearWeights,
+   |         ^^^^^
+41 |     pub output: Gr00tCategoryLinearWeights,
+   |         ^^^^^^
+   |
+   = note: `Gr00tCategoryMlpWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: struct `Gr00tMlpWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:45:12
+   |
+45 | pub struct Gr00tMlpWeights {
+   |            ^^^^^^^^^^^^^^^
+
+warning: struct `Gr00tActionEncoderWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:51:12
+   |
+51 | pub struct Gr00tActionEncoderWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Gr00tEmbodimentWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:61:12
+   |
+61 | pub struct Gr00tEmbodimentWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `query`, `key`, `value`, and `output` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:69:9
+   |
+68 | pub struct Gr00tAttentionWeights {
+   |            --------------------- fields in this struct
+69 |     pub query: Gr00tLinearWeights,
+   |         ^^^^^
+70 |     pub key: Gr00tLinearWeights,
+   |         ^^^
+71 |     pub value: Gr00tLinearWeights,
+   |         ^^^^^
+72 |     pub output: Gr00tLinearWeights,
+   |         ^^^^^^
+   |
+   = note: `Gr00tAttentionWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `input` and `output` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:77:9
+   |
+76 | pub struct Gr00tFeedForwardWeights {
+   |            ----------------------- fields in this struct
+77 |     pub input: Gr00tLinearWeights,
+   |         ^^^^^
+78 |     pub output: Gr00tLinearWeights,
+   |         ^^^^^^
+   |
+   = note: `Gr00tFeedForwardWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `adaptive_norm`, `attention`, and `feed_forward` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:84:9
+   |
+82 | pub struct Gr00tDitBlockWeights {
+   |            -------------------- fields in this struct
+83 |     /// `SiLU(timestep_embedding) -> [scale, shift]`.
+84 |     pub adaptive_norm: Gr00tLinearWeights,
+   |         ^^^^^^^^^^^^^
+85 |     pub attention: Gr00tAttentionWeights,
+   |         ^^^^^^^^^
+86 |     pub feed_forward: Gr00tFeedForwardWeights,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `Gr00tDitBlockWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `attention_norm`, `attention`, `feed_forward_norm`, and `feed_forward` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:91:9
+   |
+90 | pub struct Gr00tVlSelfAttentionBlockWeights {
+   |            -------------------------------- fields in this struct
+91 |     pub attention_norm: Gr00tLayerNormWeights,
+   |         ^^^^^^^^^^^^^^
+92 |     pub attention: Gr00tAttentionWeights,
+   |         ^^^^^^^^^
+93 |     pub feed_forward_norm: Gr00tLayerNormWeights,
+   |         ^^^^^^^^^^^^^^^^^
+94 |     pub feed_forward: Gr00tFeedForwardWeights,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `Gr00tVlSelfAttentionBlockWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: multiple fields are never read
+   --> crates/apxinf-model/src/gr00t/action_weights.rs:100:9
+    |
+ 99 | pub struct Gr00tActionHeadWeights {
+    |            ---------------------- fields in this struct
+100 |     pub state_encoder: Gr00tCategoryMlpWeights,
+    |         ^^^^^^^^^^^^^
+101 |     pub action_encoder_input: Gr00tCategoryLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^^^^
+102 |     pub action_encoder_time: Gr00tCategoryLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^^^
+103 |     pub action_encoder_output: Gr00tCategoryLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^^^^^
+104 |     pub action_decoder: Gr00tCategoryMlpWeights,
+    |         ^^^^^^^^^^^^^^
+105 |     pub position_embedding: Option<Tensor>,
+    |         ^^^^^^^^^^^^^^^^^^
+106 |     pub backbone_layer_norm: Option<Gr00tLayerNormWeights>,
+    |         ^^^^^^^^^^^^^^^^^^^
+107 |     pub vl_self_attention: Vec<Gr00tVlSelfAttentionBlockWeights>,
+    |         ^^^^^^^^^^^^^^^^^
+108 |     pub timestep_input: Gr00tLinearWeights,
+    |         ^^^^^^^^^^^^^^
+109 |     pub timestep_output: Gr00tLinearWeights,
+    |         ^^^^^^^^^^^^^^^
+110 |     pub dit_blocks: Vec<Gr00tDitBlockWeights>,
+    |         ^^^^^^^^^^
+...
+113 |     pub output_modulation: Gr00tLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^
+114 |     pub output_projection: Gr00tLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^
+    |
+    = note: `Gr00tActionHeadWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `select_category_mlp` is never used
+   --> crates/apxinf-model/src/gr00t/action_weights.rs:274:15
+    |
+274 | pub(super) fn select_category_mlp(
+    |               ^^^^^^^^^^^^^^^^^^^
+
+warning: fields `intermediate_size`, `max_position_embeddings`, and `rms_norm_eps` are never read
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:17:9
+   |
+15 | pub struct Qwen3VLTextConfig {
+   |            ----------------- fields in this struct
+16 |     pub hidden_size: usize,
+17 |     pub intermediate_size: usize,
+   |         ^^^^^^^^^^^^^^^^^
+...
+23 |     pub max_position_embeddings: usize,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^
+24 |     pub rms_norm_eps: f32,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `Qwen3VLTextConfig` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: multiple fields are never read
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:34:9
+   |
+33 | pub struct Qwen3VLVisionConfig {
+   |            ------------------- fields in this struct
+34 |     pub depth: usize,
+   |         ^^^^^
+35 |     pub hidden_size: usize,
+   |         ^^^^^^^^^^^
+36 |     pub intermediate_size: usize,
+   |         ^^^^^^^^^^^^^^^^^
+37 |     pub num_heads: usize,
+   |         ^^^^^^^^^
+38 |     pub head_dim: usize,
+   |         ^^^^^^^^
+39 |     pub patch_size: usize,
+   |         ^^^^^^^^^^
+40 |     pub temporal_patch_size: usize,
+   |         ^^^^^^^^^^^^^^^^^^^
+41 |     pub in_channels: usize,
+   |         ^^^^^^^^^^^
+42 |     pub spatial_merge_size: usize,
+   |         ^^^^^^^^^^^^^^^^^^
+43 |     pub num_position_embeddings: usize,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^
+44 |     pub out_hidden_size: usize,
+   |         ^^^^^^^^^^^^^^^
+45 |     /// Which 3 of the `depth` vision blocks feed the deepstack mergers.
+46 |     pub deepstack_visual_indexes: Vec<usize>,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `Qwen3VLVisionConfig` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: method `head_dim` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:50:12
+   |
+49 | impl Qwen3VLVisionConfig {
+   | ------------------------ method in this implementation
+50 |     pub fn head_dim(&self) -> usize {
+   |            ^^^^^^^^
+
+warning: field `vision` is never read
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:64:9
+   |
+62 | pub struct Qwen3VLConfig {
+   |            ------------- field in this struct
+63 |     pub text: Qwen3VLTextConfig,
+64 |     pub vision: Qwen3VLVisionConfig,
+   |         ^^^^^^
+   |
+   = note: `Qwen3VLConfig` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: associated function `from_json_file` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:70:12
+   |
+68 | impl Qwen3VLConfig {
+   | ------------------ associated function in this implementation
+69 |     /// Parse from a HuggingFace `config.json` file.
+70 |     pub fn from_json_file(path: &Path) -> Result<Self> {
+   |            ^^^^^^^^^^^^^^
+
+warning: struct `VisionOutput` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:24:12
+   |
+24 | pub struct VisionOutput {
+   |            ^^^^^^^^^^^^
+
+warning: type alias `VisionMatmul` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:33:17
+   |
+33 | pub(crate) type VisionMatmul<'a> = dyn Fn(&str, &Tensor, &Tensor) -> Result<Tensor> + 'a;
+   |                 ^^^^^^^^^^^^
+
+warning: type alias `VisionNormMatmul` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:34:17
+   |
+34 | pub(crate) type VisionNormMatmul<'a> =
+   |                 ^^^^^^^^^^^^^^^^
+
+warning: type alias `VisionBiasGelu` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:36:17
+   |
+36 | pub(crate) type VisionBiasGelu<'a> = dyn Fn(&str, &Tensor, &Tensor) -> Result<Tensor> + 'a;
+   |                 ^^^^^^^^^^^^^^
+
+warning: type alias `VisionConcatQuant` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:37:17
+   |
+37 | pub(crate) type VisionConcatQuant<'a> =
+   |                 ^^^^^^^^^^^^^^^^^
+
+warning: type alias `VisionSegmentedAttention` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:39:17
+   |
+39 | pub(crate) type VisionSegmentedAttention<'a> =
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `VisionResidualNormMatmul` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:41:17
+   |
+41 | pub(crate) type VisionResidualNormMatmul<'a> = dyn Fn(&str, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor, f32, &Tensor) -> Result<(Te...
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `VisionBiasResidual` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:43:17
+   |
+43 | pub(crate) type VisionBiasResidual<'a> =
+   |                 ^^^^^^^^^^^^^^^^^^
+
+warning: function `add_bias` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:58:4
+   |
+58 | fn add_bias(b: &dyn Backend, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
+   |    ^^^^^^^^
+
+warning: function `layer_norm` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:73:4
+   |
+73 | fn layer_norm(
+   |    ^^^^^^^^^^
+
+warning: function `vision_attention` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:94:4
+   |
+94 | fn vision_attention(
+   |    ^^^^^^^^^^^^^^^^
+
+warning: struct `PreparedVisionPositions` is never constructed
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:128:19
+    |
+128 | pub(crate) struct PreparedVisionPositions {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `prepare_positions` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:137:15
+    |
+137 | pub(crate) fn prepare_positions(
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: function `forward_with_prepared_positions_and_matmul` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:185:15
+    |
+185 | pub(crate) fn forward_with_prepared_positions_and_matmul(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `forward_impl` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:225:4
+    |
+225 | fn forward_impl(
+    |    ^^^^^^^^^^^^
+
+warning: function `vision_matmul` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:615:4
+    |
+615 | fn vision_matmul(
+    |    ^^^^^^^^^^^^^
+
+warning: function `prepare_position_embeddings` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:628:15
+    |
+628 | pub(crate) fn prepare_position_embeddings(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `merge_primary` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:645:4
+    |
+645 | fn merge_primary(
+    |    ^^^^^^^^^^^^^
+
+warning: function `merge_deepstack` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:666:4
+    |
+666 | fn merge_deepstack(
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `apply_bias_gelu` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:704:4
+    |
+704 | fn apply_bias_gelu(b: &dyn Backend, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `vision_bias_gelu` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:722:4
+    |
+722 | fn vision_bias_gelu(
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `apply_bias_residual` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:735:4
+    |
+735 | fn apply_bias_residual(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `vision_bias_residual` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:764:4
+    |
+764 | fn vision_bias_residual(
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `apply_bias_residual_layer_norm` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:779:4
+    |
+779 | fn apply_bias_residual_layer_norm(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `slice_and_reshape` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:850:4
+    |
+850 | fn slice_and_reshape(
+    |    ^^^^^^^^^^^^^^^^^
+
+warning: function `split_vision_qkv` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:891:4
+    |
+891 | fn split_vision_qkv(
+    |    ^^^^^^^^^^^^^^^^
+
+warning: enum `PreparedVisionPositionBuffer` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:935:6
+    |
+935 | enum PreparedVisionPositionBuffer {
+    |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `prepare_vision_position_ids` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:952:4
+    |
+952 | fn prepare_vision_position_ids(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `apply_vision_rope_pair` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:975:4
+    |
+975 | fn apply_vision_rope_pair(
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `segmented_vision_sdpa` is never used
+    --> crates/apxinf-model/src/gr00t/backbone/vision.rs:1022:4
+     |
+1022 | fn segmented_vision_sdpa(
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `compute_pos_embeds` is never used
+    --> crates/apxinf-model/src/gr00t/backbone/vision.rs:1233:4
+     |
+1233 | fn compute_pos_embeds(
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLVisionWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:15:12
+   |
+15 | pub struct Qwen3VLVisionWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLVisionBlock` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:27:12
+   |
+27 | pub struct Qwen3VLVisionBlock {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLMerger` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:46:12
+   |
+46 | pub struct Qwen3VLMerger {
+   |            ^^^^^^^^^^^^^
+
+warning: associated functions `from_map` and `take_from_map` are never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:59:12
+   |
+58 | impl Qwen3VLVisionWeights {
+   | ------------------------- associated functions in this implementation
+59 |     pub fn from_map(cfg: &Qwen3VLConfig, mut tensors: HashMap<String, Tensor>) -> Result<Self> {
+   |            ^^^^^^^^
+...
+64 |     pub(crate) fn take_from_map(
+   |                   ^^^^^^^^^^^^^
+
+warning: function `load_merger` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:141:4
+    |
+141 | fn load_merger(
+    |    ^^^^^^^^^^^
+
+warning: function `reshape_5d_to_2d` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:162:4
+    |
+162 | fn reshape_5d_to_2d(t: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `reshape_linear_weight` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:196:4
+    |
+196 | fn reshape_linear_weight(t: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `transpose_2d` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:200:4
+    |
+200 | fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^
+
+warning: function `transfer_vision_weights` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:237:8
+    |
+237 | pub fn transfer_vision_weights(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLTextWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/weights.rs:15:12
+   |
+15 | pub struct Qwen3VLTextWeights {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLLayer` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/weights.rs:23:12
+   |
+23 | pub struct Qwen3VLLayer {
+   |            ^^^^^^^^^^^^
+
+warning: associated function `take_from_map` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/weights.rs:51:19
+   |
+46 | impl Qwen3VLTextWeights {
+   | ----------------------- associated function in this implementation
+...
+51 |     pub(crate) fn take_from_map(
+   |                   ^^^^^^^^^^^^^
+
+warning: function `transfer_weights` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/weights.rs:101:15
+    |
+101 | pub(crate) fn transfer_weights(
+    |               ^^^^^^^^^^^^^^^^
+
+warning: function `transpose_2d` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/weights.rs:136:4
+    |
+136 | fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^
+
+warning: associated function `from_json_file` is never used
+   --> crates/apxinf-model/src/gr00t/config.rs:230:12
+    |
+229 | impl Gr00tConfig {
+    | ---------------- associated function in this implementation
+230 |     pub fn from_json_file(path: &Path) -> Result<Self> {
+    |            ^^^^^^^^^^^^^^
+
+warning: struct `Gr00tWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/weights.rs:20:12
+   |
+20 | pub struct Gr00tWeights {
+   |            ^^^^^^^^^^^^
+
+warning: associated functions `from_safetensors` and `from_map` are never used
+  --> crates/apxinf-model/src/gr00t/weights.rs:29:12
+   |
+26 | impl Gr00tWeights {
+   | ----------------- associated functions in this implementation
+...
+29 |     pub fn from_safetensors(
+   |            ^^^^^^^^^^^^^^^^
+...
+42 |     pub fn from_map(
+   |            ^^^^^^^^
+
+warning: function `load_backbone_config` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:101:8
+    |
+101 | pub fn load_backbone_config(
+    |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `validate_backbone_config` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:116:4
+    |
+116 | fn validate_backbone_config(config: &Gr00tConfig, backbone: &Qwen3VLConfig) -> Result<()> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `validate_backbone_weights` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:188:4
+    |
+188 | fn validate_backbone_weights(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `validate_merger` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:394:4
+    |
+394 | fn validate_merger(
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `checked_mul` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:441:4
+    |
+441 | fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize> {
+    |    ^^^^^^^^^^^
+
+warning: associated function `from_json_file` is never used
+   --> crates/apxinf-model/src/walloss/config.rs:148:12
+    |
+147 | impl WallossConfig {
+    | ------------------ associated function in this implementation
+148 |     pub fn from_json_file(path: &Path) -> Result<Self> {
+    |            ^^^^^^^^^^^^^^
+
+warning: struct `WallossWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:23:12
+   |
+23 | pub struct WallossWeights {
+   |            ^^^^^^^^^^^^^^
+
+warning: struct `WallossLayerWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:32:12
+   |
+32 | pub struct WallossLayerWeights {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `WallossVisionWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:46:12
+   |
+46 | pub struct WallossVisionWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `WallossVisionBlockWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:57:12
+   |
+57 | pub struct WallossVisionBlockWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `WallossActionWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:70:12
+   |
+70 | pub struct WallossActionWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `from_safetensors`, `from_map`, and `to_bf16_device` are never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:80:12
+    |
+ 79 | impl WallossWeights {
+    | ------------------- associated items in this implementation
+ 80 |     pub fn from_safetensors(config: &mut WallossConfig, path: &Path) -> Result<Self> {
+    |            ^^^^^^^^^^^^^^^^
+...
+ 86 |     pub fn from_map(
+    |            ^^^^^^^^
+...
+163 |     pub fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |            ^^^^^^^^^^^^^^
+
+warning: method `to_bf16_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:184:8
+    |
+183 | impl WallossLayerWeights {
+    | ------------------------ method in this implementation
+184 |     fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^^^^^^
+
+warning: method `to_bf16_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:198:8
+    |
+197 | impl WallossVisionWeights {
+    | ------------------------- method in this implementation
+198 |     fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^^^^^^
+
+warning: method `to_bf16_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:216:8
+    |
+215 | impl WallossVisionBlockWeights {
+    | ------------------------------ method in this implementation
+216 |     fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^^^^^^
+
+warning: method `to_bf16_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:270:19
+    |
+269 | impl WallossActionWeights {
+    | ------------------------- method in this implementation
+270 |     pub(super) fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |                   ^^^^^^^^^^^^^^
+
+warning: function `bf16_to_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:285:15
+    |
+285 | pub(super) fn bf16_to_device(tensor: &Tensor, backend: &dyn Backend) -> Result<Tensor> {
+    |               ^^^^^^^^^^^^^^
+
+warning: function `load_layer` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:299:4
+    |
+299 | fn load_layer(
+    |    ^^^^^^^^^^
+
+warning: function `load_vision` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:365:4
+    |
+365 | fn load_vision(
+    |    ^^^^^^^^^^^
+
+warning: function `load_action` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:410:4
+    |
+410 | fn load_action(
+    |    ^^^^^^^^^^^
+
+warning: function `take` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:481:4
+    |
+481 | fn take(tensors: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
+    |    ^^^^
+
+warning: function `flatten_and_transpose` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:507:4
+    |
+507 | fn flatten_and_transpose(tensor: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `transpose_2d` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:526:4
+    |
+526 | fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^
+
+warning: function `split_columns` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:557:4
+    |
+557 | fn split_columns(tensor: &Tensor, first_columns: usize) -> Result<(Tensor, Tensor)> {
+    |    ^^^^^^^^^^^^^
+
+warning: function `to_bf16` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:602:4
+    |
+602 | fn to_bf16(tensor: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^
+
+warning: `apxinf-model` (lib test) generated 118 warnings (26 duplicates) (run `cargo fix --lib -p apxinf-model --tests` to apply 3 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/apxinf_model-c9e47585fb24871f)
+
+running 1 test
+test metal_lfm3::model::tests::c4_compiled_shape_mismatch_retraces_or_fails_loudly ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 344 filtered out; finished in 0.03s
+
+     Running tests/decision_api_compat.rs (target/debug/deps/decision_api_compat-d06e01a3ea4ebcae)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/model_family_boundaries.rs (target/debug/deps/model_family_boundaries-52d8c2ea5cb8cdc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/qwen_drive_loading.rs (target/debug/deps/qwen_drive_loading-43c5ef278ddde0ee)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/unified_llm_input.rs (target/debug/deps/unified_llm_input-78bec0f4019634b7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+warning: field `max_seq_len` is never read
+  --> crates/apxinf-core/src/kv_cache.rs:37:5
+   |
+33 | pub struct CpuKVCache {
+   |            ---------- field in this struct
+...
+37 |     max_seq_len: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `apxinf-core` (lib) generated 1 warning
+warning: apxinf-mlx@0.1.0: In file included from native/bridge.cpp:2:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/mlx.h:5:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/array.h:11:
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/allocator.h:39:36: warning: unused parameter 'ptr' [-Wunused-parameter]
+warning: apxinf-mlx@0.1.0:    39 |   virtual Buffer make_buffer(void* ptr, size_t size) {
+warning: apxinf-mlx@0.1.0:       |                                    ^
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/allocator.h:39:48: warning: unused parameter 'size' [-Wunused-parameter]
+warning: apxinf-mlx@0.1.0:    39 |   virtual Buffer make_buffer(void* ptr, size_t size) {
+warning: apxinf-mlx@0.1.0:       |                                                ^
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/allocator.h:42:31: warning: unused parameter 'buffer' [-Wunused-parameter]
+warning: apxinf-mlx@0.1.0:    42 |   virtual void release(Buffer buffer) {}
+warning: apxinf-mlx@0.1.0:       |                               ^
+warning: apxinf-mlx@0.1.0: In file included from native/bridge.cpp:2:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/mlx.h:5:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/array.h:13:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/dtype.h:9:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/types/complex.h:5:
+warning: apxinf-mlx@0.1.0: In file included from /Users/haiyan-mini/mlx-sdk/include/mlx/types/half_types.h:32:
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/types/bf16.h:29:3: warning: definition of implicit copy assignment operator for '_MLX_BFloat16' is deprecated because it has a user-declared copy constructor [-Wdeprecated-copy]
+warning: apxinf-mlx@0.1.0:    29 |   _MLX_BFloat16(_MLX_BFloat16 const&) = default;
+warning: apxinf-mlx@0.1.0:       |   ^
+warning: apxinf-mlx@0.1.0: /Users/haiyan-mini/mlx-sdk/include/mlx/types/bf16.h:38:19: note: in implicit copy assignment operator for 'mlx::core::_MLX_BFloat16' first required here
+warning: apxinf-mlx@0.1.0:    38 |     return (*this = _MLX_BFloat16(x));
+warning: apxinf-mlx@0.1.0:       |                   ^
+warning: apxinf-mlx@0.1.0: 4 warnings generated.
+warning: field `out` is never read
+  --> crates/apxinf-mlx/src/quantized.rs:14:5
+   |
+ 9 | pub struct Quantized {
+   |            --------- field in this struct
+...
+14 |     out: usize,
+   |     ^^^
+   |
+   = note: `Quantized` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `apxinf-mlx` (lib) generated 1 warning
+warning: use of deprecated function `libc::mach_host_self`: Use the `mach2` crate instead
+   --> crates/apxinf-model/src/metal_qwen_image/weights.rs:757:19
+    |
+757 |             libc::mach_host_self(),
+    |                   ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `allow_online_tune`
+  --> crates/apxinf-model/src/accelerator.rs:21:5
+   |
+21 |     allow_online_tune: bool,
+   |     ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_allow_online_tune`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `recipe_cache_dir`
+  --> crates/apxinf-model/src/accelerator.rs:22:5
+   |
+22 |     recipe_cache_dir: Option<String>,
+   |     ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_recipe_cache_dir`
+
+warning: variable does not need to be mutable
+   --> crates/apxinf-model/src/metal_qwen3/model.rs:600:13
+    |
+600 |         let mut x = self
+    |             ----^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable `else` clause
+   --> crates/apxinf-model/src/metal_qwen_image/text_kv_cache.rs:474:70
+    |
+468 | /         let [start, end] = <[u64; 2]>::try_from(
+469 | |             offsets
+470 | |                 .iter()
+471 | |                 .map(|value| value.as_u64().unwrap_or(u64::MAX))
+...   |
+474 | |         .map_err(|_| fail(format!("{name} data_offsets malformed")))?
+    | |                                                                     -^
+    | |_____________________________________________________________________|
+    |                                                                       assigning to binding pattern will always succeed
+    |
+    = note: this pattern always matches, so the else clause is unreachable
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: field `weight` is never read
+  --> crates/apxinf-model/src/d3/weights/host.rs:19:16
+   |
+18 | pub struct D3ReadoutWeights {
+   |            ---------------- field in this struct
+19 |     pub(crate) weight: Tensor,
+   |                ^^^^^^
+   |
+   = note: `D3ReadoutWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `transpose_2d` is never used
+  --> crates/apxinf-model/src/d3/weights/host.rs:97:15
+   |
+97 | pub(super) fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
+   |               ^^^^^^^^^^^^
+
+warning: field `0` is never read
+   --> crates/apxinf-model/src/metal_qwen_image/weights.rs:825:14
+    |
+825 |     Disabled(PrefetchGate),
+    |     -------- ^^^^^^^^^^^^
+    |     |
+    |     field in this variant
+    |
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+    |
+825 -     Disabled(PrefetchGate),
+825 +     Disabled(()),
+    |
+
+warning: function `concat_host_2d` is never used
+ --> crates/apxinf-model/src/pi05/weights/packing.rs:3:24
+  |
+3 | pub(in crate::pi05) fn concat_host_2d(tensors: &[&Tensor]) -> Result<Tensor> {
+  |                        ^^^^^^^^^^^^^^
+
+warning: struct `Bf16DeviceLayerNorm` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:11:12
+   |
+11 | pub struct Bf16DeviceLayerNorm {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Bf16DeviceVisionBlock` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:17:12
+   |
+17 | pub struct Bf16DeviceVisionBlock {
+   |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Bf16DeviceLanguageLayer` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:27:12
+   |
+27 | pub struct Bf16DeviceLanguageLayer {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `VisionPatchEmbeddingF32` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:44:12
+   |
+44 | pub struct VisionPatchEmbeddingF32 {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `StaticBf16Pi0FastWeights` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:53:12
+   |
+53 | pub struct StaticBf16Pi0FastWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `from_host` is never used
+  --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:67:12
+   |
+66 | impl StaticBf16Pi0FastWeights {
+   | ----------------------------- associated function in this implementation
+67 |     pub fn from_host(
+   |            ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:111:19
+    |
+110 | impl VisionPatchEmbeddingF32 {
+    | ---------------------------- associated function in this implementation
+111 |     pub(super) fn from_host(
+    |                   ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:129:19
+    |
+128 | impl Bf16DeviceLayerNorm {
+    | ------------------------ associated function in this implementation
+129 |     pub(super) fn from_host(weights: &LayerNormWeights, backend: &dyn Backend) -> Result<Self> {
+    |                   ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:138:8
+    |
+137 | impl Bf16DeviceVisionBlock {
+    | -------------------------- associated function in this implementation
+138 |     fn from_host(weights: &VisionBlockWeights, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:151:8
+    |
+150 | impl Bf16DeviceLanguageLayer {
+    | ---------------------------- associated function in this implementation
+151 |     fn from_host(weights: &LanguageLayerWeights, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^
+
+warning: struct `LinearView` is never constructed
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:183:19
+    |
+183 | pub(super) struct LinearView;
+    |                   ^^^^^^^^^^
+
+warning: associated function `columns` is never used
+   --> crates/apxinf-model/src/pi0fast/static_bf16_weights.rs:186:19
+    |
+185 | impl LinearView {
+    | --------------- associated function in this implementation
+186 |     pub(super) fn columns(tensor: &Tensor, columns: &[usize]) -> Result<super::LinearWeights> {
+    |                   ^^^^^^^
+
+warning: struct `Fp8DeviceVisionBlock` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:16:12
+   |
+16 | pub struct Fp8DeviceVisionBlock {
+   |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Fp8DeviceLanguageLayer` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:26:12
+   |
+26 | pub struct Fp8DeviceLanguageLayer {
+   |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `StaticFp8Pi0FastWeights` is never constructed
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:36:12
+   |
+36 | pub struct StaticFp8Pi0FastWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `from_host` is never used
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:53:12
+   |
+52 | impl StaticFp8Pi0FastWeights {
+   | ---------------------------- associated function in this implementation
+53 |     pub fn from_host(
+   |            ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+  --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:94:8
+   |
+93 | impl Fp8DeviceVisionBlock {
+   | ------------------------- associated function in this implementation
+94 |     fn from_host(weights: &VisionBlockWeights, backend: &dyn Backend) -> Result<Self> {
+   |        ^^^^^^^^^
+
+warning: associated function `from_host` is never used
+   --> crates/apxinf-model/src/pi0fast/static_fp8_weights.rs:107:8
+    |
+106 | impl Fp8DeviceLanguageLayer {
+    | --------------------------- associated function in this implementation
+107 |     fn from_host(weights: &LanguageLayerWeights, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^
+
+warning: `apxinf-model` (lib) generated 27 warnings (run `cargo fix --lib -p apxinf-model` to apply 3 suggestions)
+warning: unused import: `Shape`
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:13:43
+   |
+13 | use apxinf_core::{Backend, Error, Result, Shape, Tensor};
+   |                                           ^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `WallossTextConfig`
+  --> crates/apxinf-model/src/walloss/mod.rs:35:40
+   |
+35 | pub(crate) use config::{WallossConfig, WallossTextConfig, WallossVisionConfig};
+   |                                        ^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `allow_cached_residual_layer_norm`
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:242:5
+    |
+242 |     allow_cached_residual_layer_norm: bool,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_allow_cached_residual_layer_norm`
+
+warning: fields `weight` and `bias` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:34:9
+   |
+33 | pub struct Gr00tLayerNormWeights {
+   |            --------------------- fields in this struct
+34 |     pub weight: Tensor,
+   |         ^^^^^^
+35 |     pub bias: Tensor,
+   |         ^^^^
+   |
+   = note: `Gr00tLayerNormWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `input` and `output` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:40:9
+   |
+39 | pub struct Gr00tCategoryMlpWeights {
+   |            ----------------------- fields in this struct
+40 |     pub input: Gr00tCategoryLinearWeights,
+   |         ^^^^^
+41 |     pub output: Gr00tCategoryLinearWeights,
+   |         ^^^^^^
+   |
+   = note: `Gr00tCategoryMlpWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: struct `Gr00tMlpWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:45:12
+   |
+45 | pub struct Gr00tMlpWeights {
+   |            ^^^^^^^^^^^^^^^
+
+warning: struct `Gr00tActionEncoderWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:51:12
+   |
+51 | pub struct Gr00tActionEncoderWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Gr00tEmbodimentWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:61:12
+   |
+61 | pub struct Gr00tEmbodimentWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `query`, `key`, `value`, and `output` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:69:9
+   |
+68 | pub struct Gr00tAttentionWeights {
+   |            --------------------- fields in this struct
+69 |     pub query: Gr00tLinearWeights,
+   |         ^^^^^
+70 |     pub key: Gr00tLinearWeights,
+   |         ^^^
+71 |     pub value: Gr00tLinearWeights,
+   |         ^^^^^
+72 |     pub output: Gr00tLinearWeights,
+   |         ^^^^^^
+   |
+   = note: `Gr00tAttentionWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `input` and `output` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:77:9
+   |
+76 | pub struct Gr00tFeedForwardWeights {
+   |            ----------------------- fields in this struct
+77 |     pub input: Gr00tLinearWeights,
+   |         ^^^^^
+78 |     pub output: Gr00tLinearWeights,
+   |         ^^^^^^
+   |
+   = note: `Gr00tFeedForwardWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `adaptive_norm`, `attention`, and `feed_forward` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:84:9
+   |
+82 | pub struct Gr00tDitBlockWeights {
+   |            -------------------- fields in this struct
+83 |     /// `SiLU(timestep_embedding) -> [scale, shift]`.
+84 |     pub adaptive_norm: Gr00tLinearWeights,
+   |         ^^^^^^^^^^^^^
+85 |     pub attention: Gr00tAttentionWeights,
+   |         ^^^^^^^^^
+86 |     pub feed_forward: Gr00tFeedForwardWeights,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `Gr00tDitBlockWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `attention_norm`, `attention`, `feed_forward_norm`, and `feed_forward` are never read
+  --> crates/apxinf-model/src/gr00t/action_weights.rs:91:9
+   |
+90 | pub struct Gr00tVlSelfAttentionBlockWeights {
+   |            -------------------------------- fields in this struct
+91 |     pub attention_norm: Gr00tLayerNormWeights,
+   |         ^^^^^^^^^^^^^^
+92 |     pub attention: Gr00tAttentionWeights,
+   |         ^^^^^^^^^
+93 |     pub feed_forward_norm: Gr00tLayerNormWeights,
+   |         ^^^^^^^^^^^^^^^^^
+94 |     pub feed_forward: Gr00tFeedForwardWeights,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `Gr00tVlSelfAttentionBlockWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: multiple fields are never read
+   --> crates/apxinf-model/src/gr00t/action_weights.rs:100:9
+    |
+ 99 | pub struct Gr00tActionHeadWeights {
+    |            ---------------------- fields in this struct
+100 |     pub state_encoder: Gr00tCategoryMlpWeights,
+    |         ^^^^^^^^^^^^^
+101 |     pub action_encoder_input: Gr00tCategoryLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^^^^
+102 |     pub action_encoder_time: Gr00tCategoryLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^^^
+103 |     pub action_encoder_output: Gr00tCategoryLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^^^^^
+104 |     pub action_decoder: Gr00tCategoryMlpWeights,
+    |         ^^^^^^^^^^^^^^
+105 |     pub position_embedding: Option<Tensor>,
+    |         ^^^^^^^^^^^^^^^^^^
+106 |     pub backbone_layer_norm: Option<Gr00tLayerNormWeights>,
+    |         ^^^^^^^^^^^^^^^^^^^
+107 |     pub vl_self_attention: Vec<Gr00tVlSelfAttentionBlockWeights>,
+    |         ^^^^^^^^^^^^^^^^^
+108 |     pub timestep_input: Gr00tLinearWeights,
+    |         ^^^^^^^^^^^^^^
+109 |     pub timestep_output: Gr00tLinearWeights,
+    |         ^^^^^^^^^^^^^^^
+110 |     pub dit_blocks: Vec<Gr00tDitBlockWeights>,
+    |         ^^^^^^^^^^
+...
+113 |     pub output_modulation: Gr00tLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^
+114 |     pub output_projection: Gr00tLinearWeights,
+    |         ^^^^^^^^^^^^^^^^^
+    |
+    = note: `Gr00tActionHeadWeights` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `select_category_mlp` is never used
+   --> crates/apxinf-model/src/gr00t/action_weights.rs:274:15
+    |
+274 | pub(super) fn select_category_mlp(
+    |               ^^^^^^^^^^^^^^^^^^^
+
+warning: fields `intermediate_size`, `max_position_embeddings`, and `rms_norm_eps` are never read
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:17:9
+   |
+15 | pub struct Qwen3VLTextConfig {
+   |            ----------------- fields in this struct
+16 |     pub hidden_size: usize,
+17 |     pub intermediate_size: usize,
+   |         ^^^^^^^^^^^^^^^^^
+...
+23 |     pub max_position_embeddings: usize,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^
+24 |     pub rms_norm_eps: f32,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `Qwen3VLTextConfig` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: multiple fields are never read
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:34:9
+   |
+33 | pub struct Qwen3VLVisionConfig {
+   |            ------------------- fields in this struct
+34 |     pub depth: usize,
+   |         ^^^^^
+35 |     pub hidden_size: usize,
+   |         ^^^^^^^^^^^
+36 |     pub intermediate_size: usize,
+   |         ^^^^^^^^^^^^^^^^^
+37 |     pub num_heads: usize,
+   |         ^^^^^^^^^
+38 |     pub head_dim: usize,
+   |         ^^^^^^^^
+39 |     pub patch_size: usize,
+   |         ^^^^^^^^^^
+40 |     pub temporal_patch_size: usize,
+   |         ^^^^^^^^^^^^^^^^^^^
+41 |     pub in_channels: usize,
+   |         ^^^^^^^^^^^
+42 |     pub spatial_merge_size: usize,
+   |         ^^^^^^^^^^^^^^^^^^
+43 |     pub num_position_embeddings: usize,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^
+44 |     pub out_hidden_size: usize,
+   |         ^^^^^^^^^^^^^^^
+45 |     /// Which 3 of the `depth` vision blocks feed the deepstack mergers.
+46 |     pub deepstack_visual_indexes: Vec<usize>,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `Qwen3VLVisionConfig` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: method `head_dim` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:50:12
+   |
+49 | impl Qwen3VLVisionConfig {
+   | ------------------------ method in this implementation
+50 |     pub fn head_dim(&self) -> usize {
+   |            ^^^^^^^^
+
+warning: field `vision` is never read
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:64:9
+   |
+62 | pub struct Qwen3VLConfig {
+   |            ------------- field in this struct
+63 |     pub text: Qwen3VLTextConfig,
+64 |     pub vision: Qwen3VLVisionConfig,
+   |         ^^^^^^
+   |
+   = note: `Qwen3VLConfig` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: associated function `from_json_file` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/config.rs:70:12
+   |
+68 | impl Qwen3VLConfig {
+   | ------------------ associated function in this implementation
+69 |     /// Parse from a HuggingFace `config.json` file.
+70 |     pub fn from_json_file(path: &Path) -> Result<Self> {
+   |            ^^^^^^^^^^^^^^
+
+warning: struct `VisionOutput` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:24:12
+   |
+24 | pub struct VisionOutput {
+   |            ^^^^^^^^^^^^
+
+warning: type alias `VisionMatmul` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:33:17
+   |
+33 | pub(crate) type VisionMatmul<'a> = dyn Fn(&str, &Tensor, &Tensor) -> Result<Tensor> + 'a;
+   |                 ^^^^^^^^^^^^
+
+warning: type alias `VisionNormMatmul` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:34:17
+   |
+34 | pub(crate) type VisionNormMatmul<'a> =
+   |                 ^^^^^^^^^^^^^^^^
+
+warning: type alias `VisionBiasGelu` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:36:17
+   |
+36 | pub(crate) type VisionBiasGelu<'a> = dyn Fn(&str, &Tensor, &Tensor) -> Result<Tensor> + 'a;
+   |                 ^^^^^^^^^^^^^^
+
+warning: type alias `VisionConcatQuant` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:37:17
+   |
+37 | pub(crate) type VisionConcatQuant<'a> =
+   |                 ^^^^^^^^^^^^^^^^^
+
+warning: type alias `VisionSegmentedAttention` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:39:17
+   |
+39 | pub(crate) type VisionSegmentedAttention<'a> =
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `VisionResidualNormMatmul` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:41:17
+   |
+41 | pub(crate) type VisionResidualNormMatmul<'a> = dyn Fn(&str, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor, f32, &Tensor) -> Result<(Te...
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `VisionBiasResidual` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:43:17
+   |
+43 | pub(crate) type VisionBiasResidual<'a> =
+   |                 ^^^^^^^^^^^^^^^^^^
+
+warning: function `add_bias` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:58:4
+   |
+58 | fn add_bias(b: &dyn Backend, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
+   |    ^^^^^^^^
+
+warning: function `layer_norm` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:73:4
+   |
+73 | fn layer_norm(
+   |    ^^^^^^^^^^
+
+warning: function `vision_attention` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision.rs:94:4
+   |
+94 | fn vision_attention(
+   |    ^^^^^^^^^^^^^^^^
+
+warning: struct `PreparedVisionPositions` is never constructed
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:128:19
+    |
+128 | pub(crate) struct PreparedVisionPositions {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `prepare_positions` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:137:15
+    |
+137 | pub(crate) fn prepare_positions(
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: function `forward_with_prepared_positions_and_matmul` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:185:15
+    |
+185 | pub(crate) fn forward_with_prepared_positions_and_matmul(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `forward_impl` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:225:4
+    |
+225 | fn forward_impl(
+    |    ^^^^^^^^^^^^
+
+warning: function `vision_matmul` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:615:4
+    |
+615 | fn vision_matmul(
+    |    ^^^^^^^^^^^^^
+
+warning: function `prepare_position_embeddings` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:628:15
+    |
+628 | pub(crate) fn prepare_position_embeddings(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `merge_primary` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:645:4
+    |
+645 | fn merge_primary(
+    |    ^^^^^^^^^^^^^
+
+warning: function `merge_deepstack` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:666:4
+    |
+666 | fn merge_deepstack(
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `apply_bias_gelu` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:704:4
+    |
+704 | fn apply_bias_gelu(b: &dyn Backend, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `vision_bias_gelu` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:722:4
+    |
+722 | fn vision_bias_gelu(
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `apply_bias_residual` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:735:4
+    |
+735 | fn apply_bias_residual(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `vision_bias_residual` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:764:4
+    |
+764 | fn vision_bias_residual(
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `apply_bias_residual_layer_norm` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:779:4
+    |
+779 | fn apply_bias_residual_layer_norm(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `slice_and_reshape` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:850:4
+    |
+850 | fn slice_and_reshape(
+    |    ^^^^^^^^^^^^^^^^^
+
+warning: function `split_vision_qkv` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:891:4
+    |
+891 | fn split_vision_qkv(
+    |    ^^^^^^^^^^^^^^^^
+
+warning: enum `PreparedVisionPositionBuffer` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:935:6
+    |
+935 | enum PreparedVisionPositionBuffer {
+    |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `prepare_vision_position_ids` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:952:4
+    |
+952 | fn prepare_vision_position_ids(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `apply_vision_rope_pair` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision.rs:975:4
+    |
+975 | fn apply_vision_rope_pair(
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `segmented_vision_sdpa` is never used
+    --> crates/apxinf-model/src/gr00t/backbone/vision.rs:1022:4
+     |
+1022 | fn segmented_vision_sdpa(
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `compute_pos_embeds` is never used
+    --> crates/apxinf-model/src/gr00t/backbone/vision.rs:1233:4
+     |
+1233 | fn compute_pos_embeds(
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLVisionWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:15:12
+   |
+15 | pub struct Qwen3VLVisionWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLVisionBlock` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:27:12
+   |
+27 | pub struct Qwen3VLVisionBlock {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLMerger` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:46:12
+   |
+46 | pub struct Qwen3VLMerger {
+   |            ^^^^^^^^^^^^^
+
+warning: associated functions `from_map` and `take_from_map` are never used
+  --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:59:12
+   |
+58 | impl Qwen3VLVisionWeights {
+   | ------------------------- associated functions in this implementation
+59 |     pub fn from_map(cfg: &Qwen3VLConfig, mut tensors: HashMap<String, Tensor>) -> Result<Self> {
+   |            ^^^^^^^^
+...
+64 |     pub(crate) fn take_from_map(
+   |                   ^^^^^^^^^^^^^
+
+warning: function `load_merger` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:141:4
+    |
+141 | fn load_merger(
+    |    ^^^^^^^^^^^
+
+warning: function `reshape_5d_to_2d` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:162:4
+    |
+162 | fn reshape_5d_to_2d(t: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `reshape_linear_weight` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:196:4
+    |
+196 | fn reshape_linear_weight(t: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `transpose_2d` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:200:4
+    |
+200 | fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^
+
+warning: function `transfer_vision_weights` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/vision_weights.rs:237:8
+    |
+237 | pub fn transfer_vision_weights(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLTextWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/weights.rs:15:12
+   |
+15 | pub struct Qwen3VLTextWeights {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: struct `Qwen3VLLayer` is never constructed
+  --> crates/apxinf-model/src/gr00t/backbone/weights.rs:23:12
+   |
+23 | pub struct Qwen3VLLayer {
+   |            ^^^^^^^^^^^^
+
+warning: associated function `take_from_map` is never used
+  --> crates/apxinf-model/src/gr00t/backbone/weights.rs:51:19
+   |
+46 | impl Qwen3VLTextWeights {
+   | ----------------------- associated function in this implementation
+...
+51 |     pub(crate) fn take_from_map(
+   |                   ^^^^^^^^^^^^^
+
+warning: function `transfer_weights` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/weights.rs:101:15
+    |
+101 | pub(crate) fn transfer_weights(
+    |               ^^^^^^^^^^^^^^^^
+
+warning: function `transpose_2d` is never used
+   --> crates/apxinf-model/src/gr00t/backbone/weights.rs:136:4
+    |
+136 | fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^
+
+warning: associated function `from_json_file` is never used
+   --> crates/apxinf-model/src/gr00t/config.rs:230:12
+    |
+229 | impl Gr00tConfig {
+    | ---------------- associated function in this implementation
+230 |     pub fn from_json_file(path: &Path) -> Result<Self> {
+    |            ^^^^^^^^^^^^^^
+
+warning: struct `Gr00tWeights` is never constructed
+  --> crates/apxinf-model/src/gr00t/weights.rs:20:12
+   |
+20 | pub struct Gr00tWeights {
+   |            ^^^^^^^^^^^^
+
+warning: associated functions `from_safetensors` and `from_map` are never used
+  --> crates/apxinf-model/src/gr00t/weights.rs:29:12
+   |
+26 | impl Gr00tWeights {
+   | ----------------- associated functions in this implementation
+...
+29 |     pub fn from_safetensors(
+   |            ^^^^^^^^^^^^^^^^
+...
+42 |     pub fn from_map(
+   |            ^^^^^^^^
+
+warning: function `load_backbone_config` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:101:8
+    |
+101 | pub fn load_backbone_config(
+    |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `validate_backbone_config` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:116:4
+    |
+116 | fn validate_backbone_config(config: &Gr00tConfig, backbone: &Qwen3VLConfig) -> Result<()> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `validate_backbone_weights` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:188:4
+    |
+188 | fn validate_backbone_weights(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `validate_merger` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:394:4
+    |
+394 | fn validate_merger(
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `checked_mul` is never used
+   --> crates/apxinf-model/src/gr00t/weights.rs:441:4
+    |
+441 | fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize> {
+    |    ^^^^^^^^^^^
+
+warning: associated function `from_json_file` is never used
+   --> crates/apxinf-model/src/walloss/config.rs:148:12
+    |
+147 | impl WallossConfig {
+    | ------------------ associated function in this implementation
+148 |     pub fn from_json_file(path: &Path) -> Result<Self> {
+    |            ^^^^^^^^^^^^^^
+
+warning: struct `WallossWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:23:12
+   |
+23 | pub struct WallossWeights {
+   |            ^^^^^^^^^^^^^^
+
+warning: struct `WallossLayerWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:32:12
+   |
+32 | pub struct WallossLayerWeights {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `WallossVisionWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:46:12
+   |
+46 | pub struct WallossVisionWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `WallossVisionBlockWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:57:12
+   |
+57 | pub struct WallossVisionBlockWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `WallossActionWeights` is never constructed
+  --> crates/apxinf-model/src/walloss/weights/mod.rs:70:12
+   |
+70 | pub struct WallossActionWeights {
+   |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `from_safetensors`, `from_map`, and `to_bf16_device` are never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:80:12
+    |
+ 79 | impl WallossWeights {
+    | ------------------- associated items in this implementation
+ 80 |     pub fn from_safetensors(config: &mut WallossConfig, path: &Path) -> Result<Self> {
+    |            ^^^^^^^^^^^^^^^^
+...
+ 86 |     pub fn from_map(
+    |            ^^^^^^^^
+...
+163 |     pub fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |            ^^^^^^^^^^^^^^
+
+warning: method `to_bf16_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:184:8
+    |
+183 | impl WallossLayerWeights {
+    | ------------------------ method in this implementation
+184 |     fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^^^^^^
+
+warning: method `to_bf16_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:198:8
+    |
+197 | impl WallossVisionWeights {
+    | ------------------------- method in this implementation
+198 |     fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^^^^^^
+
+warning: method `to_bf16_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:216:8
+    |
+215 | impl WallossVisionBlockWeights {
+    | ------------------------------ method in this implementation
+216 |     fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |        ^^^^^^^^^^^^^^
+
+warning: method `to_bf16_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:270:19
+    |
+269 | impl WallossActionWeights {
+    | ------------------------- method in this implementation
+270 |     pub(super) fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+    |                   ^^^^^^^^^^^^^^
+
+warning: function `bf16_to_device` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:285:15
+    |
+285 | pub(super) fn bf16_to_device(tensor: &Tensor, backend: &dyn Backend) -> Result<Tensor> {
+    |               ^^^^^^^^^^^^^^
+
+warning: function `load_layer` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:299:4
+    |
+299 | fn load_layer(
+    |    ^^^^^^^^^^
+
+warning: function `load_vision` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:365:4
+    |
+365 | fn load_vision(
+    |    ^^^^^^^^^^^
+
+warning: function `load_action` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:410:4
+    |
+410 | fn load_action(
+    |    ^^^^^^^^^^^
+
+warning: function `take` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:481:4
+    |
+481 | fn take(tensors: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
+    |    ^^^^
+
+warning: function `flatten_and_transpose` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:507:4
+    |
+507 | fn flatten_and_transpose(tensor: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `transpose_2d` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:526:4
+    |
+526 | fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^^^^^^
+
+warning: function `split_columns` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:557:4
+    |
+557 | fn split_columns(tensor: &Tensor, first_columns: usize) -> Result<(Tensor, Tensor)> {
+    |    ^^^^^^^^^^^^^
+
+warning: function `to_bf16` is never used
+   --> crates/apxinf-model/src/walloss/weights/mod.rs:602:4
+    |
+602 | fn to_bf16(tensor: &Tensor) -> Result<Tensor> {
+    |    ^^^^^^^
+
+warning: `apxinf-model` (lib test) generated 118 warnings (26 duplicates) (run `cargo fix --lib -p apxinf-model --tests` to apply 3 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/apxinf_model-c9e47585fb24871f)
+
+running 1 test
+test metal_lfm3::model::tests::c4_compiled_shape_mismatch_retraces_or_fails_loudly ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 344 filtered out; finished in 0.03s
+
+     Running tests/decision_api_compat.rs (target/debug/deps/decision_api_compat-d06e01a3ea4ebcae)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/model_family_boundaries.rs (target/debug/deps/model_family_boundaries-52d8c2ea5cb8cdc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/qwen_drive_loading.rs (target/debug/deps/qwen_drive_loading-43c5ef278ddde0ee)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/unified_llm_input.rs (target/debug/deps/unified_llm_input-78bec0f4019634b7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+

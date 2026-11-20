@@ -1,0 +1,182 @@
+PHASE start 2026-11-20T13:32:08 branch=20bd7edc1c8c7774b925aaa3004c8204828df3ab
+PHASE lock_peek 2026-11-20T13:32:08
+locks_busy wait 2026-11-20T13:32:08
+locks_busy wait 2026-11-20T13:32:38
+PHASE start 2026-11-20T13:33:31 branch=20bd7edc1c8c7774b925aaa3004c8204828df3ab
+PHASE lock_peek 2026-11-20T13:33:31
+PHASE locks_free_confirmed 2026-11-20T13:33:31
+BUILD dev_tests start 2026-11-20T13:33:31
+BUILD dev_tests exit=0 at 2026-11-20T13:33:51
+BUILD release start 2026-11-20T13:33:51
+BUILD release exit=101 at 2026-11-20T13:33:51
+PHASE start 2026-11-20T13:35:59 branch=20bd7edc1c8c7774b925aaa3004c8204828df3ab
+PHASE lock_peek 2026-11-20T13:35:59
+PHASE locks_free_confirmed 2026-11-20T13:36:00
+BUILD dev_tests start 2026-11-20T13:36:00
+BUILD dev_tests exit=0 at 2026-11-20T13:36:00
+BUILD release start 2026-11-20T13:36:00
+BUILD release exit=0 at 2026-11-20T13:36:31
+PHASE locks_start 2026-11-20T13:36:31
+LOCKS_HELD_OK LOCKS_ACQUIRED 2026-11-20T13:36:31 at 2026-11-20T13:36:36
+GATE c4 start 2026-11-20T13:36:36
+GATE c4 NOT_RUN_OR_NOT_PASSED (rc=0) => gate failure
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/qwen_drive_loading.rs (target/debug/deps/qwen_drive_loading-43c5ef278ddde0ee)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/unified_llm_input.rs (target/debug/deps/unified_llm_input-78bec0f4019634b7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+PHASE start 2026-11-20T13:39:31 branch=20bd7edc1c8c7774b925aaa3004c8204828df3ab
+PHASE lock_peek 2026-11-20T13:39:31
+PHASE locks_free_confirmed 2026-11-20T13:39:31
+BUILD dev_tests start 2026-11-20T13:39:31
+BUILD dev_tests exit=0 at 2026-11-20T13:39:31
+BUILD release start 2026-11-20T13:39:31
+BUILD release exit=0 at 2026-11-20T13:39:31
+PHASE locks_start 2026-11-20T13:39:31
+LOCKS_HELD_OK LOCKS_ACQUIRED 2026-11-20T13:39:31 at 2026-11-20T13:39:36
+GATE c4 start 2026-11-20T13:39:36
+GATE c4 exit=0 at 2026-11-20T13:39:36
+test metal_lfm3::model::tests::c4_compiled_shape_mismatch_retraces_or_fails_loudly ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 344 filtered out; finished in 0.04s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+test metal_lfm3::model::tests::c4_compiled_shape_mismatch_retraces_or_fails_loudly ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 344 filtered out; finished in 0.03s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+GATE c1 start 2026-11-20T13:39:36
+GATE c1 NOT_RUN_OR_NOT_PASSED (rc=0) => gate failure
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/qwen_drive_loading.rs (target/debug/deps/qwen_drive_loading-43c5ef278ddde0ee)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/unified_llm_input.rs (target/debug/deps/unified_llm_input-78bec0f4019634b7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+PHASE start 2026-11-20T13:42:22 branch=20bd7edc1c8c7774b925aaa3004c8204828df3ab
+PHASE lock_peek 2026-11-20T13:42:22
+PHASE locks_free_confirmed 2026-11-20T13:42:22
+BUILD dev_tests start 2026-11-20T13:42:22
+BUILD dev_tests exit=0 at 2026-11-20T13:42:23
+BUILD release start 2026-11-20T13:42:23
+BUILD release exit=0 at 2026-11-20T13:42:23
+PHASE locks_start 2026-11-20T13:42:23
+LOCKS_HELD_OK LOCKS_ACQUIRED 2026-11-20T13:42:23 at 2026-11-20T13:42:28
+GATE c4 start 2026-11-20T13:42:28
+GATE c4 exit=0 at 2026-11-20T13:42:28
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+test metal_lfm3::model::tests::c4_compiled_shape_mismatch_retraces_or_fails_loudly ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 344 filtered out; finished in 0.03s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+test metal_lfm3::model::tests::c4_compiled_shape_mismatch_retraces_or_fails_loudly ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 344 filtered out; finished in 0.03s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+GATE c1 start 2026-11-20T13:42:28
+GATE c1 exit=0 at 2026-11-20T13:43:17
+test metal_lfm3::model::tests::c1_compiled_greedy_matches_eager_pipelined_token_for_token ... Metal 0: Apple M4 (applegpu_g16g)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 344 filtered out; finished in 54.96s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+test metal_lfm3::model::tests::c1_compiled_greedy_matches_eager_pipelined_token_for_token ... Metal 0: Apple M4 (applegpu_g16g)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 344 filtered out; finished in 49.13s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+GATE c2 start 2026-11-20T13:43:17
+GATE c2 exit=0 at 2026-11-20T13:43:29
+test metal_lfm3::model::tests::c2_compiled_budget_eos_and_cancel_boundaries_match_sync ... Metal 0: Apple M4 (applegpu_g16g)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 344 filtered out; finished in 11.71s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+GATE c3 start 2026-11-20T13:43:29
+GATE c3 exit=0 at 2026-11-20T13:43:53
+test metal_lfm3::model::tests::c3_compiled_continuation_state_matches_sync_byte_for_byte ... Metal 0: Apple M4 (applegpu_g16g)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 344 filtered out; finished in 22.86s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+PHASE gates_done 2026-11-20T13:43:53
+identity apxinf-serve=7f11e798652d9aa579c10b59120ca2ff467a9360f15fafcec79e15fce23d2ee7 model=135922caef64e81e52af88ede8b7c3ddaa9d6da220a9737fb3065275dbfb4330
+PHASE census_start 2026-11-20T13:43:59
+gw_up tag=census-A pid=79995 env=--worker-env APXINF_LFM3_DECODE_STAGES=1 at 2026-11-20T13:44:16
+banner tag=census-A {"event":"worker_stderr","worker_epoch":"c3d36f22-0227-46fc-aeae-32ba36509b21","text":"decode_schedule=pipelined overlaps_callbacks=true decode_stages=true prefill_fast=false native_4bit=false decode_compiled=false batch="}
+bench arm=apxinf-pipe seg=100 tag=census-A exit=0 at 2026-11-20T13:45:14
+gw_up tag=census-B pid=80481 env=--worker-env APXINF_LFM3_DECODE_STAGES=1 --worker-env APXINF_LFM3_COMPILED_DECODE=1 at 2026-11-20T13:45:28
+banner tag=census-B {"event":"worker_stderr","worker_epoch":"c017340e-4c07-4d00-bdd7-456e9a412816","text":"decode_schedule=pipelined overlaps_callbacks=true decode_stages=true prefill_fast=false native_4bit=false decode_compiled=true batch=1
+"}
+bench arm=apxinf-pipe-compiled seg=100 tag=census-B exit=0 at 2026-11-20T13:46:22
+PHASE census_done 2026-11-20T13:46:22
+decomp-census-A exit=1 exists=yes
+decomp-census-B exit=1 exists=yes
+PHASE warmup_start 2026-11-20T13:46:22
+gw_up tag=warm-A pid=80760 env= at 2026-11-20T13:46:40
+banner tag=warm-A {"event":"worker_stderr","worker_epoch":"42d3334c-590b-49bb-aaab-29d372a47d29","text":"decode_schedule=pipelined overlaps_callbacks=true decode_stages=false prefill_fast=false native_4bit=false decode_compiled=false batch=1
+"}
+bench arm=apxinf-pipe seg=90 tag=warm-A exit=0 at 2026-11-20T13:47:31
+gw_up tag=warm-B pid=81056 env=--worker-env APXINF_LFM3_COMPILED_DECODE=1 at 2026-11-20T13:47:47
+banner tag=warm-B {"event":"worker_stderr","worker_epoch":"1a044146-de48-4928-8369-9d6196c5028f","text":"decode_schedule=pipelined overlaps_callbacks=true decode_stages=false prefill_fast=false native_4bit=false decode_compiled=true batch=1
+"}
+bench arm=apxinf-pipe-compiled seg=90 tag=warm-B exit=0 at 2026-11-20T13:48:37
+PHASE warmup_done 2026-11-20T13:48:37
+PHASE abba_start 2026-11-20T13:48:37
+gw_up tag=s-A-0 pid=81430 env= at 2026-11-20T13:48:53
+banner tag=s-A-0 {"event":"worker_stderr","worker_epoch":"58674fbd-0de7-486d-9f88-59c0500b6fef","text":"decode_schedule=pipelined overlaps_callbacks=true decode_stages=false prefill_fast=false native_4bit=false decode_compiled=false batch=1
+"}
+bench arm=apxinf-pipe seg=0 tag=s-A-0 exit=0 at 2026-11-20T13:49:44
+gw_up tag=s-B-1 pid=81799 env=--worker-env APXINF_LFM3_COMPILED_DECODE=1 at 2026-11-20T13:50:02
+banner tag=s-B-1 {"event":"worker_stderr","worker_epoch":"df30d414-9e18-45ac-bcda-6711af831a25","text":"decode_schedule=pipelined overlaps_callbacks=true decode_stages=false prefill_fast=false native_4bit=false decode_compiled=true batch=1
+"}
+bench arm=apxinf-pipe-compiled seg=1 tag=s-B-1 exit=0 at 2026-11-20T13:50:52
+gw_up tag=s-B-2 pid=82152 env=--worker-env APXINF_LFM3_COMPILED_DECODE=1 at 2026-11-20T13:51:06
+banner tag=s-B-2 {"event":"worker_stderr","worker_epoch":"bda4361f-02de-4bb6-85f7-71b507aae752","text":"decode_schedule=pipelined overlaps_callbacks=true decode_stages=false prefill_fast=false native_4bit=false decode_compiled=true batch=1
+"}
+bench arm=apxinf-pipe-compiled seg=2 tag=s-B-2 exit=0 at 2026-11-20T13:51:56
+gw_up tag=s-A-3 pid=82463 env= at 2026-11-20T13:52:32
+banner tag=s-A-3 {"event":"worker_stderr","worker_epoch":"d6ab7ad4-0788-439f-b548-eb056794aa95","text":"decode_schedule=pipelined overlaps_callbacks=true decode_stages=false prefill_fast=false native_4bit=false decode_compiled=false batch=1
+"}
+bench arm=apxinf-pipe seg=3 tag=s-A-3 exit=0 at 2026-11-20T13:53:22
+gw_up tag=s-A-4 pid=82847 env= at 2026-11-20T13:53:44
+banner tag=s-A-4 {"event":"worker_stderr","worker_epoch":"ebe9d934-8915-4685-8a3b-c07febfbd282","text":"decode_schedule=pipelined overlaps_callbacks=true decode_stages=false prefill_fast=false native_4bit=false decode_compiled=false batch=1"}
+bench arm=apxinf-pipe seg=4 tag=s-A-4 exit=0 at 2026-11-20T13:54:34
+gw_up tag=s-B-5 pid=83205 env=--worker-env APXINF_LFM3_COMPILED_DECODE=1 at 2026-11-20T13:54:49
+banner tag=s-B-5 {"event":"worker_stderr","worker_epoch":"9e4068d7-0f74-4657-8046-1d7c5e888f25","text":"decode_schedule=pipelined overlaps_callbacks=true decode_stages=false prefill_fast=false native_4bit=false decode_compiled=true batch=1
+"}
+bench arm=apxinf-pipe-compiled seg=5 tag=s-B-5 exit=0 at 2026-11-20T13:55:38
+PHASE abba_done 2026-11-20T13:55:38
+PAIRED {"A": {"(1024, 128)": [36.7035, 36.5064, 36.4487], "(4096, 128)": [36.7285, 36.9519, 36.6705]}, "B": {"(1024, 128)": [36.4847, 36.2475, 36.3213], "(4096, 128)": [36.809, 36.4774, 36.4188]}}
+CELL (1024, 128) A=36.5064 B=36.3213 C=0.1851 A/A_worst=0.70% segs_A=3 segs_B=3
+CELL (4096, 128) A=36.7285 B=36.4774 C=0.2511 A/A_worst=1.07% segs_A=3 segs_B=3
+PHASE all_done 2026-11-20T13:55:38

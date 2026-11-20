@@ -1,0 +1,29 @@
+{
+  "session": "M4 haiyan-mac-mini 2026-11-20T13:42-13:55Z, both Metal locks held (locks.log)",
+  "banner_effect_proof": {
+    "census-A": "decode_compiled=false",
+    "census-B": "decode_compiled=true",
+    "note": "every armed gateway asserted before its segment; see session.log banner lines"
+  },
+  "retrace_gate": {
+    "source": "c1.log (in-process census, test c1_compiled_greedy_matches_eager_pipelined_token_for_token)",
+    "baseline_trace_callbacks_delta": 0,
+    "armed_first_request_traces": 36,
+    "armed_later_requests_delta": 0,
+    "regions": "13 conv + 2x11 attention + 1 head = 36"
+  },
+  "host_submission_time": {
+    "source": "decode_stage path=device lines in logs/apxinf-census-{A,B}-diag.jsonl, 515 steps per arm",
+    "census-A_build_ms_median": 0.3864,
+    "census-B_build_ms_median": 0.2002,
+    "delta_ms_per_step": -0.1862,
+    "note": "B max=3607ms is the one-time 36-region prepare_timed warm-up step; median excludes steady-state warmup"
+  },
+  "eager_op_estimate": {
+    "baseline_step_ops": "~700 (static estimate from the build_graph recipe)",
+    "armed_step": "11x12 + 13 + 2 = 148 eager ops + 36 compiled calls (static estimate)",
+    "kernel_launch_count": "mechanism unknown (no MLX/Metal counter available)"
+  },
+  "eval_calls_and_bytes": "mechanism unknown (not measured; counters not exposed through the gateway)",
+  "stage_decomposition": "N/A for pipelined arms: stage_decomposition.py only parses path=sync lines; recorded, not substituted"
+}

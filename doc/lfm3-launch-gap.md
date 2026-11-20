@@ -270,3 +270,69 @@ this counter. Corrected §8 census:
 - **`eval_calls` / byte counters**: armed arm must show no extra
   evaluation boundary per step vs baseline beyond the one-time warm-up
   evals (prepare_timed's two evals per region on the first step only).
+
+---
+
+### 2026-11-20 13:57 Verdict (dated, post-window)
+
+**Verdict: PARTIAL** — token-consistent, retrace-clean, A/A-clean, C ≥ 0.25
+on one cell only. Per §7 the compiled-subgraph step **stays behind
+`APXINF_LFM3_COMPILED_DECODE` (off by default)** until the remaining gap is
+addressed.
+
+**Run identity.** M4 (`haiyan-mac-mini`); locks
+`LOCKS_ACQUIRED 2026-11-20T13:42:23` (fcntl order, waited not stolen);
+gates 13:42:28–13:43:53; census 13:43:59–13:46:22; warm-ups
+13:46:40–13:48:37; ABBA 13:48:37–13:55:38. `apxinf-serve` sha256
+`7f11e798652d9aa579c10b59120ca2ff467a9360f15fafcec79e15fce23d2ee7`
+(rebuilt in-session from branch tip `20bd7edc`), model
+`135922caef64e81e52af88ede8b7c3ddaa9d6da220a9737fb3065275dbfb4330`.
+All 16 bench invocations `exit=0`; every gateway asserted its banner before
+its segment (armed banners `decode_compiled=true`, baseline `false`).
+Receipts: `doc/receipts/lfm3-launch-gap/`.
+
+**Hard gates (all pass).**
+
+1. **Token equality (C1)**: 4 prompts × 128 tokens, compiled ==
+   eager-pipelined, exact match. The same test carries the retrace
+   census: baseline `trace_callbacks` delta 0; armed +36 on the first
+   request (13 conv + 2×11 attention + 1 head) and **0 on every later
+   request** — one profile serves all positions and both context lengths,
+   no steady-state retrace (§5.2). C2 (budget/EOS/cancel == sync), C3
+   (continuation KV/conv byte-identical), C4 (retrace observable) all
+   pass.
+2. **Empty arm**: none — banner asserted per segment (§5.3).
+3. **A/A**: worst segmented-median spread **0.70%** (1024) / **1.07%**
+   (4096), both ≤ 5%.
+
+**Raw numbers** (ms/token, segment medians; `PAIRED` line in session.log):
+
+| cell | A segments | A | B segments | B | C = A−B | A/A |
+| --- | --- | --- | --- | --- | --- | --- |
+| (1024,128) | 36.7035, 36.5064, 36.4487 | 36.5064 | 36.4847, 36.2475, 36.3213 | 36.3213 | **0.1851** | 0.70% |
+| (4096,128) | 36.7285, 36.9519, 36.6705 | 36.7285 | 36.8090, 36.4774, 36.4188 | 36.4774 | **0.2511** | 1.07% |
+
+**Decision-rule application.** WIN needs both cells C ≥ 0.25: (1024)
+0.1851 < 0.25 ⇒ not WIN. PARITY needs both cells 0.10 < C < 0.25: (4096)
+0.2511 ≥ 0.25 ⇒ not PARITY. **PARTIAL** — one cell ≥ 0.25.
+
+**Mechanism arithmetic.** Host submission time per step
+(`decode_stage path=device build_ms`, 515 steps/arm, census): baseline
+median **0.3864 ms** → armed **0.2002 ms** = **−0.1862 ms/step**. The
+1024 harvest (0.1851) matches the submission-time reduction within 0.001
+ms — the harvest is the removed host enqueue, not different GPU work
+(same kernels, same shapes, token-identical). The 4096 harvest (0.2511)
+exceeds the same Δ by 0.065 ms; A/A (1.07% ≈ ±0.39 ms) covers it, so no
+second mechanism is claimed. Kernel launch count and `eval_calls`/byte
+counters: 机制未知 (no MLX/Metal counter exposed through the gateway).
+Eager op counts: static estimate ~700 → 148 eager + 36 compiled calls
+(not measured). Stage decomposition (path=sync): N/A for pipelined arms
+— that instrument only parses the sync schedule; recorded, not
+substituted.
+
+**Remaining gap** (for the next candidate): the armed step still issues
+~148 eager submissions/step; the sdpa window and KV write are irreducibly
+position-shaped under the exact-shape rule, so a deeper merge needs a
+different mechanism (a shape-static attention formulation — but every
+such formulation so far changes reduction extents ⇒ #128-class token
+drift; not tried here).
