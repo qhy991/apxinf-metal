@@ -4,6 +4,7 @@
 
 - 相关队列：QUEUE.md v2 第 8 项（Lead 决策 2026-11-19 22:01「4-bit 可以，最高价值杠杆」；Lead 修订 2026-11-19 22:05「M4 现场量化，不从 M1 拷」）。
 - 权威代码基座：`agent/lfm3-dig`，tip（本 commit 之前）`9f12e4d9`（QUEUE #6 预登记），base `feat/lfm3-metal`。
+- **交付状态（round-81 定稿）**：QUEUE #8 已随 PR #132 **合并**入 `feat/lfm3-metal`（merge commit `e353eda5`）；两产品门判定：**G4-speed PASS（3.26–3.31×，≤ llama Q4）+ G1′ PARTIAL（n=20，both −5.00pp / either 0.00pp，A/A DISAGREE caveat 保留）** ⇒ 按 §5 = **PARTIAL**：4-bit 保持 opt-in（`APXINF_LFM3_4BIT=1`），**BF16 默认**。Lead 09:31 已接受该 opt-in 形态为 campaign 收口状态，无待裁决项。
 
 ---
 
