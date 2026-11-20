@@ -160,16 +160,19 @@ out = {"bytes": N, "warmup": WARMUP, "rounds": ROUNDS, "device": str(mx.default_
        "mlx_version": md.version("mlx"), "copy": [], "reduce": []}
 
 def timed(fn, rounds, bucket):
-    # MLX submits GPU work asynchronously; the host clock must be fenced by an
-    # explicit synchronize on both sides or it only measures launch cost
-    # (round-110 INVALID: a 0.002 ms "1 GiB" window implying 1.7e6 GB/s).
+    # MLX submits GPU work asynchronously. Two fences are required, and the
+    # second must evaluate the produced array: mx.eval() with no arguments does
+    # NOT wait for work already dispatched to a non-default stream, and
+    # mx.synchronize() fences only the default stream (round-111 INVALID:
+    # 0.0016 ms "1 GiB" windows implying 5.9e4 GB/s even with sync fences;
+    # verified: eval(c) on the gpu stream -> ~159 GB/s, eval() -> ~17000).
     for _ in range(WARMUP):
-        mx.synchronize(); fn(); mx.eval()
+        mx.synchronize(mx.gpu); c = fn(); mx.eval(c)
     for _ in range(rounds):
         mx.clear_cache()
-        mx.synchronize()
+        mx.synchronize(mx.gpu)
         t0 = time.perf_counter()
-        fn(); mx.eval(); mx.synchronize()
+        c = fn(); mx.eval(c)
         out[bucket].append({"ms": (time.perf_counter() - t0) * 1e3})
 
 timed(lambda: mx.add(a, b, stream=mx.gpu), ROUNDS, "copy")   # read 2x1GiB, write 1GiB
