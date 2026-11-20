@@ -12,17 +12,56 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 use apxinf_mlx::{Array, MlxDType, Stream};
 use std::collections::HashMap;
 
-/// One HF linear projection, kept as a canonical `[in, out]` view.
-pub(crate) struct Linear {
-    canonical: Array,
+/// MLX affine packing derived once from the canonical weight (`APXINF_LFM3_Q4_BITS`).
+struct Quantized {
+    packed: Array,
+    scales: Array,
+    biases: Array,
+    bits: i32,
+}
+
+impl Quantized {
+    fn new(hf_weight: &Array) -> Result<Self> {
+        let bits: i32 = match std::env::var("APXINF_LFM3_Q4_BITS").ok().as_deref() {
+            Some("8") => 8,
+            Some("6") => 6,
+            _ => 4,
+        };
+        let [packed, scales, biases] = hf_weight.quantize(64, bits)?;
+        hf_weight
+            .stream()
+            .eval(&[packed.clone(), scales.clone(), biases.clone()])?;
+        Ok(Self {
+            packed,
+            scales,
+            biases,
+            bits,
+        })
+    }
+}
+
+/// One HF linear projection, kept as a canonical `[in, out]` view when dense.
+pub(crate) enum Linear {
+    Dense(Array),
+    Quantized(Quantized),
 }
 
 impl Linear {
     pub fn call(&self, x: &Array) -> Result<Array> {
-        x.matmul(&self.canonical)
+        match self {
+            Linear::Dense(canonical) => x.matmul(canonical),
+            Linear::Quantized(q) => {
+                x.quantized_matmul(&q.packed, &q.scales, &q.biases, true, 64, q.bits)
+            }
+        }
     }
     pub fn array(&self) -> Array {
-        self.canonical.clone()
+        match self {
+            Linear::Dense(canonical) => canonical.clone(),
+            Linear::Quantized(_) => {
+                unreachable!("quantized LFM3 projection has no dense array")
+            }
+        }
     }
 }
 
@@ -109,9 +148,11 @@ fn linear(
     output: usize,
     stream: &Stream,
 ) -> Result<Linear> {
-    Ok(Linear {
-        canonical: take(map, name, &[output, input], stream)?.transpose(&[1, 0])?,
-    })
+    let rows = take(map, name, &[output, input], stream)?;
+    if std::env::var("APXINF_LFM3_Q4").ok().as_deref() == Some("1") {
+        return Ok(Linear::Quantized(Quantized::new(&rows)?));
+    }
+    Ok(Linear::Dense(rows.transpose(&[1, 0])?))
 }
 
 /// Per-head RMSNorm weights stay BF16 so the family uses the same weighted
