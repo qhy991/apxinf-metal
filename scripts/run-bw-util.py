@@ -453,7 +453,7 @@ def run_a2(res: Path, ctxs: tuple[int, ...]) -> dict:
                 term = lane.submit(lane_ids[: ctx], GEN)
                 out["lane"].setdefault(str(ctx), []).append(
                     {"rep": rep, "terminal": term, "tx_path": str(tx),
-                     "token_count": len(lane_ids)})
+                     "token_count": len(lane_ids), "request_id": term["request_id"]})
             except Exception as error:  # noqa: BLE001
                 out["lane"].setdefault(str(ctx), []).append(
                     {"rep": rep, "error": repr(error)})
@@ -466,10 +466,11 @@ def run_a2(res: Path, ctxs: tuple[int, ...]) -> dict:
                     out["reference_status"][str(ctx)] = "failed"
     lane.shutdown()
 
-    rows = _ledger_rows(ledger, {r.get("terminal", {}).get("request_id", "")
-                                 for v in out["lane"].values() for r in v})
+    all_ids = {r["request_id"] for v in out["lane"].values() for r in v
+               if r.get("request_id")}
+    rows = _ledger_rows(ledger, all_ids)
     for ctx_key, runs in out["lane"].items():
-        req_ids = {r.get("terminal", {}).get("request_id", "") for r in runs}
+        req_ids = {r["request_id"] for r in runs if r.get("request_id")}
         matching = [r for r in rows if r.get("request_id") in req_ids]
         vals = []
         for m in matching:
@@ -478,7 +479,7 @@ def run_a2(res: Path, ctxs: tuple[int, ...]) -> dict:
         out["lane"][ctx_key] = {
             "step_ms_per_token": vals,
             "median": statistics.median(vals) if vals else None,
-            "spread_frac": _spread(vals),
+            "spread_frac": _spread(vals) if vals else None,
             "rows": matching,
         }
         # reference arm summary
@@ -486,14 +487,24 @@ def run_a2(res: Path, ctxs: tuple[int, ...]) -> dict:
         out["reference"][ctx_key] = {
             "step_ms_median": statistics.median(ref_vals) if ref_vals else None,
             "repeats": ref_vals,
-            "spread_frac": _spread(ref_vals),
+            "spread_frac": _spread(ref_vals) if ref_vals else None,
         }
-    valid = all(v["spread_frac"] <= 0.05 for v in out["lane"].values()) and all(
-        (v["spread_frac"] <= 0.05) for v in out["reference"].values() if v["step_ms_median"] is not None)
-    out["valid"] = valid
+    # Gate: every lane cell needs >=1 ledger value; missing median => INVALID,
+    # never a silent pass (RUNNER §4 — no median-fixing on empty cells).
+    lane_cells_ok = all(
+        v["median"] is not None and v["spread_frac"] is not None
+        for v in out["lane"].values())
+    lane_aa_ok = all(v["spread_frac"] <= 0.05 for v in out["lane"].values()
+                     if v["spread_frac"] is not None)
+    ref_vals_present = [v for v in out["reference"].values()
+                        if v["step_ms_median"] is not None]
+    ref_ok = (not ref_vals_present) or all(v["spread_frac"] <= 0.05
+                                           for v in ref_vals_present)
+    out["valid"] = lane_cells_ok and lane_aa_ok and ref_ok
     _dump(res, "a2.json", out)
     _log(res, f"A2 lane medians={[out['lane'][str(c)]['median'] for c in ctxs]} "
-              f"ref={[out['reference'][str(c)]['step_ms_median'] for c in ctxs]} valid={valid}")
+              f"ref={[out['reference'][str(c)]['step_ms_median'] for c in ctxs]} "
+              f"lane_cells_ok={lane_cells_ok} valid={out['valid']}")
     return out
 
 
@@ -538,6 +549,7 @@ def run_a3(res: Path) -> dict:
             proc.wait(timeout=90)
             out["lane_terminal"] = term
             out["trace_rc"] = proc.returncode
+            # join before judging: the trace file is written on exit.
             out["trace_ok"] = proc.returncode == 0 and trace_path.exists()
         except Exception as error:  # noqa: BLE001
             out["trace_error"] = repr(error)
