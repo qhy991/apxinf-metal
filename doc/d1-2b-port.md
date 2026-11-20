@@ -107,6 +107,27 @@ no MPS inductor backend).
   cross-device): text-only fixtures max|Δp| ≤ **0.0644**, image fixtures
   max|Δp| ≤ **0.0053**. Filled from measurement, not changed after.
 
+## 4a. P1a result — text D1 path
+
+PR #131. `metal_d1/` family (text path) with the question engine; loads
+through `metal_d1::load` + the `d1_fixtures` example (shared
+`decision.rs` integration is P2, after the contract confirmation on the
+issue).
+
+| Gate (22 text fixtures vs frozen MPS BF16 reference) | Limit | Result |
+| --- | --- | --- |
+| Prompt construction (host-only) | packed ids/state_len/question tags/slots byte-identical | 22/22 exact |
+| R1 labels/spans | all labels equal | 22/22 |
+| R2 max\|Δp\| | ≤ 0.0644 (3× reference self-noise) | worst 0.0134, mean 0.0034 |
+| R3 determinism | two runs bit-identical | 22/22 byte-identical; `usage.input_tokens` 22/22 |
+
+Execution notes: one packed sequence per forward (the reference's padded
+multi-request batching is a P2 comparison point); eager composition only;
+the 22-fixture suite runs in ~11 s warm on the M1 Pro (no optimization
+claimed). A sliding-attention mask offset bug (key positions not anchored
+at `low` in block-decomposed windows) was found by the packed-set fixture
+and fixed; it is covered by the R1/R2 gates above.
+
 ## 5. Role map and operator gaps
 
 Full table in `devlocal/d1-2b-port/reports/role-map.md`; summary:
