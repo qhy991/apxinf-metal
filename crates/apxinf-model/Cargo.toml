@@ -31,6 +31,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # Decodes recorded Core ML packages in the Clef GPU+ANE device test.
 prost = "0.14"
 apxinf-tokenizer = { path = "../apxinf-tokenizer" }
+metal = "0.33"
+objc2-metal = "0.3"
 
 # The d3-lite os_signpost shim (native/d3_signpost_shim.c), compiled only
 # when the `mlx` feature is on for Apple Silicon.
@@ -149,3 +151,8 @@ required-features = ["mlx"]
 name = "qmm_probe"
 path = "examples/qmm_probe.rs"
 required-features = ["mlx"]
+
+[[example]]
+name = "ane_probe"
+path = "examples/ane_probe.rs"
+required-features = ["coreml"]
