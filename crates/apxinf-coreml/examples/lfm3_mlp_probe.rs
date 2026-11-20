@@ -235,9 +235,22 @@ fn main() -> Result<()> {
     let cache = ProgramCache::new(dir);
     let out_path = std::env::args().nth(1);
 
+    // APXINF_LFM3_PROBE_ONLY="S,T" runs one single-tile cell (smoke test).
+    let only: Option<(usize, usize)> = std::env::var("APXINF_LFM3_PROBE_ONLY")
+        .ok()
+        .and_then(|v| {
+            let (a, b) = v.split_once(',')?;
+            Some((a.parse().ok()?, b.parse().ok()?))
+        });
+
     let mut cells = Vec::new();
     for s in [2048usize, 3584, 4096, 5632, 7680] {
         for t in [128usize, 512, 2048] {
+            if let Some((os, ot)) = only {
+                if (s, t) != (os, ot) {
+                    continue;
+                }
+            }
             let cell = probe_cell(&cache, s, t, t, "single", 1)?;
             println!(
                 "lfm3-mlp-probe: S={s} T={t} single median={:.3}ms min={:.3} max={:.3} \
@@ -248,6 +261,9 @@ fn main() -> Result<()> {
         }
         // The deployment pattern: a 2048-token prefill as four sequential
         // 512-token tiles on the same per-layer program.
+        if only.is_some() {
+            continue;
+        }
         let cell = probe_cell(&cache, s, 512, 2048, "4x512", 4)?;
         println!(
             "lfm3-mlp-probe: S={s} T=2048 4x512 median={:.3}ms min={:.3} max={:.3} \
