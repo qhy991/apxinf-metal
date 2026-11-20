@@ -467,3 +467,51 @@ token gate is required before any window anyway; do (2) first if the
 Lead wants `/readyz` honesty restored immediately, since it is a
 prerequisite for (1)'s effect-proof banner. Do not run a timing window
 on the shipped tree: it measures 1.0× by construction.
+
+---
+
+## Amendment 2 — 2026-11-20 (appended after the option-(2) fix commit, before
+any device run)
+
+Dated, append-only under the Status line. No gate, threshold or decision rule
+changes (Lead 02:18: 不得事后改判据); the frozen §4 falsifier, §6.1 token
+gate, §6.3 effect proof and §5 verdict tiers stand.
+
+### What was implemented — Amendment §D option (2), fail-closed advertisement
+
+`Service::batching_enabled()` now requires a third conjunct, `batched_forward`:
+
+```
+batched_forward && batch_size > 1
+                  && worker max_active_sequences == batch_size
+```
+
+- The **production** path hardcodes `batched_forward: false`, because the
+  shipped dispatcher is a serial pop window with per-request weight re-reads
+  (mechanism (a), §B) and no batched forward exists. `/readyz` therefore
+  always answers `"batching": false` until mechanism (b) lands — §6.3 effect
+  proof can no longer be over-claimed.
+- The `batched_forward` gate is an in-tree bool, **not** a new contract key,
+  so the strict `fields()` whitelist (contracts.rs `unexpected fields`) and the
+  Python `contracts.py` mirror are untouched — no capability/validator surface
+  to keep in sync and no fixture digest churn.
+- Test helper `gateway_test_service_with_batch(batch, max_active_sequences,
+  batched_forward)` parametrises the bit so the gate is load-bearing, not dead
+  code: with `batched_forward=false` the bit stays false for every `(B,
+  advertised)` pair; with `true`, agreement on `(2,2)` advertises and every
+  disagreement still fails closed.
+
+### Verification (offline, no lock, no device)
+
+- `cargo check -p apxinf-serving --all-targets`: **0 errors**, only the
+  pre-existing `apxinf-core` `max_seq_len` dead-code warning.
+- `cargo test --release -p apxinf-serving --lib`: **270 passed / 0 failed /
+  1 ignored** (round-74 baseline 268 → 270 as on the branch; no regression).
+- `git diff --check`: clean. 7 files, +60/−20.
+
+### Effect on the three options (§D)
+
+Option (2) is done. Unchanged frozen conclusion: the shipped tree cannot
+reach WIN (§B arithmetic), so no timing window should be run on it.
+Mechanism (b), option (1), remains the only path to WIN and is the
+prerequisite for ever setting `batched_forward: true` in production.
