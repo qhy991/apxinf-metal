@@ -806,15 +806,38 @@ impl Lfm3Model {
         let op = norm(op, &layer.post_operator_norm, eps)?;
         let hidden = x.add(&op)?;
         let ffn = norm(&hidden, &layer.ffn_norm, eps)?;
-        let share = ane_mlp_split(self.config.intermediate_size)?;
-        // SCAFFOLD ONLY: the switch is parsed and validated, but the column split
-        // is not implemented yet, so every share takes the GPU-only path. That
-        // makes `APXINF_LFM3_ANE=<n>` a no-op today and keeps the numerics
-        // byte-identical for every value; the split lands as the next change, and
-        // only then does a non-zero share become observable.
-        let gate = layer.w1.call(&ffn)?;
-        let up = layer.w3.call(&ffn)?;
-        let activated = silu_mul(&gate, &up)?;
+        let intermediate = self.config.intermediate_size;
+        let share = ane_mlp_split(intermediate)?;
+        let activated = if share == 0 {
+            let gate = layer.w1.call(&ffn)?;
+            let up = layer.w3.call(&ffn)?;
+            silu_mul(&gate, &up)?
+        } else {
+            if share >= intermediate {
+                return Err(Error::Other(format!(
+                    "APXINF_LFM3_ANE must be < {intermediate} (the split needs a GPU half), got {share}"
+                )));
+            }
+            // Column split: columns `[0, share)` are the GPU half and
+            // `[share, intermediate)` the ANE half. Both halves currently run on
+            // the GPU, so the only thing this changes is the GEMM column count --
+            // a non-zero share is therefore NOT expected to be byte-identical to
+            // share == 0 (#128's tiling lesson), and the token gate in
+            // doc/lfm3-ane-fp16-port-preregister.md is what decides that.
+            //
+            // The `ane` binding below is the single line that becomes a Core ML
+            // call when the FP16 ANE program is wired in; the split around it and
+            // the concatenation back to `intermediate` columns stay as they are.
+            let gate = layer.w1.call(&ffn)?;
+            let up = layer.w3.call(&ffn)?;
+            let gate_gpu = gate.slice_axis(1, 0, share)?;
+            let up_gpu = up.slice_axis(1, 0, share)?;
+            let gate_ane = gate.slice_axis(1, share, intermediate)?;
+            let up_ane = up.slice_axis(1, share, intermediate)?;
+            let gpu = silu_mul(&gate_gpu, &up_gpu)?;
+            let ane = silu_mul(&gate_ane, &up_ane)?;
+            Array::concat(&[&gpu, &ane], 1)?
+        };
         let down = layer.w2.call(&activated)?;
         let down = norm(&down, &layer.post_ffn_norm, eps)?;
         hidden.add(&down)
