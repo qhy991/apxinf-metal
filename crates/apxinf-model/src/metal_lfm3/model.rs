@@ -98,32 +98,59 @@ fn silu_mul(gate: &Array, up: &Array) -> Result<Array> {
     gate.mul(&gate.sigmoid()?)?.mul(up)
 }
 
-/// ANE column share for the MLP (`APXINF_LFM3_ANE`), in intermediate columns.
+/// ANE column split for the MLP (`APXINF_LFM3_ANE`), in intermediate columns.
 ///
 /// `0` (the default) leaves the MLP on the GPU-only path, byte-identical to
-/// before this switch existed. A value in `1..=7680` splits the MLP: the gate/up
-/// projections are computed for columns `[0, share)` by the GPU and `[share,
-/// 7680)` by the ANE half, and the down projection accumulates the two halves
-/// separately. **The scaffold currently runs both halves on the GPU**, so a
-/// non-zero share exercises the split (and its numerics, which are not
-/// guaranteed bit-identical because the GEMM tiling changes with the column
-/// count) without needing Core ML; the ANE half is the only line that changes
-/// when the Core ML program is wired in.
+/// before this switch existed. An integer in `1..7680` is the split point:
+/// columns `[0, share)` stay on the GPU and `[share, 7680)` run as one FP16
+/// Core ML program per layer (`--features coreml`). The two halves' down
+/// projections are summed before `post_ffn_norm`.
+///
+/// A fraction in `(0, 1)` is the pre-registered ANE share: `S = round(share *
+/// 7680 / 64) * 64`, columns `[7680 - S, 7680)` on the ANE. `0.7333` is the
+/// registered `S = 5632` point; the integer form stays for the #159 scaffold
+/// smoke and for choosing an arbitrary split.
+///
+/// Without the `coreml` feature the switch still validates and exercises the
+/// split geometry, but both halves run on the GPU; the model never claims an ANE
+/// run in that build. A non-zero share is not expected to be byte-identical to
+/// `share == 0` because the projection's column count changes the GEMM tiling
+/// (#128); the token gate in `doc/lfm3-ane-fp16-port-preregister.md` decides.
 fn ane_mlp_split(limit: usize) -> Result<usize> {
     let Some(raw) = std::env::var_os("APXINF_LFM3_ANE") else {
         return Ok(0);
     };
     let text = raw.to_string_lossy();
-    let share: usize = text
-        .trim()
-        .parse()
-        .map_err(|_| Error::Other(format!("APXINF_LFM3_ANE must be an integer, got `{text}`")))?;
-    if share > limit {
+    let value = text.trim();
+    if let Ok(share) = value.parse::<usize>() {
+        if share > limit {
+            return Err(Error::Other(format!(
+                "APXINF_LFM3_ANE must be <= {limit}, got {share}"
+            )));
+        }
+        return Ok(share);
+    }
+    let share: f64 = value.parse().map_err(|_| {
+        Error::Other(format!(
+            "APXINF_LFM3_ANE must be an integer column or a fraction in (0,1), got `{text}`"
+        ))
+    })?;
+    if !share.is_finite() || share < 0.0 || share >= 1.0 {
         return Err(Error::Other(format!(
-            "APXINF_LFM3_ANE must be <= {limit}, got {share}"
+            "APXINF_LFM3_ANE fraction must be in (0,1), got `{text}`"
         )));
     }
-    Ok(share)
+    if share == 0.0 {
+        return Ok(0);
+    }
+    let ane = ((share * limit as f64 / 64.0).round() as usize) * 64;
+    if ane < 64 || ane > limit - 64 {
+        return Err(Error::Other(format!(
+            "APXINF_LFM3_ANE share {share} rounds to {ane} columns; needs 64..={}",
+            limit - 64
+        )));
+    }
+    Ok(limit - ane)
 }
 
 /// Fused one-token depthwise convolution over a seven-column window.
@@ -205,6 +232,14 @@ pub struct Lfm3Model {
     config: Lfm3Config,
     backend: MlxBackend,
     weights: Weights,
+    /// `APXINF_LFM3_ANE` split point: columns `[0, ane_share)` stay on the GPU
+    /// and `[ane_share, intermediate)` run on the Neural Engine. `0` is the
+    /// default GPU-only path and builds no Core ML program.
+    ane_share: usize,
+    /// One loaded FP16 program per layer when `ane_share > 0`. Empty otherwise;
+    /// the `coreml` feature is the only build that can fill it.
+    #[cfg(feature = "coreml")]
+    ane: Vec<super::ane_slice::AneSlice>,
     /// Compiled `apxinf_causal_depthwise_conv` pipeline for the decode step.
     causal_conv: CausalDepthwiseConv,
     kinds: Vec<LayerKind>,
@@ -256,6 +291,42 @@ impl Lfm3Model {
             .ok_or_else(|| err("LFM3 native implementation requires an MLX backend"))?
             .clone();
         let weights = Weights::load(&config, tensors, backend.stream())?;
+        let intermediate = config.intermediate_size;
+        let ane_share = ane_mlp_split(intermediate)?;
+        if ane_share >= intermediate {
+            return Err(Error::Other(format!(
+                "APXINF_LFM3_ANE must be < {intermediate} (the split needs a GPU half), got {ane_share}"
+            )));
+        }
+        // Build each layer's program from the full BF16 weights, then keep only
+        // the GPU share in the model. share == 0 never enters this block, so the
+        // default arm neither compiles nor loads a Core ML program.
+        #[cfg(feature = "coreml")]
+        let (weights, ane) = if ane_share == 0 {
+            (weights, Vec::new())
+        } else {
+            let cache = apxinf_coreml::ProgramCache::new(super::ane_slice::cache_dir());
+            let mut slices = Vec::with_capacity(weights.layers.len());
+            for layer in &weights.layers {
+                slices.push(super::ane_slice::AneSlice::load(
+                    &cache,
+                    ane_share,
+                    intermediate,
+                    &layer.w1,
+                    &layer.w3,
+                    &layer.w2,
+                )?);
+            }
+            let mut sliced = weights;
+            for layer in &mut sliced.layers {
+                layer.w1 = layer.w1.output_slice(0, ane_share)?;
+                layer.w3 = layer.w3.output_slice(0, ane_share)?;
+                layer.w2 = layer.w2.input_slice(0, ane_share)?;
+            }
+            (sliced, slices)
+        };
+        #[cfg(not(feature = "coreml"))]
+        let weights = weights;
         let causal_conv = CausalDepthwiseConv::new(backend.stream())?;
         let kinds = config.layer_kinds()?;
         let layers = config.num_hidden_layers;
@@ -263,6 +334,9 @@ impl Lfm3Model {
             config,
             backend,
             weights,
+            ane_share,
+            #[cfg(feature = "coreml")]
+            ane,
             causal_conv,
             kinds,
             initial_kv: vec![None; layers],
@@ -801,42 +875,52 @@ impl Lfm3Model {
         x: &Array,
         op: &Array,
         layer: &LayerWeights,
+        layer_idx: usize,
     ) -> Result<Array> {
         let eps = self.config.norm_eps;
         let op = norm(op, &layer.post_operator_norm, eps)?;
         let hidden = x.add(&op)?;
         let ffn = norm(&hidden, &layer.ffn_norm, eps)?;
-        let intermediate = self.config.intermediate_size;
-        let share = ane_mlp_split(intermediate)?;
-        let activated = if share == 0 {
+        let share = self.ane_share;
+        #[cfg(not(feature = "coreml"))]
+        let _ = layer_idx;
+        let down = if share == 0 {
+            // The default arm: exactly the three GPU calls it made before the
+            // ANE switch existed.
             let gate = layer.w1.call(&ffn)?;
             let up = layer.w3.call(&ffn)?;
-            silu_mul(&gate, &up)?
+            let activated = silu_mul(&gate, &up)?;
+            layer.w2.call(&activated)?
         } else {
-            if share >= intermediate {
-                return Err(Error::Other(format!(
-                    "APXINF_LFM3_ANE must be < {intermediate} (the split needs a GPU half), got {share}"
-                )));
+            #[cfg(feature = "coreml")]
+            {
+                let slice = self.ane.get(layer_idx).ok_or_else(|| {
+                    Error::Other(format!(
+                        "LFM3 ANE split is {share} but layer {layer_idx} has no Core ML program"
+                    ))
+                })?;
+                // The model kept only the GPU share of w1/w3/w2 at load.
+                let gate = layer.w1.call(&ffn)?;
+                let up = layer.w3.call(&ffn)?;
+                let gpu = silu_mul(&gate, &up)?;
+                let gpu = layer.w2.call(&gpu)?;
+                gpu.add(&slice.predict(&ffn)?)?
             }
-            // Column split: columns `[0, share)` are the GPU half and
-            // `[share, intermediate)` the ANE half. Both halves currently run on
-            // the GPU, so the only thing this changes is the GEMM column count --
-            // a non-zero share is therefore NOT expected to be byte-identical to
-            // share == 0 (#128's tiling lesson), and the token gate in
-            // doc/lfm3-ane-fp16-port-preregister.md is what decides that.
-            //
-            // The `ane` binding below is the single line that becomes a Core ML
-            // call when the FP16 ANE program is wired in; the split around it and
-            // the concatenation back to `intermediate` columns stay as they are.
-            let gate = layer.w1.call(&ffn)?;
-            let up = layer.w3.call(&ffn)?;
-            let gpu = silu_mul(&gate.slice_axis(1, 0, share)?, &up.slice_axis(1, 0, share)?)?;
-            // The ANE half lives in `ane_slice`; wiring the Core ML program is a
-            // change to that module alone.
-            let ane = super::ane_slice::AneSlice::new(share, intermediate)?.from_parts(&gate, &up)?;
-            Array::concat(&[&gpu, &ane], 1)?
+            #[cfg(not(feature = "coreml"))]
+            {
+                // No Core ML in this build: exercise the split geometry on the
+                // GPU, exactly as the scaffold did.
+                let gate = layer.w1.call(&ffn)?;
+                let up = layer.w3.call(&ffn)?;
+                let gpu =
+                    silu_mul(&gate.slice_axis(1, 0, share)?, &up.slice_axis(1, 0, share)?)?;
+                let ane =
+                    super::ane_slice::AneSlice::new(share, self.config.intermediate_size)?
+                        .from_parts(&gate, &up)?;
+                let activated = Array::concat(&[&gpu, &ane], 1)?;
+                layer.w2.call(&activated)?
+            }
         };
-        let down = layer.w2.call(&activated)?;
         let down = norm(&down, &layer.post_ffn_norm, eps)?;
         hidden.add(&down)
     }
@@ -877,7 +961,7 @@ impl Lfm3Model {
             };
             (op, LayerState::Attention(next))
         };
-        let output = self.mix_and_residual(x, &op, layer)?;
+        let output = self.mix_and_residual(x, &op, layer, layer_idx)?;
         if let Some(states) = states {
             // The fast arm publishes the captured snapshot into the live slots
             // inside `build_graph` so both stay in lockstep; skip the eval here
@@ -1923,4 +2007,84 @@ mod tests {
         Ok(())
     }
 
+    /// One-layer smoke for the FP16 Core ML path: builds layer 0's program,
+    /// loads it with placement admission, and predicts one 512-token tile.
+    #[cfg(feature = "coreml")]
+    #[test]
+    #[ignore = "requires APXINF_LFM3_TEST_MODEL and an ANE host"]
+    fn ane_slice_program_loads_and_predicts_one_layer() -> Result<()> {
+        let path = test_checkpoint()?;
+        let json = std::fs::read_to_string(path.join("config.json"))
+            .map_err(|e| err(format!("cannot read LFM3 config: {e}")))?;
+        let config = Lfm3Config::from_json(&json)?;
+        let (tensors, _) = apxinf_loader::safetensors::load_native_path(&path)
+            .map_err(|e| err(format!("cannot load LFM3 checkpoint: {e}")))?;
+        let backend = Arc::new(MlxBackend::new(0)?);
+        let weights = Weights::load(&config, tensors, backend.stream())?;
+        let start = 5632;
+        let cache = apxinf_coreml::ProgramCache::new(super::super::ane_slice::cache_dir());
+        let slice = super::super::ane_slice::AneSlice::load(
+            &cache,
+            start,
+            config.intermediate_size,
+            &weights.layers[0].w1,
+            &weights.layers[0].w3,
+            &weights.layers[0].w2,
+        )?;
+        // A deterministic unit-range activation; this is a program-identity
+        // smoke, not the #151 real-activation corpus.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let values: Vec<f32> = (0..512 * config.hidden_size)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+            })
+            .collect();
+        let x = Array::from_f32(backend.stream(), &[1, 512, config.hidden_size], &values)?
+            .cast(MlxDType::BF16)?;
+        let y = slice.predict(&x)?;
+        assert_eq!(y.shape(), &[1, 512, config.hidden_size]);
+
+        // Same column share on the GPU in BF16: down(silu(x*w1) * (x*w3)).
+        let end = config.intermediate_size;
+        let gate = x.matmul(
+            &weights.layers[0]
+                .w1
+                .bf16()?
+                .slice_axis(1, start, end)?
+                .contiguous()?,
+        )?;
+        let up = x.matmul(
+            &weights.layers[0]
+                .w3
+                .bf16()?
+                .slice_axis(1, start, end)?
+                .contiguous()?,
+        )?;
+        let activation = gate.mul(&gate.sigmoid()?)?.mul(&up)?;
+        let reference = activation.matmul(
+            &weights.layers[0]
+                .w2
+                .bf16()?
+                .slice_axis(0, start, end)?
+                .contiguous()?,
+        )?;
+        let ane = y.to_f32_vec()?;
+        let gpu = reference.to_f32_vec()?;
+        let (mut error, mut energy) = (0f64, 0f64);
+        for (&a, &g) in ane.iter().zip(&gpu) {
+            let d = f64::from(a - g);
+            error += d * d;
+            energy += f64::from(g) * f64::from(g);
+        }
+        let relative = (error / energy).sqrt();
+        println!(
+            "LFM3 ANE slice {start}..{end}: relL2 vs BF16 GPU = {:.4}%",
+            relative * 100.0
+        );
+        assert!(relative < 0.02, "ANE program identity relL2 {relative:.4}");
+        Ok(())
+    }
 }
