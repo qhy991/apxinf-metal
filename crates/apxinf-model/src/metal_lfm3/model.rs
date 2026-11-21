@@ -98,6 +98,34 @@ fn silu_mul(gate: &Array, up: &Array) -> Result<Array> {
     gate.mul(&gate.sigmoid()?)?.mul(up)
 }
 
+/// ANE column share for the MLP (`APXINF_LFM3_ANE`), in intermediate columns.
+///
+/// `0` (the default) leaves the MLP on the GPU-only path, byte-identical to
+/// before this switch existed. A value in `1..=7680` splits the MLP: the gate/up
+/// projections are computed for columns `[0, share)` by the GPU and `[share,
+/// 7680)` by the ANE half, and the down projection accumulates the two halves
+/// separately. **The scaffold currently runs both halves on the GPU**, so a
+/// non-zero share exercises the split (and its numerics, which are not
+/// guaranteed bit-identical because the GEMM tiling changes with the column
+/// count) without needing Core ML; the ANE half is the only line that changes
+/// when the Core ML program is wired in.
+fn ane_mlp_split(limit: usize) -> Result<usize> {
+    let Some(raw) = std::env::var_os("APXINF_LFM3_ANE") else {
+        return Ok(0);
+    };
+    let text = raw.to_string_lossy();
+    let share: usize = text
+        .trim()
+        .parse()
+        .map_err(|_| Error::Other(format!("APXINF_LFM3_ANE must be an integer, got `{text}`")))?;
+    if share > limit {
+        return Err(Error::Other(format!(
+            "APXINF_LFM3_ANE must be <= {limit}, got {share}"
+        )));
+    }
+    Ok(share)
+}
+
 /// Fused one-token depthwise convolution over a seven-column window.
 ///
 /// `window` is `[1, kernel, hidden]` BF16 in tap order (oldest first) and
@@ -778,9 +806,36 @@ impl Lfm3Model {
         let op = norm(op, &layer.post_operator_norm, eps)?;
         let hidden = x.add(&op)?;
         let ffn = norm(&hidden, &layer.ffn_norm, eps)?;
-        let gate = layer.w1.call(&ffn)?;
-        let up = layer.w3.call(&ffn)?;
-        let activated = silu_mul(&gate, &up)?;
+        let intermediate = self.config.intermediate_size;
+        let share = ane_mlp_split(intermediate)?;
+        let activated = if share == 0 {
+            let gate = layer.w1.call(&ffn)?;
+            let up = layer.w3.call(&ffn)?;
+            silu_mul(&gate, &up)?
+        } else {
+            if share >= intermediate {
+                return Err(Error::Other(format!(
+                    "APXINF_LFM3_ANE must be < {intermediate} (the split needs a GPU half), got {share}"
+                )));
+            }
+            // Column split: columns `[0, share)` are the GPU half and
+            // `[share, intermediate)` the ANE half. Both halves currently run on
+            // the GPU, so the only thing this changes is the GEMM column count --
+            // a non-zero share is therefore NOT expected to be byte-identical to
+            // share == 0 (#128's tiling lesson), and the token gate in
+            // doc/lfm3-ane-fp16-port-preregister.md is what decides that.
+            //
+            // The `ane` binding below is the single line that becomes a Core ML
+            // call when the FP16 ANE program is wired in; the split around it and
+            // the concatenation back to `intermediate` columns stay as they are.
+            let gate = layer.w1.call(&ffn)?;
+            let up = layer.w3.call(&ffn)?;
+            let gpu = silu_mul(&gate.slice_axis(1, 0, share)?, &up.slice_axis(1, 0, share)?)?;
+            // The ANE half lives in `ane_slice`; wiring the Core ML program is a
+            // change to that module alone.
+            let ane = super::ane_slice::AneSlice::new(share, intermediate)?.from_parts(&gate, &up)?;
+            Array::concat(&[&gpu, &ane], 1)?
+        };
         let down = layer.w2.call(&activated)?;
         let down = norm(&down, &layer.post_ffn_norm, eps)?;
         hidden.add(&down)
