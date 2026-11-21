@@ -14,6 +14,9 @@ required-features = ["native-minicpm5"]
 
 [features]
 native-minicpm5 = ["dep:apxinf-model", "dep:apxinf-core", "dep:apxinf-tokenizer", "dep:apxinf-mlx"]
+# Same native text provider, but with the Core ML half enabled so the FP16 ANE
+# MLP path (`APXINF_LFM3_ANE`) can be exercised through this binary.
+native-minicpm5-coreml = ["native-minicpm5", "apxinf-model/coreml"]
 
 [dependencies]
 axum = "=0.8.9"
