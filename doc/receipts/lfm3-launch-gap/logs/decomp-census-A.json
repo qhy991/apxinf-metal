@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/Users/haiyan-mini/lfm3bench/lfm3-pipelined-decode/scripts/stage_decomposition.py", line 91, in <module>
+    "build_ms": round(sum(col("build_ms_sum")) / total_steps, 4),
+                      ~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~
+ZeroDivisionError: division by zero
