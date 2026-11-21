@@ -5,7 +5,8 @@
 //! RMSNorm, a per-head sigmoid attention gate and two independent partial-RoPE
 //! parameter sets. See `README.md` for the supported contract and scope.
 
-pub mod config;
+pub mod ane_slice;
+mod config;
 mod model;
 mod weights;
 mod q4;
