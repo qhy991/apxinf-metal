@@ -6,6 +6,10 @@
 **人工约束**：本棒只测量、不携入 `metal_lfm3` 运行时；不新增 `ane.rs`；只出探针 + 数字 + 判定。
 **Blocked by**：#144（packed 4-bit）——故本棒只测「假设权重已是 INT8」的吞吐，不测端到端。
 
+**[2026-11-21 更正，issue #153]** 这条依赖对 ANE 不成立：FP16 配方直接从 BF16 checkpoint 取权重
+（#151：ρ=1.89/1.85、relL2 0.36%），不需要 packed 4-bit；#144 本身以 measured NEGATIVE 关闭、未合入。
+**FP16 ANE 移植的依赖是「无」**；移植预注册见 `doc/lfm3-ane-fp16-port-preregister.md`。
+
 ---
 
 ## 0. 事实基座（引用，非本轮测量）
