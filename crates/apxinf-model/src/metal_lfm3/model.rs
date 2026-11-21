@@ -830,12 +830,10 @@ impl Lfm3Model {
             // the concatenation back to `intermediate` columns stay as they are.
             let gate = layer.w1.call(&ffn)?;
             let up = layer.w3.call(&ffn)?;
-            let gate_gpu = gate.slice_axis(1, 0, share)?;
-            let up_gpu = up.slice_axis(1, 0, share)?;
-            let gate_ane = gate.slice_axis(1, share, intermediate)?;
-            let up_ane = up.slice_axis(1, share, intermediate)?;
-            let gpu = silu_mul(&gate_gpu, &up_gpu)?;
-            let ane = silu_mul(&gate_ane, &up_ane)?;
+            let gpu = silu_mul(&gate.slice_axis(1, 0, share)?, &up.slice_axis(1, 0, share)?)?;
+            // The ANE half lives in `ane_slice`; wiring the Core ML program is a
+            // change to that module alone.
+            let ane = super::ane_slice::AneSlice::new(share, intermediate)?.from_parts(&gate, &up)?;
             Array::concat(&[&gpu, &ane], 1)?
         };
         let down = layer.w2.call(&activated)?;
