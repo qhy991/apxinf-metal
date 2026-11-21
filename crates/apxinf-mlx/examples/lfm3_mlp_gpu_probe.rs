@@ -35,6 +35,9 @@ struct Cell {
     median_ms: f64,
     min_ms: f64,
     max_ms: f64,
+    /// GPU rate in TFLOP/s: one multiply-add counts as 2 FLOPs (multiply +
+    /// add), while the ANE probe's `tmacs` counts it as 1 MAC. Do not divide
+    /// `tmacs` by `tflops` directly; use `2 * tmacs / tflops` or `gpu_ms / ane_ms`.
     tflops: f64,
 }
 

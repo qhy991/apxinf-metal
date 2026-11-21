@@ -42,7 +42,12 @@
 - **Q4 group-64 `quantized_matmul`**（#144 blocked-by 的 packed 4-bit 口径）
 - 每 cell：warmup 3 + 20 次逐次 `stream.eval`，取中位；报 TFLOP/s
 
-**对照比**：ρ(T,S) = (ANE MAC/s) ÷ (GPU BF16 FLOP/s)，同机同窗同 T。
+**对照比**：ρ(T,S) = (ANE MAC/s) ÷ (GPU BF16 FLOP/s)，同机同窗同 T。**（此式漏了 ×2，见下方更正；原文保留。）**
+
+> **更正（2026-11-21，issue #154）**：上式漏了 MAC→FLOP 的 ×2——探针的 `tmacs` 把一次乘加记 1，
+> `tflops` 记 2，**不可直接相除**。ρ 的正确口径是 `ρ = GPU ms / ANE ms`
+> = `2 × ANE TMAC/s ÷ GPU BF16 TFLOP/s`。本 doc 与结果档报出的 ρ 数值、冻结栏杆与判定
+> 一直按 `GPU ms / ANE ms` 口径，均不变；原文保留以维持预登记记录。
 
 ## 3. 回收算术（公式冻结；f 与缺口先写死）
 
