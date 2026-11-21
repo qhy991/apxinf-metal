@@ -90,7 +90,10 @@ down K-split + 512 tile），真实权重 + 真实激活的 MLP 输出误差落�
 同一探针在同一窗口内报 ANE 每层 512-token 的 `predict` 中位 ms（warmup 3 + 20 次），
 `T=2048` 以 4×512 顺序 predict 表示（#146 的部署形态）；GPU BF16 的 ms 由既有
 `lfm3_mlp_gpu_probe` 在同窗口复跑 `S=7680` 的 T=512/2048 得到。
-`ρ = ANE TMAC/s ÷ GPU BF16 TFLOP/s`，`R_max = f·ρ/(1+ρ)`，`f=0.73`（#146 冻结值）。
+`ρ = GPU BF16 ms / ANE ms`（同 T、同 S 的无量纲时间比，单位安全；等价于
+`ρ = 2 × ANE TMAC/s ÷ GPU BF16 TFLOP/s`）。**不要写 `tmacs ÷ tflops`**：探针的 `tmacs`
+按 MAC 计数（一次乘加记 1），`tflops` 按 FLOP 计数（一次乘加记 2 = 乘 + 加），两者不可直接
+相除，否则 ρ 会系统性偏小一半。`R_max = f·ρ/(1+ρ)`，`f=0.73`（#146 冻结值）。
 
 ---
 
@@ -287,7 +290,9 @@ lane 的 registration-gate 口径是 98%；全部臂 ≥99.2%，比 gate 高 1.2
 
 ### 6.8 FP16 ANE 的吞吐预算（owner 更新版第 3 条）
 
-同一窗口内 ANE 与 GPU BF16 的 512-token tile 实测（4 层中位；GPU BF16 S=7680 T=512/2048）：
+同一窗口内 ANE 与 GPU BF16 的 512-token tile 实测（4 层中位；GPU BF16 S=7680 T=512/2048）。
+下表 ρ 一律是 `GPU ms / ANE ms`（同 T 的时间比，§2.4），**不是** `tmacs ÷ tflops`（差 ×2）；
+ρ 与 R_max 的数值、判定均不变：
 
 | 臂 | T=512 ms | T=2048（4×512）ms | ρ(T=512) | ρ(T=2048) | R_max（f=0.73） |
 |---|---:|---:|---:|---:|---:|

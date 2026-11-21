@@ -157,6 +157,8 @@ struct Cell {
     median_ms: f64,
     min_ms: f64,
     max_ms: f64,
+    /// ANE rate in TMAC/s: one multiply-add counts as 1 MAC. A GPU probe's
+    /// `tflops` counts the same operation as 2 FLOPs, so use `2 * tmacs / tflops`.
     tmacs: f64,
     placement_ok: bool,
     placement: String,
