@@ -236,7 +236,7 @@ mod native {
         let stream = Stream::metal(0)?;
         // ANE natural layout: [1, KV_HEADS, rows, HEAD_DIM].
         let shape = vec![1, KV_HEADS, kv_rows, HEAD_DIM];
-        let mut data = vec![0u8; slab_elems * 2];
+        let mut data = vec![0u8; slab_bytes];
         let live = KV_HEADS * p * HEAD_DIM; // full-attn rows only
         let live_bits = 0x3c00u16;
         for i in 0..live.min(slab_elems) {
