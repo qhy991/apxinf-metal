@@ -414,7 +414,7 @@ mod native {
         })?;
         let payload = match mode.as_str() {
             "copy" | "host" => run_grid(&mode, &p_list, reps, warmup)?,
-            "iosurface" => run_iosurface(iosurface_probe)?,
+            "iosurface" => run_iosurface(iosurface_probe, &p_list, reps, warmup)?,
             other => return Err(err(format!("unknown mode {other:?}"))),
         };
         let text =
