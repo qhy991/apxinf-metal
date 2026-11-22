@@ -43,6 +43,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 LETTER = re.compile(r"[ABCD]")
@@ -228,8 +229,17 @@ def run_segment(args) -> int:
         return row
 
     total = len(mmlu_sub) + len(gsm_sub)
-    for i, s in enumerate(mmlu_sub, 1):
-        results.append(one("mmlu", s, i, total))
+    # MMLU answers are one letter (short), so host-side concurrency (doc
+    # lfm3-bug2-concurrent-smoke Decision) only shortens the smoke window;
+    # GSM8K stays serial.  Thread-safety: each sample's "one" is a single
+    # curl, join_timing's claimed set is the only shared mutable state.
+    if args.concurrency > 1:
+        with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+            results.extend(ex.map(lambda it: one("mmlu", it[1], it[0], total),
+                                   enumerate(mmlu_sub, 1)))
+    else:
+        for i, s in enumerate(mmlu_sub, 1):
+            results.append(one("mmlu", s, i, total))
     for i, s in enumerate(gsm_sub, 1):
         results.append(one("gsm8k", s, len(mmlu_sub) + i, total))
 
@@ -560,6 +570,9 @@ def main() -> int:
                         help="MMLU max tokens (overrides --max-tokens)")
         ap.add_argument("--max-tokens-gsm8k", type=int, default=256,
                         help="GSM8K max tokens (default 256, bug-2)")
+        ap.add_argument("--concurrency", type=int, default=1,
+                        help="MMLU segment request concurrency (default 1, "
+                             "serial; doc lfm3-bug2-concurrent-smoke)")
         ap.add_argument("--timeout", type=int, default=180)
         args = ap.parse_args(sys.argv[2:])
         args.max_tokens_mmlu = (args.max_tokens_mmlu

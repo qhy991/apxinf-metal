@@ -179,7 +179,8 @@ seg_arm() { # arm seg tag model_root expect_4bit [worker_env...]
     --mmlu-seed $MMLU_SUBSET_SEED --gsm8k-seed $GSM8K_SUBSET_SEED \
     --request-log "$RES/apxinf-$tag-requests.jsonl" \
     --repo "$REPO" --out "$RES/$arm-seg$seg.json" \
-    --max-tokens-mmlu 64 --max-tokens-gsm8k 256 --timeout 180 >> "$RES/$arm-seg$seg.log" 2>&1
+    --max-tokens-mmlu 64 --max-tokens-gsm8k 256 \
+    --concurrency 4 --timeout 180 >> "$RES/$arm-seg$seg.log" 2>&1
   echo "seg arm=$arm seg=$seg exit=$? at $(date +%FT%T)" >> "$CLOG"
   stop_gw
 }
