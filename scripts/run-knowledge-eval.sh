@@ -3,7 +3,8 @@
 # doc/lfm3-4bit-knowledge-eval.md; Lead 10:52 scale revision).
 #
 # Default shape = Lead 10:52 smoke test: MMLU 10 + GSM8K 10, greedy
-# temp=0 max_tokens=64, native-4bit (A, APXINF_LFM3_4BIT=1) vs
+# temp=0, max_tokens MMLU 64 / GSM8K 256 (bug-2, Lead 2026-11-22 10:52),
+# native-4bit (A, APXINF_LFM3_4BIT=1) vs
 # native-bf16 (B, switch unset), 1 segment per arm, arms interleaved
 # A then B to avoid drift (Lead: no multi-segment ABBA at this scale).
 # The full prereg shape stays reachable via args, e.g.
@@ -178,7 +179,7 @@ seg_arm() { # arm seg tag model_root expect_4bit [worker_env...]
     --mmlu-seed $MMLU_SUBSET_SEED --gsm8k-seed $GSM8K_SUBSET_SEED \
     --request-log "$RES/apxinf-$tag-requests.jsonl" \
     --repo "$REPO" --out "$RES/$arm-seg$seg.json" \
-    --max-tokens 64 --timeout 180 >> "$RES/$arm-seg$seg.log" 2>&1
+    --max-tokens-mmlu 64 --max-tokens-gsm8k 256 --timeout 180 >> "$RES/$arm-seg$seg.log" 2>&1
   echo "seg arm=$arm seg=$seg exit=$? at $(date +%FT%T)" >> "$CLOG"
   stop_gw
 }

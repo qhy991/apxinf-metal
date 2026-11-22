@@ -205,7 +205,8 @@ def run_segment(args) -> int:
 
     def one(ds: str, sample: dict, idx: int, total: int) -> dict:
         prompt = mmlu_prompt(sample) if ds == "mmlu" else gsm8k_prompt(sample)
-        a = ask(args.gateway, args.model, prompt, args.max_tokens, args.timeout)
+        cap = args.max_tokens_mmlu if ds == "mmlu" else args.max_tokens_gsm8k
+        a = ask(args.gateway, args.model, prompt, cap, args.timeout)
         timing = join_timing(ledger, claimed) if args.request_log else {}
         if ds == "mmlu":
             parsed = extract_mmlu(a["reply"]) if a["ok"] else None
@@ -251,7 +252,9 @@ def run_segment(args) -> int:
                    "mmlu_idx": mmlu_ids, "gsm8k_idx": gsm_ids,
                    "mmlu_idx_sha256": hashlib.sha256(json.dumps(mmlu_ids).encode()).hexdigest(),
                    "gsm8k_idx_sha256": hashlib.sha256(json.dumps(gsm_ids).encode()).hexdigest()},
-        "max_tokens": args.max_tokens, "timeout": args.timeout,
+        "max_tokens_mmlu": args.max_tokens_mmlu,
+        "max_tokens_gsm8k": args.max_tokens_gsm8k,
+        "max_tokens": args.max_tokens_mmlu, "timeout": args.timeout,
         "n": len(results),
         "ok_count": sum(1 for r in results if r["ok"]),
         "error_count": sum(1 for r in results if not r["ok"]),
@@ -548,9 +551,20 @@ def main() -> int:
         ap.add_argument("--request-log", default="")
         ap.add_argument("--repo", required=True)
         ap.add_argument("--out", required=True)
-        ap.add_argument("--max-tokens", type=int, default=64)
+        # bug-2 (Lead 2026-11-22 10:52): GSM8K cap 64->256, MMLU stays 64.
+        # Kept as a single flag whose value now drives MMLU, and a new
+        # GSM8K flag; old receipts with "max_tokens" stay readable.
+        ap.add_argument("--max-tokens", type=int, default=64,
+                        help="MMLU max tokens (default 64)")
+        ap.add_argument("--max-tokens-mmlu", type=int, default=None,
+                        help="MMLU max tokens (overrides --max-tokens)")
+        ap.add_argument("--max-tokens-gsm8k", type=int, default=256,
+                        help="GSM8K max tokens (default 256, bug-2)")
         ap.add_argument("--timeout", type=int, default=180)
         args = ap.parse_args(sys.argv[2:])
+        args.max_tokens_mmlu = (args.max_tokens_mmlu
+                                if args.max_tokens_mmlu is not None
+                                else args.max_tokens)
         return run_segment(args)
     if len(sys.argv) > 1 and sys.argv[1] == "analyze":
         res = sys.argv[2] if len(sys.argv) > 2 else "."
