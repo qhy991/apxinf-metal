@@ -16,10 +16,14 @@ mod native {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    /// Doc §1.1: KV slab handed to the ANE arm. 4 kv_heads x 8192 positions
-    /// x 128 head_dim, BF16. The allocator-level size is what the gate
-    /// compares against (row padding and hardware alignment may add bytes).
-    pub const IOSURFACE_BYTES: usize = 98_552_320;
+    /// Doc §1.1: KV slab handed to the ANE arm. `[1, 4, 8192, 128]` BF16
+    /// = 8,388,608 B. The Lead review (13:05) noted the frozen 98,552,320 B
+    /// figure does not match the actual shape arithmetic; we keep the frozen
+    /// constant as `DOC_FROZEN_REQUESTED_BYTES` for provenance but allocate
+    /// the true shape and assert the surface covers it.
+    pub const DOC_FROZEN_REQUESTED_BYTES: usize = 98_552_320;
+    /// Actual bytes for `[1, 4, 8192, 128]` BF16 (4 * 8192 * 128 * 2).
+    pub const SHAPE_BYTES: usize = 4 * 8192 * 128 * 2;
     const WIDTH: c_uint = 1;
     const HEIGHT: c_uint = 4;
     const BYTES_PER_ROW: c_uint = 8192 * 128 * 2;
@@ -207,6 +211,17 @@ mod native {
                     get_plane_count(surface),
                 )
             };
+            // Lead review (13:05): the arm must not proceed to timing with a
+            // surface that does not cover the bytes the state occupies. Assert
+            // before releasing the surface so a short allocation cannot be
+            // masked by a later code path.
+            if size < SHAPE_BYTES {
+                unsafe { cf_release(surface as CFTypeRef) };
+                return Err(format!(
+                    "IOSurface alloc_size {size} B < required shape bytes {SHAPE_BYTES} B \
+                     (Lead 13:05: allocate enough before timing)"
+                ));
+            }
             unsafe { cf_release(surface as CFTypeRef) };
             // `io` and `cf` drop here, after the last release.
 
@@ -214,9 +229,12 @@ mod native {
                 "probe": "iosurface",
                 "framework": FRAMEWORK,
                 "available": true,
-                "requested_bytes": IOSURFACE_BYTES,
+                "requested_bytes": SHAPE_BYTES,
+                "doc_frozen_requested_bytes": DOC_FROZEN_REQUESTED_BYTES,
                 "alloc_size": size,
-                "alloc_size_delta": size as i64 - IOSURFACE_BYTES as i64,
+                "alloc_size_delta": size as i64 - SHAPE_BYTES as i64,
+                "doc_frozen_delta": size as i64 - DOC_FROZEN_REQUESTED_BYTES as i64,
+                "shape_covers_requested": size >= SHAPE_BYTES,
                 "width": width,
                 "height": height,
                 "bytes_per_row": bpr,

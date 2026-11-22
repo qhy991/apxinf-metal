@@ -29,7 +29,7 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod native {
     use apxinf_core::{Error, Result};
-    use apxinf_mlx::{Array, MlxDType, Stream};
+    use apxinf_mlx::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
     use serde_json::{json, Value};
     use std::env;
     use std::fs;
@@ -147,26 +147,101 @@ mod native {
             / med
     }
 
-    /// Arm C: the decoder-layout copy. `Array::copy()` is MLX's explicit
-    /// device-to-device copy (op 33), so it reads and writes the full slab.
+    /// Implicit MLX Metal Shading Language source for the arm-C copy. Keep it
+    /// identical in spirit to `crates/apxinf-mlx/native/ane_tile_merge.metal`:
+    /// one thread per output element, a direct 32-bit index, no arithmetic.
+    const COPY_KERNEL_SOURCE: &str = r#"
+    const uint n = uint(n);
+    const uint tid = thread_position_in_grid.x;
+    if (tid < n) {
+        out[tid] = bfloat(src[tid]);
+    }
+    "#;
+
+    /// Peak M4 memory bandwidth (RUNNER §2) rounded to a hard 150 GB/s
+    /// ceiling. Any arm that would require a faster path is treated as a
+    /// broken measurement and must exit non-zero (Lead 13:05).
+    const MAX_PLAUSIBLE_GBPS: f64 = 150.0;
+
+    /// Arm C: the decoder-layout copy. `Array::copy()` (bridge op 33) is
+    /// MLX's `mx::copy`, which may alias when the source is already
+    /// row-contiguous. To guarantee a real device-side copy of the full state
+    /// we dispatch an explicit Metal kernel that reads and writes every BF16
+    /// element. The kernel output is a fresh MLX array, so `eval + synchronize`
+    /// waits for the real transfer. After the timing window, a hard
+    /// arithmetic self-check rejects any measurement above 150 GB/s.
     fn run_copy(p: usize, reps: usize, warmup: usize) -> Result<Value> {
         let bytes = state_bytes_expected(p)?;
         let stream = Stream::metal(0)?;
         let source = mock_state(&stream, p)?;
-        for _ in 0..warmup {
-            let dst = source.copy()?;
+        let kernel = MetalKernel::new(
+            &stream,
+            "apxinf_p2_state_copy",
+            &["src", "n"],
+            &["out"],
+            COPY_KERNEL_SOURCE,
+            "",
+        )?;
+        let shape = state_shape(p);
+        let n = source.numel();
+        if n != shape.iter().product::<usize>() {
+            return Err(err(format!(
+                "copy arm element count mismatch: Array numel {n}, state_shape product {}",
+                shape.iter().product::<usize>()
+            )));
+        }
+        if n.checked_mul(2).map_or(true, |b| b != bytes) {
+            return Err(err(format!(
+                "copy arm byte accounting mismatch: {n} BF16 elems = {} B, expected {bytes} B",
+                n * 2
+            )));
+        }
+        let n_array = Array::from_i32(
+            &stream,
+            &[1],
+            &[i32::try_from(n)
+                .map_err(|_| err(format!("copy arm element count exceeds i32: {n}")))?],
+        )?;
+        // Each of the `n` threads owns one BF16 element: reads `src` and
+        // writes the fresh `out` at the same 32-bit index. The grid is `n` and
+        // the threadgroup is 1024, so `thread_position_in_grid.x` ranges
+        // `[0, n)` with a single element per thread. No threads race.
+        let copy_once = || -> Result<Array> {
+            let outputs = unsafe {
+                kernel.call(
+                    &[source.clone(), n_array.clone()],
+                    &[(&shape, MlxDType::BF16)],
+                    [n, 1, 1],
+                    [1024, 1, 1],
+                    &[("T", TemplateArg::DType(MlxDType::BF16))],
+                )?
+            };
+            let dst = outputs
+                .into_iter()
+                .next()
+                .ok_or_else(|| err("copy kernel produced no output"))?;
             stream.eval(&[dst.clone()])?;
             stream.synchronize()?;
+            Ok(dst)
+        };
+        for _ in 0..warmup {
+            let _ = copy_once()?;
         }
         let mut times = Vec::with_capacity(reps);
         for _ in 0..reps {
             let start = Instant::now();
-            let dst = source.copy()?;
-            stream.eval(&[dst.clone()])?;
-            stream.synchronize()?;
+            let _ = copy_once()?;
             times.push(start.elapsed().as_secs_f64() * 1e3);
         }
         let med = median(times.as_slice());
+        let gbps = bytes as f64 / (med / 1e3) / 1e9;
+        if !gbps.is_finite() || gbps > MAX_PLAUSIBLE_GBPS {
+            return Err(err(format!(
+                "arm C arithmetic self-check failed: {bytes} B / {med:.6} ms = {gbps:.1} GB/s \
+                 exceeds {MAX_PLAUSIBLE_GBPS} GB/s (M4 streaming peak ≈ 100.6 GB/s); \
+                 the copy did not move the full state"
+            )));
+        }
         Ok(json!({
             "probe": "kv_handoff_copy",
             "arm": "C",
@@ -177,7 +252,9 @@ mod native {
             "times_ms": times,
             "median_ms": med,
             "spread": spread(times.as_slice()),
-            "gbps": bytes as f64 / (med / 1e3) / 1e9,
+            "gbps": gbps,
+            "plausibility_cap_gbps": MAX_PLAUSIBLE_GBPS,
+            "copy_kernel": "apxinf_p2_state_copy (explicit Metal element copy, not mx::copy)",
             "state_shape": state_shape(p),
             "bytes_from_formula": state_bytes(p),
             "bytes_match_formula": bytes == state_bytes(p),
