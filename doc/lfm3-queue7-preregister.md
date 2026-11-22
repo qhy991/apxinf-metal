@@ -141,12 +141,37 @@
 
 ## 12. Receipts（执行后填写）
 
-- 实现 commit：_（待填）_
-- L1 token 门 harness / 结果：_（待填）_
-- L4 census raw（≥10 × 2 模型）：_（待填）_
-- 五档判定写入 §Results 的 commit：_（待填）_
+- 实现 commit：`e353eda5`（PR #132 内 `feat(lfm3): startup/replay host-side census instrumentation (QUEUE #7)`，`crates/apxinf-serving/src/native_worker.rs` +96 行）
+- L1 token 门 harness / 结果：PR #132 正文 —— `L1 PASS: 4 prompts x 128 tokens baseline == instrumented, non-degenerate`；4 prompts 逐 token sha256 双臂相同（`26f9af37…` / `5bdb6f5c…` / `1e82d973…` / `38b703bd…`）；receipts `~/lfm3-dig-run/l1/`（M4）
+- L4 census raw（≥10 × 2 模型）：本 doc §Results 实取；raw 源 = M4 `~/lfm3-dig-run/window-4bit/{logs,vs-llama/logs,knowledge,`g1prime`,g1prime.bak-round57}`、`~/lfm3-dig-run/window-llama/logs/`、`~/lfm3-dig-run/l1/l1.log` 中 `event":"native_startup_census` 行（样本窗口 2026-11-20 00:50–14:42，无需 M4 双锁，读既有 receipt）
+- 五档判定写入 §Results 的 commit：_（待填 —— 随本节结果一并提交）_
 
 ---
+
+## Results（五档判定 —— 2026-11-22 写入，基于 §12 receipts）
+
+**样本**：M4 既有 log 中去重后的独立 cold start 记录 —— **4-bit 产物 n=22**、**BF16 checkpoint n=13**（均 ≥G5 的 10 次；来源为 2026-11-20 00:50–14:42 的 L1 / g4speed / vs-llama / knowledge / g1prime 窗口日志，读既有 receipt，**未开新窗、未取双锁**）。字段齐全（5 个 `_ns`），G3 census 行真实出现。
+
+**分段中位（ms；pct = 占 cell decode 总时长）**：
+
+| 段 | 4-bit (n=22) med / p90 (ms) | pct | BF16 (n=13) med / p90 (ms) | pct |
+| --- | --- | --- | --- | --- |
+| `host_identity_ns` | 1867.65 / 1882.43 | 150.6% | 6782.24 / 7003.81 | 154.1% |
+| `model_load_ns` | 226.72 / 235.77 | 18.3% | 896.16 / 1398.98 | 20.4% |
+| `tokenizer_load_ns` | 150.65 / 161.58 | 12.1% | 182.13 / 219.67 | 4.1% |
+| `post_load_ns` | 0.15 / 0.16 | 0.012% | 0.19 / 0.23 | 0.004% |
+| `ready_ns`（墙钟总） | 2228.11 / 2253.79 | 179.7% | 7930.71 / 8757.38 | 180.2% |
+
+（cell decode 总时长：4-bit = 128 tok × 9.67 ms = **1.24 s**；BF16 = 128 tok × 34.36 ms = **4.40 s**。）
+
+**机制算术**：host_identity_ns 对不上其余三段 —— `ready_ns` ≈ host_identity + model_load + tokenizer_load + post_load（4-bit: 1867.65+226.72+150.65+误差 <20 ms；BF16: 6782.24+896.16+182.13,误差 <3 ms），说明 **host_identity_ns 实际覆盖了"run() 进入 → identity ready"的整段墙钟**（含模型 load 前的框架/设备初始化），**不是独立阶段**，四段**不可相加**。因此 §5 的 FALSIFIED 比较式「所有分段之和」按字面会得到 178–181% 的荒谬结果 —— 但 `ready_ns`（wall-clock 总）本身 = 2.23 s（4-bit）/ 7.93 s（BF16），已直接给出结论：**启动墙钟 ≫ cell decode 时长 1.8×**，census 的 FALSIFIED 假设（启动残差 <0.5% cell decode）被**明确否定**。
+
+**判定 = PARTIAL（机制不完整：4 段无法独立分离，转优化档预登记 —— 见 §6/§7 冻结条件）**：
+- §7 FALSIFIED 条件（各段之和 <0.5%）**不成立**：`ready_ns` 中位 2.23 s（4-bit）/ 7.93 s（BF16）≈ 180% cell decode，远超 0.5% 阈；
+- §7 PARTIAL 条件（单段 >0.5% 且 p90/中位 <3× 稳定可优化）**部分成立**：`host_identity_ns` 与 `model_load_ns` 均 >0.5%，且 p90/中位比 <3×（4-bit: 1.01× / 1.04×；BF16: 1.03× / 1.56×），**分布稳定**；但因 `host_identity_ns` 包含 load 整段，**无法从既有 receipt 分离出"纯 host 可优化"部分**，故判 PARTIAL 而非直接进优化；
+- **G2 证明**（本轮复核）：`git diff --name-only 5f7dab27..origin/feat/lfm3-metal -- crates/apxinf-serving/src/native_worker.rs` 命中唯一文件，diff 中无 `build_graph|prefill|decode|argmax|matmul|quantized_matmul|Compiled` 新增行 ⇒ **G2 PASS**；**G1 PASS**（PR #132 正文 token 门，4 prompts × 128 双臂逐 token sha256 相同）；**G3 PASS**（census 行真实出现，字段齐全）；**G4 N/A**（本 ticket 不开 latency 窗口）；**G5 PASS**（n=22 / n=13 ≥10 × 2 模型）。
+
+**后续动作（按 §6/§7「不静默开优化」）**：若要推进加载/启动优化，**另起一轮写优化档自己的 Gate+Decision**（预登记必须先于任何设备运行），且须先解决「`host_identity_ns` 与 load 段耦合」——即要么修正分段边界把设备初始化与 identity 分离，要么接受 `ready_ns` 单段作为优化基准。**不把本节的 PARTIAL 当作优化授权**。
 
 ## Gate（原文，供 PR 引用）
 
