@@ -20,6 +20,15 @@ def sha256(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+# Lead-frozen aggregate shas for the g1prime-v2 20-task suite
+# (doc/lfm3-native-4bit.md:178; round-63 / round-65 M4 builder receipts,
+# recomputed 2026-11-22 round-84). The per-task FROZEN table below only pins
+# prompt/test/code 12-char prefixes, so a payload change in any other field
+# could slip past it; these two aggregates pin the emitted task set itself.
+FROZEN_TASK_SET_SHA = "13a96e891bf484b86fd92dd04db8e0611c190709362e1c3e9a76366f6fc72910"
+FROZEN_ID_SEQ_SHA = "31157e868ae01230386f484daef0703c63ec637d0f229dddbabd77a3b49242d6"
+
+
 def mbpp_tasks(rows: list[dict], k: int) -> list[dict]:
     out = []
     for r in rows[:k]:
@@ -127,6 +136,17 @@ def main() -> int:
                         "frozen AG2 cache row set; aborting before any device run)")
     for t in tasks:
         t["sha256"] = sha256(json.dumps(t, sort_keys=True, ensure_ascii=False))
+    if args.k >= 19:
+        task_set_sha = sha256("".join(t["sha256"] for t in tasks))
+        id_seq_sha = sha256("".join(t["id"] for t in tasks))
+        if task_set_sha != FROZEN_TASK_SET_SHA or id_seq_sha != FROZEN_ID_SEQ_SHA:
+            raise SystemExit(
+                "AGGREGATE_SHA_MISMATCH: task_set_sha=%s (want %s) "
+                "id_seq_sha=%s (want %s) — emitted task set differs from the "
+                "Lead-frozen g1prime-v2 suite; aborting before any device run"
+                % (task_set_sha, FROZEN_TASK_SET_SHA, id_seq_sha, FROZEN_ID_SEQ_SHA))
+        print("task_set_sha=" + task_set_sha)
+        print("id_seq_sha=" + id_seq_sha)
     suite = {
         "suite_version": "g1prime-v2" if args.k >= 19 else "g1prime-v1",
         "frozen_at": None,  # set by builder run time below
