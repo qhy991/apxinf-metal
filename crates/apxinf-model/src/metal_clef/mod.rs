@@ -59,7 +59,7 @@ const GPU_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
 /// it, quality against stock, memory, and paired latency against the
 /// reference implementation).
 #[cfg(feature = "coreml")]
-const GPU_ANE_COLUMNS_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
+const GPU_ANE_COLUMNS_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s", "applegpu_g14g"];
 
 /// MLX architectures where the GPU composition with MLP neurons split onto the
 /// Neural Engine passed its gates; `auto` prefers it there: the M4 (2026-10-18;
@@ -79,11 +79,13 @@ fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
     let requested = match options.model_variant.as_deref() {
         None | Some("auto") => None,
         Some("reference") => Some(Composition::Reference),
-        Some(_) => {
-            return Err(Error::Contract(
-                "Clef MLX supports the auto and reference variants",
-            ))
-        }
+        #[cfg(feature = "coreml")]
+        Some("gpu-ane-columns") => Some(Composition::GpuAneColumns),
+        #[cfg(feature = "coreml")]
+        Some("gpu-ane-neurons") => Some(Composition::GpuAneNeurons),
+        Some(_) => return Err(Error::Contract(
+            "Clef MLX supports the auto, reference, gpu-ane-columns and gpu-ane-neurons variants",
+        )),
     };
     if !matches!(
         options.precision,
@@ -427,8 +429,13 @@ mod tests {
     #[test]
     fn admission_needs_no_device_or_checkpoint() {
         assert_eq!(admit(&LoadOptions::default()).unwrap(), None);
-        for (variant, composition) in [("auto", None), ("reference", Some(Composition::Reference))]
-        {
+        let mut cases = vec![("auto", None), ("reference", Some(Composition::Reference))];
+        #[cfg(feature = "coreml")]
+        cases.extend([
+            ("gpu-ane-columns", Some(Composition::GpuAneColumns)),
+            ("gpu-ane-neurons", Some(Composition::GpuAneNeurons)),
+        ]);
+        for (variant, composition) in cases {
             let options = LoadOptions {
                 model_variant: Some(variant.into()),
                 ..LoadOptions::default()
@@ -473,12 +480,16 @@ mod tests {
         );
         #[cfg(not(feature = "coreml"))]
         assert_eq!(select(None, "applegpu_g16g", None), Composition::Reference);
-        for other in ["applegpu_g14g", "applegpu_g13g", ""] {
-            assert_eq!(
-                select(None, other, None),
-                Composition::Reference,
-                "{other}"
-            );
+        #[cfg(feature = "coreml")]
+        assert_eq!(
+            select(None, "applegpu_g14g", None),
+            Composition::GpuAneColumns,
+            "M2 columns is the qualified composition"
+        );
+        #[cfg(not(feature = "coreml"))]
+        assert_eq!(select(None, "applegpu_g14g", None), Composition::Reference);
+        for other in ["applegpu_g13g", ""] {
+            assert_eq!(select(None, other, None), Composition::Reference, "{other}");
         }
         for architecture in ["applegpu_g13s", "applegpu_g16g"] {
             assert_eq!(
@@ -487,6 +498,9 @@ mod tests {
             );
         }
         // The gate replaces auto, while an explicit variant request wins.
+        // The ANE compositions exist only with the `coreml` feature, so
+        // `parse_composition` and this assertion share its cfg gate.
+        #[cfg(feature = "coreml")]
         assert_eq!(
             select(None, "applegpu_g16g", Some(Composition::GpuAneColumns)),
             Composition::GpuAneColumns

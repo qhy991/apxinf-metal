@@ -865,7 +865,16 @@ impl AneMlp {
         };
         let admission = super::ane_admission::Admission::new(package, [1, HIDDEN, 1, tile])?;
         let units = ComputeUnits::CpuAndNeuralEngine;
-        let timeout = std::time::Duration::from_secs(60);
+        // 60 s suffices on the qualified M1 Pro/M4; a slower or
+        // newly-enabled architecture (the M2) can raise it without a
+        // rebuild. Invalid or out-of-range values keep 60.
+        let timeout = std::time::Duration::from_secs(
+            std::env::var("APXINF_COREML_PLAN_TIMEOUT_S")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|seconds| (1..=900).contains(seconds))
+                .unwrap_or(60),
+        );
         // A placement-inspect race under ANE service load is transient (the
         // same compiled directory loads cleanly on a retry); a bad
         // placement/port/admission is not and must fail on the first attempt.

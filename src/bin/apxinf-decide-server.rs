@@ -1,7 +1,8 @@
 //! Resident Clef decision process for the Mario demo (`APXINF_DECIDE_CMD`).
 //!
 //! ```text
-//! apxinf-decide-server --model <checkpoint> [--model-variant reference|auto]
+//! apxinf-decide-server --model <checkpoint>
+//!                       [--model-variant auto|reference|gpu-ane-columns|gpu-ane-neurons]
 //! ```
 //!
 //! Loads one checkpoint, prints one `ready` line on stdout, then serves JSONL
@@ -158,7 +159,7 @@ fn parse_options() -> Fallible<Options> {
             }
             "--help" | "-h" => {
                 return Err(
-                    "usage: apxinf-decide-server --model <checkpoint> [--model-variant reference|auto]"
+                    "usage: apxinf-decide-server --model <checkpoint> [--model-variant auto|reference|gpu-ane-columns|gpu-ane-neurons]"
                         .into(),
                 )
             }
