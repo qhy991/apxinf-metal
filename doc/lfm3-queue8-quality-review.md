@@ -33,12 +33,39 @@
   （`$HOME/ag2-datasets-cache/…json`、`$HOME/ag-run/suite/AG2-suite-v1.json`），
   M1 无副本 ⇒ **本轮无法离线复算，无法本地证伪或证实该 sha。**
 
-**结论 F1（INCONCLUSIVE，机制 = 缺复算输入 + 缺脚本门）**：冻结 sha 有历史 receipt、
-脚本的 per-task FROZEN 表把关 payload 一致性，但"当前 builder 输出 == 13a96e89…"这一命题
-**既无脚本门、也本轮无法复算**。挂起项：
+**结论 F1（round-83 = INCONCLUSIVE；round-84 M4 复算后 = CONFIRMED，见 §2.1.1）**：冻结 sha 有历史 receipt、
+脚本的 per-task FROZEN 表把关 payload 一致性，round-83 因 M1 无复算输入、且无脚本门，
+"当前 builder 输出 == 13a96e89…"一度无法证实或证伪。挂起项：
 - 复算须 M4（锁内或离线均可，builder 本身不需锁），round-63/65 同法 `python3 -I`；
 - 可选加固（须先预登记再改脚本）：builder 输出 task-set 聚合 sha 与 id-seq sha 并与冻结值
   比对，不一致 abort。**本轮不动脚本。**
+
+### 2.1.1 round-84 复算结果（2026-11-22 15:52 CST，M4 锁外、只读，零双锁）
+
+- 输入在位（M4 实取）：`~/ag2-datasets-cache/google-research-datasets__mbpp__sanitized__test.json`
+  154,279 B（11-16 21:32）、`~/ag-run/suite/AG2-suite-v1.json` 11,912 B（11-17 19:21）；
+  历史产物 `~/lfm3-dig-run/window-4bit/g1prime/suite.json` 17,537 B，
+  `frozen_at = 2026-11-20T02:47:02+08:00`。
+- builder 未改：本地 md5 == `origin/feat/lfm3-metal` md5 == `8f16751206fce2e4e8fe17a4fc7c1109`。
+- 重建（`python3 -I scripts/build-g1prime-suite.py --force --k 19 --mbpp-cache … --ag2-suite …
+  --out /tmp/suite-recheck-20204/suite.json`，FROZEN 表门通过、无 abort）：
+  tasks=20，版本 `g1prime-v2`。
+- 冻结公式确认（round-63/65 同法，本轮锁定定义）：
+  - task-set sha = `sha256("".join(t["sha256"] for t in tasks))`（t 为 builder 写入的
+    per-task payload sha，顺序即 suite.json 顺序）；
+  - id-seq sha = `sha256("".join(t["id"] for t in tasks))`。
+- 重建值 vs 冻结值：
+  - task-set sha = `13a96e891bf484b86fd92dd04db8e0611c190709362e1c3e9a76366f6fc72910` ✅ 逐字一致；
+  - id-seq sha = `31157e868ae01230386f484daef0703c63ec637d0f229dddbabd77a3b49242d6` ✅ 逐字一致；
+  - 与 11-20 历史产物逐字段比对：`task_payloads_identical_ignoring_frozen_at = True`
+    （仅 `frozen_at` 因重建时刻不同而变：02:47:02 → 15:52:12）。
+- 机制注记：`run-g1prime.sh:48` 的整文件 `shasum` 每次运行必然不同（`frozen_at` 是时间戳），
+  故该值**不能**作为冻结门 —— 冻结的只能是 task-set / id-seq 两个 payload 聚合 sha。
+  builder 加固（输出并校验这两个聚合 sha，不一致 abort）仍是**可选项、须先预登记再改脚本**，
+  round-84 未动脚本。
+
+**F1 档位由 INCONCLUSIVE 改为 CONFIRMED（PASS）**：冻结 task-set / id-seq 与当前 builder
+从冻结输入重建的输出逐字一致，payload 未漂移。
 
 ### 2.2 GSM8K bug-2：未修复，且无 Lead 批准（F2，BLOCKED）
 
@@ -72,12 +99,14 @@ knowledge 门（MMLU 500 + GSM8K 200）最终五档不可出。批准后另起�
 
 | # | 问题 | 结论 | 档 | 是否需 Lead |
 |--- | --- | --- | --- | --- |
-| F1 | 冻结 task-set sha 是否等于当前 builder 输出 | 本轮无法离线复算；脚本无 sha 门；有历史 receipt | INCONCLUSIVE | 复算在 M4；加固须预登记 |
+| F1 | 冻结 task-set sha 是否等于当前 builder 输出 | round-83 离线不可复算（INCONCLUSIVE）→ **round-84 M4 复算逐字一致** | **CONFIRMED** | 加固须预登记；裁决无需 |
 | F2 | GSM8K bug-2 是否未修复 | 未修复，20/20 `cause=length`，无批准 | BLOCKED | **是（批准 64→256 或替代方案）** |
 | F3 | A/A DISAGREE 是否需扩 ≥40 | Lead 09:31 已接受，明确不扩 | CLOSED | 否 |
 
 **QUEUE #8 当前状态不变**：PARTIAL（G1′）+ G4-speed PASS ⇒ 4-bit opt-in、BF16 默认；
-knowledge 门 final verdict 挂起于 F2。
+knowledge 门 final verdict 挂起于 F2。F1 由 INCONCLUSIVE 改判 CONFIRMED
+（§2.1.1），不改变上述总体判定，仅清掉一条 Lead 挂起项
+（suite aggregate-sha M4 复算）。
 
 ## 4. 本轮动作与未动作
 
@@ -87,8 +116,14 @@ knowledge 门 final verdict 挂起于 F2。
   本地未推送 commit `bcb30a48`（queue6 review，round-82 因网络未推）从指针丢失，
   **已从 reflog cherry-pick 恢复为 `e86fda01`**（本文档在其上再提交）。
   `167fd236`（queue7 census）已在 PR #164，无需恢复。
-- 未做：未连 M4、未取双 Metal 锁、未 pmset/caffeinate、未开测量窗、未改任何脚本/冻结值/生成路径。
+- 未做（round-83）：未连 M4、未取双 Metal 锁、未 pmset/caffeinate、未开测量窗、未改任何脚本/冻结值/生成路径。
   bug-2、IOSurface 常数 98,552,320、`lfm3-ane-load` 锁持有者（pid 9884/24582）三项 Lead 挂起项**均未动**。
+- round-84 追加（2026-11-22 15:52 CST）：M4 锁外复算 F1（§2.1.1），
+  `CONFIRMED`。做了：读三件套、确认 builder md5 未变、M4 重建 suite 并比对两个聚合 sha。
+  未做：仍未取双 Metal 锁、未 pmset/caffeinate、未开测量窗、未改任何脚本/冻结值/生成路径、
+  未动 F2（bug-2）与另两项 Lead 挂起项；`lfm3-ane-load` 持有者本轮未触碰。
+  纪律：锁外只读 builder 复算 ≠ 测量窗（RUNNER §3）；`python3 -I` 隔离解释器；
+  产物落 `/tmp/suite-recheck-20204/suite.json`，未覆盖任何历史 receipt。
 
 ## 5. 附：知识评测 artifacts 位置说明（交接）
 
