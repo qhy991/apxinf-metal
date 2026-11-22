@@ -156,3 +156,12 @@ required-features = ["mlx"]
 name = "ane_probe"
 path = "examples/ane_probe.rs"
 required-features = ["coreml"]
+
+[[example]]
+name = "ane_kv_handoff_probe"
+path = "examples/ane_kv_handoff_probe.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "iosurface_probe"
+path = "examples/iosurface_probe.rs"
