@@ -62,7 +62,11 @@ round-84（§645，M4 锁外只读）复算：当前 builder（md5 未变）
 > 含两字段），且两值均等于冻结值；打印缺失或值不符 ⇒ **G3 FAIL**（不能以「per-task
 > FROZEN 表已过」代替 —— 那正是 round-83 发现的缺口）。
 > **G4 mismatch 负控（门必须是 load-bearing 的）**：人为扰动一个 task payload
-> （构造一份与冻结输入仅一处字节不同的 cache 副本，落 `--mbpp-cache` 指向的临时文件），
+> （构造一份与冻结输入仅一处字节不同的 cache 副本，落 `--mbpp-cache` 指向的临时文件；
+> **实测收紧解释（round-163 §7）**：MBPP 侧 prompt/test/code 已被 per-task `FROZEN`
+> 前缀表钉死，MBPP 扰动必然先被 `FROZEN_PAYLOAD_MISMATCH` 拦下 —— 「仅新门干活」的
+> 构造在 MBPP 上不存在；故 G4 的有效构造 = 扰动 per-task `FROZEN` **未覆盖**的 payload
+> 字段（如 HumanEval 的 `problem`，经 `--ag2-suite` 副本），该路径须由**聚合门**拦截），
 > 脚本**必须 abort**（非零退出）且错误信息指向 task-set 或 id-seq 的 mismatch
 > （不能静默写出新 suite）。**不 abort ⇒ INVALID**（门是死代码）。
 > **G5 A/A**：本档不跑任何设备窗，**A/A N/A**。若后续基于此 suite 开任何
@@ -82,6 +86,10 @@ round-84（§645，M4 锁外只读）复算：当前 builder（md5 未变）
 > 本地 `python3 -I` 自检（`--help`、语法）→ M4 `python3 -I` 冻结输入复现 G1/G3
 > （无需双 Metal 锁，builder 不占锁）→ G4 负控 → 五档判定 → 写入本文 §5 Results →
 > 一个 commit，一个 PR（base `feat/lfm3-metal`）。
+> **完成档判定的档位命名勘误（round-163 §7 实际填写时）**：§2/§4 旧文称「五档判定 →
+> 写入本文 §5 Results」，但 RUNNER §5 五档（WIN/PARITY/PARTIAL/FALSIFIED/INCONCLUSIVE）
+> 仅适用于设备加速结论；本档无测量 ⇒ **不产生五档**，实际写入 = **完成档 PASS**（§4 已
+> 明定 PASS/INVALID/INCONCLUSIVE 三档），§7 按此执行。该勘误不改任何门、不改判据。
 > **单 gate 单 PR**：本档不与任何设备测量窗、不与 P2 W1、不与 GSM8K bug-2 混在一个
 > PR（RUNNER §6「一个方向一个 PR」）。
 > **不静默开优化**：本档**不授权**任何对 suite 内容、任务数、评测协议的改动；
@@ -161,11 +169,97 @@ stderr）落 M4 `~/lfm3-dig-run/g1prime-sha-gate/`，**不覆盖**任何历史 r
 - **前置 receipt（round-84，§645，已在 `agent/lfm3-dig` commit `78e8a2c0` / PR #164）**：
   M4 锁外只读复算，两聚合 sha 逐字一致；builder md5
   `8f16751206fce2e4e8fe17a4fc7c1109` == `origin/feat/lfm3-metal` 同文件。
-- 预登记 commit：_（本 commit）_ `docs(lfm3): preregister G1′ suite builder aggregate-sha gate (round-162)`
-- 实现 commit：_（待填）_
-- G1/G3 M4 receipt：_（待填，落 `~/lfm3-dig-run/g1prime-sha-gate/`）_
-- G4 负控 receipt：_（待填，含扰动 cache 的 md5 与 abort stderr）_
-- PR：_（待填；base `feat/lfm3-metal`，head `agent/lfm3-g1prime-sha-gate`）_
+- 预登记 commit：`ae71939f`（round-162，先于任何脚本改动 ✅）。
+- 实现 commit：`9fcefb17` `feat(scripts): abort g1prime-v2 build on Lead-frozen
+  aggregate-sha mismatch`（round-163，2026-11-22 16:15 CST push `ae71939f..9fcefb17`
+  RC=0 至 `origin/agent/lfm3-g1prime-sha-gate`；脚本 md5
+  `63e28d80ef7f16050d14f7b95d396431`，+20/−0，v1 `k<19` 路径与 `FROZEN` 表逐字未动）。
+- G1/G3 M4 receipt：M4 `~/lfm3-dig-run/g1prime-sha-gate/`，2026-11-22 16:16–16:18 CST
+  （builder 不占双 Metal 锁；M4 网络侧 `Proxy CONNECT aborted` ⇒ 脚本经 `scp` 传输
+  落盘 md5 对拍 `8f167512…`/`63e28d80…` 与本地一致，未在 M4 侧 git fetch）：
+  - `before.py`（`origin/feat/lfm3-metal` 版，md5 `8f16751206fce2e4e8fe17a4fc7c1109`）、
+    `after.py`（`origin/agent/lfm3-g1prime-sha-gate` 版，md5
+    `63e28d80ef7f16050d14f7b95d396431`）；
+  - **G3 PASS**：`after.py --force --k 19 …` RC=0，`after.stdout` 实印
+    `task_set_sha=13a96e891bf484b86fd92dd04db8e0611c190709362e1c3e9a76366f6fc72910` +
+    `id_seq_sha=31157e868ae01230386f484daef0703c63ec637d0f229dddbabd77a3b49242d6`
+    （均 = 冻结值，两值等值打印非「per-task FROZEN 表替代」）；
+  - **G1 PASS**：`before.py` 同输入 RC=0 产出 `suite-before.json`；
+    `suite-after.json` vs `suite-before.json` 逐 task 全字段相等
+    （`tasks_identical_ignoring_frozen_at = True`、`id_order_identical = True`、
+    `diffing_fields = []`、`other_meta_diffs = {}`，n=20/20），且**两文件整文件
+    sha256 同为 `989bd0bb390163b86cbf1d9390034d7b5d260185f293fe3d071b22f6171075b5`**
+    （本轮两次构建恰好同秒写入 `frozen_at`，整文件亦逐字节相同 —— 整文件 shasum
+    因时间戳「可能」变，本轮未变，不影响门；G3 只认 payload 聚合）；
+  - 从 `suite-after.json` 反推复核两聚合 sha 与冻结值一致（RC=0）。
+- G4 负控 receipt：同一目录，两次扰动（HARNESS 双盲点，如实记录 —— 见 §7）：
+  - **N-A（MBPP cache 扰动）**：`mbpp-perturbed.json`（md5
+    `5c1b4102e9fe3a6e699bd7b2a65c724719aa2e26a0390096f3e8a4ed6e3b0201`，
+    rows[0].prompt 尾追 1 字节）⇒ RC=**1**、`neg.stderr` =
+    `FROZEN_PAYLOAD_MISMATCH mbpp_0011.prompt …`、`suite-negative.json` 未写出 ——
+    由**既有 per-task 前缀门**拦截，未触到聚合门；因 MBPP 的
+    prompt/test/code 三字段已被 `FROZEN` 表钉死，MBPP 侧不存在 1-byte 扰动
+    可绕过前缀门直达聚合门的构造路径（构造路径不存在，非负控失败）。
+  - **N-B（AG2 HumanEval 扰动，命中新门）**：`ag2-perturbed.json`（md5
+    `fbe7a4fa0d57ac491ccb5592a2923c4be29ef6125c82c35dc1516439737634b6`，
+    `humaneval_0080.problem` 尾追 10 字节 —— `problem` 不在 per-task
+    `FROZEN` 三字段内）⇒ RC=**1**、`neg2.stderr` =
+    `AGGREGATE_SHA_MISMATCH: task_set_sha=ae7e69fa… (want 13a96e89…) id_seq_sha=31157e86… (want 31157e86…)
+    — emitted task set differs from the Lead-frozen g1prime-v2 suite; aborting before any device run`、
+    `suite-negative2.json` 未写出 ⇒ **聚合门 load-bearing、G4 PASS**。
+    算术：id-seq 不变（31157e86…）而 task-set 变（13a96e89…→ae7e69fa…），
+    恰与「单 task payload 变 ⇒ 其 per-task sha 变 ⇒ 串联变 ⇒ task-set 变、
+    id 序列不变」的机制预测一致。
+- PR：_（待填；base `feat/lfm3-metal`，head `agent/lfm3-g1prime-sha-gate` —— 按本 doc
+  §2 冻结流程，实现+测试+完成档判定齐后由本分支开出，不为实现中途抢先开 PR）_
+
+---
+
+## 7. Results（round-163 实现 + 测试；2026-11-22 16:15–16:18 CST，`date` 实取）
+
+**完成档判定 = PASS（G1–G5 全过；非 RUNNER §5 加速五档，理由见 §4）。**
+
+| 门 | 结果 | 依据 |
+| --- | --- | --- |
+| **G1** 产物一致性（硬） | **PASS** | `suite-after.json` vs `suite-before.json` 逐 task 全字段相等（忽略 `frozen_at` 恒等、
+  `diffing_fields=[]`、id 序同、n=20/20）；加固未改 suite 本身 |
+| **G2** 不触碰生成路径（硬） | **PASS** | `git diff --name-only` = 仅 `scripts/build-g1prime-suite.py`（本轮 results commit
+  前 T5 复核）；新增行 `grep -E 'build_graph\|prefill\|decode\|argmax\|matmul\|quantized_matmul\|Compiled\|model'`
+  = **0 命中**；无任何 Rust / 模型 / kernel 改动 |
+| **G3** 聚合 sha 门生效（硬，空臂门） | **PASS** | `after.stdout` 真实打印两行且逐字等于冻结值（`13a96e89…` / `31157e86…`）；
+  从输出 suite 反推复核同值 |
+| **G4** mismatch 负控（硬，load-bearing） | **PASS** | N-B（`ag2-perturbed.json` md5 `fbe7a4fa…`，`humaneval_0080.problem` 不在 per-task
+  `FROZEN` 三字段内）⇒ RC=1、stderr 含 `AGGREGATE_SHA_MISMATCH`（task-set 变、id-seq 不变，符合机制预测）、
+  无 suite 落盘；N-A（MBPP cache 尾追 1 字节）被既有 per-task 前缀门拦在 `FROZEN_PAYLOAD_MISMATCH`，
+  该构造路径不存在（MBPP prompt/test/code 已被 `FROZEN` 表钉死），如实记录不冒充 |
+| **G5** A/A | **N/A** | 本档无设备窗（builder 不占双 Metal 锁，全程 `python3 -I` 离线） |
+
+**T1–T5**：T1 `--help` + `py_compile` 本地通过（16:14）✅；T2 M4 正向构建打印两聚合 sha ✅；
+T3 改动前同输入逐 task 相等 ✅；T4 负控非零退出且错误指向聚合 sha ✅；
+T5 `git diff --check` RC=0 + `--name-only` 仅脚本（+ 本 doc）✅。
+
+**机制算术**：本档不产生 GB/s、launch 数或速度数字（host 离线脚本，如实标注）；唯一机制
+证据 = G4 N-B 的「task-set 13a96e89…→ae7e69fa…、id-seq 保持 31157e86…」对分叉，
+证明门比对的是 payload 聚合而非仅 id 列表；「1-byte 扰动 ⇒ 1 per-task sha 变 ⇒ 串联变 ⇒
+task-set 变」由 SHA-256 抗单字节碰撞保证，本轮以 10-byte 扰动实证（N-B）。
+
+**QUEUE #8 F1 缺口关闭**：「builder 无聚合 sha 门」（round-83 §633 F1）自本轮起 =
+**已关闭**（PASS）；round-84 §645 F1 = CONFIRMED 不变；**QUEUE #8 总体判定不变** =
+PARTIAL（G1′ n=20）+ G4-speed PASS ⇒ **4-bit opt-in、BF16 默认**。
+
+**非静默开优化声明**：本轮未改任何 suite 内容、任务数、评测协议；`doc/lfm3-native-4bit.md`
+§2/§5 全部 Gate/阈值/判据、`FROZEN` 表、`run-g1prime.sh` 行为逐字未动。
+
+**HARNESS 双盲点（如实记录，不美化）**：
+1. **G4 构造的下界**：G4 的机制算术（§4）以「扰动 1 byte ⇒ task-set sha 变」为前提，
+   但 N-A 显示 MBPP 缓存扰动会被**已有 per-task 前缀门**先拦下 —— 在 MBPP 侧，
+   「只让新门干活」的构造在数学上不存在（三字段已被 12-char 前缀钉死）。
+   因此 G4 的可执行路径 = 扰动 **per-task `FROZEN` 未覆盖的 payload**（本轮用
+   HumanEval `problem`）；这是对原 Gate 文本「cache 副本」字面义的收紧解释，
+   已在本节显式记录，不留待后人误判。
+2. **本轮两文件整文件 sha256 恰同**（均 `989bd0bb…`）：因两次构建写入同一
+   `frozen_at` 秒。整文件 shasum 因时间戳**可能**每次变（round-84 已证），故 G3
+   **只认 payload 聚合 sha** —— 本轮整文件相同是巧合，不可引用为冻结门。
 
 ---
 
