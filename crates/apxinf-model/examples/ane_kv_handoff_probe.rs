@@ -234,8 +234,10 @@ mod native {
         let slab_elems = 2 * KV_HEADS * HEAD_DIM * kv_rows;
         let slab_bytes = slab_elems * 2;
         let stream = Stream::metal(0)?;
-        // ANE natural layout: [1, KV_HEADS, rows, HEAD_DIM].
-        let shape = vec![1, KV_HEADS, kv_rows, HEAD_DIM];
+        // ANE natural layout, K and V merged on axis 0: [2, KV_HEADS, rows, HEAD_DIM].
+        // Each K/V slice is the per-tensor [1, KV_HEADS, rows, HEAD_DIM] layout;
+        // merging them keeps one upload sized to the full KV slab (slab_bytes).
+        let shape = vec![2, KV_HEADS, kv_rows, HEAD_DIM];
         let mut data = vec![0u8; slab_bytes];
         let live = KV_HEADS * p * HEAD_DIM; // full-attn rows only
         let live_bits = 0x3c00u16;
@@ -246,11 +248,11 @@ mod native {
         source.eval()?;
         stream.synchronize()?;
 
-        // [1, 4, rows, 128] -> [1, rows, 4, 128]: move the head axis behind
-        // the row axis. `contiguous()` performs the physical conversion the
-        // decoder would consume.
+        // [2, 4, rows, 128] -> [2, rows, 4, 128]: move the head axis behind
+        // the row axis (K/V axis 0 untouched). `contiguous()` performs the
+        // physical conversion the decoder would consume.
         let transposed = source.transpose(&[0, 2, 1, 3])?;
-        let expected_shape = vec![1, kv_rows, KV_HEADS, HEAD_DIM];
+        let expected_shape = vec![2, kv_rows, KV_HEADS, HEAD_DIM];
 
         for _ in 0..warmup {
             let dst = transposed.contiguous()?;
