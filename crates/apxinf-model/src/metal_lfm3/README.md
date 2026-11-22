@@ -50,9 +50,19 @@ f  = post_ffn_norm(feed_forward(ffn_norm(x))); x = x + f
   keeps columns `[0, split)` on the GPU and runs `[split, 7680)` as one FP16
   Core ML program per layer on the Neural Engine (FP32 `y * gate_scale * up_scale` restore, then
   the two down projections are summed). Unset/`0` is the unchanged GPU-only path;
-  decode (`len == 1`) never uses the ANE path. The program is the FP16 chain
+  decode (`len == 1`) never uses the ANE path — the split is wired into the
+  prefill branch only, and the full BF16 projections stay resident for decode
+  alongside the GPU share's sliced copies and the FP16 program constants (the
+  pre-registration's neutral-memory estimate assumed sliced weights only; that
+  estimate missed decode's full-width MLP and is corrected at the measured
+  window). The program is the FP16 chain
   measured in issue #151 and must be entirely ANE-preferred, otherwise loading
   fails rather than reporting a CPU/GPU fallback as an ANE run.
+  `APXINF_LFM3_MLP_ABLATE=1` is a timing-only instrument: prefill's MLP section
+  (gate/up/silu/down) is replaced by a same-shape zero tensor so a window can
+  difference out the MLP wall clock (`f`). It changes numerics on purpose, is
+  rejected for values other than `0`/`1`, must never appear in a correctness or
+  TTFT gate arm, and never touches decode.
 - Head: `embedding_norm` then the tied embedding used as `lm_head`.
 
 Prefill evaluates every layer boundary; decode builds one graph per token and

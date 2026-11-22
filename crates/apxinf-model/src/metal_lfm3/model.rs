@@ -11,6 +11,8 @@
 //! accumulation is kept only as the test-only parity reference. Every other
 //! operation names the backend primitive the reference itself calls.
 
+#[cfg(feature = "coreml")]
+use super::weights::Linear;
 use super::{
     config::{LayerKind, Lfm3Config},
     q4,
@@ -51,6 +53,26 @@ pub fn prefill_fast_enabled() -> bool {
 /// so the unset baseline arm never inspects quantized keys (empty-arm gate).
 pub fn native_4bit_enabled() -> bool {
     q4::enabled()
+}
+
+/// `APXINF_LFM3_MLP_ABLATE=1` short-circuits the prefill MLP section
+/// (gate/up/silu/down) to a same-shape zero tensor so a timing window can
+/// difference out the MLP wall clock (`f`, `doc/lfm3-ane-fp16-port-preregister.md`
+/// §3.1.8/§5.3). This arm changes numerics and is for timing only: it must
+/// never appear in a correctness or TTFT gate arm. Anything but `0`/`1` is
+/// rejected at load so a typo cannot silently turn the instrument off
+/// mid-window.
+fn mlp_ablate_requested() -> Result<bool> {
+    let Some(raw) = std::env::var_os("APXINF_LFM3_MLP_ABLATE") else {
+        return Ok(false);
+    };
+    match raw.to_string_lossy().trim() {
+        "1" => Ok(true),
+        "0" => Ok(false),
+        other => Err(Error::Other(format!(
+            "APXINF_LFM3_MLP_ABLATE must be 0 or 1, got `{other}`"
+        ))),
+    }
 }
 
 // Platform C math library, used only to generate the fixed rotary tables on the
@@ -228,6 +250,19 @@ struct PrefillCache {
     states: Vec<LayerState>,
 }
 
+/// The GPU half of the ANE column split for one layer: the BF16 projections
+/// restricted to columns `[0, share)`, used only by the prefill split arm.
+/// Keeping these alongside the full weights is what lets decode keep the
+/// untouched full-width MLP while prefill runs the honest GPU share (computing
+/// the full projection and slicing the result would inflate the GPU arm's
+/// FLOPs and wreck the `f` accounting).
+#[cfg(feature = "coreml")]
+struct AneGpuShare {
+    w1: Linear,
+    w3: Linear,
+    w2: Linear,
+}
+
 pub struct Lfm3Model {
     config: Lfm3Config,
     backend: MlxBackend,
@@ -240,6 +275,16 @@ pub struct Lfm3Model {
     /// the `coreml` feature is the only build that can fill it.
     #[cfg(feature = "coreml")]
     ane: Vec<super::ane_slice::AneSlice>,
+    /// The GPU share's BF16 projections (columns `[0, ane_share)` of w1/w3,
+    /// matching w2 input slice) for the prefill split arm. The full weights
+    /// stay in `weights` because decode (`len == 1`) keeps running the
+    /// untouched full-width MLP; the split is prefill-only. Empty when
+    /// `ane_share == 0`.
+    #[cfg(feature = "coreml")]
+    ane_gpu: Vec<AneGpuShare>,
+    /// `APXINF_LFM3_MLP_ABLATE=1`: prefill MLP section replaced by zeros
+    /// (timing-only instrument, captured once at construction).
+    ablate: bool,
     /// Compiled `apxinf_causal_depthwise_conv` pipeline for the decode step.
     causal_conv: CausalDepthwiseConv,
     kinds: Vec<LayerKind>,
@@ -298,15 +343,19 @@ impl Lfm3Model {
                 "APXINF_LFM3_ANE must be < {intermediate} (the split needs a GPU half), got {ane_share}"
             )));
         }
-        // Build each layer's program from the full BF16 weights, then keep only
-        // the GPU share in the model. share == 0 never enters this block, so the
-        // default arm neither compiles nor loads a Core ML program.
+        let ablate = mlp_ablate_requested()?;
+        // Build each layer's program from the full BF16 weights and keep the
+        // GPU share's projections beside (not instead of) the full weights:
+        // decode keeps the untouched full-width MLP, so the split is wired
+        // into the prefill path only. share == 0 never enters this block, so
+        // the default arm neither compiles nor loads a Core ML program.
         #[cfg(feature = "coreml")]
-        let (weights, ane) = if ane_share == 0 {
-            (weights, Vec::new())
+        let (ane, ane_gpu) = if ane_share == 0 {
+            (Vec::new(), Vec::new())
         } else {
             let cache = apxinf_coreml::ProgramCache::new(super::ane_slice::cache_dir());
             let mut slices = Vec::with_capacity(weights.layers.len());
+            let mut gpu = Vec::with_capacity(weights.layers.len());
             for layer in &weights.layers {
                 slices.push(super::ane_slice::AneSlice::load(
                     &cache,
@@ -316,17 +365,14 @@ impl Lfm3Model {
                     &layer.w3,
                     &layer.w2,
                 )?);
+                gpu.push(AneGpuShare {
+                    w1: layer.w1.output_slice(0, ane_share)?,
+                    w3: layer.w3.output_slice(0, ane_share)?,
+                    w2: layer.w2.input_slice(0, ane_share)?,
+                });
             }
-            let mut sliced = weights;
-            for layer in &mut sliced.layers {
-                layer.w1 = layer.w1.output_slice(0, ane_share)?;
-                layer.w3 = layer.w3.output_slice(0, ane_share)?;
-                layer.w2 = layer.w2.input_slice(0, ane_share)?;
-            }
-            (sliced, slices)
+            (slices, gpu)
         };
-        #[cfg(not(feature = "coreml"))]
-        let weights = weights;
         let causal_conv = CausalDepthwiseConv::new(backend.stream())?;
         let kinds = config.layer_kinds()?;
         let layers = config.num_hidden_layers;
@@ -337,6 +383,9 @@ impl Lfm3Model {
             ane_share,
             #[cfg(feature = "coreml")]
             ane,
+            #[cfg(feature = "coreml")]
+            ane_gpu,
+            ablate,
             causal_conv,
             kinds,
             initial_kv: vec![None; layers],
@@ -368,6 +417,22 @@ impl Lfm3Model {
                 "native_4bit census: quantized_triples={}/154",
                 model.weights.quantized_layers
             );
+        }
+        // Worker-witness banner (G3): an ANE claim without a matching banner
+        // is an INVALID run. The default arm prints nothing.
+        #[cfg(feature = "coreml")]
+        if ane_share > 0 {
+            eprintln!(
+                "lfm3_ane: split={ane_share}/{intermediate} programs={} feature=coreml",
+                model.ane.len()
+            );
+        }
+        #[cfg(not(feature = "coreml"))]
+        if ane_share > 0 {
+            eprintln!("lfm3_ane: split={ane_share}/{intermediate} programs=0 feature=mlx-only");
+        }
+        if model.ablate {
+            eprintln!("lfm3_mlp_ablate=on (timing-only arm: prefill MLP shorted to zeros)");
         }
         model.prepare(1, 0)?;
         Ok(model)
@@ -869,13 +934,16 @@ impl Lfm3Model {
         Ok((op, KvState { keys, values }))
     }
 
-    /// Sandwich-norm residual composition shared by both branches.
+    /// Sandwich-norm residual composition shared by both branches. `len` is
+    /// the step's token count; the ANE split and the ablation instrument are
+    /// prefill-only, so a one-token step always takes the original path.
     fn mix_and_residual(
         &self,
         x: &Array,
         op: &Array,
         layer: &LayerWeights,
         layer_idx: usize,
+        len: usize,
     ) -> Result<Array> {
         let eps = self.config.norm_eps;
         let op = norm(op, &layer.post_operator_norm, eps)?;
@@ -884,13 +952,22 @@ impl Lfm3Model {
         let share = self.ane_share;
         #[cfg(not(feature = "coreml"))]
         let _ = layer_idx;
-        let down = if share == 0 {
-            // The default arm: exactly the three GPU calls it made before the
-            // ANE switch existed.
+        let down = if share == 0 || len == 1 {
+            // The default and the decode arm: exactly the three GPU calls this
+            // MLP made before the ANE switch existed, on the full-width
+            // weights. Decode (`len == 1`) lands here no matter what share is
+            // set, so a non-zero share can never change a decode step
+            // (pre-registration §3.2: decode stays on the GPU, untouched).
             let gate = layer.w1.call(&ffn)?;
             let up = layer.w3.call(&ffn)?;
             let activated = silu_mul(&gate, &up)?;
             layer.w2.call(&activated)?
+        } else if self.ablate {
+            // Timing-only instrument (`APXINF_LFM3_MLP_ABLATE=1`,
+            // pre-registration §3.1.8): the prefill MLP section is a zero
+            // tensor of the down shape. It changes numerics on purpose and
+            // must never appear in a correctness or TTFT gate arm.
+            Array::zeros(x.stream(), x.shape(), x.dtype())?
         } else {
             #[cfg(feature = "coreml")]
             {
@@ -899,11 +976,18 @@ impl Lfm3Model {
                         "LFM3 ANE split is {share} but layer {layer_idx} has no Core ML program"
                     ))
                 })?;
-                // The model kept only the GPU share of w1/w3/w2 at load.
-                let gate = layer.w1.call(&ffn)?;
-                let up = layer.w3.call(&ffn)?;
+                let gpu_share = self.ane_gpu.get(layer_idx).ok_or_else(|| {
+                    Error::Other(format!(
+                        "LFM3 ANE split is {share} but layer {layer_idx} has no GPU share"
+                    ))
+                })?;
+                // The full weights stay in `weights` for decode; the GPU half
+                // runs on its sliced projections so its FLOPs are the honest
+                // share, and the ANE half returns its FP32-restored down part.
+                let gate = gpu_share.w1.call(&ffn)?;
+                let up = gpu_share.w3.call(&ffn)?;
                 let gpu = silu_mul(&gate, &up)?;
-                let gpu = layer.w2.call(&gpu)?;
+                let gpu = gpu_share.w2.call(&gpu)?;
                 gpu.add(&slice.predict(&ffn)?)?
             }
             #[cfg(not(feature = "coreml"))]
@@ -961,7 +1045,7 @@ impl Lfm3Model {
             };
             (op, LayerState::Attention(next))
         };
-        let output = self.mix_and_residual(x, &op, layer, layer_idx)?;
+        let output = self.mix_and_residual(x, &op, layer, layer_idx, len)?;
         if let Some(states) = states {
             // The fast arm publishes the captured snapshot into the live slots
             // inside `build_graph` so both stay in lockstep; skip the eval here
@@ -2085,6 +2169,169 @@ mod tests {
             relative * 100.0
         );
         assert!(relative < 0.02, "ANE program identity relL2 {relative:.4}");
+        Ok(())
+    }
+
+    // ---- FP16 ANE MLP column split acceptance (issue #157). Real ----
+    // checkpoint, real Metal: `APXINF_LFM3_TEST_MODEL=<snapshot dir> cargo
+    // test -p apxinf-model --features mlx,coreml metal_lfm3 -- --ignored
+    // --test-threads=1` under the shared Metal qualification lock. The tests
+    // mutate process env to select the schedule, so they must run
+    // single-threaded.
+
+    const ANE_ENV: &str = "APXINF_LFM3_ANE";
+    const ABLATE_ENV: &str = "APXINF_LFM3_MLP_ABLATE";
+
+    fn set_ane_share(value: Option<&str>) {
+        match value {
+            Some(value) => std::env::set_var(ANE_ENV, value),
+            None => std::env::remove_var(ANE_ENV),
+        }
+    }
+
+    fn set_mlp_ablate(on: bool) {
+        if on {
+            std::env::set_var(ABLATE_ENV, "1");
+        } else {
+            std::env::remove_var(ABLATE_ENV);
+        }
+    }
+
+    /// Raw bytes of the last-position prefill logits for a prompt.
+    fn prefill_logits_bytes(model: &mut Lfm3Model, prompt: &[u32]) -> Result<Vec<u8>> {
+        let logits = model.prefill(LlmInput::text(prompt))?;
+        model.backend.array(&logits)?.to_bytes_ready()
+    }
+
+    #[test]
+    fn mlp_ablate_env_parses_strictly() {
+        let saved = std::env::var_os(ABLATE_ENV);
+        std::env::remove_var(ABLATE_ENV);
+        assert!(!mlp_ablate_requested().unwrap(), "unset must be off");
+        std::env::set_var(ABLATE_ENV, "0");
+        assert!(!mlp_ablate_requested().unwrap(), "0 must be off");
+        std::env::set_var(ABLATE_ENV, "1");
+        assert!(mlp_ablate_requested().unwrap(), "1 must be on");
+        std::env::set_var(ABLATE_ENV, "2");
+        assert!(mlp_ablate_requested().is_err(), "2 must be refused");
+        std::env::set_var(ABLATE_ENV, "");
+        assert!(mlp_ablate_requested().is_err(), "empty must be refused");
+        match saved {
+            Some(value) => std::env::set_var(ABLATE_ENV, value),
+            None => std::env::remove_var(ABLATE_ENV),
+        }
+    }
+
+    /// G6/share=0 gate: `APXINF_LFM3_ANE=0` must be byte-identical to the
+    /// unset arm on the same prompt — the switch off is a no-op.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn ane_share_zero_prefill_matches_unset_byte_for_byte() -> Result<()> {
+        let prompt = pseudo_prompt(24, 617);
+        set_ane_share(None);
+        let mut baseline = load_checkpoint_model()?;
+        let expected = prefill_logits_bytes(&mut baseline, &prompt)?;
+
+        set_ane_share(Some("0"));
+        let mut zero = load_checkpoint_model()?;
+        let got = prefill_logits_bytes(&mut zero, &prompt)?;
+        set_ane_share(None);
+        assert_eq!(
+            got, expected,
+            "APXINF_LFM3_ANE=0 must be byte-identical to the unset GPU-only arm"
+        );
+        Ok(())
+    }
+
+    /// Decode-untouched gate (pre-registration §3.2): from identical
+    /// freshly-reset state, an armed model's one-token step must equal the
+    /// share=0 model's byte for byte — logits and KV/conv state. If a
+    /// non-zero share leaked into `len == 1`, the ANE tile padding alone
+    /// would break the byte equality.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn ane_armed_decode_step_matches_share_zero_byte_for_byte() -> Result<()> {
+        let token_id = 42_000i32;
+
+        set_ane_share(None);
+        let mut baseline = load_checkpoint_model()?;
+        baseline.reset();
+        baseline.prepare(1, 4)?;
+        let token = Array::from_i32(baseline.backend.stream(), &[1], &[token_id])?;
+        let expected = baseline.decode(&token)?.to_bytes_ready()?;
+        let (expected_kv, expected_conv) = state_bytes(&baseline, 1)?;
+
+        set_ane_share(Some("0.7333"));
+        let mut armed = load_checkpoint_model()?;
+        armed.reset();
+        armed.prepare(1, 4)?;
+        let token = Array::from_i32(armed.backend.stream(), &[1], &[token_id])?;
+        let got = armed.decode(&token)?.to_bytes_ready()?;
+        let (got_kv, got_conv) = state_bytes(&armed, 1)?;
+        set_ane_share(None);
+
+        assert_eq!(
+            got, expected,
+            "an armed ANE share must not change the decode step's logits"
+        );
+        assert_eq!(got_kv, expected_kv, "armed decode changed the KV state");
+        assert_eq!(
+            got_conv, expected_conv,
+            "armed decode changed the conv state"
+        );
+        Ok(())
+    }
+
+    /// End-to-end smoke for the armed arm: prefill runs the split across all
+    /// 24 layers and eight greedy decode steps follow, deterministically.
+    #[cfg(feature = "coreml")]
+    #[test]
+    #[ignore = "requires shared Metal qualification lock, APXINF_LFM3_TEST_MODEL and an ANE host"]
+    fn ane_armed_greedy_runs_eight_tokens_deterministically() -> Result<()> {
+        let prompt = pseudo_prompt(24, 619);
+        set_ane_share(Some("0.7333"));
+        let mut first = load_checkpoint_model()?;
+        let expected = run_greedy(&mut first, &prompt, 8)?;
+        let mut second = load_checkpoint_model()?;
+        let got = run_greedy(&mut second, &prompt, 8)?;
+        set_ane_share(None);
+        assert_eq!(got.len(), 8, "armed arm must honour the decode budget");
+        assert_eq!(
+            got, expected,
+            "armed arm greedy must be deterministic run to run"
+        );
+        Ok(())
+    }
+
+    /// The ablation instrument (pre-registration §3.1.8): with
+    /// `APXINF_LFM3_MLP_ABLATE=1` the prefill MLP section is a zero tensor,
+    /// so the logits change on purpose, the shapes stay valid, and decode
+    /// still runs afterwards.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn ane_mlp_ablate_shorts_prefill_mlp_and_still_decodes() -> Result<()> {
+        let prompt = pseudo_prompt(24, 623);
+
+        set_mlp_ablate(true);
+        let mut ablated = load_checkpoint_model()?;
+        let ablated_bytes = prefill_logits_bytes(&mut ablated, &prompt)?;
+        // Decode still runs on the ablated model: reset, re-prefill, one step.
+        ablated.reset();
+        let first = ablated.prefill(LlmInput::text(&prompt))?;
+        let first = ablated.backend.array(&first)?;
+        let prompt_end = prompt.len() as u32;
+        let mut seq = Box::new(GreedySequence::new(&mut ablated, first, prompt_end)?);
+        let _ = seq.next(true)?;
+        seq.finish(1)?;
+        set_mlp_ablate(false);
+
+        let mut normal = load_checkpoint_model()?;
+        let normal_bytes = prefill_logits_bytes(&mut normal, &prompt)?;
+
+        assert_ne!(
+            ablated_bytes, normal_bytes,
+            "ablated prefill logits must differ (the MLP section is zeros)"
+        );
         Ok(())
     }
 }
