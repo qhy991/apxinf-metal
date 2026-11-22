@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Minimal OpenPI websocket client: connect, read metadata, send one observation.
 
-The distilled client half of the LIBERO eval (scripts/eval_pi05_libero_openpi.py)
-with the simulator and resumable ledger stripped away — just how to reach a
-``apxinf.serving`` server (or any OpenPI ``WebsocketPolicyServer``) and get an
-action chunk back. Pair it with ``openpi_server.py``.
+The distilled client half of a benchmark rollout, with the simulator and
+resumable ledger stripped away — just how to reach a ``apxinf.serving`` server
+(or any OpenPI ``WebsocketPolicyServer``) and get an action chunk back. Pair it
+with ``openpi_server.py``.
 
 The client sends *raw* camera frames + prompt; the server's policy owns resize /
 tokenize / normalize. Only OpenPI-contract keys come back on the wire
@@ -50,7 +50,15 @@ def main() -> None:
     metadata = client.get_server_metadata()
     print("server metadata:", metadata)
 
-    observation = synthetic_observation(prompt=args.prompt)
+    observation = synthetic_observation(
+        # The wire contract comes from the server, not from a constant here —
+        # hardcoding keys is the mismatch that shows up as "bad accuracy". A
+        # null state_key means the server drops state, so none is sent.
+        image_keys=metadata["image_keys"],
+        state_key=metadata["state_key"],
+        prompt_key=metadata.get("prompt_key", "prompt"),
+        prompt=args.prompt,
+    )
     response = client.infer(observation)
 
     actions = np.asarray(response["actions"], dtype=np.float32)

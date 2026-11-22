@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use memmap2::Mmap;
 use serde::Deserialize;
@@ -63,14 +63,41 @@ pub fn load_native(
 pub fn load_native_path(
     path: &Path,
 ) -> Result<(HashMap<String, Tensor>, HashMap<String, String>), String> {
+    let resolved = resolve_checkpoint(path)?;
+    if is_index(&resolved) {
+        load_native_sharded(&resolved)
+    } else {
+        load_native(&resolved)
+    }
+}
+
+/// List the SafeTensors files of a checkpoint without reading tensor data.
+/// Accepts the same inputs as [`load_native_path`]; an index yields its shards
+/// in name order, after the same shard-path checks.
+pub fn safetensors_files(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let resolved = resolve_checkpoint(path)?;
+    if !is_index(&resolved) {
+        return Ok(vec![resolved]);
+    }
+    let (_, shards) = read_index(&resolved)?;
+    let parent = resolved.parent().unwrap_or_else(|| Path::new("."));
+    Ok(shards.iter().map(|shard| parent.join(shard)).collect())
+}
+
+fn is_index(path: &Path) -> bool {
+    path.extension().and_then(|value| value.to_str()) == Some("json")
+}
+
+/// Resolve a directory to its index or single SafeTensors file.
+fn resolve_checkpoint(path: &Path) -> Result<PathBuf, String> {
     if path.is_dir() {
         let index = path.join("model.safetensors.index.json");
         if index.is_file() {
-            return load_native_sharded(&index);
+            return Ok(index);
         }
         let model = path.join("model.safetensors");
         if model.is_file() {
-            return load_native(&model);
+            return Ok(model);
         }
         let mut candidates = std::fs::read_dir(path)
             .map_err(|e| {
@@ -86,7 +113,7 @@ pub fn load_native_path(
             .collect::<Vec<_>>();
         candidates.sort();
         return match candidates.as_slice() {
-            [only] => load_native(only),
+            [only] => Ok(only.clone()),
             [] => Err(format!(
                 "no SafeTensors model or index in {}",
                 path.display()
@@ -97,18 +124,11 @@ pub fn load_native_path(
             )),
         };
     }
-    if path.extension().and_then(|value| value.to_str()) == Some("json") {
-        load_native_sharded(path)
-    } else {
-        load_native(path)
-    }
+    Ok(path.to_path_buf())
 }
 
-/// Load all shards named by a Hugging Face `*.safetensors.index.json` file.
-/// Each indexed tensor is checked against the shard in which it was found.
-pub fn load_native_sharded(
-    index_path: &Path,
-) -> Result<(HashMap<String, Tensor>, HashMap<String, String>), String> {
+/// Parse an index and return its shard names after rejecting unsafe paths.
+fn read_index(index_path: &Path) -> Result<(SafetensorsIndex, BTreeSet<String>), String> {
     let raw = std::fs::read_to_string(index_path)
         .map_err(|e| format!("failed to read {}: {e}", index_path.display()))?;
     let index: SafetensorsIndex = serde_json::from_str(&raw)
@@ -119,13 +139,9 @@ pub fn load_native_sharded(
             index_path.display()
         ));
     }
-    let parent = index_path.parent().unwrap_or_else(|| Path::new("."));
     let shards = index.weight_map.values().cloned().collect::<BTreeSet<_>>();
-    let mut tensors = HashMap::with_capacity(index.weight_map.len());
-    let mut metadata = HashMap::new();
-
-    for shard in shards {
-        let shard_path = Path::new(&shard);
+    for shard in &shards {
+        let shard_path = Path::new(shard);
         if shard_path.is_absolute()
             || shard_path
                 .components()
@@ -136,6 +152,21 @@ pub fn load_native_sharded(
                 index_path.display()
             ));
         }
+    }
+    Ok((index, shards))
+}
+
+/// Load all shards named by a Hugging Face `*.safetensors.index.json` file.
+/// Each indexed tensor is checked against the shard in which it was found.
+pub fn load_native_sharded(
+    index_path: &Path,
+) -> Result<(HashMap<String, Tensor>, HashMap<String, String>), String> {
+    let (index, shards) = read_index(index_path)?;
+    let parent = index_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tensors = HashMap::with_capacity(index.weight_map.len());
+    let mut metadata = HashMap::new();
+
+    for shard in shards {
         let (shard_tensors, shard_metadata) = load_native(&parent.join(&shard))?;
         metadata.extend(shard_metadata);
         for (name, tensor) in shard_tensors {
@@ -304,6 +335,17 @@ fn parse_dtype(s: &str) -> Option<DType> {
         "F16" => Some(DType::F16),
         "BF16" => Some(DType::BF16),
         "F8_E4M3" => Some(DType::F8E4M3),
+        // SafeTensors has no sub-byte float dtype, so quantizers that emit
+        // packed FP4 store it as U8 with the trailing dimension halved.
+        // `E2M1Pair` means exactly that -- one byte holding two E2M1 values --
+        // so the mapping preserves both the byte layout and the element count.
+        //
+        // This assumes U8 tensors in a checkpoint are packed FP4. If a
+        // checkpoint ever stores genuine byte data under U8, the mismatch
+        // surfaces at the model layer as a dtype error rather than silently
+        // producing wrong numbers, because every consumer of `E2M1Pair`
+        // requires the NVFP4 quantization contract.
+        "U8" => Some(DType::E2M1Pair),
         _ => None,
     }
 }
@@ -326,6 +368,9 @@ mod tests {
                 DType::F16 => "F16",
                 DType::BF16 => "BF16",
                 DType::F8E4M3 => "F8_E4M3",
+                DType::E2M1Pair => "U8",
+                #[allow(unreachable_patterns)]
+                other => panic!("fixture does not support dtype {other}"),
             };
             let shape_json: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
             let end = data_offset + data.len();
@@ -452,6 +497,23 @@ mod tests {
     }
 
     #[test]
+    fn test_u8_loads_as_packed_fp4_preserving_bytes() {
+        // A quantizer writes packed FP4 as U8 with the trailing dimension
+        // halved: this [2, 3] U8 tensor encodes a [2, 6] FP4 operand.
+        let packed: [u8; 6] = [0x21, 0x43, 0x65, 0x07, 0x12, 0x34];
+        let file_bytes = make_safetensors(&[("w", DType::E2M1Pair, &[2, 3], &packed)]);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&file_bytes).unwrap();
+
+        let (tensors, _) = load_native(tmp.path()).unwrap();
+        let tensor = &tensors["w"];
+        assert_eq!(tensor.dtype(), DType::E2M1Pair);
+        // The shape stays physical; the caller derives logical K as 2 * 3.
+        assert_eq!(tensor.shape().dims(), &[2, 3]);
+        assert_eq!(tensor.as_e2m1_pairs().unwrap(), &packed);
+    }
+
+    #[test]
     fn test_load_native_sharded_index() {
         let directory = tempfile::tempdir().unwrap();
         let a_data = [half::f16::from_f32(1.5)]
@@ -482,5 +544,37 @@ mod tests {
         assert_eq!(tensors.len(), 2);
         assert_eq!(tensors["a"].dtype(), DType::F16);
         assert_eq!(tensors["b"].as_f16().unwrap()[0].to_f32(), -2.0);
+        assert_eq!(
+            safetensors_files(directory.path()).unwrap(),
+            [
+                directory.path().join("model-00001-of-00002.safetensors"),
+                directory.path().join("model-00002-of-00002.safetensors"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_safetensors_files_resolves_without_reading_tensors() {
+        let directory = tempfile::tempdir().unwrap();
+        let only = directory.path().join("weights.safetensors");
+        std::fs::write(&only, b"not parsed").unwrap();
+        assert_eq!(safetensors_files(directory.path()).unwrap(), [only.clone()]);
+        assert_eq!(safetensors_files(&only).unwrap(), [only]);
+
+        std::fs::write(directory.path().join("second.safetensors"), b"").unwrap();
+        assert!(safetensors_files(directory.path())
+            .unwrap_err()
+            .contains("no model.safetensors.index.json"));
+
+        for shard in ["../outside.safetensors", "/abs.safetensors"] {
+            let index = directory.path().join("model.safetensors.index.json");
+            std::fs::write(&index, format!(r#"{{"weight_map":{{"a":"{shard}"}}}}"#)).unwrap();
+            assert!(safetensors_files(directory.path())
+                .unwrap_err()
+                .contains("unsafe shard path"));
+            assert!(load_native_path(directory.path())
+                .unwrap_err()
+                .contains("unsafe shard path"));
+        }
     }
 }

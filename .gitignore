@@ -7,3 +7,16 @@ nsys/
 .DS_Store
 __pycache__/
 *.py[cod]
+
+# Local model-port worktrees
+experiment/
+
+# Local development artifacts (see AGENTS.md)
+/devlocal/
+crates/.gemm-pilot-link.lock
+target-gemm-pilot/
+target-p92i/
+.claude/
+
+/configs/tuning/**/*.recipe
+/configs/tuning/**/*.recipe.*.tmp

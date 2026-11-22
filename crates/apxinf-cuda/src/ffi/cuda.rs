@@ -91,6 +91,15 @@ extern "C" {
         count: usize,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    /// Row-strided fill: `height` runs of `width` bytes, each `pitch` apart.
+    pub fn cudaMemset2DAsync(
+        devPtr: *mut c_void,
+        pitch: usize,
+        value: i32,
+        width: usize,
+        height: usize,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 
     pub fn cudaStreamCreate(stream: *mut cudaStream_t) -> cudaError_t;
     pub fn cudaStreamDestroy(stream: cudaStream_t) -> cudaError_t;
@@ -118,6 +127,7 @@ extern "C" {
     pub fn cudaStreamEndCapture(stream: cudaStream_t, pGraph: *mut *mut c_void) -> cudaError_t;
 
     pub fn cudaGetLastError() -> cudaError_t;
+    pub fn cudaPeekAtLastError() -> cudaError_t;
     pub fn cudaGetErrorString(error: cudaError_t) -> *const std::ffi::c_char;
 
     pub fn cudaSetDevice(device: i32) -> cudaError_t;

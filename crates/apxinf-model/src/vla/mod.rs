@@ -1,6 +1,8 @@
 //! Model-neutral interfaces for vision-language-action runtimes.
 
-use apxinf_core::{Error, Result, Tensor};
+use std::collections::BTreeMap;
+
+use apxinf_core::{Error, Result, RngKey, Tensor};
 
 /// Memory layout for an RGB `u8` observation batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -23,7 +25,12 @@ pub enum VisionObservation {
 pub struct Observation {
     pub vision: VisionObservation,
     pub token_ids: Vec<u32>,
-    pub noise: Tensor,
+    /// Optional normalized proprioceptive state for models that project it
+    /// directly instead of encoding it in the prompt.
+    pub state: Option<Tensor>,
+    /// Optional per-dimension action mask. Missing means every action
+    /// dimension is active.
+    pub action_mask: Option<Tensor>,
 }
 
 impl Observation {
@@ -41,6 +48,124 @@ impl Observation {
                 VisionObservation::Patches(_) => None,
                 VisionObservation::RgbU8 { layout, .. } => Some(layout),
             },
+        }
+    }
+}
+
+/// Initial continuous latent used by a flow/diffusion VLA.
+///
+/// Production callers may have ApxInf generate standard-normal noise directly
+/// in a captured device buffer; correctness fixtures can inject an exact
+/// latent for reproducible parity checks.
+#[derive(Clone, Copy, Debug)]
+pub enum InitialLatent<'a> {
+    Generate { rng: RngKey },
+    Provided(&'a Tensor),
+}
+
+/// Internal autoregressive reasoning before continuous action generation.
+/// Token IDs and turn completion are supplied by the policy/tokenizer.
+#[derive(Clone, Debug)]
+pub struct ReasoningOptions {
+    pub max_new_tokens: usize,
+    pub min_new_tokens: usize,
+    pub terminator_ids: Vec<u32>,
+    pub closing_ids: Vec<u32>,
+}
+
+/// Per-request planning controls for runtimes with a planning-options contract.
+#[derive(Clone, Debug, Default)]
+pub struct PlanningOptions {
+    pub num_steps: Option<usize>,
+    pub reasoning: Option<ReasoningOptions>,
+    /// Caller-selected source, first-stage and final RGB geometry. The policy
+    /// still decides whether each resize is needed; the runtime only executes
+    /// the Pillow-12.3 integer operator on this declared representation.
+    pub raw_rgb_resize: Option<Vec<RawRgbResizeFrame>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RawRgbResizeFrame {
+    pub source_width: u32,
+    pub source_height: u32,
+    pub stage_width: u32,
+    pub stage_height: u32,
+    pub final_width: u32,
+    pub final_height: u32,
+}
+
+/// Optional typed metadata emitted by preprocessors for VLA families whose
+/// inputs include more than image patches and token IDs.
+///
+/// Keeping these fields on the request preserves the stable observation shape
+/// used by existing PI0.5 and WallOSS callers. A runtime that requires one of
+/// these fields validates it explicitly; other runtimes ignore the empty
+/// default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VlaMetadata<'a> {
+    pub attention_mask: Option<&'a [u8]>,
+    pub image_grid_thw: Option<&'a [[u32; 3]]>,
+    pub embodiment_id: Option<usize>,
+    pub planning: Option<&'a PlanningOptions>,
+}
+
+/// Complete VLA request: an environment observation plus the model-generation
+/// input that is deliberately not part of the observation itself.
+#[derive(Clone, Copy, Debug)]
+pub struct VlaRequest<'a> {
+    pub observation: &'a Observation,
+    pub initial_latent: InitialLatent<'a>,
+    pub metadata: VlaMetadata<'a>,
+}
+
+impl<'a> VlaRequest<'a> {
+    pub const fn generated(observation: &'a Observation, rng: RngKey) -> Self {
+        Self {
+            observation,
+            initial_latent: InitialLatent::Generate { rng },
+            metadata: VlaMetadata {
+                attention_mask: None,
+                image_grid_thw: None,
+                embodiment_id: None,
+                planning: None,
+            },
+        }
+    }
+
+    pub const fn provided(observation: &'a Observation, latent: &'a Tensor) -> Self {
+        Self {
+            observation,
+            initial_latent: InitialLatent::Provided(latent),
+            metadata: VlaMetadata {
+                attention_mask: None,
+                image_grid_thw: None,
+                embodiment_id: None,
+                planning: None,
+            },
+        }
+    }
+
+    pub const fn generated_with_metadata(
+        observation: &'a Observation,
+        rng: RngKey,
+        metadata: VlaMetadata<'a>,
+    ) -> Self {
+        Self {
+            observation,
+            initial_latent: InitialLatent::Generate { rng },
+            metadata,
+        }
+    }
+
+    pub const fn provided_with_metadata(
+        observation: &'a Observation,
+        latent: &'a Tensor,
+        metadata: VlaMetadata<'a>,
+    ) -> Self {
+        Self {
+            observation,
+            initial_latent: InitialLatent::Provided(latent),
+            metadata,
         }
     }
 }
@@ -68,7 +193,10 @@ impl InferenceSpec {
     }
 }
 
-/// Model action output. The tensor stays on the runtime device unless the
+/// Model action output. A prepared runtime may reuse its output storage on
+/// the next run; clone the underlying data or transfer it to the host before
+/// retaining results across calls. Cloning `Action` alone shares the storage.
+/// The tensor stays on the runtime device unless the
 /// caller explicitly asks its backend-facing integration to transfer it, or
 /// uses [`VlaRuntime::infer_host_f32`] to get host values directly.
 #[derive(Clone, Debug)]
@@ -90,11 +218,59 @@ impl Action {
     }
 }
 
+/// Requested execution policy. A runtime must explicitly support this contract;
+/// legacy `prepare` implementations are not assumed to honor it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionPolicy {
+    Eager,
+    PreferGraph,
+    RequireGraph,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Eager,
+    Graph,
+}
+
+/// Readiness for the plan's fixed specification, not whole-model readiness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreparationStatus {
+    /// The implementation has not adopted the explicit readiness contract.
+    RuntimeManaged,
+    Ready {
+        mode: ExecutionMode,
+        fallback_reason: Option<String>,
+    },
+    /// Execution choices changed; prepare a new plan before running again.
+    Invalidated,
+}
+
 /// A prepared, fixed-shape inference plan. Implementations own every resource
 /// referenced by eager execution or a captured graph.
 pub trait PreparedInference {
     fn spec(&self) -> &InferenceSpec;
-    fn run(&self, observation: &Observation) -> Result<Action>;
+
+    fn status(&self) -> PreparationStatus {
+        PreparationStatus::RuntimeManaged
+    }
+
+    fn run(&self, request: &VlaRequest<'_>) -> Result<Action>;
+}
+
+/// Fixed public shape contract of a loaded VLA runtime.
+///
+/// Frontends use this to validate host inputs without parsing a concrete
+/// model family's checkpoint config or repeating model-name switches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VlaContract {
+    pub action_shape: [usize; 2],
+    pub patch_shape: [usize; 2],
+    pub max_token_len: usize,
+    pub num_views: usize,
+    pub image_size: usize,
+    pub patch_size: usize,
+    pub accepts_rgb_u8: bool,
 }
 
 /// Unified VLA runtime interface.
@@ -102,8 +278,57 @@ pub trait PreparedInference {
 /// The boxed return keeps this trait object-safe so `LoadedModel::Vla` can
 /// directly hold heterogeneous model runtimes.
 pub trait VlaRuntime {
-    fn infer(&self, observation: &Observation) -> Result<Action>;
+    /// Resolved model-local implementation ID, when supported by the family.
+    fn model_variant(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Fixed input/output capabilities of this loaded checkpoint.
+    fn contract(&self) -> VlaContract;
+
+    /// Native action tensor shape produced by this loaded checkpoint.
+    fn action_shape(&self) -> [usize; 2] {
+        self.contract().action_shape
+    }
+
+    fn infer(&self, request: &VlaRequest<'_>) -> Result<Action>;
     fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>>;
+
+    /// Prepare without tuning on placeholder data. Compatible runs do not
+    /// capture or autotune; unsupported implementations fail explicitly.
+    fn prepare_with_policy(
+        &self,
+        _spec: &InferenceSpec,
+        _policy: ExecutionPolicy,
+    ) -> Result<Box<dyn PreparedInference>> {
+        Err(Error::Other(
+            "explicit VLA preparation policy is not supported".into(),
+        ))
+    }
+
+    /// Optional real-input tuning followed by fixed-spec preparation. The
+    /// sample is not retained as semantic request state.
+    fn prepare_for(
+        &self,
+        _sample: &VlaRequest<'_>,
+        _policy: ExecutionPolicy,
+    ) -> Result<Box<dyn PreparedInference>> {
+        Err(Error::Other(
+            "real-input VLA preparation is not supported".into(),
+        ))
+    }
+
+    /// Evict implicit cached plans. Explicitly owned plans remain alive.
+    /// This is not a request/RNG reset.
+    fn clear_prepared(&self) -> Result<()> {
+        Err(Error::Other("VLA plan eviction is not supported".into()))
+    }
+
+    /// Current execution path for diagnostics and benchmarks. Implementations
+    /// should report an eager fallback explicitly after a graph attempt.
+    fn execution_mode(&self) -> &'static str {
+        "runtime-managed"
+    }
 
     /// Run inference and copy the resulting action to host as `f32`.
     ///
@@ -113,5 +338,135 @@ pub trait VlaRuntime {
     /// handle and transfer it themselves — reaching around the abstraction.
     /// This convenience performs the device→host copy inside the runtime, which
     /// already owns the backend.
-    fn infer_host_f32(&self, observation: &Observation) -> Result<Vec<f32>>;
+    fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>>;
+
+    /// Run inference, return host actions, and report model-local phase timings.
+    ///
+    /// This is diagnostic-only and optional; unsupported families return an
+    /// explicit error rather than degrading to a misleading total-only profile.
+    fn infer_host_f32_profiled(
+        &self,
+        _request: &VlaRequest<'_>,
+    ) -> Result<(Vec<f32>, BTreeMap<String, f64>)> {
+        Err(Error::Other(
+            "this VLA runtime does not expose phase profiling".into(),
+        ))
+    }
+
+    /// Discrete action-token output shape for autoregressive token VLAs.
+    ///
+    /// A runtime whose deployable output is a token sequence (π0-FAST) returns
+    /// `Some([1, max_action_tokens])`; continuous-action runtimes keep `None`
+    /// and use [`contract`](Self::contract) alone.
+    fn action_token_shape(&self) -> Option<[usize; 2]> {
+        None
+    }
+
+    /// Run inference and return the raw action token ids as `[1, steps]` `f32`.
+    ///
+    /// Integral values are exact in `f32` well beyond any model vocabulary.
+    /// Token detokenization (FAST BPE + DCT) is action postprocessing and stays
+    /// in the Python policy layer.
+    ///
+    /// `stop_token` ends an autoregressive decode early: the runtime emits the
+    /// id, stops, and returns the shorter stream (π0-FAST's FAST stream ends at
+    /// the `|` terminator after ~10% of `max_action_tokens`, and its detokenizer
+    /// truncates there anyway). It rides this token-only entry point rather than
+    /// [`Observation`] so a continuous-action family never carries — or has to
+    /// spell out — a control knob that only token decoding reads.
+    fn infer_action_tokens(
+        &self,
+        _request: &VlaRequest<'_>,
+        _stop_token: Option<u32>,
+    ) -> Result<Tensor> {
+        Err(Error::Other(
+            "this VLA runtime does not produce discrete action tokens".into(),
+        ))
+    }
+
+    /// Collect named BF16 activation maxima for an FP8 calibration profile.
+    fn calibration_amax(&self, _request: &VlaRequest<'_>) -> Result<BTreeMap<String, f32>> {
+        Err(Error::Other(
+            "activation calibration is not supported by this VLA runtime".into(),
+        ))
+    }
+
+    /// Same capture, but a token decoder may end it at ``stop_token``.
+    ///
+    /// A calibration profile has to describe the activations deployment
+    /// actually quantizes. A token decoder that free-runs past its terminator
+    /// records activations from a token stream inference never produces, and a
+    /// maximum taken over them can be orders of magnitude above the real range.
+    /// Continuous-action families have no token stream and keep the default.
+    fn calibration_amax_stop(
+        &self,
+        request: &VlaRequest<'_>,
+        _stop_token: Option<u32>,
+    ) -> Result<BTreeMap<String, f32>> {
+        self.calibration_amax(request)
+    }
+
+    /// Stable logical sites required by this runtime's calibration profile.
+    fn calibration_plan(&self) -> Result<Vec<String>> {
+        Err(Error::Other(
+            "activation calibration is not supported by this VLA runtime".into(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apxinf_core::DType;
+
+    fn observation() -> Observation {
+        Observation {
+            vision: VisionObservation::RgbU8 {
+                bytes: vec![0; 2 * 4 * 4 * 3],
+                layout: ImageLayout::Nhwc,
+            },
+            token_ids: vec![1, 2, 3],
+            state: None,
+            action_mask: None,
+        }
+    }
+
+    #[test]
+    fn observation_spec_contains_only_fixed_shape_routing_fields() {
+        let observation = observation();
+        assert_eq!(
+            observation.inference_spec(),
+            InferenceSpec {
+                token_count: 3,
+                image_layout: Some(ImageLayout::Nhwc),
+            }
+        );
+        assert!(observation.validate().is_ok());
+
+        let empty = Observation {
+            vision: VisionObservation::Patches(Tensor::zeros((1, 2), DType::F32)),
+            token_ids: Vec::new(),
+            state: None,
+            action_mask: None,
+        };
+        assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn vla_request_keeps_provided_and_generated_latents_distinct() {
+        let observation = observation();
+        let latent = Tensor::zeros((1, 50, 7), DType::F32);
+        let provided = VlaRequest::provided(&observation, &latent);
+        match provided.initial_latent {
+            InitialLatent::Provided(actual) => assert!(std::ptr::eq(actual, &latent)),
+            InitialLatent::Generate { .. } => panic!("provided latent was changed to generated"),
+        }
+
+        let rng = RngKey::new(17, 23, 42);
+        let generated = VlaRequest::generated(&observation, rng);
+        match generated.initial_latent {
+            InitialLatent::Generate { rng: actual } => assert_eq!(actual, rng),
+            InitialLatent::Provided(_) => panic!("generated latent requires a caller tensor"),
+        }
+    }
 }

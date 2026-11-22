@@ -7,8 +7,31 @@ import numpy.typing as npt
 
 __version__: str
 
-class Model:
-    """A loaded pi05 model handle exposing L0/L1 bare-model inference."""
+class HfTokenizer:
+    """Rust-backed Hugging Face ``tokenizer.json`` runtime."""
+
+    @staticmethod
+    def from_file(path: str) -> "HfTokenizer": ...
+    def encode(self, text: str) -> list[int]: ...
+    def decode(self, token_ids: list[int]) -> str: ...
+    def add_tokens(self, tokens: list[str]) -> int: ...
+    def token_to_id(self, token: str) -> int | None: ...
+    @property
+    def vocab_size(self) -> int: ...
+
+class SentencePieceTokenizer:
+    """Native SentencePiece ``.model`` runtime."""
+
+    @staticmethod
+    def from_file(path: str) -> "SentencePieceTokenizer": ...
+    def encode(self, text: str, add_bos: bool = ...) -> list[int]: ...
+
+class _PackedRgbU8:
+    """Owned contiguous RGB storage consumed by one inference call."""
+    ...
+
+class ModelRunner:
+    """A loaded VLA model handle exposing its bare-model inference contract."""
 
     @staticmethod
     def load(
@@ -18,21 +41,110 @@ class Model:
         precision: str = ...,
         calibration: str | None = ...,
         tactics: str | None = ...,
-    ) -> "Model":
+        autotune: bool = ...,
+        config_json: str | None = ...,
+        action_horizon: int | None = ...,
+        num_views: int | None = ...,
+        num_flow_steps: int | None = ...,
+        flow_start_time: float | None = ...,
+        sampling_seed: int = ...,
+        assets: dict[str, str] | None = ...,
+    ) -> "ModelRunner":
         """Load a checkpoint through the unified ``AutoModel`` frontend.
 
         ``device`` is ``cuda:N`` (default) or ``cpu``.
         ``precision`` is ``auto`` (default), ``fp8``, ``bf16``, or ``int8``.
+        ``config_json`` supplies architecture JSON when it is stored outside the
+        checkpoint's ``config.json``. ``None`` leaves loading to AutoModel.
+        ``action_horizon`` overrides the checkpoint's chunk length (a sequence
+        length, not a weight dimension).
+        ``num_views`` serves fewer cameras than the checkpoint declares (1..=its
+        own count), which is numerically equivalent to openpi padding + masking
+        the absent views but skips their patch tokens.
+        ``num_flow_steps`` and ``flow_start_time`` are PI0.5 deployment overrides.
+        ``sampling_seed`` seeds the implicit device-side noise stream.
         """
         ...
 
-    def infer_patches(
+    def _infer_preprocessed(
+        self,
+        pixel_values: npt.NDArray[np.float32],
+        image_grid_thw: npt.NDArray[np.uint32],
+        token_ids: npt.NDArray[np.uint32],
+        attention_mask: npt.NDArray[np.uint8],
+        state: npt.NDArray[np.float32],
+        embodiment_id: int | None,
+        noise: npt.NDArray[np.float32],
+        *,
+        num_steps: int | None = None,
+        max_new_tokens: int | None = None,
+        min_new_tokens: int = 0,
+        terminator_ids: list[int] | None = None,
+        closing_ids: list[int] | None = None,
+    ) -> npt.NDArray[np.float32]:
+        """Private L0 path for processor-produced typed VLA inputs."""
+        ...
+
+    @staticmethod
+    def _pack_rgb_u8_frames(frames: list[npt.NDArray[np.uint8]]) -> _PackedRgbU8: ...
+
+    def _infer_resized_rgb(
+        self,
+        rgb_u8: npt.NDArray[np.uint8],
+        image_grid_thw: npt.NDArray[np.uint32],
+        token_ids: npt.NDArray[np.uint32],
+        attention_mask: npt.NDArray[np.uint8],
+        state: npt.NDArray[np.float32],
+        embodiment_id: int | None,
+        noise: npt.NDArray[np.float32],
+        *,
+        num_steps: int | None = None,
+        max_new_tokens: int | None = None,
+        min_new_tokens: int = 0,
+        terminator_ids: list[int] | None = None,
+        closing_ids: list[int] | None = None,
+        raw_resize_frames: npt.NDArray[np.uint32] | None = None,
+    ) -> npt.NDArray[np.float32]: ...
+
+    def _infer_resized_rgb_packed(
+        self,
+        packed: _PackedRgbU8,
+        image_grid_thw: npt.NDArray[np.uint32],
+        token_ids: npt.NDArray[np.uint32],
+        attention_mask: npt.NDArray[np.uint8],
+        state: npt.NDArray[np.float32],
+        embodiment_id: int | None,
+        noise: npt.NDArray[np.float32],
+        *,
+        num_steps: int | None = None,
+        max_new_tokens: int | None = None,
+        min_new_tokens: int = 0,
+        terminator_ids: list[int] | None = None,
+        closing_ids: list[int] | None = None,
+        raw_resize_frames: npt.NDArray[np.uint32] | None = None,
+    ) -> npt.NDArray[np.float32]: ...
+
+    def _calibrate_preprocessed(
+        self,
+        pixel_values: npt.NDArray[np.float32],
+        image_grid_thw: npt.NDArray[np.uint32],
+        token_ids: npt.NDArray[np.uint32],
+        attention_mask: npt.NDArray[np.uint8],
+        state: npt.NDArray[np.float32],
+        embodiment_id: int,
+        noise: npt.NDArray[np.float32],
+    ) -> dict[str, float]:
+        """Private activation probe used by the common calibration runner."""
+        ...
+
+    def _infer_patches(
         self,
         patches: npt.NDArray[np.float32],
         token_ids: npt.NDArray[np.uint32],
-        noise: npt.NDArray[np.float32],
+        noise: npt.NDArray[np.float32] | None = ...,
+        action_mask: npt.NDArray[np.float32] | None = ...,
     ) -> npt.NDArray[np.float32]:
-        """L0: infer from pre-computed patches. Returns normalized-domain action."""
+        """Private L0 path used by model-specific policies and parity tests."""
         ...
 
     def infer_rgb(
@@ -40,10 +152,29 @@ class Model:
         rgb_u8: npt.NDArray[np.uint8],
         layout: str,
         token_ids: npt.NDArray[np.uint32],
-        noise: npt.NDArray[np.float32],
+        noise: npt.NDArray[np.float32] | None = ...,
+        action_mask: npt.NDArray[np.float32] | None = ...,
     ) -> npt.NDArray[np.float32]:
         """L1: infer from resized RGB uint8. Returns normalized-domain action."""
         ...
+
+    def _calibrate_rgb(
+        self,
+        rgb_u8: npt.NDArray[np.uint8],
+        layout: str,
+        token_ids: npt.NDArray[np.uint32],
+        noise: npt.NDArray[np.float32],
+    ) -> dict[str, float]: ...
+
+    def _calibrate_tokens_rgb(
+        self,
+        rgb_u8: npt.NDArray[np.uint8],
+        layout: str,
+        token_ids: npt.NDArray[np.uint32],
+        stop_token: int | None = ...,
+    ) -> dict[str, float]: ...
+
+    def _calibration_plan(self) -> list[str]: ...
 
     @property
     def device(self) -> str: ...
@@ -61,3 +192,70 @@ class Model:
     def patches_per_view(self) -> int: ...
     @property
     def max_token_len(self) -> int: ...
+    @property
+    def accepts_rgb_u8(self) -> bool: ...
+
+class DecisionRunner:
+    """A loaded decision model handle for encoded-prompt or schema requests."""
+
+    @staticmethod
+    def load(
+        model_path: str,
+        device: str = ...,
+        autotune: bool = ...,
+        tuning_dir: str | None = ...,
+    ) -> "DecisionRunner":
+        """Load a decision model checkpoint.
+
+        ``model_path`` is the checkpoint directory detected by AutoModel.
+        ``device`` defaults to ``cuda:0``. D3 requires CUDA; Clef requires
+        ``metal:N`` and a build with the ``mlx`` feature.
+        ``autotune`` — tune missing GEMM recipes from the first request.
+        ``tuning_dir`` — directory to persist tuning recipes.
+        """
+        ...
+
+    def decide(
+        self,
+        token_ids: npt.NDArray[np.uint32],
+        candidate_count: int,
+    ) -> dict:
+        """Run a text decision and return scored codes.
+
+        Returns:
+            dict with ``selected_index`` (int) and ``scores``
+            (list of ``{"code": str, "token_id": int, "probability": float}``).
+        """
+        ...
+
+    def decide_schema(self, request_json: str) -> dict:
+        """Run a schema decision on the same loaded model.
+
+        ``request_json`` contains ``{"state": ..., "questions": {id: question}}``.
+        Each question has ``type`` and optional ``instructions`` and ``criteria``.
+        Question IDs must be unique. The model family defines question semantics.
+
+        Returns ``{"answers": [...]}`` in request order. Each answer has
+        ``question_id``, ``selected_index`` and ``scores`` in option order.
+        Each score has ``code``, ``token_id`` (int or None), and ``probability``.
+        Probabilities remain grouped by question without renormalization.
+        Invalid JSON or schema raises ValueError; runtime errors, including
+        unsupported input forms, raise RuntimeError.
+        """
+        ...
+
+    @property
+    def codes(self) -> list[str]:
+        """Available code names in the package code table."""
+        ...
+    @property
+    def num_codes(self) -> int:
+        """Total number of codes."""
+        ...
+    @property
+    def device(self) -> str: ...
+    @property
+    def model_path(self) -> str: ...
+
+# Exported by CUDA builds; shared fixed-profile geometry.
+QWEN_DRIVE_FIXED_SCENE_TOKENS: int

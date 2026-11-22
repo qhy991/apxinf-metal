@@ -1,9 +1,9 @@
 # apxinf (Python frontend)
 
-Pure-Python (numpy/PIL/sentencepiece) processor library + the **L2** policy
+Python-first (NumPy/Pillow plus native Rust tokenizers) processor library + the **L2** policy
 layer for the ApxInf VLA runtime. The bare-model L1 inference binding lives in
 the [`apxinf-py`](../../crates/apxinf-py) PyO3 crate; `apxinf` re-exports it as
-`apxinf.Model` so you never import `apxinf_py` directly.
+`apxinf.ModelRunner` so you never import `apxinf_py` directly.
 
 ## Layout
 
@@ -11,12 +11,16 @@ the [`apxinf-py`](../../crates/apxinf-py) PyO3 crate; `apxinf` re-exports it as
 apxinf/
 ├── processors/   pure-numpy pre/post steps + Pipeline (offline, no GPU/Rust)
 ├── policies/     the L2 layer — stable machinery + volatile per-model impls
-│   ├── base.py       Policy + BareModel contracts (structural Protocols)
+│   ├── base.py       Policy + ModelRunnerProtocol contracts (structural Protocols)
 │   ├── registry.py   model_type -> policy-class registry
 │   ├── auto.py       AutoPolicy: checkpoint -> concrete policy by config type
 │   └── impls/        concrete per-model policies (the part that grows)
-│       └── pi05.py       Pi05Policy (registered as "pi05")
-└── __init__.py   facade: Model (lazy), Pi05Policy, AutoPolicy, Policy, steps
+│       ├── pi05.py       Pi05Policy (registered as "pi05")
+│       └── walloss.py    WallossPolicy (registered as "walloss")
+├── checkpoints/  read a checkpoint's layout, norm stats and metadata; the
+│                 `.pth` sidecar reader here is tensor-only (no Torch import)
+├── serving/      the L3 layer — the OpenPI-compatible websocket server
+└── __init__.py   facade: ModelRunner (lazy), concrete policies, AutoPolicy, Policy, steps
 ```
 
 **Adding a model:** drop `apxinf/policies/impls/<name>.py` following `pi05.py`
@@ -27,14 +31,21 @@ apxinf/
 
 - **Processor steps** (`apxinf.processors`) — each an independently-callable
   `ProcessorStep`: `ParseImage`, `ResizeWithPad`, `PromptTokenizer`,
-  `Normalizer`/`Unnormalizer`, `GaussianNoise`, chained by `Pipeline`. No GPU /
-  no Rust dependency; unit-tests run offline. sentencepiece is imported lazily
-  by the tokenizer only.
-- **L2 policies** (`apxinf.Pi05Policy` / `apxinf.AutoPolicy`) — compose a pre
-  pipeline + a bare-model handle (L1 `infer_rgb` by default) + a post unnormalize
-  step into one `infer(obs_dict) -> {actions, timing, ...}` call. `import apxinf`
-  stays CUDA-free; only `apxinf.Model` and a policy's `from_pretrained` pull in
-  `apxinf_py`.
+  `Normalizer`/`Unnormalizer`, `GaussianNoise`, chained by `Pipeline`. The
+  package remains importable without a GPU or native extension; built-in
+  tokenization loads `apxinf-py` lazily when the tokenizer is constructed.
+- **WallOSS processor** — its family-local policy reads `tokenizer.json`
+  through `apxinf-py`. Pillow performs smart resize;
+  the native runtime performs Qwen2.5-VL normalization and patchification in
+  CUDA, while NumPy retains a compatible patch path for custom processors. Its
+  legacy `.pth` normalizer sidecars are read by a restricted tensor-only loader,
+  without importing Torch or Transformers.
+- **L2 policies** (`apxinf.Pi05Policy`, `apxinf.WallossPolicy`, or
+  `apxinf.AutoPolicy`) — own each model family's pre/post contract around a
+  bare-model handle and return deployable actions from one
+  `infer(obs_dict) -> {actions, timing, ...}` call. `import apxinf`
+  stays CUDA-free; built-in tokenizer construction and model loading import
+  `apxinf_py` lazily.
 
 ## Domains
 
@@ -65,6 +76,13 @@ Two layers of `ProcessorStep` live here, and they extend differently:
   output key. They define a *role* (which key they produce), not an
   implementation.
 
+WallOSS also accepts a callable `processor=` in `WallossPolicy.from_pretrained`.
+It must return `(patches_f32, token_ids_u32, action_mask_f32)` using the model's
+canonical shapes. The built-in processor remains the checkpoint-compatible
+default and sends resized RGB to runtimes that advertise that capability, so
+normalization and patchification run in the CUDA graph. This seam lets Python
+applications customize observation handling without forking the Rust runtime.
+
 **A new implementation should not touch `transforms.py`.** The swap seam is
 dependency injection at pipeline-assembly time, not the transform classes:
 
@@ -74,10 +92,15 @@ class BetaNoise(ProcessorStep): ...
 
 # inject it — the transform (SampleNoise) is unchanged
 input_pipeline, output_pipeline = Pi05Policy.default_pipelines(model, ..., noise=BetaNoise(H, D))
-# or swap on an existing pipeline (copy-on-write):
-input_pipeline = input_pipeline.replace("sample_noise", SampleNoise(BetaNoise(H, D)))
+# or insert/swap it on an existing pipeline (copy-on-write):
+input_pipeline = input_pipeline.insert_after(
+    "tokenize", ("sample_noise", SampleNoise(BetaNoise(H, D)))
+)
 input_pipeline = input_pipeline.override("sample_noise", ...)   # tweak PARAMS only
 ```
+
+The default pipeline has no `sample_noise` step: omitting external noise lets
+the runtime generate it directly in the stable device buffer.
 
 **Organize growth by implementation family, not by transform key.** When a
 category earns a second implementation, promote its file to a package
@@ -98,16 +121,27 @@ ahead of the second example.
 
 ## Policy
 
+The PR-era `compute_variant` keyword and `--compute-variant` CLI flag are replaced
+by `model_variant` and `--model-variant`; callers must update.
+
+PI0.5 selects its implementation with `model_variant`: `auto`, `bf16`,
+`fp8_static` or `int8_dynamic`. Static FP8 uses calibrated activation scales;
+dynamic INT8 uses per-row activation scales and fixed per-channel weight scales.
+`ModelRunner.model_variant` and PI0.5 policy metadata report the resolved
+implementation, including when loading with `auto`.
+The previous PI0.5 `precision` keyword is no longer accepted. Other model families
+retain their own loading options until migrated.
+
 Two entry points, both returning something that satisfies the `Policy` contract:
 
 ```python
 from apxinf import AutoPolicy, Pi05Policy
 
 # Generic: read config.json's model type and dispatch to the right class.
-policy = AutoPolicy.from_pretrained("model_dir", precision="bf16", action_dim=7)
+policy = AutoPolicy.from_pretrained("model_dir", model_variant="bf16", action_dim=7)
 
 # Concrete: when you need model-specific knobs.
-policy = Pi05Policy.from_pretrained("model_dir", precision="bf16", action_dim=7)
+policy = Pi05Policy.from_pretrained("model_dir", model_variant="bf16", action_dim=7)
 
 result = policy.infer({
     "observation/image": base_rgb,
@@ -119,26 +153,85 @@ result["actions"]   # unnormalized float32 [horizon, action_dim]
 result["timing"]    # {"model_ms": ..., "total_ms": ...}
 ```
 
-For bare-model (L1) use, the binding is reachable as `apxinf.Model`:
+For bare-model (L1) use, the binding is reachable as `apxinf.ModelRunner`:
 
 ```python
-from apxinf import Model
-model = Model.load("pi05", "model.safetensors", precision="bf16")
-model.infer_rgb(rgb_u8, "nhwc", token_ids, noise)   # normalized-domain action
+from apxinf import ModelRunner
+model = ModelRunner.load("pi05", "model.safetensors", model_variant="bf16")
+model.infer_rgb(rgb_u8, "nhwc", token_ids)          # internal device sampling
+model.infer_rgb(rgb_u8, "nhwc", token_ids, noise)   # exact external noise
 ```
 
 Any default step is replaceable at construction (`image_pipeline=`,
 `tokenizer=`, `unnormalizer=`, `noise=`) for a custom high-performance
 implementation.
 
+### GR00T local assets
+
+`AutoPolicy` dispatches GR00T by its checkpoint config and loads its local
+configuration and processor resources from `model_dir/assets/cosmos/`.
+Prepare these resources once from an existing compatible local snapshot:
+
+```python
+from apxinf import Gr00tPolicy
+
+Gr00tPolicy.prepare_assets(
+    "/models/GR00T-N1.7-LIBERO/libero_10",
+    "/models/nvidia/Cosmos-Reason2-2B",
+)
+```
+
+The preparation method copies configuration, tokenizer, image/video processor
+and chat-template resources plus an `apxinf_assets.json` manifest. It does not
+copy Cosmos weights. Then load with the model directory alone:
+
+```python
+policy = AutoPolicy.from_pretrained(
+    "/models/GR00T-N1.7-LIBERO/libero_10",
+    precision="bf16",
+)
+```
+
+All backbone and action-head inference weights and NVIDIA's checkpoint
+processor metadata remain in the GR00T checkpoint. `backbone=` is an optional
+local override for existing deployments. Loading does not search environment
+paths or checkpoint export paths, or download missing resources. See the
+[GR00T loading contract](../../doc/gr00t-n1.7.md#loading) for the required assets
+and an FP8 calibration bound to the selected model/processor metadata. Profiles
+without the versioned GR00T processor identity require recalibration for both
+prepared resources and explicit `backbone=` snapshots.
+GR00T uses `precision=`, rather than PI0.5's `model_variant=`.
+
 ## Policy contract
 
 `apxinf.Policy` is a structural `typing.Protocol` every L2 policy satisfies:
-`metadata`, `action_dim`, `action_horizon`, `infer(obs) -> dict`, `close()`.
+`metadata`, `action_dim`, `action_horizon`, `infer(obs, noise=None) -> dict`, `close()`.
 `infer` guarantees the `actions` and `timing` keys across all policies. It's the
 anchor point for future models (a `GrootPolicy` satisfies the same contract),
 for `AutoPolicy` dispatch, and for a future lerobot adaptor — no inheritance
 required, structural typing only.
+
+## lerobot interop
+
+Not here: wrapping a `Policy` in lerobot's surface means translating *its*
+robot/camera/dataset-feature vocabulary, which is a property of the robot stack
+rather than of the checkpoint. An adaptor built one layer up wraps any `Policy`
+satisfying the contract above, so a lerobot user keeps their robot, cameras,
+feature plumbing and action dispatch and swaps only the policy.
+
+Two notes that are the engine's to make, because they are about what this package
+does and does not run:
+
+**Whose pre/post runs: ours.** apxinf's `Pipeline` does resize, tokenize, and
+unnormalize; the model runtime generates prior noise unless it is supplied
+explicitly. lerobot splits the same work differently (resize and prior noise live
+*inside* its policy; normalize lives in its processor pipeline), so pipelines from
+its `make_pre_post_processors` are **not** interchangeable with ours — feeding
+their output here would drop resize and double-normalize.
+
+**No training path.** Fine-tuning / PEFT through this engine is structurally
+impossible: there is no autograd behind `infer`. Train elsewhere, export, serve
+here.
 
 ## Camera views
 
@@ -148,13 +241,38 @@ slots — the openpi convention for masked/missing cameras — so 2 cameras driv
 3-slot model. Passing more keys than slots is an error; disable padding with
 `pad_missing_views=False`.
 
-## State gap (reserved, not wired)
+## State injection
 
-pi05 expects proprioception injected as a **discretized state** spliced into the
-prompt (`build_prompt(..., discrete_state=True)`, aligned with Rust
-`pi05_prompt`). The current serving link omits it: `observation/state` is read
-but **dropped**. The interface slot exists (construct the tokenizer with
-`discrete_state=True`); the default path matches today's behavior.
+PI0.5 supports state injection with `discrete_state=True`. The policy normalizes
+raw state using the checkpoint-selected transform, discretizes it and builds the
+`Task/State/Action` prompt. This requires an explicit `state_key`; robot presets
+may supply both settings. Direct policy construction leaves injection off by
+default. Choose normalization dtype according to the checkpoint/reference:
+rounding near a bin edge can change the prompt tokens.
+
+## Built-in family contracts
+
+Tokenizer execution is native, while prompt/state orchestration and action
+postprocessing remain Python. The shared lifecycle and ownership rules are in
+[Model Lifecycle and Contracts](../../doc/model-lifecycle.md).
+
+| Contract | PI0.5 | WallOSS |
+| --- | --- | --- |
+| State encoding | optional 256-bin encoding, preserving underflow bin `-1`; normalization dtype is significant | required configured bins, clipping to range and selecting active state dimensions |
+| Token sequence | SentencePiece BOS; without state, append a separately encoded newline | HF added tokens, camera labels, image placeholder expansion and action tokens |
+| Image/model input | configured resized RGB views and token IDs | built-in resized RGB with two `18x18` grids; custom processor returns canonical patches, token IDs and action mask |
+| Output | trimmed, checkpoint-transformed actions plus normalized model actions | trimmed, inverse-normalized actions plus normalized model actions |
+| Customization | replaceable Python input/output pipelines | explicit `processor=` callable; custom processing does not implicitly select native RGB |
+
+For WallOSS, each image placeholder expands to
+`product(grid_thw) / merge_size^2` tokens. Camera order, labels and grid metadata
+must agree. A one-dimensional DOF mask broadcasts to
+`[action_horizon, action_dim]`; the active-state mask supplies its default.
+For PI0.5, separately encoding the trailing newline is part of the non-state
+sequence contract; concatenating it to the task before encoding is not an
+established equivalent. Both models return checkpoint-domain policy actions;
+external robot units, actuator ordering and command encoding remain adapter
+responsibilities. These differences must survive a future native prompt builder.
 
 ## Tests
 
@@ -163,6 +281,9 @@ pip install -e '.[test]'
 pytest tests/        # offline; tokenizer + real-model tests skip without a checkpoint
 ```
 
-Tokenizer-encode tests need a SentencePiece model (`APXINF_TOKENIZER` or
-`APXINF_PI05_MODEL_DIR`); the real-model layering test needs a CUDA `apxinf_py`
-build plus `APXINF_PI05_MODEL_DIR`.
+The `test` extra holds reference implementations, never runtime dependencies: the
+native tokenizer differential tests need the Python `sentencepiece` reference and
+a SentencePiece model (`APXINF_TOKENIZER` or `APXINF_PI05_MODEL_DIR`). Everything
+else is checked against the definition or against itself — the π0-FAST inverse DCT
+is compared with the textbook term-by-term sum, not with scipy. The real-model
+layering test needs a CUDA `apxinf_py` build plus `APXINF_PI05_MODEL_DIR`.

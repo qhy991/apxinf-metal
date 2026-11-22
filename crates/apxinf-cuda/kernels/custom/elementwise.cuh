@@ -49,6 +49,30 @@ __global__ void add_bf16_kernel(
     output[gid] = __float2bfloat16(x);
 }
 
+// Eight elements per thread through 16-byte accesses, for the same reason the
+// GELU wanted them: one bf16 per thread has a warp touching 64 bytes of a
+// 128-byte sector. This kernel is 85.7 ms across a 64-token scene, spread over
+// 4145 launches in both prefill and decode. Per-element arithmetic unchanged.
+__global__ void add_bf16_vec8_kernel(
+    const float4* __restrict__ a, const float4* __restrict__ b,
+    float4* __restrict__ output, uint32_t vec_count)
+{
+    for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < vec_count;
+         v += gridDim.x * blockDim.x) {
+        float4 pa = a[v];
+        float4 pb = b[v];
+        const __nv_bfloat16* la = reinterpret_cast<const __nv_bfloat16*>(&pa);
+        const __nv_bfloat16* lb = reinterpret_cast<const __nv_bfloat16*>(&pb);
+        float4 out;
+        __nv_bfloat16* lo = reinterpret_cast<__nv_bfloat16*>(&out);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            lo[i] = __float2bfloat16(__bfloat162float(la[i]) + __bfloat162float(lb[i]));
+        }
+        output[v] = out;
+    }
+}
+
 
 
 // ── Mul (bf16) ────────────────────────────────────────────────────────────
@@ -73,6 +97,58 @@ __global__ void scale_bf16_kernel(
     if (gid >= count) return;
     float x = __bfloat162float(input[gid]) * scale;
     output[gid] = __float2bfloat16(x);
+}
+
+__global__ void add_f16_kernel(
+    const half* a, const half* b, half* output, uint32_t count)
+{
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) return;
+    output[gid] = __float2half(__half2float(a[gid]) + __half2float(b[gid]));
+}
+
+__global__ void add_f16_vec8_kernel(
+    const float4* __restrict__ a, const float4* __restrict__ b,
+    float4* __restrict__ output, uint32_t vec_count)
+{
+    for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < vec_count;
+         v += gridDim.x * blockDim.x) {
+        float4 pa = a[v];
+        float4 pb = b[v];
+        const half* la = reinterpret_cast<const half*>(&pa);
+        const half* lb = reinterpret_cast<const half*>(&pb);
+        float4 out;
+        half* lo = reinterpret_cast<half*>(&out);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            lo[i] = __float2half(__half2float(la[i]) + __half2float(lb[i]));
+        }
+        output[v] = out;
+    }
+}
+
+__global__ void scale_f16_kernel(
+    const half* input, half* output, uint32_t count, float scale)
+{
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) return;
+    output[gid] = __float2half(__half2float(input[gid]) * scale);
+}
+
+__global__ void scale_f16_vec8_kernel(
+    const float4* __restrict__ input, float4* __restrict__ output,
+    uint32_t vec_count, float scale)
+{
+    for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < vec_count;
+         v += gridDim.x * blockDim.x) {
+        float4 packed = input[v];
+        half* lane = reinterpret_cast<half*>(&packed);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            lane[i] = __float2half(__half2float(lane[i]) * scale);
+        }
+        output[v] = packed;
+    }
 }
 
 
@@ -154,6 +230,54 @@ __global__ void concat_rows_bf16_kernel(
   }
 }
 
+__global__ void gather_rows_bf16_kernel(
+    const __nv_bfloat16* input, const uint32_t* indices,
+    __nv_bfloat16* output, int rows, int cols) {
+  const int64_t count = static_cast<int64_t>(rows) * cols;
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int row = static_cast<int>(index / cols);
+    const int col = static_cast<int>(index % cols);
+    output[index] = input[static_cast<int64_t>(indices[row]) * cols + col];
+  }
+}
+
+__global__ void scatter_rows_bf16_kernel(
+    const __nv_bfloat16* source, const uint32_t* rows,
+    __nv_bfloat16* output, int64_t count, int cols, bool add) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int source_row = static_cast<int>(index / cols);
+    const int column = static_cast<int>(index % cols);
+    const int64_t output_index =
+        static_cast<int64_t>(rows[source_row]) * cols + column;
+    if (add) {
+      output[output_index] = __float2bfloat16(
+          __bfloat162float(output[output_index]) + __bfloat162float(source[index]));
+    } else {
+      output[output_index] = source[index];
+    }
+  }
+}
+
+__global__ void replace_rows_bf16_kernel(
+    const __nv_bfloat16* base, const __nv_bfloat16* replacement,
+    const uint32_t* row_map, __nv_bfloat16* output, int rows, int cols) {
+  const int64_t count = static_cast<int64_t>(rows) * cols;
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int row = static_cast<int>(index / cols);
+    const int col = static_cast<int>(index % cols);
+    const uint32_t replacement_row = row_map[row];
+    output[index] = replacement_row == 0xffffffffu
+        ? base[index]
+        : replacement[static_cast<int64_t>(replacement_row) * cols + col];
+  }
+}
+
 __global__ void euler_update_bf16_kernel(
     const __nv_bfloat16* state, const __nv_bfloat16* velocity,
     __nv_bfloat16* output, int64_t count, float dt) {
@@ -162,6 +286,21 @@ __global__ void euler_update_bf16_kernel(
   for (; index < count; index += stride) {
     output[index] = __float2bfloat16(
         __bfloat162float(state[index]) + dt * __bfloat162float(velocity[index]));
+  }
+}
+
+__global__ void bias_position_f32_kernel(
+    const float* projection, const float* bias,
+    const float* position, __nv_bfloat16* output,
+    int64_t count, int cols, int tokens_per_view) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int col = static_cast<int>(index % cols);
+    const int token = static_cast<int>((index / cols) % tokens_per_view);
+    float value = projection[index] + position[token * cols + col];
+    if (bias != nullptr) value += bias[col];
+    output[index] = __float2bfloat16(value);
   }
 }
 
@@ -180,5 +319,3 @@ __global__ void bias_position_bf16_kernel(
     output[index] = __float2bfloat16(value);
   }
 }
-
-

@@ -1,6 +1,6 @@
 """Pi05Policy composition tests.
 
-Most run offline against a ``MockModel`` implementing the ``BareModel`` protocol
+Most run offline against a ``MockModel`` implementing the ``ModelRunnerProtocol`` protocol
 (no CUDA, no apxinf_py). One gated test cross-checks the real ``apxinf_py`` model
 when ``APXINF_PI05_MODEL_DIR`` + a CUDA build are available.
 
@@ -18,6 +18,7 @@ import pytest
 
 from apxinf import Pi05Policy
 from apxinf.processors import (
+    GaussianNoise,
     ParseImage,
     Pipeline,
     ProcessorStep,
@@ -35,7 +36,7 @@ DEFAULT_KEYS = ("observation/image", "observation/wrist_image")
 
 
 class MockModel:
-    """Deterministic stand-in: normalized action == the sampled noise."""
+    """Stand-in: provided noise is exact; absent noise is sampled internally."""
 
     def __init__(self):
         self.action_horizon = HORIZON
@@ -45,14 +46,34 @@ class MockModel:
         self.max_token_len = 200
         self.last_rgb = None
         self.last_tokens = None
+        self.last_noise = None
+        self.sampling_seed = 0
+        self.sampling_draw = 0
 
-    def infer_rgb(self, rgb_u8, layout, token_ids, noise):
+    def reset_sampling(self, seed=None):
+        if seed is not None:
+            self.sampling_seed = int(seed)
+        self.sampling_draw = 0
+
+    def infer_rgb(self, rgb_u8, layout, token_ids, noise=None):
         assert layout == "nhwc"
         assert rgb_u8.shape == (NUM_VIEWS, IMAGE_SIZE, IMAGE_SIZE, 3)
         assert rgb_u8.dtype == np.uint8
         self.last_rgb = rgb_u8
         self.last_tokens = np.asarray(token_ids)
-        return np.asarray(noise, dtype=np.float32)
+        if noise is None:
+            noise = np.full(
+                (self.action_horizon, self.action_dim),
+                self.sampling_seed + self.sampling_draw,
+                dtype=np.float32,
+            )
+            self.sampling_draw += 1
+        self.last_noise = np.asarray(noise, dtype=np.float32).copy()
+        return self.last_noise
+
+    def _calibrate_rgb(self, rgb_u8, layout, token_ids, noise):
+        self.infer_rgb(rgb_u8, layout, token_ids, noise)
+        return {"vision.patch_input": float(np.max(rgb_u8))}
 
 
 class ConstTokenizer(PromptTokenizer):
@@ -117,6 +138,66 @@ def test_infer_returns_unnormalized_numpy():
     assert isinstance(actions, np.ndarray)
     assert actions.dtype == np.float32
     assert actions.shape == (HORIZON, LIBERO_DIM)
+
+
+def test_missing_external_noise_uses_internal_sampling():
+    policy = build_policy()
+    first = policy.infer(make_obs())
+    second = policy.infer(make_obs())
+    assert first["noise"] is None
+    assert second["noise"] is None
+    assert not np.array_equal(first["normalized_actions"], second["normalized_actions"])
+
+
+def test_explicit_noise_is_forwarded_exactly():
+    policy = build_policy()
+    noise = np.arange(HORIZON * MODEL_DIM, dtype=np.float32).reshape(HORIZON, MODEL_DIM)
+    result = policy.infer(make_obs(), noise=noise)
+    np.testing.assert_array_equal(result["noise"], noise)
+    np.testing.assert_array_equal(result["normalized_actions"], noise)
+    np.testing.assert_array_equal(policy.model_runner.last_noise, noise)
+
+
+def test_calibration_and_inference_share_observation_preprocessing():
+    policy = build_policy()
+    observation = make_obs()
+    noise = np.arange(HORIZON * MODEL_DIM, dtype=np.float32).reshape(HORIZON, MODEL_DIM)
+
+    policy.infer(observation, noise=noise)
+    expected_rgb = policy.model_runner.last_rgb.copy()
+    expected_tokens = policy.model_runner.last_tokens.copy()
+    records = policy.calibrate_observation(observation, noise=noise)
+
+    assert records == {"vision.patch_input": float(np.max(expected_rgb))}
+    np.testing.assert_array_equal(policy.model_runner.last_rgb, expected_rgb)
+    np.testing.assert_array_equal(policy.model_runner.last_tokens, expected_tokens)
+    np.testing.assert_array_equal(policy.model_runner.last_noise, noise)
+
+
+def test_explicit_noise_does_not_advance_internal_stream():
+    policy = build_policy()
+    first = policy.infer(make_obs())["normalized_actions"]
+    policy.infer(make_obs(), noise=np.full((HORIZON, MODEL_DIM), 99.0, dtype=np.float32))
+    second = policy.infer(make_obs())["normalized_actions"]
+    np.testing.assert_array_equal(first, np.zeros((HORIZON, MODEL_DIM), dtype=np.float32))
+    np.testing.assert_array_equal(second, np.ones((HORIZON, MODEL_DIM), dtype=np.float32))
+
+
+def test_observation_noise_is_supported_and_keyword_wins():
+    policy = build_policy()
+    observation_noise = np.ones((HORIZON, MODEL_DIM), dtype=np.float32)
+    keyword_noise = np.full((HORIZON, MODEL_DIM), 2.0, dtype=np.float32)
+    obs = make_obs()
+    obs["noise"] = observation_noise
+    np.testing.assert_array_equal(policy.infer(obs)["normalized_actions"], observation_noise)
+    np.testing.assert_array_equal(
+        policy.infer(obs, noise=keyword_noise)["normalized_actions"], keyword_noise
+    )
+
+
+def test_invalid_external_noise_shape_is_rejected():
+    with pytest.raises(ValueError, match="noise shape"):
+        build_policy().infer(make_obs(), noise=np.zeros((HORIZON, MODEL_DIM - 1)))
 
 
 def test_layering_invariant_l2_minus_unnormalize_equals_l1():
@@ -198,18 +279,20 @@ def test_satisfies_policy_protocol():
 
 def test_metadata_reports_pipeline_step_names():
     policy = build_policy()
-    assert policy.metadata["input_pipeline"] == ["image_stack", "tokenize", "sample_noise"]
+    assert policy.metadata["input_pipeline"] == ["image_stack", "tokenize"]
     assert policy.metadata["output_pipeline"] == ["trim", "unnormalize"]
 
 
 def test_reorder_independent_pre_steps_is_identical():
-    """tokenize and sample_noise are independent, so swapping them changes nothing."""
+    """Image stacking and tokenization are independent pre-processing steps."""
     obs = make_obs()
     baseline = build_policy().infer(obs)["actions"]
 
     model, in_pipe, out_pipe = make_parts()
-    reordered = in_pipe.reorder(["image_stack", "sample_noise", "tokenize"])
-    policy = Pi05Policy(model, input_pipeline=reordered, output_pipeline=out_pipe)
+    reordered = in_pipe.reorder(["tokenize", "image_stack"])
+    policy = Pi05Policy(
+        model, input_pipeline=reordered, output_pipeline=out_pipe, image_keys=DEFAULT_KEYS
+    )
     np.testing.assert_array_equal(policy.infer(obs)["actions"], baseline)
 
 
@@ -225,9 +308,29 @@ def test_insert_passthrough_step_does_not_change_result():
 
     model, in_pipe, out_pipe = make_parts()
     injected = in_pipe.insert_after("image_stack", ("noop", Passthrough()))
-    policy = Pi05Policy(model, input_pipeline=injected, output_pipeline=out_pipe)
-    assert policy.metadata["input_pipeline"] == ["image_stack", "noop", "tokenize", "sample_noise"]
+    policy = Pi05Policy(
+        model, input_pipeline=injected, output_pipeline=out_pipe, image_keys=DEFAULT_KEYS
+    )
+    assert policy.metadata["input_pipeline"] == ["image_stack", "noop", "tokenize"]
     np.testing.assert_array_equal(policy.infer(obs)["actions"], baseline)
+
+
+def test_explicit_host_sampler_remains_pluggable():
+    model = MockModel()
+    in_pipe, out_pipe = Pi05Policy.default_pipelines(
+        model,
+        tokenizer=ConstTokenizer(),
+        unnormalizer=make_quantile_unnormalizer(),
+        noise=GaussianNoise(HORIZON, MODEL_DIM, seed=7),
+        image_keys=DEFAULT_KEYS,
+    )
+    policy = Pi05Policy(
+        model, input_pipeline=in_pipe, output_pipeline=out_pipe, image_keys=DEFAULT_KEYS
+    )
+    assert policy.metadata["input_pipeline"] == ["image_stack", "tokenize", "sample_noise"]
+    result = policy.infer(make_obs())
+    assert result["noise"] is not None
+    np.testing.assert_array_equal(result["normalized_actions"], result["noise"])
 
 
 def test_default_vs_explicitly_built_pipeline_are_bit_identical():
@@ -236,7 +339,9 @@ def test_default_vs_explicitly_built_pipeline_are_bit_identical():
     default = build_policy().infer(obs)
 
     model, in_pipe, out_pipe = make_parts()
-    explicit = Pi05Policy(model, input_pipeline=in_pipe, output_pipeline=out_pipe).infer(obs)
+    explicit = Pi05Policy(
+        model, input_pipeline=in_pipe, output_pipeline=out_pipe, image_keys=DEFAULT_KEYS
+    ).infer(obs)
     np.testing.assert_array_equal(default["actions"], explicit["actions"])
     np.testing.assert_array_equal(default["normalized_actions"], explicit["normalized_actions"])
     np.testing.assert_array_equal(default["token_ids"], explicit["token_ids"])
@@ -249,23 +354,36 @@ def test_real_model_layering(model_dir):
     apxinf_py = pytest.importorskip("apxinf_py")
     from apxinf import AutoPolicy
 
-    precision = os.environ.get("APXINF_PI05_PRECISION", "bf16")
+    model_variant = os.environ.get("APXINF_PI05_MODEL_VARIANT", "bf16")
     try:
         # AutoPolicy reads config.json (type="pi05") and dispatches to Pi05Policy,
         # exercising the real registry path end to end.
         policy = AutoPolicy.from_pretrained(
             model_dir,
             device=os.environ.get("APXINF_PI05_DEVICE", "cuda:0"),
-            precision=precision,
+            model_variant=model_variant,
             action_dim=LIBERO_DIM,
+            # make_obs() speaks the openpi wire; the fallback would be the
+            # model's own view slots, which that observation does not carry.
+            image_keys=DEFAULT_KEYS,
             seed=0,
         )
-    except Exception as error:  # noqa: BLE001 - load needs CUDA build + checkpoint
+    except (OSError, RuntimeError) as error:
+        # Only the environment may skip this test: a missing tactics JSON or
+        # checkpoint file (OSError) and every engine/device failure the binding
+        # reports (RuntimeError). A broader `except Exception` would also
+        # swallow the binding's argument validation (ValueError) and a broken
+        # import, i.e. exactly the regressions this test exists to catch.
         pytest.skip(f"pi05 load failed: {error}")
 
     assert isinstance(policy, Pi05Policy)
     obs = make_obs()
-    result = policy.infer(obs)
+    # The real checkpoint's horizon and width come from the weights, not from
+    # MockModel's constants — pi05_libero_base runs H=50, not HORIZON.
+    noise = np.random.default_rng(0).standard_normal(
+        (policy.model_runner.action_horizon, policy.model_runner.action_dim), dtype=np.float32
+    )
+    result = policy.infer(obs, noise=noise)
     normalized = result["normalized_actions"]
 
     # L1: feed identical preprocessed inputs straight to the binding. The pre-chain's
@@ -274,10 +392,23 @@ def test_real_model_layering(model_dir):
     image_stack = policy.input_pipeline["image_stack"]
     views = [image_stack.image_pipeline(obs[key]) for key in image_stack.image_keys]
     rgb = np.ascontiguousarray(np.stack(views), dtype=np.uint8)
-    l1 = policy.model.infer_rgb(rgb, "nhwc", result["token_ids"], result["noise"])
+    l1 = policy.model_runner.infer_rgb(rgb, "nhwc", result["token_ids"], result["noise"])
     np.testing.assert_allclose(normalized, l1, rtol=0.0, atol=2e-3)
 
     # L2 minus unnormalize reproduces L1's first action_dim columns.
     unnormalizer = policy.output_pipeline["unnormalize"].unnormalizer
     recomputed = unnormalizer(np.ascontiguousarray(l1[:, :LIBERO_DIM]))
     np.testing.assert_allclose(result["actions"], recomputed, rtol=0.0, atol=2e-3)
+
+    # The real Observation seam reaches the native BF16 collector and must
+    # cover exactly the stable sites declared by the FP8 execution plan.
+    records = policy.calibrate_observation(obs, noise=noise)
+    assert set(records) == set(policy.model_runner._calibration_plan())
+    assert all(np.isfinite(value) and value >= 0.0 for value in records.values())
+
+
+def test_policy_reports_resolved_model_variant_over_requested_auto():
+    model = MockModel()
+    model.model_variant = "bf16"
+    policy = Pi05Policy.from_random(model, token_count=10, metadata={"model_variant": "auto"})
+    assert policy.metadata["model_variant"] == "bf16"

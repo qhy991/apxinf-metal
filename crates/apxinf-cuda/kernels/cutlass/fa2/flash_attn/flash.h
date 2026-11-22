@@ -9,22 +9,7 @@
 #include <cuda.h>
 #include <vector>
 
-// Vendor patch: replace PyTorch ATen dependency with a minimal POD stub.
-// at::PhiloxCudaState is only needed so Flash_fwd_params can carry it
-// through to at::cuda::philox::unpack() in the kernel. In inference we
-// always run with p_dropout=0 so the state is inert; the kernel still
-// reads the struct's fields as part of boilerplate codegen, so we keep
-// field layout byte-compatible with upstream ATen.
-#include <cstdint>
-namespace at {
-struct PhiloxCudaState {
-    bool captured_ = false;
-    uint64_t seed_ = 0;
-    uint64_t offset_ = 0;
-    uint64_t* seed_ptr_ = nullptr;
-    uint64_t* offset_ptr_ = nullptr;
-};
-} // namespace at
+#include <ATen/cuda/CUDAGeneratorImpl.h> // For at::Generator and at::PhiloxCudaState
 
 namespace FLASH_NAMESPACE {
 constexpr int TOTAL_DIM = 0;

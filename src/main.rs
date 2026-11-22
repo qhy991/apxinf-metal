@@ -3,10 +3,13 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
 use apxinf_core::{DType, Device, Tensor};
-use apxinf_model::{AutoModel, ImageInput, LlmInput, LoadOptions};
-use apxinf_tokenizer::{Tokenizer, ChatMessage};
+use apxinf_model::{
+    AutoModel, DecisionInput, GenerationConfigSource, GenerationOptions, ImageInput, ImageRequest,
+    LlmInput, LoadOptions, SamplingMode, SpeechRequest,
+};
+use apxinf_tokenizer::{ChatMessage, Tokenizer};
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "apxinf")]
@@ -24,6 +27,27 @@ enum Commands {
         #[arg(short, long)]
         model: PathBuf,
 
+        /// Explicit registry family (e.g. minicpm5 when checkpoint model_type is llama)
+        #[arg(long)]
+        model_name: Option<String>,
+
+        /// Family-local implementation variant; unsupported choices are rejected by its loader
+        #[arg(long)]
+        model_variant: Option<String>,
+
+        /// Auxiliary checkpoint asset as NAME=PATH (for example draft=/path/to/DSpark)
+        #[arg(long, value_parser = parse_asset)]
+        asset: Vec<(String, PathBuf)>,
+
+        /// JSON chat-template options, rendered with exact checkpoint whitespace
+        #[arg(long)]
+        chat_options: Option<String>,
+
+        /// Preserve semantic control tokens such as tool-call XML tags.
+        /// Also enabled automatically when chat options supply tools.
+        #[arg(long)]
+        keep_special_tokens: bool,
+
         /// Input prompt (treated as user message in chat mode, or raw text if no chat template)
         #[arg(short, long)]
         prompt: String,
@@ -35,8 +59,52 @@ enum Commands {
         image: Option<PathBuf>,
 
         /// Maximum new tokens to generate
-        #[arg(long, default_value = "50")]
-        max_tokens: usize,
+        #[arg(long)]
+        max_tokens: Option<usize>,
+
+        /// Explicitly enable random categorical sampling.
+        #[arg(long, conflicts_with = "greedy")]
+        sample: bool,
+
+        /// Explicitly use greedy token selection.
+        #[arg(long, conflicts_with = "sample")]
+        greedy: bool,
+
+        /// Sampling temperature. Zero selects greedy generation.
+        #[arg(long)]
+        temperature: Option<f32>,
+
+        /// Retain only the highest-k logits; zero or negative disables top-k.
+        #[arg(long)]
+        top_k: Option<i64>,
+
+        /// Nucleus probability mass.
+        #[arg(long)]
+        top_p: Option<f32>,
+
+        /// Repetition penalty; 1 disables it.
+        #[arg(long)]
+        repetition_penalty: Option<f32>,
+
+        /// Frequency penalty applied per token occurrence.
+        #[arg(long)]
+        frequency_penalty: Option<f32>,
+
+        /// Presence penalty applied once to previously seen tokens.
+        #[arg(long)]
+        presence_penalty: Option<f32>,
+
+        /// Counter-based sampling seed.
+        #[arg(long)]
+        seed: Option<u64>,
+
+        /// Generation defaults: auto, apxinf, or a JSON file/directory path.
+        #[arg(long, default_value = "auto")]
+        generation_config: String,
+
+        /// JSON object applied over model defaults and under request flags.
+        #[arg(long)]
+        override_generation_config: Option<String>,
 
         /// Disable EOS-based early stopping (generate until max_tokens)
         #[arg(long)]
@@ -46,7 +114,7 @@ enum Commands {
         #[arg(long)]
         system: Option<String>,
 
-        /// Device to run inference on (cpu or cuda)
+        /// Device to run inference on (cpu, cuda[:N], or metal[:N]; mlx is an alias)
         #[arg(short, long, default_value = "cpu")]
         device: String,
 
@@ -54,6 +122,132 @@ enum Commands {
         /// bandwidth and enables the bf16 fast path. Ignored on CPU.
         #[arg(long, default_value = "fp32")]
         dtype: String,
+    },
+
+    /// Run a decision model and print scored codes
+    Decide {
+        /// Path to HuggingFace model directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Explicit registry family
+        #[arg(long)]
+        model_name: Option<String>,
+
+        /// Input prompt, scored over the package code table
+        #[arg(short, long, required_unless_present = "request")]
+        prompt: Option<String>,
+
+        /// JSON file with a schema request {"state", "questions"}, for models
+        /// that encode their own prompt
+        #[arg(long, conflicts_with_all = ["prompt", "system", "candidates"])]
+        request: Option<PathBuf>,
+
+        /// System prompt for chat mode
+        #[arg(long)]
+        system: Option<String>,
+
+        /// Device to run inference on (cuda[:N] or metal[:N])
+        #[arg(short, long, default_value = "cuda:0")]
+        device: String,
+
+        /// Number of leading codes to score (default: all codes in package)
+        #[arg(short, long)]
+        candidates: Option<usize>,
+
+        /// Enable online autotuning
+        #[arg(long)]
+        autotune: bool,
+
+        /// Directory to persist tuning recipes
+        #[arg(long)]
+        tuning_dir: Option<PathBuf>,
+    },
+
+    /// Generate an image from a text prompt and write it as binary PPM
+    GenerateImage {
+        /// Path to the image model directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Explicit registry family
+        #[arg(long)]
+        model_name: Option<String>,
+
+        /// Family execution variant (Qwen-Image: auto or reference)
+        #[arg(long)]
+        model_variant: Option<String>,
+
+        /// Text prompt
+        #[arg(short, long)]
+        prompt: String,
+
+        /// Image width in pixels
+        #[arg(long, default_value_t = 1024)]
+        width: usize,
+
+        /// Image height in pixels
+        #[arg(long, default_value_t = 1024)]
+        height: usize,
+
+        /// Noise seed
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+
+        /// Denoising steps; families reject counts they do not support
+        #[arg(long, default_value_t = 40)]
+        steps: usize,
+
+        /// Output file (binary PPM, P6)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Device to run inference on (metal[:N])
+        #[arg(short, long, default_value = "metal")]
+        device: String,
+    },
+
+    /// Synthesize speech from text and write it as 32-bit float WAV
+    Speak {
+        /// Path to the speech model directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Explicit registry family
+        #[arg(long)]
+        model_name: Option<String>,
+
+        /// Family-local implementation variant; unsupported choices are rejected by its loader
+        #[arg(long)]
+        model_variant: Option<String>,
+
+        /// Text to speak
+        #[arg(short, long)]
+        text: String,
+
+        /// Voice name (families list the voices they support)
+        #[arg(long)]
+        voice: String,
+
+        /// Language name, or "auto"
+        #[arg(long, default_value = "auto")]
+        language: String,
+
+        /// Optional speaking-style instruction
+        #[arg(long, default_value = "")]
+        instruction: String,
+
+        /// Sampling seed
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+
+        /// Output WAV file
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Device to run inference on (metal[:N])
+        #[arg(short, long, default_value = "metal")]
+        device: String,
     },
 
     /// Run a quick test of the engine
@@ -64,12 +258,48 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Generate { model, prompt, image, max_tokens, no_eos_stop, system, device, dtype } => {
-            let device = parse_device(&device);
+        Commands::Generate {
+            model,
+            model_name,
+            model_variant,
+            asset,
+            chat_options,
+            keep_special_tokens,
+            prompt,
+            image,
+            max_tokens,
+            sample,
+            greedy,
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            seed,
+            generation_config,
+            override_generation_config,
+            no_eos_stop,
+            system,
+            device,
+            dtype,
+        } => {
+            let device = match parse_device(&device) {
+                Ok(device) => device,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            };
             // Report a failed generation through the exit status; a CLI that
             // printed an error and still exited 0 reads as success to any caller.
             if let Err(error) = run_generate(
                 &model,
+                model_name.as_deref(),
+                model_variant.as_deref(),
+                &asset,
+                chat_options.as_deref(),
+                keep_special_tokens,
                 &prompt,
                 image.as_ref(),
                 max_tokens,
@@ -77,7 +307,134 @@ fn main() {
                 system.as_deref(),
                 device,
                 &dtype,
+                sample,
+                greedy,
+                temperature,
+                top_k,
+                top_p,
+                repetition_penalty,
+                frequency_penalty,
+                presence_penalty,
+                seed,
+                &generation_config,
+                override_generation_config.as_deref(),
             ) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Decide {
+            model,
+            model_name,
+            prompt,
+            request,
+            system,
+            device,
+            candidates,
+            autotune,
+            tuning_dir,
+        } => {
+            let device = match parse_device(&device) {
+                Ok(device) => device,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            };
+            let options = LoadOptions {
+                model_name,
+                autotune,
+                tuning_path: tuning_dir,
+                ..LoadOptions::default()
+            };
+            let result = match (request, prompt) {
+                (Some(request), _) => run_decide_schema(
+                    &model,
+                    &request,
+                    device,
+                    options,
+                    |device, path, options| AutoModel::load_model(device, path, options),
+                    &mut std::io::stdout().lock(),
+                ),
+                (None, Some(prompt)) => run_decide(
+                    &model,
+                    &prompt,
+                    system.as_deref(),
+                    device,
+                    candidates,
+                    options,
+                ),
+                (None, None) => Err("decide needs --prompt or --request".into()),
+            };
+            if let Err(error) = result {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        Commands::GenerateImage {
+            model,
+            model_name,
+            model_variant,
+            prompt,
+            width,
+            height,
+            seed,
+            steps,
+            output,
+            device,
+        } => {
+            let request = ImageRequest {
+                prompt: &prompt,
+                width,
+                height,
+                seed,
+                steps,
+            };
+            let result = parse_device(&device).and_then(|device| {
+                run_generate_image(
+                    &model,
+                    model_name.as_deref(),
+                    model_variant.as_deref(),
+                    device,
+                    &request,
+                    &output,
+                )
+            });
+            if let Err(error) = result {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Speak {
+            model,
+            model_name,
+            model_variant,
+            text,
+            voice,
+            language,
+            instruction,
+            seed,
+            output,
+            device,
+        } => {
+            let request = SpeechRequest {
+                text: &text,
+                voice: &voice,
+                language: &language,
+                instruction: &instruction,
+                seed,
+            };
+            let result = parse_device(&device).and_then(|device| {
+                run_speak(
+                    &model,
+                    model_name.as_deref(),
+                    model_variant.as_deref(),
+                    device,
+                    &request,
+                    &output,
+                )
+            });
+            if let Err(error) = result {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
@@ -88,32 +445,508 @@ fn main() {
     }
 }
 
-fn parse_device(s: &str) -> Device {
-    match s.to_lowercase().as_str() {
-        "cuda" | "gpu" => Device::Cuda(0),
-        "cpu" => Device::Cpu,
-        _ => {
-            eprintln!("Unknown device '{s}', defaulting to CPU. Use 'cpu' or 'cuda'.");
-            Device::Cpu
+fn parse_asset(value: &str) -> Result<(String, PathBuf), String> {
+    let (name, path) = value
+        .split_once('=')
+        .ok_or("expected auxiliary asset NAME=PATH")?;
+    if name.is_empty() || path.is_empty() || name.chars().any(char::is_whitespace) {
+        return Err("expected nonempty asset name and path".into());
+    }
+    Ok((name.to_owned(), PathBuf::from(path)))
+}
+
+fn parse_device(spec: &str) -> Result<Device, String> {
+    let normalized = spec.to_ascii_lowercase();
+    let (kind, index) = match normalized.split_once(':') {
+        Some((kind, index)) => {
+            let index = index.parse::<usize>().map_err(|_| {
+                format!("Invalid device index in '{spec}'; use cpu, cuda:N, or metal:N")
+            })?;
+            (kind, index)
+        }
+        None => (normalized.as_str(), 0),
+    };
+    match kind {
+        "cpu" if index == 0 => Ok(Device::Cpu),
+        "cuda" | "gpu" => Ok(Device::Cuda(index)),
+        "metal" | "mlx" => Ok(Device::Metal(index)),
+        _ => Err(format!(
+            "Unknown device '{spec}'; use cpu, cuda:N, or metal:N (mlx:N is an alias)"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::{parse_device, run_generate_image, Cli, Commands, ImageRequest};
+    use apxinf_core::Device;
+    use clap::Parser;
+
+    #[test]
+    fn parses_explicit_accelerator_devices() {
+        assert_eq!(parse_device("cpu").unwrap(), Device::Cpu);
+        assert_eq!(parse_device("gpu").unwrap(), Device::Cuda(0));
+        assert_eq!(parse_device("cuda:2").unwrap(), Device::Cuda(2));
+        assert_eq!(parse_device("metal").unwrap(), Device::Metal(0));
+        assert_eq!(parse_device("MLX:1").unwrap(), Device::Metal(1));
+    }
+
+    #[test]
+    fn malformed_devices_do_not_fall_back_to_cpu() {
+        for spec in [
+            "tpu",
+            "",
+            "metal:",
+            "mlx:-1",
+            "cuda:x",
+            "cpu:1",
+            "metal:0:1",
+        ] {
+            assert!(parse_device(spec).is_err(), "accepted {spec}");
+        }
+    }
+
+    #[test]
+    fn accepts_explicit_family_and_variant() {
+        let cli = Cli::try_parse_from([
+            "apxinf",
+            "generate",
+            "--model",
+            "/checkpoint",
+            "--prompt",
+            "hello",
+            "--device",
+            "metal",
+            "--model-name",
+            "minicpm5",
+            "--model-variant",
+            "bf16-compiled",
+        ])
+        .unwrap();
+        let Commands::Generate {
+            model_name,
+            model_variant,
+            ..
+        } = cli.command
+        else {
+            panic!("expected generate command");
+        };
+        assert_eq!(model_name.as_deref(), Some("minicpm5"));
+        assert_eq!(model_variant.as_deref(), Some("bf16-compiled"));
+    }
+
+    #[test]
+    fn decide_takes_a_prompt_or_a_schema_request() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["apxinf", "decide", "--model", "/m"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        let cli = parse(&["--request", "/r.json", "--device", "metal"]).unwrap();
+        let Commands::Decide {
+            prompt, request, ..
+        } = cli.command
+        else {
+            panic!("expected decide command");
+        };
+        assert_eq!(
+            (prompt, request),
+            (None, Some(std::path::PathBuf::from("/r.json")))
+        );
+        assert!(parse(&["--prompt", "p"]).is_ok());
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--prompt", "p", "--request", "/r.json"]).is_err());
+        assert!(parse(&["--request", "/r.json", "--candidates", "2"]).is_err());
+    }
+
+    #[test]
+    fn image_cli_accepts_reference_variant() {
+        let result = Cli::try_parse_from([
+            "apxinf",
+            "generate-image",
+            "--model",
+            "/checkpoint",
+            "--prompt",
+            "a red bicycle",
+            "--output",
+            "image.ppm",
+            "--model-variant",
+            "reference",
+        ]);
+        let cli = result.unwrap_or_else(|error| panic!("reference variant rejected: {error}"));
+        let Commands::GenerateImage {
+            model_variant,
+            width,
+            height,
+            steps,
+            ..
+        } = cli.command
+        else {
+            panic!("expected generate-image command");
+        };
+        assert_eq!(model_variant.as_deref(), Some("reference"));
+        assert_eq!((width, height, steps), (1024, 1024, 40));
+    }
+
+    #[test]
+    fn image_cli_preserves_default_and_auto_variants() {
+        for variant in [None, Some("auto")] {
+            let mut arguments = vec![
+                "apxinf",
+                "generate-image",
+                "--model",
+                "/checkpoint",
+                "--prompt",
+                "a red bicycle",
+                "--output",
+                "image.ppm",
+            ];
+            if let Some(variant) = variant {
+                arguments.extend(["--model-variant", variant]);
+            }
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let Commands::GenerateImage { model_variant, .. } = cli.command else {
+                panic!("expected generate-image command");
+            };
+            assert_eq!(model_variant.as_deref(), variant);
+        }
+    }
+
+    #[test]
+    fn image_command_forwards_variant_to_loader_before_checkpoint_io() {
+        let request = ImageRequest {
+            prompt: "a red bicycle",
+            width: 512,
+            height: 512,
+            seed: 7,
+            steps: 40,
+        };
+        let error = run_generate_image(
+            &"/missing-qwen-image-checkpoint".into(),
+            Some("qwen_image"),
+            Some("reference"),
+            Device::Cpu,
+            &request,
+            &"/unused-image.ppm".into(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("model qwen_image does not yet support model_variant"),
+            "{error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod schema_decision_tests {
+    use super::*;
+    use apxinf_core::{Error, Result};
+    use apxinf_model::{
+        DecisionAnswer, DecisionOutput, DecisionRuntime, DecisionSchema, DecisionScore,
+        LlmCapabilities, LoadedModel,
+    };
+
+    const REQUEST: &str = include_str!("../tests/fixtures/decision/schema.json");
+
+    struct StubDecisionRuntime {
+        output: Option<Result<DecisionOutput>>,
+    }
+
+    impl DecisionRuntime for StubDecisionRuntime {
+        fn capabilities(&self) -> LlmCapabilities {
+            LlmCapabilities::TEXT_ONLY
+        }
+
+        fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput> {
+            let DecisionInput::Schema(schema) = input else {
+                panic!("expected schema dispatch");
+            };
+            assert_eq!(*schema, DecisionSchema::from_json(REQUEST).unwrap());
+            assert_eq!(
+                schema
+                    .questions
+                    .iter()
+                    .map(|question| question.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["zeta", "alpha"]
+            );
+            self.output.take().expect("unexpected inference call")
+        }
+
+        fn code_names(&self) -> &[String] {
+            &[]
+        }
+
+        fn token_ids(&self) -> &[u32] {
+            &[]
+        }
+    }
+
+    fn run_schema(
+        extra: &[&str],
+        load_model: impl FnOnce(Device, &std::path::Path, &LoadOptions) -> Result<LoadedModel>,
+    ) -> (std::result::Result<(), String>, String) {
+        let mut args = vec![
+            "apxinf",
+            "decide",
+            "--model",
+            "/unused-checkpoint",
+            "--model-name",
+            "clef",
+            "--device",
+            "metal:1",
+            "--request",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/decision/schema.json"
+            ),
+        ];
+        args.extend_from_slice(extra);
+        let Commands::Decide {
+            model,
+            model_name,
+            request,
+            device,
+            autotune,
+            tuning_dir,
+            ..
+        } = Cli::try_parse_from(args).unwrap().command
+        else {
+            panic!("expected decide command");
+        };
+        let mut stdout = Vec::new();
+        let result = run_decide_schema(
+            &model,
+            &request.unwrap(),
+            parse_device(&device).unwrap(),
+            LoadOptions {
+                model_name,
+                autotune,
+                tuning_path: tuning_dir,
+                ..LoadOptions::default()
+            },
+            load_model,
+            &mut stdout,
+        );
+        (result, String::from_utf8(stdout).unwrap())
+    }
+
+    #[test]
+    fn schema_forwards_tuning_options_and_loader_errors() {
+        for (flags, autotune, tuning_path) in [
+            (vec!["--autotune"], true, None),
+            (vec!["--tuning-dir", "/recipes"], false, Some("/recipes")),
+            (
+                vec!["--autotune", "--tuning-dir", "/recipes"],
+                true,
+                Some("/recipes"),
+            ),
+        ] {
+            let (result, stdout) = run_schema(&flags, |device, path, options| {
+                assert_eq!(device, Device::Metal(1));
+                assert_eq!(path, std::path::Path::new("/unused-checkpoint"));
+                assert_eq!(options.model_name.as_deref(), Some("clef"));
+                assert_eq!(options.autotune, autotune);
+                assert_eq!(
+                    options.tuning_path.as_deref(),
+                    tuning_path.map(std::path::Path::new)
+                );
+                Err(Error::Other("family rejects tuning options".into()))
+            });
+            assert_eq!(
+                result.unwrap_err(),
+                "Failed to load model: family rejects tuning options"
+            );
+            assert!(!stdout.contains("Model ready"));
+        }
+    }
+
+    #[test]
+    fn schema_dispatch_prints_grouped_answers_in_order() {
+        let (result, stdout) = run_schema(&[], |_, _, options| {
+            assert!(!options.autotune);
+            assert!(options.tuning_path.is_none());
+            let answers = [
+                ("zeta", vec![("go", 0.25), ("stay", 0.75)]),
+                (
+                    "alpha",
+                    vec![("low", 0.125), ("medium", 0.5), ("high", 0.375)],
+                ),
+            ]
+            .into_iter()
+            .map(|(question_id, scores)| DecisionAnswer {
+                question_id: Some(question_id.into()),
+                selected_index: 1,
+                scores: scores
+                    .into_iter()
+                    .map(|(code, probability)| DecisionScore {
+                        code: code.into(),
+                        token_id: None,
+                        probability,
+                    })
+                    .collect(),
+            })
+            .collect();
+            Ok(LoadedModel::Decision(Box::new(StubDecisionRuntime {
+                output: Some(Ok(DecisionOutput { answers })),
+            })))
+        });
+        result.unwrap();
+        let lines: Vec<Vec<_>> = stdout
+            .lines()
+            .skip(3)
+            .map(|line| line.split_whitespace().collect())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                vec!["zeta:", "selected", "stay", "probability", "0.75000000"],
+                vec!["go", "probability=0.25000000"],
+                vec!["stay", "probability=0.75000000"],
+                vec!["alpha:", "selected", "medium", "probability", "0.50000000"],
+                vec!["low", "probability=0.12500000"],
+                vec!["medium", "probability=0.50000000"],
+                vec!["high", "probability=0.37500000"],
+            ]
+        );
+    }
+
+    #[test]
+    fn schema_dispatch_propagates_runtime_and_output_errors() {
+        for (output, expected) in [
+            (
+                Err(Error::Other("schema unsupported by runtime".into())),
+                "Decision failed: schema unsupported by runtime",
+            ),
+            (
+                Ok(DecisionOutput {
+                    answers: vec![DecisionAnswer {
+                        question_id: Some("zeta".into()),
+                        selected_index: 0,
+                        scores: vec![],
+                    }],
+                }),
+                "Invalid decision output: decision output: selected index 0 outside 0 scores",
+            ),
+        ] {
+            let (result, stdout) = run_schema(&[], |_, _, _| {
+                Ok(LoadedModel::Decision(Box::new(StubDecisionRuntime {
+                    output: Some(output),
+                })))
+            });
+            assert_eq!(result.unwrap_err(), expected);
+            assert!(!stdout.contains("selected"));
         }
     }
 }
 
+fn run_decide_schema(
+    model_dir: &PathBuf,
+    request: &PathBuf,
+    device: Device,
+    mut options: LoadOptions,
+    load_model: impl FnOnce(
+        Device,
+        &std::path::Path,
+        &LoadOptions,
+    ) -> apxinf_core::Result<apxinf_model::LoadedModel>,
+    writer: &mut impl Write,
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(request)
+        .map_err(|error| format!("Failed to read {request:?}: {error}"))?;
+    let schema =
+        apxinf_model::DecisionSchema::from_json(&text).map_err(|error| error.to_string())?;
+    let model_name = match options.model_name.as_ref() {
+        Some(name) => name.clone(),
+        None => AutoModel::detect_model_name(model_dir)
+            .map_err(|error| format!("Failed to detect model type: {error}"))?,
+    };
+    options.model_name = Some(model_name.clone());
+    writeln!(writer, "Loading {model_name} from {:?}...", model_dir)
+        .map_err(|error| error.to_string())?;
+    let mut model = load_model(device, model_dir, &options)
+        .map_err(|error| format!("Failed to load model: {error}"))?;
+    writeln!(writer, "Model ready.\n").map_err(|error| error.to_string())?;
+    let output = model
+        .decide(DecisionInput::Schema(&schema))
+        .map_err(|error| format!("Decision failed: {error}"))?;
+    for answer in &output.answers {
+        let selected = answer
+            .selected()
+            .map_err(|error| format!("Invalid decision output: {error}"))?;
+        writeln!(
+            writer,
+            "{}: selected {}  probability {:.8}",
+            answer.question_id.as_deref().unwrap_or("-"),
+            selected.code,
+            selected.probability
+        )
+        .map_err(|error| error.to_string())?;
+        for score in &answer.scores {
+            writeln!(
+                writer,
+                "  {:<20}  probability={:.8}",
+                score.code, score.probability
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 fn run_generate(
     model_dir: &PathBuf,
+    model_name_override: Option<&str>,
+    model_variant: Option<&str>,
+    assets: &[(String, PathBuf)],
+    chat_options: Option<&str>,
+    keep_special_tokens: bool,
     prompt: &str,
     image_path: Option<&PathBuf>,
-    max_tokens: usize,
+    max_tokens: Option<usize>,
     eos_stop: bool,
     system_prompt: Option<&str>,
     device: Device,
     dtype: &str,
+    sample: bool,
+    greedy: bool,
+    temperature: Option<f32>,
+    top_k: Option<i64>,
+    top_p: Option<f32>,
+    repetition_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    seed: Option<u64>,
+    generation_config: &str,
+    override_generation_config: Option<&str>,
 ) -> Result<(), String> {
     println!("apxinf — LLM/VLM inference engine");
     println!();
 
-    let model_name = AutoModel::detect_model_name(model_dir)
-        .map_err(|error| format!("Failed to detect model type: {error}"))?;
+    let mut asset_map = std::collections::BTreeMap::new();
+    for (name, path) in assets {
+        if asset_map.insert(name.clone(), path.clone()).is_some() {
+            return Err(format!("duplicate auxiliary asset: {name}"));
+        }
+    }
+    if image_path.is_some() && chat_options.is_some() {
+        return Err("--chat-options currently supports text prompts only".into());
+    }
+    let template_options = chat_options
+        .map(|raw| {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw)
+                .map_err(|e| format!("invalid --chat-options object: {e}"))
+        })
+        .transpose()?;
+    let skip_special_tokens = !(keep_special_tokens
+        || template_options
+            .as_ref()
+            .is_some_and(|options| options.contains_key("tools")));
+    let model_name = match model_name_override {
+        Some(name) => name.to_owned(),
+        None => AutoModel::detect_model_name(model_dir)
+            .map_err(|error| format!("Failed to detect model type: {error}"))?,
+    };
     if image_path.is_some() && !matches!(model_name.as_str(), "qwen3_vl" | "qwen3vl") {
         return Err(format!("Model `{model_name}` does not support image input"));
     }
@@ -124,11 +957,7 @@ fn run_generate(
         .map_err(|error| format!("Failed to load tokenizer: {error}"))?;
     println!("Vocab size: {}", tok.vocab_size());
 
-    let eos_token_id = if eos_stop {
-        tok.eos_token_id()
-    } else {
-        None
-    };
+    let eos_token_id = tok.eos_token_id();
     if let Some(eos) = eos_token_id {
         println!("EOS token ID: {eos}");
     }
@@ -150,7 +979,7 @@ fn run_generate(
             .map_err(|error| format!("Invalid processor output: {error}"))?;
         (tokens, Some((pixels, vec![grid])))
     } else {
-        let tokens = encode_prompt(&tok, prompt, system_prompt)
+        let tokens = encode_prompt(&tok, prompt, system_prompt, template_options.as_ref())
             .map_err(|error| format!("Failed to encode prompt: {error}"))?;
         (tokens, None)
     };
@@ -164,61 +993,327 @@ fn run_generate(
             ))
         }
     };
+    let generation_overrides = override_generation_config
+        .map(GenerationOptions::from_json_str)
+        .transpose()
+        .map_err(|error| format!("Invalid --override-generation-config: {error}"))?
+        .unwrap_or_default();
     let options = LoadOptions {
         model_name: Some(model_name.clone()),
+        model_variant: model_variant.map(str::to_owned),
+        assets: asset_map,
         text_weight_dtype,
+        generation_config: GenerationConfigSource::from_cli_value(generation_config),
+        generation_overrides,
         ..LoadOptions::default()
     };
 
-    println!("Loading {model_name} from {:?}... (dtype: {dtype})", model_dir);
+    println!(
+        "Loading {model_name} from {:?}... (dtype: {dtype})",
+        model_dir
+    );
     let mut model = AutoModel::load_model(device, model_dir, &options)
         .map_err(|error| format!("Failed to load model: {error}"))?;
     if prepared_image.is_some() {
         match model.text_capabilities() {
             Ok(capabilities) if capabilities.image => {}
-            Ok(_) => {
-                return Err(format!("Model `{model_name}` does not support image input"))
-            }
+            Ok(_) => return Err(format!("Model `{model_name}` does not support image input")),
             Err(error) => return Err(format!("Cannot generate with this model: {error}")),
         }
     }
     println!("Model ready.");
 
     let input = match prepared_image.as_ref() {
-        Some((pixels, grids)) => {
-            LlmInput::with_image(&tokens, ImageInput::new(pixels, grids))
-        }
+        Some((pixels, grids)) => LlmInput::with_image(&tokens, ImageInput::new(pixels, grids)),
         None => LlmInput::text(&tokens),
     };
 
+    let configured_eos = model
+        .generation_defaults()
+        .map_err(|error| format!("Cannot read generation defaults: {error}"))?
+        .eos_token_ids
+        .is_some();
+    let effective_max_tokens = max_tokens
+        .or(model
+            .generation_defaults()
+            .ok()
+            .and_then(|defaults| defaults.max_new_tokens))
+        .unwrap_or(GenerationOptions::DEFAULT_MAX_NEW_TOKENS);
+
     println!();
-    println!("Generating {max_tokens} tokens...");
+    println!("Generating up to {effective_max_tokens} tokens...");
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut all_tokens = tokens.clone();
 
-    let (_, profile) = model
-        .generate_streaming(
-            input,
-            max_tokens,
-            |token_id| {
-                all_tokens.push(token_id);
-                if let Ok(text) = tok.decode(&all_tokens) {
-                    let previous = tok
-                        .decode(&all_tokens[..all_tokens.len() - 1])
-                        .unwrap_or_default();
-                    let delta = text.strip_prefix(&previous).unwrap_or(&text);
-                    print!("{delta}");
-                    out.flush().ok();
-                }
-            },
-            eos_token_id,
-        )
+    let generation_options = GenerationOptions {
+        max_new_tokens: max_tokens,
+        eos_token_ids: if !eos_stop {
+            Some(Vec::new())
+        } else if configured_eos {
+            None
+        } else {
+            eos_token_id.map(|id| vec![id])
+        },
+        sampling_mode: if sample {
+            Some(SamplingMode::Random)
+        } else if greedy {
+            Some(SamplingMode::Greedy)
+        } else {
+            None
+        },
+        temperature,
+        top_k,
+        top_p,
+        repetition_penalty,
+        frequency_penalty,
+        presence_penalty,
+        seed,
+        return_logprob: Some(false),
+    };
+    let output = model
+        .generate_streaming_with_options(input, &generation_options, |token| {
+            let token_id = token.token_id;
+            all_tokens.push(token_id);
+            if let Ok(text) = tok.decode_with_options(&all_tokens, skip_special_tokens) {
+                let previous = tok
+                    .decode_with_options(&all_tokens[..all_tokens.len() - 1], skip_special_tokens)
+                    .unwrap_or_default();
+                let delta = text.strip_prefix(&previous).unwrap_or(&text);
+                print!("{delta}");
+                out.flush().ok();
+            }
+        })
         .map_err(|error| format!("Generation failed: {error}"))?;
 
     println!();
     println!();
-    println!("{}", profile.summary());
+    println!("{}", output.profile.summary());
+    Ok(())
+}
+
+fn run_generate_image(
+    model_dir: &PathBuf,
+    model_name_override: Option<&str>,
+    model_variant: Option<&str>,
+    device: Device,
+    request: &ImageRequest<'_>,
+    output: &PathBuf,
+) -> Result<(), String> {
+    let model_name = match model_name_override {
+        Some(name) => name.to_owned(),
+        None => AutoModel::detect_model_name(model_dir)
+            .map_err(|error| format!("Failed to detect model type: {error}"))?,
+    };
+    let options = LoadOptions {
+        model_name: Some(model_name.clone()),
+        model_variant: model_variant.map(str::to_owned),
+        ..LoadOptions::default()
+    };
+    eprintln!("Loading {model_name} from {:?}...", model_dir);
+    let started = std::time::Instant::now();
+    let mut model = AutoModel::load_model(device, model_dir, &options)
+        .map_err(|error| format!("Failed to load model: {error}"))?;
+    eprintln!("Loaded in {:.2}s", started.elapsed().as_secs_f64());
+    let started = std::time::Instant::now();
+    let image = model
+        .generate_image(request)
+        .map_err(|error| format!("Image generation failed: {error}"))?;
+    eprintln!("Generated in {:.2}s", started.elapsed().as_secs_f64());
+    let mut ppm = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
+    ppm.extend_from_slice(&image.rgb);
+    std::fs::write(output, ppm)
+        .map_err(|error| format!("Failed to write {}: {error}", output.display()))?;
+    println!("{}", output.display());
+    Ok(())
+}
+
+fn run_speak(
+    model_dir: &PathBuf,
+    model_name_override: Option<&str>,
+    model_variant: Option<&str>,
+    device: Device,
+    request: &SpeechRequest<'_>,
+    output: &PathBuf,
+) -> Result<(), String> {
+    let model_name = match model_name_override {
+        Some(name) => name.to_owned(),
+        None => AutoModel::detect_model_name(model_dir)
+            .map_err(|error| format!("Failed to detect model type: {error}"))?,
+    };
+    let options = LoadOptions {
+        model_name: Some(model_name.clone()),
+        model_variant: model_variant.map(str::to_owned),
+        ..LoadOptions::default()
+    };
+    eprintln!("Loading {model_name} from {:?}...", model_dir);
+    let started = std::time::Instant::now();
+    let mut model = AutoModel::load_model(device, model_dir, &options)
+        .map_err(|error| format!("Failed to load model: {error}"))?;
+    eprintln!("Loaded in {:.2}s", started.elapsed().as_secs_f64());
+    let started = std::time::Instant::now();
+    let audio = model
+        .synthesize(request)
+        .map_err(|error| format!("Speech synthesis failed: {error}"))?;
+    let seconds = audio.samples.len() as f64 / audio.channels as f64 / audio.sample_rate as f64;
+    eprintln!(
+        "Synthesized {seconds:.2}s of audio in {:.2}s{}",
+        started.elapsed().as_secs_f64(),
+        if audio.complete {
+            ""
+        } else {
+            " (stopped at the length limit)"
+        }
+    );
+    std::fs::write(output, float_wav(&audio))
+        .map_err(|error| format!("Failed to write {}: {error}", output.display()))?;
+    println!("{}", output.display());
+    Ok(())
+}
+
+/// RIFF WAVE with IEEE float samples (format 3), so samples are stored exactly.
+fn float_wav(audio: &apxinf_model::GeneratedAudio) -> Vec<u8> {
+    let data = (audio.samples.len() * 4) as u32;
+    let channels = audio.channels as u16;
+    let mut out = Vec::with_capacity(44 + data as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&3u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&audio.sample_rate.to_le_bytes());
+    out.extend_from_slice(&(audio.sample_rate * 4 * channels as u32).to_le_bytes());
+    out.extend_from_slice(&(4 * channels).to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data.to_le_bytes());
+    for sample in &audio.samples {
+        out.extend_from_slice(&sample.to_le_bytes());
+    }
+    out
+}
+
+#[cfg(test)]
+mod wav_tests {
+    use super::float_wav;
+    use apxinf_model::GeneratedAudio;
+
+    #[test]
+    fn float_wav_header_describes_the_samples() {
+        let audio = GeneratedAudio {
+            sample_rate: 24000,
+            channels: 1,
+            samples: vec![0.5, -0.25, 1.0],
+            complete: true,
+        };
+        let wav = float_wav(&audio);
+        let u32_at = |i: usize| u32::from_le_bytes(wav[i..i + 4].try_into().unwrap());
+        let u16_at = |i: usize| u16::from_le_bytes(wav[i..i + 2].try_into().unwrap());
+        assert_eq!(
+            (&wav[0..4], &wav[8..16], &wav[36..40]),
+            (&b"RIFF"[..], &b"WAVEfmt "[..], &b"data"[..])
+        );
+        assert_eq!(
+            (u32_at(4), u16_at(20), u16_at(22), u32_at(24)),
+            (36 + 12, 3, 1, 24000)
+        );
+        assert_eq!(
+            (u32_at(28), u16_at(32), u16_at(34), u32_at(40)),
+            (96000, 4, 32, 12)
+        );
+        assert_eq!(f32::from_le_bytes(wav[48..52].try_into().unwrap()), -0.25);
+    }
+}
+
+fn run_decide(
+    model_dir: &PathBuf,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    device: Device,
+    candidates: Option<usize>,
+    mut options: LoadOptions,
+) -> Result<(), String> {
+    println!("apxinf — decision inference engine");
+    println!();
+
+    let model_name = match options.model_name.as_ref() {
+        Some(name) => name.clone(),
+        None => AutoModel::detect_model_name(model_dir)
+            .map_err(|error| format!("Failed to detect model type: {error}"))?,
+    };
+
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    println!("Loading tokenizer from {:?}...", tokenizer_path);
+    let tok = Tokenizer::from_file(&tokenizer_path)
+        .map_err(|error| format!("Failed to load tokenizer: {error}"))?;
+    println!("Vocab size: {}", tok.vocab_size());
+
+    // d3_format.py requires exact Hugging Face chat-template bytes and disables
+    // the Qwen thinking preamble. The legacy no-options path normalizes blank
+    // lines, which changes the Decision 3 prompt contract.
+    let template_options = serde_json::Map::from_iter([(
+        "enable_thinking".to_string(),
+        serde_json::Value::Bool(false),
+    )]);
+    let tokens = encode_prompt(&tok, prompt, system_prompt, Some(&template_options))
+        .map_err(|error| format!("Failed to encode prompt: {error}"))?;
+    println!("Prompt tokens: {}", tokens.len());
+
+    options.model_name = Some(model_name.clone());
+
+    println!("Loading {model_name} from {:?}...", model_dir);
+    let mut model = AutoModel::load_model(device, model_dir, &options)
+        .map_err(|error| format!("Failed to load model: {error}"))?;
+
+    let code_names = model
+        .decision_code_names()
+        .map_err(|error| format!("Not a decision model: {error}"))?;
+    let candidate_count = candidates.unwrap_or(code_names.len());
+    if candidate_count == 0 || candidate_count > code_names.len() {
+        return Err(format!(
+            "--candidates {candidate_count} is outside 1..={}",
+            code_names.len()
+        ));
+    }
+    println!(
+        "Codes: {} (scoring top {candidate_count})",
+        code_names.len()
+    );
+    println!("Model ready.");
+    println!();
+
+    let output = model
+        .decide(DecisionInput::text(&tokens, candidate_count))
+        .and_then(|output| output.into_single())
+        .map_err(|error| format!("Decision failed: {error}"))?;
+
+    let selected = output
+        .selected()
+        .map_err(|error| format!("Invalid decision output: {error}"))?;
+    let token = |score: &apxinf_model::DecisionScore| {
+        score
+            .token_id
+            .map_or_else(|| "-".to_owned(), |id| id.to_string())
+    };
+    println!(
+        "selected: {}  token_id: {}  probability: {:.8}",
+        selected.code,
+        token(selected),
+        selected.probability
+    );
+    println!();
+    println!("top-5:");
+    let mut top = output.scores;
+    top.sort_by(|left, right| right.probability.total_cmp(&left.probability));
+    for score in top.iter().take(5) {
+        println!(
+            "  {:<20}  token_id={:>6}  probability={:.8}",
+            score.code,
+            token(score),
+            score.probability
+        );
+    }
     Ok(())
 }
 
@@ -226,6 +1321,7 @@ fn encode_prompt(
     tokenizer: &Tokenizer,
     prompt: &str,
     system_prompt: Option<&str>,
+    template_options: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Vec<u32>, String> {
     if tokenizer.has_chat_template() {
         let mut messages = Vec::new();
@@ -233,7 +1329,15 @@ fn encode_prompt(
             messages.push(ChatMessage::system(system));
         }
         messages.push(ChatMessage::user(prompt));
-        tokenizer.encode_chat(&messages).map_err(|error| error.to_string())
+        match template_options {
+            Some(options) => tokenizer
+                .apply_chat_template_with_options(&messages, options)
+                .and_then(|text| tokenizer.encode(&text))
+                .map_err(|error| error.to_string()),
+            None => tokenizer
+                .encode_chat(&messages)
+                .map_err(|error| error.to_string()),
+        }
     } else {
         tokenizer.encode(prompt).map_err(|error| error.to_string())
     }
@@ -250,10 +1354,8 @@ fn preprocess_image(
     use std::process::Command;
 
     let suffix = std::process::id();
-    let pixel_path =
-        std::env::temp_dir().join(format!("apxinf-cli-{suffix}-pixels.npy"));
-    let metadata_path =
-        std::env::temp_dir().join(format!("apxinf-cli-{suffix}-metadata.json"));
+    let pixel_path = std::env::temp_dir().join(format!("apxinf-cli-{suffix}-pixels.npy"));
+    let metadata_path = std::env::temp_dir().join(format!("apxinf-cli-{suffix}-metadata.json"));
     let script = r#"
 import json
 import sys
@@ -326,16 +1428,13 @@ with open(metadata_path, "w") as output:
     let grid = [
         grid_values[0]
             .as_u64()
-            .ok_or_else(|| "processor grid T is not an integer".to_string())?
-            as u32,
+            .ok_or_else(|| "processor grid T is not an integer".to_string())? as u32,
         grid_values[1]
             .as_u64()
-            .ok_or_else(|| "processor grid H is not an integer".to_string())?
-            as u32,
+            .ok_or_else(|| "processor grid H is not an integer".to_string())? as u32,
         grid_values[2]
             .as_u64()
-            .ok_or_else(|| "processor grid W is not an integer".to_string())?
-            as u32,
+            .ok_or_else(|| "processor grid W is not an integer".to_string())? as u32,
     ];
     let tokens = metadata
         .get("tokens")
@@ -357,9 +1456,7 @@ with open(metadata_path, "w") as output:
 }
 
 /// Read a NumPy v1 f32 array and convert it to bf16.
-fn read_npy_f32_to_bf16(
-    path: &std::path::Path,
-) -> Result<(Vec<usize>, Vec<half::bf16>), String> {
+fn read_npy_f32_to_bf16(path: &std::path::Path) -> Result<(Vec<usize>, Vec<half::bf16>), String> {
     use std::io::Read;
 
     let mut file =
@@ -400,9 +1497,7 @@ fn read_npy_f32_to_bf16(
     }
     let data = raw
         .chunks_exact(4)
-        .map(|bytes| {
-            half::bf16::from_f32(f32::from_le_bytes(bytes.try_into().unwrap()))
-        })
+        .map(|bytes| half::bf16::from_f32(f32::from_le_bytes(bytes.try_into().unwrap())))
         .collect();
     Ok((shape, data))
 }
@@ -488,7 +1583,10 @@ fn cuda_test() {
     let silu_gpu = activation::silu(&ctx, &x_gpu).unwrap();
     let silu_cpu = transfers::to_cpu(&silu_gpu).unwrap();
     let silu_data = silu_cpu.as_f32().unwrap();
-    let _silu_expected: Vec<f32> = [1.0f32, -1.0, 0.0, 2.0].iter().map(|x| x / (1.0 + (-x).exp())).collect();
+    let _silu_expected: Vec<f32> = [1.0f32, -1.0, 0.0, 2.0]
+        .iter()
+        .map(|x| x / (1.0 + (-x).exp()))
+        .collect();
     println!("[CUDA] silu: {:?}", silu_data);
 
     // Add test
@@ -522,7 +1620,8 @@ fn cuda_test() {
     println!("[CUDA] softmax: {:?}", softmax_cpu.as_f32().unwrap());
 
     // RoPE test
-    let rope_input = Tensor::from_f32(vec![2, 4], &[1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0]).unwrap();
+    let rope_input =
+        Tensor::from_f32(vec![2, 4], &[1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0]).unwrap();
     let rope_gpu = transfers::to_cuda(&rope_input, 0).unwrap();
     let rope_out = rope::apply(&ctx, &rope_gpu, 2, 4, 10000.0, 0).unwrap();
     let rope_cpu = transfers::to_cpu(&rope_out).unwrap();

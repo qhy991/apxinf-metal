@@ -2,7 +2,7 @@
 
 Every step is an independently-callable :class:`ProcessorStep`; :class:`Pipeline`
 chains them. Nothing here imports ``apxinf_py`` or touches CUDA, so the whole
-module unit-tests offline (sentencepiece is imported lazily by the tokenizer).
+module unit-tests offline (the native binding is imported lazily by the tokenizer).
 """
 
 from __future__ import annotations
@@ -10,9 +10,9 @@ from __future__ import annotations
 from .base import Pipeline, ProcessorStep
 from .noise import GaussianNoise
 from .normalize import Normalizer, Unnormalizer, load_norm_stats
-from .resize import ParseImage, ResizeWithPad
+from .resize import ParseImage, ResizeWithPad, ResizeWithPadNoAntialias
 from .tokenize import PromptTokenizer, SyntheticTokenizer, build_prompt, discretize_state
-from .transforms import ImageStack, SampleNoise, Tokenize, Trim
+from .transforms import ImageStack, SampleNoise, Tokenize, Trim, has_key, lookup_key, set_key
 from .transforms import Unnormalize as UnnormalizeStep
 
 __all__ = [
@@ -20,6 +20,7 @@ __all__ = [
     "Pipeline",
     "ParseImage",
     "ResizeWithPad",
+    "ResizeWithPadNoAntialias",
     "PromptTokenizer",
     "SyntheticTokenizer",
     "build_prompt",
@@ -31,6 +32,9 @@ __all__ = [
     # dict->dict steps for a policy's pre/post pipeline
     "ImageStack",
     "Tokenize",
+    "lookup_key",
+    "has_key",
+    "set_key",
     "SampleNoise",
     "Trim",
     "UnnormalizeStep",

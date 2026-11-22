@@ -1,6 +1,6 @@
 """Processor steps and the :class:`Pipeline` container.
 
-Design (mirrors the PRD's "narrow interface, thick module" goal):
+Interfaces:
 
 * A :class:`ProcessorStep` is a plain callable. Its ``__call__`` takes the
   step's *natural* input (an image, a prompt, an action array, nothing) and
@@ -9,10 +9,13 @@ Design (mirrors the PRD's "narrow interface, thick module" goal):
   ``unnormalizer(action)`` — without a pipeline and without touching the model.
 * :meth:`ProcessorStep.with_overrides` returns a reconfigured *copy* of a step,
   tweaking only the knobs the step advertises in ``PARAMS``. Heavy state (a
-  loaded SentencePiece model) is shared by shallow copy, not rebuilt.
+  loaded native tokenizer) is shared by shallow copy, not rebuilt.
 * :class:`Pipeline` chains named steps left-to-right, threading one value
   through, and supports whole-step replacement and per-step parameter override
-  while leaving the other steps untouched.
+  while leaving the other steps untouched. It also composes: ``prepend`` /
+  ``append`` wrap a chain from outside without naming anything inside it, which
+  is how one layer (a robot adapter) wraps another's chain (a model's pre/post
+  steps) without depending on its internals.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ import abc
 import copy
 from typing import Any, Iterable, Sequence, Tuple, Union
 
-__all__ = ["ProcessorStep", "Pipeline"]
+__all__ = ["ProcessorStep", "Pipeline", "StepSpec"]
 
 
 class ProcessorStep(abc.ABC):
@@ -136,6 +139,22 @@ class Pipeline:
             if step_name == name:
                 return i
         raise KeyError(f"Pipeline has no step named {name!r}; have {self.names}")
+
+    # --- composition: wrap a chain without naming its existing steps ---------
+
+    def prepend(self, *specs: StepSpec) -> "Pipeline":
+        """Return a new pipeline running ``specs``, in order, before every current step.
+
+        Names must not collide with the existing ones (``Pipeline.__init__``
+        rejects duplicates), so a wrapper cannot silently shadow an inner step.
+        """
+        return Pipeline([self._normalize(spec) for spec in specs] + list(self._steps))
+
+    def append(self, *specs: StepSpec) -> "Pipeline":
+        """Return a new pipeline running ``specs``, in order, after every current step."""
+        return Pipeline(list(self._steps) + [self._normalize(spec) for spec in specs])
+
+    # --- editing: address one existing step by name --------------------------
 
     def replace(self, name: str, step: ProcessorStep) -> "Pipeline":
         """Return a new pipeline with the whole step ``name`` swapped out."""
