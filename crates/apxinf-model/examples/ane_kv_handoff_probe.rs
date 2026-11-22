@@ -151,11 +151,9 @@ mod native {
     /// identical in spirit to `crates/apxinf-mlx/native/ane_tile_merge.metal`:
     /// one thread per output element, a direct 32-bit index, no arithmetic.
     const COPY_KERNEL_SOURCE: &str = r#"
-    const uint n = uint(n);
     const uint tid = thread_position_in_grid.x;
-    if (tid < n) {
-        out[tid] = bfloat(src[tid]);
-    }
+    if (tid >= uint(N)) return;
+    out[tid] = static_cast<bfloat16_t>(src[tid]);
     "#;
 
     /// Peak M4 memory bandwidth (RUNNER §2) rounded to a hard 150 GB/s
@@ -174,13 +172,14 @@ mod native {
         let bytes = state_bytes_expected(p)?;
         let stream = Stream::metal(0)?;
         let source = mock_state(&stream, p)?;
+        let header = format!("constant uint N = {}u;\n", n);
         let kernel = MetalKernel::new(
             &stream,
             "apxinf_p2_state_copy",
-            &["src", "n"],
+            &["src"],
             &["out"],
             COPY_KERNEL_SOURCE,
-            "",
+            &header,
         )?;
         let shape = state_shape(p);
         let n = source.numel();
@@ -196,12 +195,6 @@ mod native {
                 n * 2
             )));
         }
-        let n_array = Array::from_i32(
-            &stream,
-            &[1],
-            &[i32::try_from(n)
-                .map_err(|_| err(format!("copy arm element count exceeds i32: {n}")))?],
-        )?;
         // Each of the `n` threads owns one BF16 element: reads `src` and
         // writes the fresh `out` at the same 32-bit index. The grid is `n` and
         // the threadgroup is 1024, so `thread_position_in_grid.x` ranges
@@ -209,7 +202,7 @@ mod native {
         let copy_once = || -> Result<Array> {
             let outputs = unsafe {
                 kernel.call(
-                    &[source.clone(), n_array.clone()],
+                    &[source.clone()],
                     &[(&shape, MlxDType::BF16)],
                     [n, 1, 1],
                     [1024, 1, 1],
