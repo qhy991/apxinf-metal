@@ -172,15 +172,6 @@ mod native {
         let bytes = state_bytes_expected(p)?;
         let stream = Stream::metal(0)?;
         let source = mock_state(&stream, p)?;
-        let header = format!("constant uint N = {}u;\n", n);
-        let kernel = MetalKernel::new(
-            &stream,
-            "apxinf_p2_state_copy",
-            &["src"],
-            &["out"],
-            COPY_KERNEL_SOURCE,
-            &header,
-        )?;
         let shape = state_shape(p);
         let n = source.numel();
         if n != shape.iter().product::<usize>() {
@@ -195,6 +186,15 @@ mod native {
                 n * 2
             )));
         }
+        let header = format!("constant uint N = {}u;\n", n);
+        let kernel = MetalKernel::new(
+            &stream,
+            "apxinf_p2_state_copy",
+            &["src"],
+            &["out"],
+            COPY_KERNEL_SOURCE,
+            &header,
+        )?;
         // Each of the `n` threads owns one BF16 element: reads `src` and
         // writes the fresh `out` at the same 32-bit index. The grid is `n` and
         // the threadgroup is 1024, so `thread_position_in_grid.x` ranges
