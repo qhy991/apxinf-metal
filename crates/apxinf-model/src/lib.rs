@@ -3,11 +3,16 @@
 mod accelerator;
 pub mod auto;
 pub mod builtin;
+pub mod cuda_cosmos_policy;
+#[cfg(feature = "cuda")]
+pub mod cuda_gpt_sovits;
 pub mod d3;
 pub mod debug;
 pub mod decision;
 mod generation_config;
 pub mod gr00t;
+#[cfg(feature = "hip")]
+pub mod hip_gr00t;
 #[cfg(feature = "hip")]
 pub mod hip_pi05;
 pub mod image;
@@ -18,6 +23,8 @@ pub mod metal_clef;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_d3_lite;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_d3;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_minicpm5;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_qwen3;
@@ -25,6 +32,8 @@ pub mod metal_qwen3;
 pub mod metal_qwen_image;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_qwen3_tts;
+#[cfg(feature = "musa")]
+pub mod musa_pi05;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 mod mlx_decode;
 pub mod pi05;
@@ -38,8 +47,13 @@ pub mod registry;
 #[cfg(feature = "cuda")]
 pub mod smolvla;
 pub mod speech;
+pub mod tts_trait;
+pub mod vision_preprocess;
 pub mod vla;
 mod walloss;
+
+/// Self-contained FP32 CPU PI0.5 port.
+pub mod cpu_pi05;
 
 pub use auto::{AutoModel, LoadOptions, LoadedModel, ModelPrecision, SyntheticWeights};
 pub use builtin::register_builtin_models;
@@ -54,7 +68,11 @@ pub use decision::{
     SchemaDecisionOutput, SchemaDecisionRuntime, SchemaDecisionScore,
 };
 pub use image::{GeneratedImage, ImageRequest, ImageRuntime};
-pub use speech::{GeneratedAudio, SpeechRequest, SpeechRuntime};
+pub use speech::{GeneratedAudio as SpeechGeneratedAudio, SpeechRequest, SpeechRuntime};
+pub use tts_trait::{
+    GeneratedAudio, GptSovitsInputs, PreparedTts, TtsCacheConfig, TtsCacheInfo, TtsContract,
+    TtsExtension, TtsRequest, TtsTrait, TtsSampling, TtsSpec, gpt_sovits_inputs,
+};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};
 #[cfg(feature = "cuda")]
 pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};

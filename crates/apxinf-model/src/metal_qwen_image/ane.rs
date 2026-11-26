@@ -381,7 +381,7 @@ impl Programs {
         for i in 0..transformer.blocks.len() {
             let manifest = manifest(&identity, i, &hardware);
             let miss = Instant::now();
-            let (path, hit) = cache.compiled_for(&manifest, || package(i))?;
+            let (path, hit) = apxinf_coreml::compiled_for(&cache, &manifest, || package(i))?;
             if hit {
                 hits += 1;
             } else {
@@ -396,11 +396,11 @@ impl Programs {
         for (i, (path, hit, manifest)) in entries.into_iter().enumerate() {
             models.push(match Model::load(&path, UNITS) {
                 Err(_) if hit => {
-                    cache.evict(&path)?;
+                    apxinf_coreml::evict(&cache, &path)?;
                     hits -= 1;
                     rebuilt += 1;
                     let miss = Instant::now();
-                    let (path, _) = cache.compiled_for(&manifest, || package(i))?;
+                    let (path, _) = apxinf_coreml::compiled_for(&cache, &manifest, || package(i))?;
                     built += miss.elapsed().as_secs_f64();
                     Model::load(&path, UNITS)?
                 }

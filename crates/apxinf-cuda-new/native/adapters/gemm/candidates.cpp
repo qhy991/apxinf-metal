@@ -104,6 +104,22 @@ bool supports_native_fp8_bias_gelu(const Spec& spec) {
          spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE;
 }
 
+bool supports_native_f16_bias(const Spec& spec) {
+  return supports_cublaslt(spec) &&
+         spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+         spec.a_dtype == APXINF_DTYPE_F16 &&
+         spec.b_dtype == APXINF_DTYPE_F16 &&
+         spec.output_dtype == APXINF_DTYPE_F16 &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE &&
+         spec.k % 2 == 0 && spec.n % 2 == 0 &&
+         spec.alpha_is_unit != 0 && spec.output_scale_is_unit != 0 &&
+         // The fused heuristic is only equivalent to the staged F32 projection
+         // plus bias-before-cast when every binding meets the 256-byte contract
+         // used to choose it.
+         spec.a_alignment >= 256 && spec.b_alignment >= 256 &&
+         spec.bias_alignment >= 256 && spec.output_alignment >= 256;
+}
+
 AlignmentRequirements vendor_alignment(const Spec&) {
   return {};
 }
@@ -117,6 +133,18 @@ AlignmentRequirements cublaslt_alignment(const Spec&) {
   requirements.b = 16;
   requirements.output = 16;
   requirements.residual = 16;
+  return requirements;
+}
+
+AlignmentRequirements fused_f16_bias_alignment(const Spec& spec) {
+  auto requirements = cublaslt_alignment(spec);
+  // The Torch-compatible dense-linear recipe is selected with a 256-byte
+  // minimum alignment; this is what selects the same split-K implementation as
+  // aten::addmm on the target architecture.
+  requirements.a = 256;
+  requirements.b = 256;
+  requirements.bias = 256;
+  requirements.output = 256;
   return requirements;
 }
 
@@ -212,6 +240,39 @@ void cublaslt_configurations(const Spec&,
                              std::vector<int>& configs) {
   for (int rank = 0; rank < 8; ++rank) {
     configs.push_back(rank);
+  }
+}
+
+// The extended tile/custom-option sweep is a Cosmos Policy joint-latent
+// optimization. It is gated on the plain-BF16 M=1764 token geometry that only
+// that family produces: enumerating 72 more configurations for every family's
+// BF16 GEMM would multiply first-run autotuning time, and re-tuning can land on
+// algorithms whose FP32 accumulation order was never validated for those
+// models. Heuristic ranks 0..7 therefore stay the only candidates elsewhere.
+bool supports_extended_tiles(const Spec& spec) {
+  return spec.a_dtype == APXINF_DTYPE_BF16 &&
+         spec.b_dtype == APXINF_DTYPE_BF16 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.accumulation_dtype == APXINF_DTYPE_F32 &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE &&
+         spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
+         spec.m == 1764;
+}
+
+void cublaslt_plain_configurations(const Spec& spec, std::vector<int>& configs) {
+  cublaslt_configurations(spec, configs);
+  if (supports_extended_tiles(spec)) {
+    // 0..7 retain their original heuristic-rank meaning. New configurations
+    // encode 8 + 8 * heuristic_rank + custom_option (options 0..7).
+    for (int configuration = 8; configuration < 72; ++configuration) {
+      configs.push_back(configuration);
+    }
+#if CUDART_VERSION >= 13000
+    // Algorithm 66, 128x224 tile, 2x1x1 cluster: all custom options.
+    for (int configuration = 72; configuration < 80; ++configuration) {
+      configs.push_back(configuration);
+    }
+#endif
   }
 }
 
@@ -413,6 +474,24 @@ bool supports_device(const Implementation& implementation,
   return true;
 }
 
+#ifdef APXINF_GEMM_CUTLASS
+bool supports_exact_gelu(const Spec& s) {
+  return s.semantic == APXINF_GEMM_SEMANTIC_GEMM_GELU_EXACT &&
+      s.m==1764 && s.n==8192 && s.k==2048 &&
+      s.a_dtype==APXINF_DTYPE_BF16 && s.b_dtype==APXINF_DTYPE_BF16 &&
+      s.output_dtype==APXINF_DTYPE_BF16 && s.quantization==APXINF_GEMM_QUANT_NONE &&
+      s.b_layout==APXINF_GEMM_LAYOUT_KN && s.alpha_is_unit && s.output_scale_is_unit &&
+      s.numerics==APXINF_GEMM_NUMERICS_DEFAULT;
+}
+AlignmentRequirements exact_gelu_alignment(const Spec&) {
+  AlignmentRequirements requirements{};
+  requirements.a = 32;
+  requirements.b = 32;
+  requirements.output = 16;
+  return requirements;
+}
+void exact_gelu_configurations(const Spec&,std::vector<int>& out) { for(int i=0;i<6;++i)out.push_back(i); }
+#endif
 const ImplementationRegistry& registry(uint32_t semantic) {
   // Every L3 semantic has exactly one baseline fallback. cuBLAS owns that role;
   // faster or more specialized providers remain autotuning candidates only.
@@ -454,6 +533,11 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        cublaslt_alignment, cublaslt_native_fp8_resource_requirements,
        cublaslt_configurations, prepare_cublaslt_native_fp8, launch_cublaslt,
        destroy_cublaslt},
+      {kProviderCublasLt, 6, 1, "cublasLt-native-f16-bias",
+       WeightLayout::Canonical, 0, true, false, false,
+       supports_native_f16_bias, fused_f16_bias_alignment,
+       cublaslt_f16_bias_resource_requirements, one_configuration,
+       prepare_cublaslt_f16_bias, launch_cublaslt, destroy_cublaslt},
 #ifdef APXINF_GEMM_CUTLASS_SM87_W8A8
       {kProviderCutlass, 9, 1, "cutlass-w8a8-bias-m41-n4608-k1536-sm87", WeightLayout::NK, kDeviceFeatureCutlassSm87W8A8, true, true, false,
        supports_cutlass_w8a8_bias_m41_n4608_k1536,
@@ -482,7 +566,7 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
       {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", WeightLayout::Canonical, 0, true, false, false,
        supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
-       cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
+       cublaslt_plain_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
       {kProviderCublasLt, 2, 1, "cublasLt-native-fp8+custom-epilogue", WeightLayout::Canonical,
        kDeviceFeatureNativeFp8, true, false, false, supports_native_fp8,
@@ -577,6 +661,22 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        destroy_cutlass},
 #endif
   };
+  static const ImplementationRegistry exact_gelu_entries = {
+      {kProviderCublas, 1, 1, "cublas+staged-exact-gelu", WeightLayout::Canonical, 0, true, true, true,
+       supports_cublas, vendor_alignment, cublas_resource_requirements,
+       one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
+#ifdef APXINF_GEMM_CUTLASS
+      {kProviderCutlass, 11, 1, "cutlass-bf16-staged-exact-gelu", WeightLayout::Canonical,
+       kDeviceFeatureFixedSm110, true, true, false, supports_exact_gelu,
+       exact_gelu_alignment, exact_gelu_resource_requirements,
+       exact_gelu_configurations, prepare_exact_gelu, launch_exact_gelu, destroy_exact_gelu},
+      {kProviderCutlass, 12, 1, "cutlass-bf16-staged-exact-gelu-lut", WeightLayout::Canonical,
+       kDeviceFeatureFixedSm110, true, true, false, supports_exact_gelu,
+       exact_gelu_alignment, exact_gelu_lut_resource_requirements,
+       exact_gelu_configurations, prepare_exact_gelu_lut, launch_exact_gelu,
+       destroy_exact_gelu},
+#endif
+  };
   const ImplementationRegistry* selected = nullptr;
   switch (semantic) {
     case APXINF_GEMM_SEMANTIC_GEMM:
@@ -593,6 +693,9 @@ const ImplementationRegistry& registry(uint32_t semantic) {
       break;
     case APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL:
       selected = &gemm_bias_residual_entries;
+      break;
+    case APXINF_GEMM_SEMANTIC_GEMM_GELU_EXACT:
+      selected = &exact_gelu_entries;
       break;
     case APXINF_GEMM_SEMANTIC_GEMM_SWIGLU:
       selected = &gemm_swiglu_entries;

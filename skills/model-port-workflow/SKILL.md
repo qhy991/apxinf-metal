@@ -73,69 +73,12 @@ its explicit `dspark` variant adds the compiled draft chain and target
 verification schedule. Use the exact scope/profile table in `doc/mlx-backend.md`.
 None of these is CUDA Graph replay or evidence for an unrelated model family.
 
-Qwen3 `bf16-compiled` prepares one BF16 weight array for every norm site,
-including the final norm, and uses native weighted RMSNorm with BF16 activations.
-The private prepared dtype selects arithmetic through the existing compiled
-array slots. Public and MixedW8 retain FP32 weights and ordered FP32 norm math.
-Require numerical and full-model performance qualification for a replacement
-that changes rounding. Check every prepared norm category and
-keep the tiny public/compiled trajectory assertions unchanged. Record all
-short-token differences and enforce each language's external teacher floor
-before accepting full-model performance results. Compare frozen reference and
-candidate binaries with the same inputs and policies.
-
-Qwen3's established-prefix compiled decoder uses `Bf16QkTableRope` for paired
-BF16 table rotation after native Q/K normalization. Keep the kernel and its
-shape guards in `apxinf-mlx`; keep table preparation and KV updates in the
-family. Preserve the decoder's 18-input/3-output array contract. Validate BF16
-bits at both tiny D8 and checkpoint D128, including unequal table halves,
-strided inputs, changed-operand compiled replay and retained outputs. Check
-full-model parity against the current norm path before interpreting performance.
-Prefill, fresh first-token, Public and MixedW8 paths retain their own RoPE.
-
-MiniCPM5 compiled prefill uses native weighted RMSNorm with existing BF16
-weights. In pinned MLX 0.32.3, the Metal kernel rounds the normalized value to
-BF16 before multiplying the BF16 weight, preserving this family's rounding
-boundary. Check the pinned implementation and operand dtypes before replacing
-an ordered norm. Operator naming alone does not establish interchangeability.
-Keep Public and DSpark ordered normalization and packed decode normalization
-unchanged. Require full-model numerical checks and paired performance gates
-for such replacements. Check real short and long outputs,
-external-teacher agreement, and request-state behavior before accepting results.
-
-Qwen3 compiled BF16 defaults to 2048-token prefill chunks; MiniCPM5 compiled
-BF16 defaults to 1024 above 4096 prompt tokens. Other variants retain their
-512-token default. Family environment overrides remain captured at construction.
-Derive preparation, row admission and execution from the same family plan.
-
-MiniCPM5 shares one initial zero array across its 84 KV slots. Preserve separate
-changing compiled arguments and per-layer outputs. Validate replay with different
-nonzero KV after aliased preparation, retained outputs, reset/reprepare and
-physical memory. Sharing initial zeros does not reduce the required live KV
-of an executed request.
-
 Long-context preparation distinguishes total request capacity from active
 attention width. Qwen3 admits 40960 total positions, ordinary MiniCPM5 65792,
 and DSpark retains 4096. Keep short BF16 shapes and rounding boundaries intact;
 warm decode buckets before use and test crossing a bucket without retracing.
 Long generation may prepare chunk shapes without preparing full prompt logits.
 Report physical process peaks as well as tensor-size budgets.
-For prefill tuning, keep warm shapes, admission and execution derived from the
-same family-owned schedule. Record construction-time chunk overrides and
-separate their BF16 numerical evidence from decode-attention changes. A 2 GiB
-allocator-cache limit is separate from live KV memory. MiniCPM5 compiled
-non-final chunks drop logits before evaluating every KV output. Keep the final
-chunk, Public mode, DSpark and full-row `forward` contracts intact. Validate
-actual long-prompt logits and subsequent decode across exact chunk multiples
-and one-row tails before accepting cache-only changes.
-
-MiniCPM5's prepared request also owns its resolved attention mode. Automatic
-exact attention covers compiled requests with 16384–65536 prompt tokens and
-1–128 output tokens; other requests use buckets. Preserve construction-time
-overrides, replace callable/profile state when modes or exact geometry change,
-and invalidate both on preparation failure. Test same-capacity transitions on
-the actual model. Exact-width graph preparation does not imply every Metal
-pipeline is warm; report cold preparation and BF16 trajectory differences.
 
 Ordinary asynchronous text decode can use `LlmTrait::token_sequence` while the
 shared loop retains publication, EOS, budget and cancellation. Compiled Qwen3
@@ -163,17 +106,28 @@ cancellation, position restoration, cleanup and synchronous fallback through
 2. Run the reference privately and capture deterministic inputs, outputs, and
    diagnostic tensors. Completion: the reference loads and repeated captures
    are attributable to the same source, environment, weights, and stochastic
-   inputs.
+   inputs. Record dtype, shape, strides and memory format at diagnostic
+   boundaries; replaying the same values in another layout can select a
+   numerically different kernel. Record the instantiated reference configuration,
+   including inherited overrides, instead of inferring it from a base config.
 3. Inventory semantics and weight transformations. Completion: every required
    computation is understood independently of its framework operator name.
 4. Create an execution ledger from reference semantics through safe device calls.
    Inspect maintained model/Blocks implementations and fused interfaces before the
    portable backend trait. Account for tensor lifetime, reusable KV/state,
-   workspace, host traffic, and graph eligibility. Define the intended whole
+   activation workspace, persistent KV/state, provider scratch, host traffic,
+   and graph eligibility. For cuda-new, let the runner own `ProviderWorkspace`
+   and pass it to profile sessions; follow the sharing and lifetime contract in
+   [Model Layer Architecture](../../doc/model-layer-architecture.md#repacked-gemm-weight-ownership).
+   Define the intended whole
    graph or Vision/Language/Action graph boundaries, stable buffers,
    input-update mechanism, and capture blockers. Completion: every graph row
    resolves to an ApxInf-native implementation, a private scaffold with a
    named device exit criterion, or a concrete blocker.
+   For joint diffusion, trace all predicted modalities and declare the complete
+   supplied-noise geometry through `VlaRuntime::initial_latent_shape()`. Verify
+   native and Python validation, noise scaling, and prepared-profile identity
+   against the reference; action output shape alone does not define the latent.
    For MLX, record local, decoder-block and whole-step compile scopes separately;
    identify explicit dynamic state, prepared shapes and bounded lazy outputs.
    Inspect the safe array/fusion seam in `apxinf-mlx`; keep raw FFI and unsafe
@@ -181,6 +135,9 @@ cancellation, position restoration, cleanup and synchronous fallback through
    `metal_<family>` for native Metal composition and registration. The evolving
    cross-backend contract is not a prerequisite: preserve the model's numerical
    recipe and measured performance without introducing per-op trait wrappers.
+   For an explicitly requested CPU reference target, compose the model in
+   `cpu_<family>` using [apxinf-cpu](../../crates/apxinf-cpu/README.md); keep
+   CPU operators and BLAS linking in that backend and shared contracts in core.
 5. Classify fused and primitive coverage. If a real gap exists, follow
    `adding-new-kernels.md`, then replay the returned implementation against the
    original references. A CPU layer implementation is a named correctness
@@ -188,7 +145,12 @@ cancellation, position restoration, cleanup and synchronous fallback through
    repeated hot-path scaffold with a safe device path; build cost and passing
    end-to-end values do not turn host round trips into deliverable performance
    debt.
-6. Create `crates/apxinf-model/src/<model>/`. Start with a self-contained
+6. Choose the native family name and single-precision layout from
+   `adding-a-new-model.md#start-with-a-separate-model-directory`. Verify that
+   `Bf16Blocks` encapsulates tensor representations and operator composition,
+   rather than only moving subnetwork files underneath a new directory. Keep
+   host/device weights separate from forward computation, and preparation
+   separate from runtime validation. Start with a self-contained
    implementation. Inspect and copy a close model when useful, but do not import
    or modify another model-family directory for the new architecture. Defer
    shared extraction to a separate review after repeated maintained

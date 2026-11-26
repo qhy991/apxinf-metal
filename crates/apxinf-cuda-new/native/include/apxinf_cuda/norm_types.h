@@ -26,13 +26,20 @@
  *   BIAS_RESIDUAL_ADAPTIVE_LAYER
  *                          input, bias, residual, norm_style -> hidden, normalized
  *
- * The bias_order field selects whether input+bias is rounded to BF16 before
- * adding residual. The two-step order is BF16-only.
+ * The bias_order field selects whether input+bias is rounded to the tensor
+ * dtype before adding residual. The two-step order is F16/BF16-only.
  *
  * The two adaptive-conditioning vectors are distinct and are not
  * interchangeable:
  *
  *   norm_style  [2 * cols]  scale in [0, cols), shift in [cols, 2 * cols)
+ * When style_group_rows > 0, staged BF16 adaptive LayerNorm reads
+ * norm_style [rows/style_group_rows, style_parts, cols]; shift_first controls
+ * the first two parts. Staged grouped residual reads gate_style with three
+ * parts per group and rounds the gate product before adding residual.
+ * FUSED_ADD_NORM may combine these grouped styles: gate always has three
+ * parts; norm_style has style_parts parts and shares the same group rows.
+ *
  *   gate_style  [3 * cols]  the gate is the third segment,
  *                           [2 * cols, 3 * cols)
  *
@@ -44,12 +51,23 @@ typedef enum {
   APXINF_NORM_OPERATION_NORM = 0,
   APXINF_NORM_OPERATION_FUSED_ADD_NORM = 1,
   APXINF_NORM_OPERATION_RESIDUAL_ADD = 2,
+  APXINF_NORM_OPERATION_NORM_SILU = 3,
+  APXINF_NORM_OPERATION_BIAS_NORM_SILU = 4,
+  APXINF_NORM_OPERATION_FUSED_ADD_NORM_SILU = 5,
 } apxinf_norm_operation_t;
 
 typedef enum {
   APXINF_NORM_STATISTIC_NONE = 0,
   APXINF_NORM_STATISTIC_RMS = 1,
   APXINF_NORM_STATISTIC_LAYER = 2,
+  APXINF_NORM_STATISTIC_CHANNEL_L2 = 3,
+  /* Global response normalization: one block owns the whole [rows, cols]
+   * activation; the adaptive style holds gamma then beta and the input is
+   * carried through additively: gamma * x * norm + beta + x. */
+  APXINF_NORM_STATISTIC_GRN = 4,
+  /* Per-column mean/variance (Welford) with an input-dtype statistics
+   * boundary; the adaptive style holds scale then shift. */
+  APXINF_NORM_STATISTIC_COLUMN_LAYER = 5,
 } apxinf_norm_statistic_t;
 
 typedef enum {
@@ -74,6 +92,7 @@ typedef enum {
   APXINF_NORM_NUMERICS_FLEXIBLE = 0,
   APXINF_NORM_NUMERICS_STABLE_DECODE = 1,
   APXINF_NORM_NUMERICS_STABLE_PLANNING = 2,
+  APXINF_NORM_NUMERICS_STAGED_BF16 = 3,
 } apxinf_norm_numerics_t;
 
 typedef enum {
@@ -81,10 +100,14 @@ typedef enum {
   APXINF_NORM_BIAS_ORDER_THEN_RESIDUAL = 1,
 } apxinf_norm_bias_order_t;
 
-#define APXINF_NORM_SPEC_VERSION 7u
+#define APXINF_NORM_SPEC_VERSION 11u
 
 typedef struct {
   uint32_t version;
+  /* Zero for legacy vector styles; otherwise rows per group. */
+  int64_t style_group_rows;
+  uint32_t style_parts;
+  uint32_t shift_first;
   uint32_t operation;
   uint32_t statistic;
   uint32_t affine;

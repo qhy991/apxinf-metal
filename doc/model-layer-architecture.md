@@ -32,8 +32,12 @@ apxinf-model
   architecture, weights, schedules and execution orchestration
                          |
                          v
-apxinf-core / apxinf-cuda-new / apxinf-mlx
-  tensors, devices, model-neutral operators, kernel APIs
+apxinf-cpu / apxinf-cuda-new / apxinf-hip / apxinf-mlx
+  model-neutral operators, kernel APIs
+                         |
+                         v
+apxinf-core
+  tensors, devices, backend and sampling contracts
 ```
 
 Dependencies flow downward. Backend crates never import model concepts.
@@ -59,6 +63,15 @@ return its final `[1, vocab_size]` row. The common sampler selects the last row
 through `NextTokenLogits::last`; specialized schedules such as DSpark override
 the request-level generation hook without weakening `forward`.
 
+The optional `LlmTrait::token_sequence` hook changes token production while the
+shared driver retains publication, EOS, budget and cancellation. Its default is
+synchronous. `mlx_decode.rs` owns the one-step greedy cursor used by compiled
+Qwen3 and MiniCPM5; each family builds its own lazy step and drains/trims its KV.
+The backend owns array operations and greedy selection, not the request schedule.
+`LoadedModel::generate_streaming_cancellable` accepts a sticky
+`GenerationCancellation` handle. Cancellation is cooperative at token boundaries;
+DSpark's specialized schedule rejects this new entry explicitly.
+
 `decision.rs` defines the non-generative Decision category and two request
 protocols. A family implements the one it supports, and loading wraps it in
 `DecisionModel`, so `LoadedModel::Decision` states the protocol at load time.
@@ -77,15 +90,6 @@ protocols. A family implements the one it supports, and loading wraps it in
 `decide_schema` rejects a code model, with an error naming the protocol the
 model does take.
 
-The optional `LlmTrait::token_sequence` hook changes token production while the
-shared driver retains publication, EOS, budget and cancellation. Its default is
-synchronous. `mlx_decode.rs` owns the one-step greedy cursor used by compiled
-Qwen3 and MiniCPM5; each family builds its own lazy step and drains/trims its KV.
-The backend owns array operations and greedy selection, not the request schedule.
-`LoadedModel::generate_streaming_cancellable` accepts a sticky
-`GenerationCancellation` handle. Cancellation is cooperative at token boundaries;
-DSpark's specialized schedule rejects this new entry explicitly.
-
 `LlmTrait::preparation_status` exposes `TextPreparationStatus` as data only:
 state, selected implementation/variant, prepared compilation scopes and shape
 profiles, capacity and retained error. Only successful preparation reports
@@ -95,6 +99,11 @@ independent of VLA `PreparationStatus` and owns no executable resources.
 `VlaRuntime` is the observation-to-action process. It owns continuous action
 generation, stochastic inputs, schedules, and prepared inference contracts that
 do not fit token sampling.
+`initial_latent_shape()` declares supplied-noise geometry independently of
+`action_shape()`. Its default preserves action-matrix noise; joint diffusion
+families override it with the full latent shape. The native binding validates
+that shape without parsing family config. The family runner binds it, precision
+and the sampling schedule to its prepared profile and validates every request.
 
 The contracts may share model-neutral tensor or RNG facilities. They should not
 be unified merely because both accept language or images.
@@ -111,7 +120,7 @@ not a port requirement.
 | --- | --- | --- |
 | Python policy (`<Family>Policy`) | Public observation → canonical native inputs → decoded actions; prompt, tokenizer, state/action normalization and output context | [Pi05Policy](../python/apxinf/apxinf/policies/impls/pi05.py) |
 | Native binding (`ModelRunner`) | NumPy/Rust conversion, public shape validation, default sampling keys, host result conversion; delegates family computation to `VlaRuntime` | [PyO3 ModelRunner](../crates/apxinf-py/src/lib.rs) |
-| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text`, `Vla`, `Decision`, `Image` or `Speech`; these do not add another inference loop | [auto.rs](../crates/apxinf-model/src/auto.rs), [registry.rs](../crates/apxinf-model/src/registry.rs) |
+| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text`, `Vla`, `Decision`, `Image` or `Tts`; these do not add another inference loop | [auto.rs](../crates/apxinf-model/src/auto.rs), [registry.rs](../crates/apxinf-model/src/registry.rs) |
 | `config.rs`, `load.rs` | Validate family config; select a supported implementation, materialize weights and fixed embeddings, construct the runner through its constructor | [load.rs](../crates/apxinf-model/src/pi05/load.rs) |
 | `model_runner/` (`<Family>ModelRunner`) | Implements `VlaRuntime`; validates requests, owns preparation policy, input/RNG binding, bounded cache and invalidation | [runner.rs](../crates/apxinf-model/src/pi05/model_runner/runner.rs) |
 | `model_runner/prepare.rs` and prepared inference | Query requirements, allocate stable inputs/output/workspace, warm up, capture and retain resources; compatible `run` executes without capture/autotune | [prepare.rs](../crates/apxinf-model/src/pi05/model_runner/prepare.rs) |
@@ -121,6 +130,8 @@ not a port requirement.
 | `weights/` | Checkpoint mapping, model-local packing, device weight trees and fixed calibration scales; fixed weight operations stay with their physical representation | [weights/mod.rs](../crates/apxinf-model/src/pi05/weights/mod.rs) |
 | `backend.rs` | Concentrates imports/type aliases for safe CUDA resources and operations; it is not an execution engine or provider abstraction | [backend.rs](../crates/apxinf-model/src/pi05/backend.rs) |
 | `math.rs` (when needed) | CUDA-independent helpers/reference semantics; PI0.5 loading uses its time embedding, while prompt/Euler helpers are CPU references | [math.rs](../crates/apxinf-model/src/pi05/math.rs) |
+| `apxinf-core` | Tensor/storage data and backend, KV cache and sampling contracts; no concrete CPU operators or BLAS linking | [Core crate](../crates/apxinf-core/src/lib.rs) |
+| `apxinf-cpu` | Synchronous CPU operators, concrete KV storage and sampling; owns optional OpenBLAS calls and linking | [CPU crate](../crates/apxinf-cpu/README.md) |
 | `apxinf-cuda-new` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda-new/src/lib.rs) |
 | `apxinf-mlx` | Owned thread-affine arrays/streams, native operations, pure compiled callbacks and shape-guarded Metal fusions; no family schedule or checkpoint interpretation | [MLX crate](../crates/apxinf-mlx/README.md) |
 
@@ -138,13 +149,15 @@ the result is caller-owned row-major RGB8. Each family documents the sizes and
 step counts it supports, rejects others before device work, and keeps guidance,
 scheduler and file encoding out of the request.
 
-`SpeechRuntime` ([speech.rs](../crates/apxinf-model/src/speech.rs)) is the shared
-text-to-speech contract. A request carries the text, voice, language, an optional
-style instruction and a seed; the result is caller-owned interleaved `f32` samples
+`TtsTrait` ([tts_trait.rs](../crates/apxinf-model/src/tts_trait.rs)) is the shared
+text-to-speech contract. A request carries the text and seed, optional sampling
+knobs (voice, language, an optional style instruction, sampling and a length
+limit; unset knobs fall back to the family's own defaults) and one typed
+per-family extension; the result is caller-owned interleaved `f32` samples
 with their sample rate and channel count, and whether generation reached its end
 token. The family owns its random stream: the seed resets it per request. Each
-family documents its voices and languages and rejects others before device work.
-Streaming output is not part of this contract.
+family documents its extension, voices and languages and rejects others before
+device work. Streaming output is not part of this contract.
 
 The native binding and the family runner are existing language-boundary and
 execution owners. `apxinf.ModelRunner` re-exports `apxinf_py.ModelRunner`; there
@@ -152,6 +165,16 @@ is no separate Python `Pi05Model` or Python `AutoModel`. Python `AutoPolicy`
 selects a policy; that policy calls the binding, which invokes Rust `AutoModel`.
 Reuse these entry points for a new family instead of adding a factory/runner
 wrapper merely to reproduce the names in this table.
+
+Python policies declare the runner capabilities they consume. The minimal
+`ModelRunnerProtocol` covers RGB/token inference;
+`StateConditionedModelRunnerProtocol` adds the optional continuous `state=`
+input and an `initial_latent_shape` independent of action geometry. These are
+language-boundary contracts, not shared model implementations. Model families
+retain independent preprocessing recipes and native topology. An application
+adapter may replace a family's image transform with already canonical resized
+RGB; it must not silently apply or skip checkpoint-profile transforms based
+only on image dimensions.
 
 ### Repacked GEMM weight ownership
 
@@ -190,8 +213,31 @@ storage/state and retiring the old graph readers.
 
 Ordinary Tensor/`WeightVersion` arguments stay canonical: they do not authorize
 in-place packing and cannot select kernels requiring packed weights. Callers
-wanting these kernels must attach `RepackedWeight`. This change does not move
-computation scratch out of provider state or change activation workspace ownership.
+wanting these kernels must attach `RepackedWeight`. Provider computation scratch
+is managed separately from weights and activations.
+PI0.5's runner owns a cuda-new `ProviderWorkspace`, shared by its prepared
+profiles on the same stream. Each session owns its activation `GraphWorkspace`;
+persistent KV/state remains model/request storage. Serial GEMM vendor scratch
+(workspace, unpack/dequantization and projection) and attention temporary
+probabilities/LSE/partials borrow aligned slices of a per-stream block. Different
+streams/devices use distinct blocks. Blocks are rounded up to a fixed
+granularity, so growth never rewrites an old binding and per-block overhead stays
+bounded; executions and captured graphs retain the actual block they reference.
+Constants such as cuBLASLt zero bias and output scale remain private. The opaque
+prepared NVFP4 GEMM workspace and the segmented FA2 LSE buffer remain private
+until their embedded launch state supports external rebinding.
+
+Tuning candidates use private scratch. Final prepared executions borrow runner
+storage after selection and retain the actual block for graph lifetime.
+Repeated `ExecutionSession::prepare` reuses matching cached executions and
+retains them until session drop by default. Variable-length eager runners such
+as PI0FAST keep later decode executions warm across multiple early stops.
+Runner authors may opt in with `ExecutionSession::retire_stale_bindings()` before
+cloning the session when changing bindings should be discarded: executions
+unused for two prepare traversals are retired after a successful traversal.
+Captured graphs retain their own executions and storage. Retirement is separate
+from provider scratch sharing; stable eager arena bindings remain cache hits
+across repeated preparation without enabling CUDA Graphs.
 
 Kernel weight layout is an explicit property of each native `Implementation`
 registry entry. Implementation IDs are local to a semantic registry and must
@@ -272,14 +318,15 @@ That guard checks PI0.5 only; a new family must enforce its own declared boundar
 
 ### Where backend-native model code lives
 
-A model written directly against one backend's native API (cuda-new, MLX, HIP),
-rather than through `dyn Backend`, is a **port**. Ports follow one rule, whether
-or not another backend already implements the same family:
+A model written directly against one backend's native API (cuda-new, MLX, HIP,
+MUSA), rather than through `dyn Backend`, is a **port**. Ports follow one rule,
+whether or not another backend already implements the same family:
 
 1. **A port is a top-level module `<backend>_<family>/`** in `apxinf-model/src/`,
-   named by the `Device` it targets: `cuda_`, `hip_`, `metal_`. For example
-   `metal_qwen3/` is the Metal port of Qwen3; a CUDA port of the same family would
-   be `cuda_qwen3/`, beside it rather than inside it.
+   named by the `Device` it targets: `cuda_`, `hip_`, `metal_`, `musa_`, `cpu_`.
+   For example `metal_qwen3/` is the Metal port of Qwen3, `musa_pi05/` is the MUSA
+   port of PI0.5, and a CUDA port of the same family would be `cuda_qwen3/`,
+   beside it rather than inside it.
 2. **A port is self-contained.** It depends only on the core crates
    (`apxinf-core`, `apxinf-loader`), its backend crate, and the cross-model
    interfaces (`vla`, `llm_trait`, `auto`/`registry`, `LoadOptions`). It never
@@ -313,35 +360,22 @@ renamed as part of unrelated work.
 
 | Family / contract | Current organization and limits |
 | --- | --- |
-| PI0.5 / `VlaRuntime` | `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `model_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
+| PI0.5 / `VlaRuntime` | CUDA: `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `model_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
+| PI0.5 CPU / `VlaRuntime` | Independent `cpu_pi05/{config,weights,model,runner,load}.rs`; concrete `CpuPi05Model` and `CpuPi05Runner`, FP32 eager reference. See [CPU contract](pi05-cpu-reference.md). |
+| PI0.5 / `VlaRuntime`, MUSA | Independent `musa_pi05/` (`config.rs`, `math.rs`, `load.rs`, `model/`, `model_runner/`, `weights/`); `model_variant` selects `auto` (resolves to BF16), `bf16`, `int8_dynamic` or `int8_dynamic_no_encode`, while `fp8_static` is rejected before weights load; eager and captured execution, a prepared-shape ledger and a load-time tactic database. See [MUSA backend](musa-backend.md). |
+| Cosmos Policy / `VlaRuntime` | `cuda_cosmos_policy/`; single `model/blocks/bf16.rs` behind `Bf16Blocks`, `weights/{host,bf16}`, and `model_runner/{runner,prepare}`; BF16 LIBERO direct profile, full joint action/future-state/image/value denoising, FP64 solver state and family-owned fixed-profile preparation. [Scope and validation status](cosmos-policy.md) |
 | SmolVLA / `VlaRuntime` | `smolvla/`; native BF16 default with optional FP16 tensor-core GEMMs over a BF16 residual stream, two resized RGB views, native HF tokenizer in the Python policy, eager preparation and a 10-step flow schedule |
 | Qwen-Drive / `VlaRuntime` | Planning-only `model/`, `model_runner/`, `weights/`; one BF16 Blocks file; direct planning prepares the whole model and replays a captured graph, while variable-length reasoning stays eager with local GDN graphs. See [benchmark and runtime notes](qwen-drive-benchmark.md). |
 | WallOSS / `VlaRuntime` | `model/` (`WallossModel` + `ModelVariant` over BF16 and dynamic FP8, `blocks/`), `model_runner/` (`WallossModelRunner`, `prepare.rs`: explicit preparation policy/status, capture during preparation, one implicit plan replaced on shape change), `weights/`; per-request grids via `VlaMetadata::image_grid_thw` kept in the family's plan key; model-reported workspace backed by the config-only `workspace.rs` budget; rejected host requests preserve the cached plan; `check_walloss_module_boundaries.py`. See [WallOSS](walloss.md). |
 | GR00T / `VlaRuntime` | Existing `vla_runtime.rs`, `executor.rs`, precision runtime/executor files and private `backbone/`; not migrated to PI0.5's explicit preparation contract |
+| GR00T on HIP / `VlaRuntime` | `hip_gr00t/` in the PI0.5 layout (`model/`, `model_runner/`, `weights/`); `ModelVariant` dispatch over a `Blocks` seam, audited workspace requirements, `EmbodimentSource` outliving upload, execution-policy-driven capture with graph replay; `check_hip_gr00t_module_boundaries.py` applies the PI0.5 rule set. See [HIP port](hip-gr00t.md) |
 | Llama, Qwen3-VL / `LlmTrait` | Existing `general.rs` and family-specific state/decode graph paths; shared autoregressive generation remains in `LlmTrait`, not the VLA runner |
-| Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/total context 40960, request-sized KV/RoPE and 256-token decode attention buckets; `bf16-public`, `bf16-compiled` (native weighted BF16 RMSNorm, local functions and decoder blocks; changed BF16 rounding), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
-| MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/ordinary total context 65792, admitting 65536 prompt tokens plus 256 output tokens; request-sized KV/RoPE and long prefill chunks of 1024 in compiled mode or 512 in public mode, with compiled non-final chunks evaluating only KV; the prepared request owns bucketed/exact decode selection and profiles; DSpark total context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
-
-Qwen3's `weights.rs` prepares one norm array per site. The array dtype selects
-the private arithmetic in `model.rs`, including the final norm. BF16 weights
-select native weighted RMSNorm with BF16 activations for `bf16-compiled`.
-FP32 weights preserve ordered FP32 normalization for `bf16-public` and
-`mixed-w8`. The existing compiled array slots carry this representation without
-another mode argument or an unused alternate weight array. A second arithmetic
-contract using BF16 weights would require a richer private representation.
-
-Qwen3's compiled decoder block captures an immutable `Bf16QkTableRope` from
-`apxinf-mlx` for its established-prefix path. The backend owns paired table
-rotation, shape validation and device indexing. The family still supplies
-explicit Q/K and table operands and owns normalization, positions and KV updates.
-Prefill and the fresh first-token path keep their local RoPE composition.
-
-MiniCPM5 owns initial KV allocation in `model.rs`. Public, Compiled and DSpark
-initialize their 84 slots from one immutable BF16 zero array. Functional updates
-produce the per-layer KV values. Reset retains current KV and resets the
-logical position.
-| Clef Flash / `SchemaDecisionRuntime`, MLX | Independent `metal_clef/{config,encode,weights,model}.rs`; affine Q4 Qwen3.5 hybrid backbone and BF16 joint schema head, up to 16384 tokens. `auto` uses the optimized GPU composition on `applegpu_g13s` and the stock MLX-VLM `reference` composition everywhere else, including `applegpu_g16g`. With `coreml`, explicit `gpu-ane-neurons` selects the neuron split: Metal 4 MPP projections, 5632 INT8 plus 1248 FP16 ANE neurons per MLP in 128-token tiles, and 5408 GPU neurons. `gpu-ane-columns` is a separate explicit composition. Selection does not qualify a new hardware, OS, checkpoint or profile. All compositions prepare the local shapeless decay/beta callable at load for lengths 1, 2 and 16384; this is not whole-backbone/head or Core ML preparation. |
-| d3-lite / `CodeDecisionRuntime`, MLX | Independent `metal_d3_lite/{config,weights,model,vision,preprocess,mod}.rs`; d3-lite text path (`language_model.*`, 18 GatedDeltaNet + 6 non-causal full attention, FP32 255-code readout), no decode or KV cache; **plus the `visual.*` vision tower** (12 blocks + spatial merger), checkpoint-fixed resize/normalize/patchify, and the multimodal placeholder + mRoPE wiring that takes one still image to 255-code probabilities. Whole-request `Compiled` profiles prepared per `(length, candidate_count[, image_tokens])` on first use and replayed without retracing; the text callable is unchanged from P1a. Registered as `metal_d3` (checkpoint detection) and `metal_d3_lite` (explicit); `capabilities() == VISION`. Video and multi-image requests are not wired. See the [P1a report](d3-lite-metal.md) and the [P1b vision report](d3-lite-metal-vision.md). |
+| Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/total context 40960, request-sized KV/RoPE and 256-token decode attention buckets; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
+| MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/ordinary total context 65792, admitting 65536 prompt tokens plus 256 output tokens; request-sized KV/RoPE and 512-token long prefill; DSpark total context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
+| Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/context 2048; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
+| MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
+| Clef Flash / `SchemaDecisionRuntime`, MLX | Independent `metal_clef/{config,encode,weights,model}.rs`; affine Q4 Qwen3.5 hybrid backbone and BF16 joint schema head, up to 16384 tokens. `auto` (default) selects the composition qualified on the device: on `applegpu_g13s`, optimized GPU kernels (gate GEMM with SwiGLU epilogue, wm1/wn2 split projections, causal convolution and eight-lane recurrence), which passed quality and paired latency gates there; elsewhere the reference. With `coreml`, explicit `gpu-ane-columns` selects 6656 GPU columns and 5632 ANE INT8 columns per MLP in 512-token tiles; this is not device-qualified by the GPU path's evidence. `reference` is the stock MLX-VLM composition. The decision CLI owns its 1 GiB process cache limit; loading the library model leaves the caller's limit unchanged. All compositions prepare the local shapeless decay/beta callable at load for lengths 1, 2 and 16384; this is not whole-backbone/head or Core ML preparation. |
+| d3 / `CodeDecisionRuntime`, MLX | Independent `metal_d3/{config,weights,model,profiles,vision,preprocess}.rs`; d3-lite geometry only (18 GatedDeltaNet + 6 non-causal full attention, FP32 255-code readout), no decode or KV cache, plus the `visual.*` tower and multimodal wiring for one still image; `bf16` (also `auto`). Whole-request `Compiled` profiles per prompt length (and image-token count), bounded and evicted under `d3_text_profile_limit`/`d3_text_profile_token_budget`. Registered as `metal_d3`; `capabilities() == VISION`. Video and multi-image requests are not wired. See its [README](../crates/apxinf-model/src/metal_d3/README.md). |
 
 New VLA code should use `Model` for forward computation and `ModelRunner` for
 execution ownership. Existing family symbols remain their actual names until
@@ -350,15 +384,15 @@ separately migrated; do not rename or import them as part of an unrelated port.
 `PreparedInference::status` is `RuntimeManaged`. A successful legacy `prepare`
 does not prove graph readiness or PI0.5-equivalent guarantees.
 
-The common loader accepts `model_variant` for PI0.5 and Qwen-Drive registry
-names, and for every Metal request. Metal admission reaches only a registered
-`metal_` factory, and each MLX family parses its variants locally; the common
-loader does not infer quantization from a shared CUDA precision choice. A new
-Metal family needs no central *variant* admission edit; a name already claimed by
-a device-specific intercept does (the d3 family's CUDA-only intercept in
-`AutoModel` is now gated to non-Metal devices so `metal_d3` can resolve).
-Supporting a new non-Metal family requires updating that admission check and
-implementing family-local parsing/validation; registration alone is not
+The common loader accepts `model_variant` for all six built-in Python VLA
+families and D3, and for every Metal request. Metal admission reaches only a
+registered `metal_` factory, and each MLX family parses its variants locally;
+the common loader does not infer quantization from a shared CUDA precision
+choice. A new Metal family needs no central *variant* admission edit; a name
+already claimed by a device-specific intercept does (the d3 family's CUDA
+intercept in `AutoModel` is gated to non-Metal devices so `metal_d3` can
+resolve). Supporting a new non-Metal family requires updating that admission
+check and implementing family-local parsing/validation; registration alone is not
 enough. `LoadOptions.config`, Python `config_json`/shape overrides and
 `ModelRunner.random` are currently PI0.5-specific. A new family's config belongs
 in that family and its loader; use existing named assets where applicable and
@@ -368,7 +402,7 @@ extend a shared option only for a demonstrated contract, not by copying
 Metal model composition is performance-first and independent of the provisional
 cross-backend design. With the `mlx` feature, Metal selection resolves the
 registered `metal_<family>` factory: `metal_qwen3`, `metal_minicpm5`,
-`metal_clef` and `metal_d3` (`metal_d3_lite` is the explicit alias).
+`metal_clef` and `metal_d3`.
 Qwen3 checkpoint detection uses `model_type=qwen3`; MiniCPM5 requires explicit
 family selection because its official metadata says `llama`; a `d3-code-readout-v1`
 package detects as `d3` and resolves to `metal_d3` on Metal while keeping the
@@ -419,6 +453,16 @@ tokenization, robot mapping, and action postprocessing remain policy- or
 adapter-owned. PI0.5 and WallOSS both use this distinction: their native RGB
 paths perform model tensor canonicalization in Rust/CUDA, while their Python
 policies still construct the model inputs and interpret the model actions.
+
+Autoregressive VLMs expose `LlmTrait::vision_contract`: decoded RGB is the
+application seam, while the model owns checkpoint-fixed canonicalization,
+image-placeholder expansion and pixel dtype. `vision_preprocess` shares the
+pure CPU algorithm used by Qwen3-VL/Qwen38 and the Metal d3 frontage; it is not
+an image-container decoder or a backend selector. Text and image chat rendering
+share `apxinf-tokenizer`. Registered vision loaders validate local preprocessor
+assets before returning a capability. `sequence_capacity` reports allocated KV
+capacity (or the admitted bound of a dynamic request allocator), so callers can
+reject prompt + generation overflow before inference.
 
 ## Five responsibilities inside a model
 
@@ -585,3 +629,26 @@ See the [implemented component view](model-lifecycle/architecture.md#implemented
 and [migration tracker](model-lifecycle/migration.md) for qualification and scope.
 WallOSS follows the same model/, model_runner/ and weights/ split ([WallOSS](walloss.md)).
 GR00T retains its previous implementation pending its own stage.
+
+## Public VLA variant selection
+
+All six Python VLA policies accept `model_variant` and pass it unchanged to
+`ModelRunner.load` / `LoadOptions.model_variant`. Python policy `precision`
+is rejected. PI0.5, SmolVLA, Qwen-Drive and WallOSS select their implementations
+in their model-local loaders. WallOSS selects BF16 or dynamic FP8 directly;
+it does not convert through `ModelPrecision`. GR00T and PI0-FAST keep a single
+family-local `config::load_precision` adapter for their legacy executors.
+The generic loader only admits model names; it does not interpret variant names.
+
+| Family | Public variants |
+| --- | --- |
+| PI0.5 | auto, bf16, fp8_static, int8_dynamic |
+| WallOSS | auto, bf16, fp8_dynamic |
+| SmolVLA | bf16, fp16 |
+| Qwen-Drive | auto, bf16 |
+| GR00T | auto, bf16, fp8_static, int8_dynamic (hardware restrictions still apply) |
+| PI0-FAST | auto, bf16, fp8_static |
+
+CPU CI exercises each policy through AutoPolicy up to the actual native load
+signature and tests the Rust selection/adaptation rules. It does not establish
+GPU numerical or performance parity.

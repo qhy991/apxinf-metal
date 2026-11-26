@@ -8,6 +8,8 @@ pub mod program;
 pub mod proto;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod runtime;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+pub mod compat;
 
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use placement::{
@@ -17,3 +19,5 @@ pub use placement::{
 pub use program::{Operand, Package, ProgramBuilder, Var};
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use runtime::{compile, ComputeUnits, Model, ProgramCache};
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+pub use compat::{compiled_for, evict};

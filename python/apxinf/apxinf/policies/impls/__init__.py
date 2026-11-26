@@ -20,6 +20,8 @@ inside ``from_pretrained``, so importing the package stays offline-friendly.
 
 from __future__ import annotations
 
+from .cosmos_policy import CosmosPolicy
+from .gpt_sovits import GptSovitsPolicy
 from .gr00t import Gr00tPolicy
 from .pi05 import Pi05Policy
 from .pi0fast import Pi0FastPolicy
@@ -28,6 +30,8 @@ from .smolvla import SmolVlaPolicy
 from .walloss import WallossPolicy
 
 __all__ = [
+    "CosmosPolicy",
+    "GptSovitsPolicy",
     "Pi05Policy",
     "Pi0FastPolicy",
     "Gr00tPolicy",

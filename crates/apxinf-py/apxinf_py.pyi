@@ -33,6 +33,11 @@ class _PackedRgbU8:
 class ModelRunner:
     """A loaded VLA model handle exposing its bare-model inference contract."""
 
+    @property
+    def initial_latent_shape(self) -> list[int]:
+        """Complete noise geometry declared by the runtime, including batch if required."""
+        ...
+
     @staticmethod
     def load(
         model: str,
@@ -51,11 +56,17 @@ class ModelRunner:
         assets: dict[str, str] | None = ...,
         model_variant: str | None = ...,
         weight_layout_budget_bytes: int | None = ...,
+        execution: str | None = ...,
     ) -> "ModelRunner":
         """Load a checkpoint through the unified ``AutoModel`` frontend.
 
-        ``device`` is ``cuda:N`` (default) or ``cpu``.
+        ``device`` selects a compiled backend: ``cuda:N`` (default), ``hip:N``,
+        ``musa:N``, ``metal:N`` (alias ``mlx:N``), or ``cpu``. Model support
+        depends on the selected backend.
         ``precision`` is ``auto`` (default), ``fp8``, ``bf16``, or ``int8``.
+        PI0.5 uses ``model_variant``: CUDA accepts ``auto``, ``bf16``,
+        ``fp8_static``, ``int8_dynamic``; CPU accepts ``auto``/``fp32_reference``.
+        Leave legacy ``precision`` at ``auto`` for PI0.5.
         ``config_json`` supplies architecture JSON when it is stored outside the
         checkpoint's ``config.json``. ``None`` leaves loading to AutoModel.
         ``action_horizon`` overrides the checkpoint's chunk length (a sequence
@@ -65,7 +76,10 @@ class ModelRunner:
         the absent views but skips their patch tokens.
         ``num_flow_steps`` and ``flow_start_time`` are PI0.5 deployment overrides.
         ``sampling_seed`` seeds the implicit device-side noise stream.
-        ``weight_layout_budget_bytes`` limits live extra PI0.5 BF16/FP8
+        ``execution`` selects MUSA PI0.5's implicit preparation policy:
+        ``eager``, ``prefer-graph``, or ``require-graph``. ``None`` keeps the
+        family default (``prefer-graph`` for MUSA PI0.5).
+        ``weight_layout_budget_bytes`` limits live extra CUDA PI0.5 BF16/FP8
         language gate/up weight layouts. ``None`` permits one extra per weight
         for concurrent consumers, released with its last execution/graph;
         retired bases may change layout in place. ``0`` uses canonical layouts.
@@ -162,8 +176,10 @@ class ModelRunner:
         token_ids: npt.NDArray[np.uint32],
         noise: npt.NDArray[np.float32] | None = ...,
         action_mask: npt.NDArray[np.float32] | None = ...,
+        state: npt.NDArray[np.float32] | None = ...,
+        image_grid_thw: npt.NDArray[np.uint32] | None = ...,
     ) -> npt.NDArray[np.float32]:
-        """L1: infer from resized RGB uint8. Returns normalized-domain action."""
+        """L1: RGB inference; supplied noise must match ``initial_latent_shape``."""
         ...
 
     def _calibrate_rgb(

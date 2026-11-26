@@ -33,6 +33,7 @@ from .base import (
     CANONICAL_STATE_KEY,
     VIEW_SLOTS,
     ModelRunnerProtocol,
+    StateConditionedModelRunnerProtocol,
     ComposablePolicy,
     Policy,
 )
@@ -40,8 +41,10 @@ from .registry import available_policies, get_policy, register_policy
 
 # Concrete model policies (importing registers them under their model_type).
 from .impls import (
+    CosmosPolicy,
     Pi05Policy,
     Pi0FastPolicy,
+    GptSovitsPolicy,
     Gr00tPolicy,
     QwenDrivePolicy,
     SmolVlaPolicy,
@@ -49,8 +52,10 @@ from .impls import (
 )
 
 __all__ = [
+    "CosmosPolicy",
     "Policy",
     "ModelRunnerProtocol",
+    "StateConditionedModelRunnerProtocol",
     "ComposablePolicy",
     "VIEW_SLOTS",
     "CANONICAL_IMAGE_KEYS",
@@ -60,6 +65,7 @@ __all__ = [
     "register_policy",
     "get_policy",
     "available_policies",
+    "GptSovitsPolicy",
     "Pi05Policy",
     "Pi0FastPolicy",
     "Gr00tPolicy",

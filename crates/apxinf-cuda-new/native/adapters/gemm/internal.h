@@ -1,4 +1,5 @@
 #pragma once
+#include "../../framework/scratch.h"
 
 #include "../../include/apxinf_cuda/gemm.h"
 #include "../../framework/registry.h"
@@ -158,13 +159,15 @@ struct AccuracyMetrics {
 };
 
 struct Execution {
+  apxinf::framework::Scratch scratch;
   Spec spec{};
   apxinf_gemm_bindings_t bindings{};
   int configuration = 0;
   int device = 0;
   const Implementation* implementation = nullptr;
   // Opaque provider-owned state. The common execution framework never knows which
-  // handles, descriptors, algorithms or temporary buffers a provider needs.
+  // handles, descriptors or algorithms a provider needs. Temporary buffer
+  // bindings register with scratch for runner-owned storage after selection.
   void* provider_state = nullptr;
   size_t resource_bytes = 0;
   // Upper bound for provider-owned device scratch. Providers may query
@@ -197,6 +200,7 @@ void destroy_cublas(Execution& execution) noexcept;
 cudaError_t launch_cublas(Execution& execution);
 void prepare_cublaslt(Execution& execution);
 void prepare_cublaslt_native_fp8(Execution& execution);
+void prepare_cublaslt_f16_bias(Execution& execution);
 void prepare_cublaslt_native_fp4(Execution& execution);
 void prepare_cublaslt_native_fp8_gelu(Execution& execution);
 void prepare_cublaslt_split_geglu(Execution& execution);
@@ -204,6 +208,7 @@ cudaError_t launch_cublaslt_split_geglu(Execution& execution);
 size_t cublaslt_split_geglu_resource_requirements(const Spec& spec);
 size_t cublaslt_resource_requirements(const Spec& spec);
 size_t cublaslt_native_fp8_resource_requirements(const Spec& spec);
+size_t cublaslt_f16_bias_resource_requirements(const Spec& spec);
 size_t cublaslt_native_fp4_resource_requirements(const Spec& spec);
 size_t cublaslt_native_fp8_gelu_resource_requirements(const Spec& spec);
 void destroy_cublaslt(Execution& execution) noexcept;
@@ -257,4 +262,10 @@ void validate_candidates(const Spec& spec,
                          const apxinf_gemm_bindings_t& bindings, int device,
                          const float* expected, size_t expected_len);
 
+size_t exact_gelu_resource_requirements(const Spec&);
+size_t exact_gelu_lut_resource_requirements(const Spec&);
+void prepare_exact_gelu_lut(Execution&);
+void prepare_exact_gelu(Execution&);
+cudaError_t launch_exact_gelu(Execution&);
+void destroy_exact_gelu(Execution&) noexcept;
 }  // namespace apxinf::gemm

@@ -57,5 +57,7 @@ mod rms_norm_add;
 pub use rms_norm_add::RmsNormAdd;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub mod qmm_bm64;
+#[cfg(feature = "signpost")]
+pub mod signpost;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod swiglu_gemv;

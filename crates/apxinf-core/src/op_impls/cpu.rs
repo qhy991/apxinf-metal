@@ -10,6 +10,69 @@ use crate::sampling::{CpuNormalGenerator, CpuTokenSampler};
 /// CPU backend — all ops execute synchronously on the host.
 pub struct CpuBackend;
 
+impl CpuBackend {
+    /// Non-causal GQA/MHA: Q [queries, heads, dim], K/V [keys, kv_heads, dim].
+    /// All supplied keys are visible. Callers partition independent image batches.
+    pub fn attention(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        let qs = q.shape().dims();
+        let ks = k.shape().dims();
+        if qs.len() != 3
+            || ks.len() != 3
+            || k.shape() != v.shape()
+            || qs.iter().any(|&n| n == 0)
+            || ks.iter().any(|&n| n == 0)
+            || qs[2] != ks[2]
+            || qs[1] % ks[1] != 0
+        {
+            return Err(Error::Other("CPU attention: invalid Q/K/V geometry".into()));
+        }
+        let (nq, nh, d) = (qs[0], qs[1], qs[2]);
+        let (nk, nkh) = (ks[0], ks[1]);
+        let (q, k, v) = (q.as_f32()?, k.as_f32()?, v.as_f32()?);
+        let mut output = vec![0.; nq * nh * d];
+        let mut query = vec![0.; nq * d];
+        let mut key_t = vec![0.; d * nk];
+        let mut value = vec![0.; nk * d];
+        let mut scores = vec![0.; nq * nk];
+        let mut head_out = vec![0.; nq * d];
+        for h in 0..nh {
+            let kh = h / (nh / nkh);
+            for t in 0..nq {
+                query[t * d..(t + 1) * d]
+                    .copy_from_slice(&q[(t * nh + h) * d..(t * nh + h + 1) * d]);
+            }
+            for t in 0..nk {
+                for c in 0..d {
+                    key_t[c * nk + t] = k[(t * nkh + kh) * d + c];
+                }
+                value[t * d..(t + 1) * d]
+                    .copy_from_slice(&v[(t * nkh + kh) * d..(t * nkh + kh + 1) * d]);
+            }
+            crate::ops::sgemm(nq, d, nk, &query, &key_t, &mut scores);
+            for row in scores.chunks_exact_mut(nk) {
+                for x in row.iter_mut() {
+                    *x /= (d as f32).sqrt();
+                }
+                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.;
+                for x in row.iter_mut() {
+                    *x = (*x - max).exp();
+                    sum += *x;
+                }
+                for x in row {
+                    *x /= sum;
+                }
+            }
+            crate::ops::sgemm(nq, nk, d, &scores, &value, &mut head_out);
+            for t in 0..nq {
+                output[(t * nh + h) * d..(t * nh + h + 1) * d]
+                    .copy_from_slice(&head_out[t * d..(t + 1) * d]);
+            }
+        }
+        Tensor::from_f32(vec![nq, nh, d], &output)
+    }
+}
+
 impl SamplingBackend for CpuBackend {
     fn create_token_sampler(&self, spec: TokenSamplingSpec) -> Result<Box<dyn TokenSampler>> {
         Ok(Box::new(CpuTokenSampler::new(spec)?))

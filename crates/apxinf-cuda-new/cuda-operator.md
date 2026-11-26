@@ -59,6 +59,13 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Numerical policy | `GemmNumerics::Default`, or `LegacyCublas` for the established unit-scale canonical BF16 reduction path; the model still calls `gemm` |
 | Reference test | `gemm_all_candidates_match_torch`, `nvfp4_all_candidates_match_reference` |
 
+Plain BF16/FP32 GEMM also enumerates CUDA 13 cuBLASLt configurations
+72–79: algorithm 66, 128x224 tile, 64xAUTO stages, 2x1x1 cluster, custom
+options 0–7. Preparation checks library capability, actual descriptor legality,
+alignment, and workspace before allocating provider resources. Configurations
+0–71 retain their existing meaning; selection uses the ordinary fingerprint
+and autotuner, with no model-specific dispatch.
+
 <!-- l3-operator:gemm_bias -->
 ### `gemm_bias`
 
@@ -120,6 +127,41 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Constraints | `2N` is divisible by 512; scales are unit; provider padding is private and never changes the output shape |
 | Candidates | cuBLAS fallback, cuBLASLt, and fixed SM110 CUTLASS at M3387/N9216/K2560 |
 
+## Shared Convolution Contract
+
+Both convolution semantics take a channel-last input and return a channel-last
+output, accumulate the projection in FP32, and write the result in the tensor
+dtype. The build serves them through cuDNN when it is compiled in and the shape
+is supported, otherwise through the direct temporal kernel; the choice is
+private, is made per prepared execution, and never changes the result.
+
+<!-- l3-operator:conv1d -->
+### `conv1d`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::conv1d(ctx, Conv1dArgs)` |
+| Inputs | `input=[B,Lin,Cin]`, `weight=[Cout,Cin/groups,K]`, optional `bias=[Cout]`; input, weight, bias, and output share F32, F16, or BF16 |
+| Output | caller-owned `out=[B,Lout,Cout]` with `Lout=(Lin+2*padding-dilation*(K-1)-1)/stride+1`; any other length is rejected |
+| Mathematical semantic | temporal cross-correlation, with `groups` splitting the channels into independent groups |
+| Constraints | `stride`, `dilation`, and `groups` are nonzero; `Cin` and `Cout` are divisible by `groups`; `output_padding` is zero |
+| Numerical policy | `Conv1dAccumulation::Default` lets the provider choose its FP32 accumulation order; `OrderedF32` keeps the direct kernel's sequential order for a result that feeds a discrete decision |
+| Deferred bias | `with_direct_channel_last` binds the caller's channel-last buffers in place, takes no bias, and skips both layout transforms; the caller must then add it with this path's rounding, `round_dtype(x+bias)`. It needs a build with the cuDNN provider and a geometry that provider serves (an output channel count above one), and it rejects ordered accumulation; a shape the provider serves with a single deterministic engine keeps its NCHW path and reports `.channel_last_fallback` in the prepared summary |
+| Reference test | `conv1d_matches_reference` |
+
+<!-- l3-operator:conv-transpose1d -->
+### `conv-transpose1d`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::conv1d(ctx, Conv1dArgs)` with `Conv1dSemantic::ConvTranspose1d` |
+| Inputs | `input=[B,Lin,Cin]`, `weight=[Cin,Cout/groups,K]`, optional `bias=[Cout]`; same dtype rule as `conv1d` |
+| Output | caller-owned `out=[B,Lout,Cout]` with `Lout=(Lin-1)*stride-2*padding+dilation*(K-1)+output_padding+1` |
+| Mathematical semantic | adjoint of `conv1d`: each input position scatters its weight along the dilated, strided time axis |
+| Constraints | `dilation` is 1 and `0<=output_padding<stride`; every other constraint is that of `conv1d` |
+| Numerical policy | the same `Conv1dAccumulation` choice, except that `direct_channel_last` has no ordered-accumulation path and is rejected together with `OrderedF32` |
+| Reference test | `conv_transpose1d_matches_reference` |
+
 ## Shared Attention Contract
 
 Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same dtype, and `scale` is finite and positive with a default of `1/sqrt(head_dim)`. Dense and KV-cache support MHA, GQA, and MQA and require `query_heads % kv_heads == 0`.
@@ -136,6 +178,34 @@ Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same d
 | Constraints | Causal requires `Tk>=Tq`, with queries aligned to the final positions of the key sequence; ordinary output requires `output_scale=1`; E4M3 stores `round_to_e4m3(attention/output_scale)` |
 | Reference test | `attention_all_candidates_match_reference` |
 
+The BF16 custom fallback parallelizes score generation for noncausal,
+single-head, 384-dimensional inputs with at least 128 query/key tokens and
+contiguous K/V rows, without dynamic decode metadata. It tiles K through shared
+memory while preserving each dot-product accumulation order, then performs the
+reference serial softmax reduction. It uses the existing probability workspace;
+other shapes/masks keep the original path. `attention_wide_head.rs` covers a
+nontrivial scale, batched tail tiles, CPU reference, and captured storage lifetime.
+Kernel changes invalidate old recipes through the attention build fingerprint.
+
+The BF16 D128 dense contract also exposes a persistent CUTLASS FMHA candidate
+(provider 3, implementation 2, configuration 0). It preserves BF16 products and
+FP32 softmax, uses a 200/64/48 register split, and omits unused inference LSE.
+It requires the same 16-byte binding alignment and SM100-family capability as
+the original candidate, with zero workspace. Kernel initialization happens in
+preparation before Graph capture. Normal reference-gated tuning selects between
+candidates; the original implementation remains available. The register variant
+has a distinct scheduler/kernel type and translation unit to isolate its policy.
+Derived persistent scheduler types retain the persistent shared-memory layout;
+its mainloop and epilogue storage must not alias across scheduled tiles.
+
+The existing CUTLASS FMHA candidate also covers BF16 noncausal dense attention
+with B=1, Tq=1764, Tk in {512,1764}, Hq=Hkv=16 and D=128, under flexible
+numerics and 16-byte binding alignment. Residual key masking excludes padding
+from softmax when Tk is not a multiple of 128. Its existing 256x256, D72 domain
+is retained. Provider selection stays inside the native registry and autotuner;
+models do not select CUTLASS. The real-shape all-candidate reference test covers
+non-default scale, nonuniform scores, uniform scores and graph capture/replay.
+
 <!-- l3-operator:kv_cache_attention -->
 ### `kv_cache_attention`
 
@@ -146,8 +216,9 @@ Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same d
 | Output | `Y=[B,Tq,Hq,D]`, with the same dtype as the inputs |
 | Mathematical semantic | scaled dot-product attention from the query to the first `valid_key_tokens` rows of the cache |
 | Constraints | `0<valid_key_tokens<=key_capacity`; when causal, token i is at `query_start+i`, and `query_start+Tq<=valid_key_tokens` is required |
+| hd32 decode fast path | Under Flexible numerics only, the custom provider dispatches a fused single-token kernel for batch=1, single-token causal decode, `head_dim=32`, capacity `<=4096` and 16-byte-aligned q/k/v bindings. The kernel's tree-ordered FP32 softmax and value reductions are not bit-identical to the sequential reference path; the accuracy contract and the re-validation instruction live in `attention.cuh`. Misaligned bindings, larger capacities, Stable numerics, non-decode shapes and other head dims keep the sequential path, and Stable numerics leaves dynamic decode with no registered candidate |
 | Graph/tuning identity | For dynamic decode, `key_tokens` in the Spec equals fixed `key_capacity`; exact valid length and query position live only in `decode_meta`, so one execution and graph cover all positions within capacity |
-| Reference test | `kv_cache_attention_all_candidates_match_reference` |
+| Reference test | `kv_cache_attention_all_candidates_match_reference`; hd32 fast-path precision, boundaries and dispatch guards are in `ops::tests::hd32_decode` |
 
 <!-- l3-operator:segmented_attention -->
 ### `segmented_attention`
@@ -161,14 +232,492 @@ Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same d
 | Constraints | offsets contain at least two elements, are monotonically nondecreasing, begin at 0, and end at `total_tokens`; empty segments are allowed; causal and differing Q/KV head counts are unsupported |
 | Reference test | `segmented_attention_all_candidates_match_reference` |
 
+## Shared Speech Pipeline Contract
+
+The speech pipeline needs relative attention plus elementwise, statistics, and
+layout semantics that the language-model Pointwise ABI does not expose. Every
+operator in the family below accepts F32, F16, or BF16 tensors, requires all
+tensors of one call to share the dtype and CUDA device, and writes FP32
+accumulation back in the tensor dtype at the rounding points its table names.
+The speech models run one batch at a time, so these kernels are sized for that
+geometry and are not tuned for large batches.
+
+<!-- l3-operator:relative-attention -->
+### `relative_attention`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::relative_attention(ctx, RelativeAttentionArgs)` |
+| Inputs | `Q/K/V=[batch,length,heads,head_dim]`; head-shared `relative_key`, `relative_value` are `[2*window+1,head_dim]` |
+| Output | caller-owned `out=[batch,length,heads,head_dim]`, the shape of `Q` |
+| Mathematical semantic | `softmax(scale*(Q@K^T + Q@rk[j-pos+window])) @ (V + rv[j-pos+window])`; a relative row outside `[0,2*window]` contributes nothing and the attention is unmasked |
+| Constraints | all five tensors and the output share dtype and device; `scale` is finite; `length<=12288`, the number of FP32 scores that fit the 48 KiB shared window |
+| Numerical policy | scores and the weighted sum accumulate in FP32; each relative term is added in FP32 before the scale |
+| Reference test | model-level: the official-capture SoVITS encoder comparison covers this path; no crate-level candidate test yet |
+
+### `bias_activation` (pointwise family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::pointwise` with `PointwiseSemantic::BiasActivation` |
+| Inputs | `input=[rows,cols]` (F16/BF16); optional `bias=[cols]` |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | `out = activation(input + bias)` with the bias broadcast over every row; `activation` is a `PointwiseActivation` variant, `bias_rounding` rounds the sum to the tensor dtype before the activation |
+| Reference test | `leaky_relu_bias_reproduces_the_ordinary_paths_rounding` (model-level) |
+
+### `residual_add_bias` (norm family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::residual_add` with `ResidualGate::None` and `BiasOrder::BiasThenResidual` |
+| Inputs | `input` and `residual` with the same shape; `bias=[cols]` |
+| Output | `out`, the shape of `input` |
+| Mathematical semantic | `out = round(round(input + bias) + residual)` |
+| Constraints | the intermediate sum is rounded to the tensor dtype, so this matches a deferred producer bias followed by an ordinary residual add |
+| Reference test | `residual_add_bias_reproduces_the_ordinary_paths_rounding` (model-level) |
+
+### `affine` (pointwise family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::pointwise` with `PointwiseSemantic::Affine` |
+| Inputs | `input=[rows,cols]`; `bias=[2*cols]` holding scale then shift |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | `out = input * bias[col] + bias[cols+col]` |
+| Reference test | model-level: the official-capture CFM operator isolation compares every intermediate |
+
+### `glu_separate` (pointwise family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::pointwise` with `PointwiseSemantic::GluSeparate` |
+| Inputs | `input` and `secondary` (gate) with the same shape |
+| Output | `out`, the shape of `input` |
+| Mathematical semantic | `out = input * sigmoid(secondary)` |
+| Reference test | model-level: `official_ffn_operator_isolation` compares the CFM FFN intermediates |
+
+### `tanh_sigmoid_gate` (pointwise family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::pointwise` with `PointwiseSemantic::TanhSigmoidGate` |
+| Inputs | `input=[rows,2*cols]`, whose last axis holds the `a` half then the `b` half; optional same-shaped `secondary` added element-wise to both halves first |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | `out = tanh(a + secondary_a) * sigmoid(b + secondary_b)` |
+| Reference test | model-level: `official_ffn_operator_isolation` compares the CFM FFN intermediates |
+
+### `grn` (norm family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::norm` with `NormKind::Grn` and `Affine::Adaptive` |
+| Inputs | `input=[rows,cols]`; `style=[2*cols]` holding gamma then beta |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | with `n_c = sqrt(sum_r input[r,c]^2)` and `m = mean_c(n_c) + 1e-6`, `out = gamma_c * (input * n_c/m) + beta_c`, every intermediate rounded to the tensor dtype |
+| Constraints | `cols<=12288`, the FP32 normalizers that fit the 48 KiB shared window |
+| Reference test | model-level: the official-capture CFM operator isolation compares every intermediate |
+
+### `column_norm` (norm family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::norm` with `NormKind::ColumnLayer`, `Affine::Adaptive`, and `eps=1e-5` |
+| Inputs | `input=[rows,cols]`; `style=[2*cols]` holding gamma then beta |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | per-column LayerNorm over rows, `out = gamma_c * (x - mean_c) * rsqrt(var_c + eps) + beta_c` |
+| Reference test | model-level: the official-capture CFM operator isolation compares every intermediate |
+
+### `rope_apply` (rope family, interleaved table)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::rope::apply_interleaved_table(ctx, input, cos, sin, out)` |
+| Inputs | `input=[batch,time,heads,head_dim]` (F32/F16/BF16); `cos`/`sin` tables of at least `time*head_dim` |
+| Output | `out`, the shape of `input` |
+| Mathematical semantic | interleaved rotary embedding over adjacent `(2p, 2p+1)` pairs using the pair's own `cos`/`sin` entry |
+| Constraints | every product is rounded to the tensor dtype before the final add or subtract, so the result never depends on FP16/BF16 fused-contract behavior |
+| Reference test | `layer_norm_linear_rope_attention_match_reference` |
+
+### `sinusoidal_embedding_table` (embedding family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::embedding::sinusoidal_embedding_table(ctx, times, output, scale, max_period)` |
+| Inputs | `times=[rows]`; `out=[rows,width]` with `width>=4` and even, F32/F16/BF16 |
+| Output | caller-owned `out` |
+| Mathematical semantic | `angle = (scale*times[row]) * exp(-(col % (width/2)) * ln(max_period)/(width/2-1))`; the product `scale*times[row]` is rounded to the storage dtype before the sweep; the first half of each row is `sin(angle)` and the second half `cos(angle)` |
+| Constraints | `scale` is finite and `max_period>1` |
+| Reference test | model-level: the official-capture CFM time embedding comparison |
+
+### `mean_rows` (elementwise family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::elementwise::mean_rows(ctx, input, out)` |
+| Inputs | `input=[rows,cols]`, F32/F16/BF16 |
+| Output | `out=[1,cols]` |
+| Mathematical semantic | per-column mean over rows, summed sequentially in FP32 |
+| Reference test | model-level: the official-capture SoVITS encoder comparison |
+
+### `argmax_rows` (elementwise family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::elementwise::argmax_rows(ctx, logits, index)` |
+| Inputs | `logits=[rows,cols]`, F32/F16/BF16 |
+| Output | I32 `index=[rows]` |
+| Mathematical semantic | per-row argmax with first-index tie breaking |
+| Reference test | model-level: `hubert` codebook assignment inside the official capture replay |
+
+### `write_kv_cache_token` (cache family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::cache::write_kv_cache_token(ctx, input, cache, meta)` |
+| Inputs | `input=[1,1,heads,head_dim]`; `cache=[1,capacity,heads,head_dim]`; a `KvCacheDecodeMeta` whose second word is the write row |
+| Output | `cache` updated in place |
+| Mathematical semantic | copy the token into cache row `meta[1]` |
+| Constraints | F16 or BF16 with both tensors agreeing; the write row is device state, and a row at or past `capacity` writes nothing, mirroring the clamp `kv_cache_attention` applies to the same metadata |
+| Reference test | model-level: the dynamic decode-graph replay tests write and then attend over the same cache |
+
+### `fill_zero` (elementwise family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::elementwise::fill_zero(ctx, tensor)` |
+| Inputs | any nonempty F32/F16/BF16/I32/I8 tensor |
+| Output | the same tensor zeroed in place (memset) |
+| Mathematical semantic | write zero to every element |
+| Reference test | model-level: exercised by every decode and capture-replay test that starts from a zeroed buffer |
+
+### `exponential_race_sample` (sampling family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::sampling::exponential_race_sample(ctx, ExponentialRaceArgs { logits, seen, output, seed, step, top_k, temperature, repetition_penalty })` |
+| Inputs | `logits=[1,vocab]` F16 or BF16 with `vocab <= 2048`; `seen`: one byte flag per entry (`I8`); `output`: four `I32` words; scalar `seed`, `step`, `top_k <= 128`, `temperature > 0`, `repetition_penalty` |
+| Output | `output = [sampled, adjusted_argmax, status, 0]`; `seen` gains a flag on the sampled token; status 0 ok, 1 filtered logits invalid, 2 probability mass invalid |
+| Mathematical semantic | repetition-penalized, temperature-scaled, top-k-truncated softmax probabilities raced against one Philox4x32-10 exponential per candidate; winner maximizes FP16(prob/noise), strict greater with lowest-index ties |
+| Constraints | replicates the reference host sampler bit for bit (FP16 rounding boundaries, sequential FP32 softmax sum, first-index tie-break, counter words `[step_lo, step_hi, elem_lo, elem_hi]`, key `[seed_lo, seed_hi]`); nucleus (`top_p < 1.0`) truncation is not covered — callers keep that on the host |
+| Reference test | model-level: `device_exponential_race_matches_host_sampler` runs the kernel against the reference sampler for 64 steps across five sampling configurations and asserts identical token sequences |
+
 ## Testing Responsibilities
 
 The catalog test ensures only that semantics are neither missing nor duplicated; it cannot validate the written contracts. A new L3 semantic must also add a semantic test to `src/ops/tests/l3_behavior.rs` and an independent-reference all-candidate numerical test to `src/ops/tests/precision/precision.rs`.
 
 Tests must run through `crates/apxinf-cuda-new/test-new.sh`; a normal `cargo test` from the repository root does not automatically test this crate.
 
+The speech-pipeline family is currently validated through the model-level
+official-capture comparisons listed in its tables: those tests compare every
+intermediate the reference implementation materializes, one operator at a time,
+but they run only with captured fixtures present. A crate-level reference test
+still has to be added before a second model depends on these semantics.
+
 The translated fixed-shape implementations are not separate model APIs.
 D256 attention and the 624/2200 vision schedule are candidates in the existing
 Attention registries. BF16 SwiGLU is the GEMM semantic above. First-prefill GDN
 is `ops::gdn_first_prefill`; it owns both the fixed SM110 launch and the generic
 decomposition, so candidate misses never escape to model code.
+<!-- l3-operator:Conv3d -->
+### Conv3d
+
+`PreparedConv3d::new(ctx, Conv3dArgs)` binds a BF16 cross-correlation with FP32
+accumulation and BF16 output rounding. Contiguous input, optional preceding
+history and output use THWC; immutable weights use `[KT*KH*KW*Cin,Cout]`.
+`Unfold3dGeometry` supplies kernel, stride and independent before/after zero
+padding. Bias is a separate operation after convolution output rounding.
+Output may not overlap input, history or weight. Weights must remain unchanged
+through the execution/graph lifetime; input and history contents may change.
+
+`PreparedConv3d::with_policy` adds optional online tuning and exact recipe
+persistence through `Conv3dPolicy`; `new` defaults to no tuning with fallback
+allowed. The baseline uses optional system cuDNN 9 direct convolution when
+alignment and resources fit, then tiled Unfold3d plus deterministic GEMM.
+Tuning compares this baseline with explicit backend engine configurations,
+currently qualified for sm110/cuDNN 9.20. Invalid recipes are misses; a miss
+with tuning and fallback disabled is an error. `cache_dir=None` uses the
+context cache; an empty directory disables disk persistence. Preparation
+benchmarks only isolated output and never changes caller-visible results.
+`workspace_limit` bounds packed weights, transformed input, columns and provider
+workspace. No provider name or selection enters the model API. The diagnostic
+`summary()` identifies the implementation and selected algorithm/tile size.
+Preparation loads symbols, creates descriptors, packs immutable weights and
+allocates scratch before capture. Enqueue is asynchronous and allocation-free;
+captured graphs retain the execution and storage. No recipes are persisted.
+Aligned channel counts divisible by eight use128-bit input/history transfers
+with checked32-bit indices; other materialization layouts keep the scalar path.
+
+<!-- l3-operator:Unfold3d -->
+### Unfold3d
+
+`PreparedUnfold3d::new` binds a nonempty BF16 THWC volume, optional preceding
+THWC history, asymmetric zero padding, positive three-axis kernel/stride and a
+contiguous tile of flattened output rows. Columns are ordered kernel T/H/W/C.
+This preserves causal history without a host readback or a full im2col allocation;
+the caller tiles rows and composes ordinary GEMM. Output must not alias either
+source. `enqueue` performs exact BF16 copies with zero padding, allocates no
+memory and can be captured after preparation. Captured graphs retain the prepared execution and its
+input/output storage even after caller handles are dropped. Deterministic dispatch
+uses vectorized bit copies for supported aligned geometries with proven 32-bit
+index bounds, and retains a 64-bit scalar path for all other valid inputs.
+This adds no device workspace or persistent recipe and does not strengthen the
+public BF16 alignment requirement. Supported dtype is BF16 only.
+Target-device numerical/capture acceptance is required before a model claims it.
+
+<!-- l3-operator:ChannelL2Norm -->
+### ChannelL2Norm
+
+`channel_l2_norm` uses the unified `NormArgs` contract with
+`NormKind::ChannelL2` (plain weighted normalization, BF16 only, without
+quantization or fused residuals). It accepts contiguous BF16 `[rows, channels]` and learned BF16
+`[channels]` weights. It computes the L2 norm in FP32, rounds the norm to BF16,
+clamps it by epsilon (normal positive FP32), divides and rounds to BF16, multiplies
+by `sqrt(channels)` and rounds again, then multiplies by the learned weight.
+The output is BF16 with the input shape. Epsilon is a lower bound on the norm,
+not an additive variance epsilon. This distinct numerical semantic preserves
+channel normalization used by causal video autoencoders. The fixed kernel has
+no selection, workspace or allocation; it supports eager and captured launches.
+The fused SiLU variant uses a packed four-lane subgroup for 96/192 channels and
+at least 1024 rows when all three bindings are 16-byte aligned. Its tail guard
+supports arbitrary row counts. Other alignments use the original warp path;
+plain channel-L2 is unchanged. The packed path retains FP32 reduction order,
+each staged BF16 rounding and exact in-place operation.
+
+<!-- l3-operator:Multiply -->
+### Multiply
+
+`PointwiseSemantic::Multiply` multiplies same-shaped contiguous `[rows, cols]`
+input and secondary tensors, with a single round to the output dtype. F16, BF16
+and F32 are supported; all three tensors must have the same dtype. No bias,
+activation or quantization scale is accepted. Exact in-place operation is
+supported. The existing EulerUpdate semantic also accepts F32 for a full-precision
+state boundary; F32 also requires identical shapes and rejects partial aliasing.
+Its formula and existing F16/BF16 behavior are unchanged.
+
+BF16 pointwise Multiply and EulerUpdate use eight-element vector loads/stores
+for at least 1024 elements, counts divisible by eight and 16-byte aligned input,
+secondary and output bindings. Other supported alignments, tail counts and
+dtypes retain the scalar path. The scalar FP32 arithmetic and output rounding
+are preserved, including exact input/output aliasing; partial overlap remains
+rejected. `pointwise_vectors.rs` covers aligned/unaligned bindings, tails, the
+real DiT activation shape and in-place Graph replay against a CPU reference.
+
+
+<!-- l3-operator:RgbToPatchesStaged -->
+### RgbToPatchesStaged
+
+`GatherSemantic::RgbToPatchesStaged` uses the existing RGB patch geometry and
+layouts, with a distinct normalization recipe: cast the byte to output F16 or
+BF16, divide by 127.5 and round to that dtype, subtract 1 and round again.
+The existing `RgbToPatches` single-round recipe is unchanged. The fixed kernel
+has no workspace or selection; input bytes and output buffers remain device
+resident during capture. Exhaustive byte rounding is checked in
+`tests/mixed_precision_ops.rs`.
+
+<!-- l3-operator:F64Recurrence -->
+### F64Recurrence
+
+`F64RecurrenceState` owns opaque FP64 state and previous-input storage tied to
+one device stream. `prepare_reset` converts matching FP32 input to FP64 state,
+zeros history and publishes FP32 output. `prepare_update` computes
+`a*state + d*(b*input + c*previous_input)` with separate FP64 rounds, stores the
+FP64 state/current input, and publishes rounded FP32 output. Coefficients must
+be finite. Inputs and output have identical nonempty shapes; exact in-place
+output is supported, partial aliasing is rejected. Call reset at every independent
+sequence boundary. Prepared executions and captured graphs retain all storage.
+This single fixed implementation has no recipe/tuning; enqueue allocates nothing.
+`tests/mixed_precision_ops.rs` checks retained FP64 precision and graph ownership.
+
+<!-- l3-operator:IndexedColumnMean -->
+### IndexedColumnMean
+
+`PreparedIndexedMean::new` accepts an FP32 input tensor, FP32 output and a static
+row-major host index matrix `[rows, output.numel()]`. It validates and uploads
+indices once, then computes each output column's indexed arithmetic mean on GPU.
+Every index must be in bounds; output cannot overlap input. Rows are bounded by
+2^24 so the FP32 divisor remains exact. The deterministic baseline accumulates
+in FP32 with a 128-thread tree; its summation order is part of this implementation,
+not a promise of bitwise identity with arbitrary framework reductions. Graphs
+retain the input, index map, output and execution; enqueue has no allocation,
+host transfer or tuning. Noncontiguous selection and graph lifetime are tested
+in `tests/mixed_precision_ops.rs`.
+
+## Precomputed RMSNorm + rotary embedding
+
+`ops::rope::rms_norm_apply_precomputed(ctx, input, weight, table, epsilon, output)`
+is the only public precomputed-rotation entry point. It fuses per-head RMSNorm
+with half-split rotation over caller-provided FP32 cosine/sine coefficients.
+Input and output are matching contiguous BF16 `[tokens, heads, head_dim]`;
+weight is BF16 `[head_dim]`; table is FP32 `[tokens, 2, head_dim/2]`, cosine
+first and sine second, broadcast over heads. Head dimension is positive, even
+and at most 2048. The normalized value rounds to BF16 before each FP32 product,
+each product and then the sum round separately, and the result converts to BF16
+once. Coefficients are used as supplied, without device trigonometry or FMA
+contraction. Exact input/output aliasing is allowed; partial overlap and
+weight/table output overlap are rejected. The launcher selects a packed
+eight-element path for aligned 128-wide rows and an explicit staged
+Norm-then-rotation baseline otherwise; neither tunes, persists a recipe, nor
+allocates during enqueue. The caller retains its tensors for graph lifetime.
+Reference and in-place Graph coverage lives in `tests/rms_precomputed_rope.rs`.
+Existing position-based, packed-QKV and vision rotation-table contracts remain
+unchanged.
+
+The bare rotation step is deliberately **not** exported: it is an internal
+composition of this operator, and a second public entry point would let callers
+compose the rounding order by hand. Tests that need the unfused form build it
+from public `norm` plus a CPU reference.
+
+### Grouped adaptive LayerNorm
+
+`norm` accepts `Affine::GroupedAdaptive { style, shift_first }` with explicit
+`NormNumerics::StagedBf16`. Input/output are contiguous BF16 `[rows, cols]`;
+style is `[groups, parts, cols]`, with positive groups dividing rows and parts
+2 or 3. Consecutive `rows/groups` rows share conditioning; the third part is
+ignored. `shift_first` selects `[shift, scale]` versus `[scale, shift]`.
+The result is `bf16(bf16(bf16(layer_norm(x)) * bf16(1 + scale)) + shift)`.
+The existing 256-thread LayerNorm reduction order is retained. Quantization,
+RMSNorm and fused residual modes are rejected for this layout/numerics pair.
+Exact input/output aliasing is supported; partial input/output overlap and
+output/style overlap are rejected. Existing vector-adaptive calls retain their
+layout and arithmetic. The Norm ABI version is 9 and includes group geometry
+and layout; older specs are rejected. `tests/grouped_adaptive_norm.rs` covers
+independent CPU math, exact staged comparison, non-vector-aligned bindings,
+shape/numerics/alias rejection, and captured replay with input updates.
+
+For grouped adaptive LayerNorm, the 2048-column implementation retains each
+thread's eight input values in registers, preserving the 256-thread reduction
+order and staged BF16 rounding. Other column widths use the generic path.
+
+`residual_add` additionally accepts `ResidualGate::GroupedStyle { style, numerics }`.
+The BF16 style is `[groups, 3, cols]`; groups evenly divide activation rows,
+and the third part is the gate. `NormNumerics::StagedBf16` explicitly requires
+`bf16(residual + bf16(input * gate))`. Bias, other numerical modes, non-BF16
+and malformed grouping are rejected. Input or residual may exactly alias output;
+partial overlap and output/style overlap are rejected. The aligned vector path
+loads eight BF16 values per transaction; arbitrary column widths and BF16-aligned
+addresses use the scalar fallback. Existing packed-vector and unit-offset gates
+retain their contracts. The same Norm ABI grouping fields represent this layout.
+`tests/grouped_gated_residual.rs` covers both paths, all binding alignment classes,
+CPU exact references, aliasing, rejection and captured binding-content updates.
+
+
+<!-- l3-operator:RmsNormPrecomputedRoPE -->
+### RMSNorm with precomputed RoPE
+
+`rms_norm_apply_precomputed(ctx, input, weight, table, epsilon, output)` applies
+per-head weighted RMSNorm, rounds that result to BF16, then applies half-split
+rotary embedding with separately rounded FP32 products and sums before the
+final BF16 conversion. Input/output are matching contiguous BF16
+`[tokens, heads, dim]`; weight is BF16 `[dim]`; table is FP32
+`[tokens, 2, dim/2]` with cosine followed by sine, broadcast over heads.
+Dimensions are positive, dim is even and at most 2048, tokens*heads fits signed
+32 bits, and epsilon is positive and finite. Exact input/output aliasing is
+allowed; partial input/output overlap and any output overlap with weight/table
+are rejected. Inputs, weights and coefficients may change between replays.
+
+The native adapter selects a single-kernel 128-dimensional implementation,
+preserving the existing RMSNorm reduction tree and BF16 stage boundary. With
+at least 1024 rows and 16-byte-aligned input, weight and output, it packs eight
+adjacent logical lanes per thread, retaining the same reduction order and
+handling partial blocks with subgroup masks. Smaller or unaligned 128-dimensional
+bindings use the scalar implementation. Other
+head dimensions compose the existing Norm and RoPE adapters with the output
+as intermediate storage. Both paths allocate no device memory or resources,
+work during capture, and retain all bound buffers in the captured graph. The
+fixed compound operation has its own ABI version 1; existing RoPE ABI v6 is
+unchanged. There is no persisted selection or tuning. Tests in
+`tests/rms_precomputed_rope.rs` compare against the unfused operators exactly
+and independently check CPU math, aliases, rejection, binding updates and graph
+replay after the caller drops its source tensors.
+
+<!-- l3-operator:gemm_gelu_exact -->
+### BF16 staged exact GELU GEMM
+
+`gemm_gelu_exact(ctx, GemmArgs)` computes `bf16(GELU_erf(bf16(A @ B)))`
+with FP32 accumulation and FP32 GELU evaluation. BF16 A `[M,K]`, KN weights
+`[K,N]`, and BF16 output `[M,N]`; no bias, quantization or nonunit scales.
+Existing GEMM device, storage, overflow and non-overlap validation applies.
+The BF16 projection boundary is mandatory and differs from approximate
+`tanh` GELU and an activation applied directly to an unrounded accumulator.
+cuBLAS plus exact activation is the baseline. Thor SM110 has six prepared
+CUTLASS epilogue configurations for 1764×8192×2048; other valid shapes and
+insufficiently aligned bindings use the baseline. Prepared executions retain
+bindings, including mutable weights, across capture; enqueue allocates nothing.
+
+### Grouped gated residual followed by adaptive LayerNorm
+
+`fused_add_norm` combines `NormKind::Layer`, `ResidualGate::GroupedStyle` and
+`Affine::GroupedAdaptive` with `NormNumerics::StagedBf16` on both stages.
+Gate style is `[groups, 3, cols]`; independent normalization style is
+`[groups, 2 or 3, cols]`, with the same group count. Both styles remain mutable
+bindings. The hidden result rounds the gate product to BF16, then rounds the
+residual addition to BF16. Normalization and adaptive affine preserve the
+existing staged BF16 rounding boundaries and reduction order.
+
+Both native outputs are required and must be disjoint. Each may exactly alias
+an activation input; partial activation overlap or any overlap with either
+style is rejected. Bias, quantization and non-BF16 inputs are unsupported.
+The 16-byte-aligned 2048-column path assigns one warp to each row and four
+rows to a CTA, including a guarded tail. It retains the rounded BF16 hidden
+values between passes and preserves the original 256 logical lanes' reduction
+tree using warp shuffles. Gate and affine arithmetic use separate rounded BF16 pair multiply/add instructions; normalization and reductions remain FP32. The 4-byte-aligned path still packs pairs across
+128 physical threads. Other shapes or
+2-byte alignment use the existing residual and normalization kernels with
+caller-owned hidden storage. Group geometry, epsilon and affine part order
+remain runtime parameters. This extends the ABI9 contract without changing
+its layout. `tests/grouped_fused_norm.rs` covers the independent closed-form
+reference, staged-chain equivalence, in-place hidden, contract rejection,
+mutable styles, capture/replay and retained storage.
+
+### BF16 wide-head attention on SM110
+
+Dense separate-QKV attention has a non-fallback cuBLAS candidate for BF16
+input/output, batches 1–4, one query/KV head, dimension 384, noncausal flexible
+numerics, and query/key lengths from 1 through 4096. It requires 16-byte
+binding alignment. Configuration 0 uses serial FP32 softmax; configuration 1
+uses a parallel FP32 reduction. QK GEMM accumulates into FP32, V is widened
+exactly to FP32 on every call, and probability-times-V uses pedantic FP32 GEMM
+before the final BF16 cast. Probabilities are never rounded to BF16 or TF32.
+Reduction order can differ from the scalar fallback.
+
+Preparation owns the cuBLAS handle, 4 MiB vendor workspace, FP32 probabilities,
+and FP32 V/output buffers. Enqueue only launches prepared operations. Exact
+attention recipe keys now include the runtime cuBLAS version as well as the
+operator build fingerprint. Unsupported shapes/alignment/policy retain the
+existing fallback. The Thor Cosmos batch-one/batch-four VAE paths select
+configuration 1. Official model fixtures, all-candidate tests, cache/resource
+checks, graph replay with mutable inputs, and retained-storage tests pass.
+The full backend suite reports 201 passed, 0 failed, 20 ignored.
+
+<!-- l3-operator:ChannelL2NormSilu -->
+### ChannelL2NormSilu
+
+`channel_l2_norm_silu` composes staged BF16 channel-L2 normalization and
+SiLU through the Norm family (additive operation 3, unchanged Spec layout).
+The normalized result rounds to BF16 before SiLU, retaining the separate
+operator rounding boundary. It accepts the same `ChannelL2NormArgs`, including
+exact input/output aliasing, and supports only unquantized weighted BF16
+channel-L2. Large 96/192/384-channel rows use the fused warp kernel; other
+shapes use the generic fused kernel. Both preserve the existing reduction tree.
+No preparation allocation, tuning, or graph replay allocation is introduced.
+Thor Cosmos full-model qualification passes with bitwise unchanged VAE and
+full-joint outputs. Real AutoPolicy pooled median is 445.39 ms; the full
+backend suite reports 202 passed, 0 failed, 20 ignored.
+
+<!-- l3-operator:FusedAddChannelL2NormSilu -->
+### FusedAddChannelL2NormSilu
+
+`fused_add_channel_l2_norm_silu(FusedAddChannelL2NormArgs)` materializes both
+`hidden = bf16(bf16(input + bias) + residual)` and its staged channel-L2
+normalization followed by SiLU. An absent bias or residual omits that addition;
+all existing BF16 normalization boundaries are retained. Matrices are contiguous
+BF16 `[rows, cols]`; weight and optional bias are `[cols]`, and epsilon is finite
+and positive. The two outputs must be disjoint. Either may exactly alias input
+or residual; partial activation overlap and output overlap with weight/bias are
+rejected by both the safe API and native adapter.
+
+The stateless Norm backend fuses aligned 96/192-channel rows when `rows >= 1024`.
+Other legal sizes and alignments use the staged pointwise update followed by the
+existing channel normalization kernel. No scratch allocation or persistent
+state is required. CUDA Graph callers retain all bound storage through replay.
+The Norm Spec version is 10; its layout and the GEMM recipe contract are unchanged.

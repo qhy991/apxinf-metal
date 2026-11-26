@@ -83,6 +83,8 @@ dependencies = [
  "apxinf-loader",
  "apxinf-mlx",
  "apxinf-model",
+ "apxinf-musa",
+ "apxinf-serving",
  "apxinf-tokenizer",
  "base64 0.13.1",
  "clap",
@@ -128,7 +130,6 @@ dependencies = [
  "apxinf-core",
  "cc",
  "half",
- "libc",
  "prost",
  "sha2",
  "tempfile",
@@ -176,6 +177,7 @@ dependencies = [
  "apxinf-core",
  "cc",
  "half",
+ "serde_json",
 ]
 
 [[package]]
@@ -188,8 +190,10 @@ dependencies = [
  "apxinf-hip",
  "apxinf-loader",
  "apxinf-mlx",
+ "apxinf-musa",
  "apxinf-tokenizer",
  "cc",
+ "flate2",
  "half",
  "image",
  "libc",
@@ -198,7 +202,19 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "apxinf-musa"
+version = "0.1.0"
+dependencies = [
+ "apxinf-core",
+ "bytemuck",
+ "half",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

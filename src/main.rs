@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use apxinf_core::Backend;
 use apxinf_core::{DType, Device, Tensor};
 use apxinf_model::{
     AutoModel, DecisionInput, GenerationConfigSource, GenerationOptions, ImageInput, ImageRequest,
@@ -114,7 +115,8 @@ enum Commands {
         #[arg(long)]
         system: Option<String>,
 
-        /// Device to run inference on (cpu, cuda[:N], or metal[:N]; mlx is an alias)
+        /// Device to run inference on (cpu, cuda[:N], hip[:N], musa[:N], or
+        /// metal[:N]; mlx is an alias)
         #[arg(short, long, default_value = "cpu")]
         device: String,
 
@@ -147,7 +149,7 @@ enum Commands {
         #[arg(long)]
         system: Option<String>,
 
-        /// Device to run inference on (cuda[:N] or metal[:N])
+        /// Device to run inference on (cuda[:N] or metal[:N]; d3-mini requires CUDA)
         #[arg(short, long, default_value = "cuda:0")]
         device: String,
 
@@ -252,6 +254,82 @@ enum Commands {
         /// Device to run inference on (metal[:N])
         #[arg(short, long, default_value = "metal")]
         device: String,
+    },
+
+    /// Serve an LLM/VLM through OpenAI/Anthropic-compatible HTTP APIs
+    #[cfg(feature = "server")]
+    Serve {
+        /// Path to a Hugging Face checkpoint directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Explicit registry family; omitted to use config.json:model_type
+        #[arg(long)]
+        model_name: Option<String>,
+
+        /// Family-local implementation variant
+        #[arg(long)]
+        model_variant: Option<String>,
+
+        /// Auxiliary checkpoint asset as NAME=PATH
+        #[arg(long, value_parser = parse_asset)]
+        asset: Vec<(String, PathBuf)>,
+
+        /// Model name exposed by /v1/models and accepted in requests
+        #[arg(long)]
+        served_model_name: Option<String>,
+
+        /// Bind address. Use 0.0.0.0 only on a trusted network.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: std::net::IpAddr,
+
+        #[arg(long, default_value_t = 8000)]
+        port: u16,
+
+        /// Device to run inference on
+        #[arg(short, long, default_value = "cuda:0")]
+        device: String,
+
+        /// Text weight dtype: auto, fp32, or bf16
+        #[arg(long, default_value = "auto")]
+        dtype: String,
+
+        /// Maximum queued requests behind the active batch-one request
+        #[arg(long, default_value_t = 16)]
+        queue_capacity: usize,
+
+        /// Maximum HTTP request bytes
+        #[arg(long, default_value_t = 12*1024*1024)]
+        max_body_bytes: usize,
+        /// Maximum encoded file bytes per image
+        #[arg(long, default_value_t = 4*1024*1024)]
+        max_image_bytes: usize,
+        /// Maximum decoded image side for container admission
+        #[arg(long, default_value_t = 4096)]
+        max_image_dimension: u32,
+        /// Maximum total decoded image pixels per request
+        #[arg(long, default_value_t = 16*1024*1024)]
+        max_decoded_pixels: usize,
+        /// Log worker request timings
+        #[arg(long)]
+        log_timing: bool,
+
+        /// Maximum prompt tokens accepted by the HTTP layer
+        #[arg(long, default_value_t = 4096)]
+        max_input_tokens: usize,
+
+        /// Maximum generated tokens accepted per request
+        #[arg(long, default_value_t = 1024)]
+        max_output_tokens: usize,
+
+        /// Enable measured operator autotuning on recipe misses. Use only for
+        /// an explicit warmup pass, then restart serving without this flag.
+        #[arg(long)]
+        autotune: bool,
+
+        /// Absolute directory containing persistent operator tuning recipes
+        #[arg(long)]
+        tuning_dir: Option<PathBuf>,
     },
 
     /// Run a quick test of the engine
@@ -445,6 +523,98 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        #[cfg(feature = "server")]
+        Commands::Serve {
+            model,
+            model_name,
+            model_variant,
+            asset,
+            served_model_name,
+            host,
+            port,
+            device,
+            dtype,
+            queue_capacity,
+            max_body_bytes, max_image_bytes, max_image_dimension, max_decoded_pixels, log_timing,
+            max_input_tokens,
+            max_output_tokens,
+            autotune,
+            tuning_dir,
+        } => {
+            if queue_capacity == 0 || max_input_tokens == 0 || max_output_tokens == 0 {
+                eprintln!("queue and token limits must be positive");
+                std::process::exit(1);
+            }
+            let device = match parse_device(&device) {
+                Ok(device) => device,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            };
+            let text_weight_dtype = match dtype.to_ascii_lowercase().as_str() {
+                "auto" => None,
+                "fp32" | "f32" => Some(DType::F32),
+                "bf16" => Some(DType::BF16),
+                other => {
+                    eprintln!("unsupported text weight dtype '{other}'; use auto, fp32, or bf16");
+                    std::process::exit(1);
+                }
+            };
+            let mut assets = std::collections::BTreeMap::new();
+            for (name, path) in asset {
+                if assets.insert(name.clone(), path).is_some() {
+                    eprintln!("duplicate auxiliary asset: {name}");
+                    std::process::exit(1);
+                }
+            }
+            if tuning_dir.as_ref().is_some_and(|path| !path.is_absolute()) {
+                eprintln!("--tuning-dir must be an absolute path");
+                std::process::exit(1);
+            }
+            if autotune && tuning_dir.is_none() {
+                eprintln!("--autotune requires an explicit absolute --tuning-dir");
+                std::process::exit(1);
+            }
+            let alias = served_model_name.unwrap_or_else(|| {
+                model
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("apxinf-model")
+                    .to_owned()
+            });
+            let load_options = LoadOptions {
+                model_name,
+                model_variant,
+                text_weight_dtype,
+                assets,
+                autotune,
+                tuning_path: tuning_dir,
+                ..LoadOptions::default()
+            };
+            let config = apxinf_serving::ServeConfig {
+                host,
+                port,
+                queue_capacity,
+                media_limits:apxinf_serving::MediaLimits { body_bytes:max_body_bytes,image_bytes:max_image_bytes,image_dimension:max_image_dimension,decoded_pixels:max_decoded_pixels },
+                log_timing,
+                api: apxinf_serving::ApiConfig {
+                    served_model_name: alias,
+                    max_output_tokens,
+                },
+                engine: apxinf_serving::ApxInfEngineConfig {
+                    model_path: model,
+                    device,
+                    load_options,
+                    default_max_tokens: max_output_tokens,
+                    max_input_tokens,
+                },
+            };
+            if let Err(error) = apxinf_serving::serve_blocking(config) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
         Commands::Test => {
             run_test();
         }
@@ -466,7 +636,9 @@ fn parse_device(spec: &str) -> Result<Device, String> {
     let (kind, index) = match normalized.split_once(':') {
         Some((kind, index)) => {
             let index = index.parse::<usize>().map_err(|_| {
-                format!("Invalid device index in '{spec}'; use cpu, cuda:N, or metal:N")
+                format!(
+                    "Invalid device index in '{spec}'; use cpu, cuda:N, hip:N, musa:N, or metal:N"
+                )
             })?;
             (kind, index)
         }
@@ -475,9 +647,11 @@ fn parse_device(spec: &str) -> Result<Device, String> {
     match kind {
         "cpu" if index == 0 => Ok(Device::Cpu),
         "cuda" | "gpu" => Ok(Device::Cuda(index)),
+        "hip" => Ok(Device::Hip(index)),
+        "musa" => Ok(Device::Musa(index)),
         "metal" | "mlx" => Ok(Device::Metal(index)),
         _ => Err(format!(
-            "Unknown device '{spec}'; use cpu, cuda:N, or metal:N (mlx:N is an alias)"
+            "Unknown device '{spec}'; use cpu, cuda:N, hip:N, musa:N, or metal:N (mlx:N is an alias)"
         )),
     }
 }
@@ -537,6 +711,9 @@ mod device_tests {
         assert_eq!(parse_device("cpu").unwrap(), Device::Cpu);
         assert_eq!(parse_device("gpu").unwrap(), Device::Cuda(0));
         assert_eq!(parse_device("cuda:2").unwrap(), Device::Cuda(2));
+        assert_eq!(parse_device("hip").unwrap(), Device::Hip(0));
+        assert_eq!(parse_device("musa").unwrap(), Device::Musa(0));
+        assert_eq!(parse_device("MUSA:1").unwrap(), Device::Musa(1));
         assert_eq!(parse_device("metal").unwrap(), Device::Metal(0));
         assert_eq!(parse_device("MLX:1").unwrap(), Device::Metal(1));
     }
@@ -583,6 +760,141 @@ mod device_tests {
         };
         assert_eq!(model_name.as_deref(), Some("minicpm5"));
         assert_eq!(model_variant.as_deref(), Some("bf16-compiled"));
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn serving_cli_keeps_generic_model_loading_options() {
+        let cli = Cli::try_parse_from([
+            "apxinf",
+            "serve",
+            "--model",
+            "/checkpoint",
+            "--device",
+            "cpu",
+            "--model-name",
+            "llama",
+            "--model-variant",
+            "reference",
+            "--asset",
+            "aux=/asset",
+            "--served-model-name",
+            "local",
+            "--queue-capacity",
+            "2",
+            "--max-input-tokens",
+            "32",
+            "--max-output-tokens",
+            "4",
+            "--autotune",
+            "--tuning-dir",
+            "/recipes",
+        ])
+        .unwrap();
+        let Commands::Serve {
+            device,
+            model_name,
+            model_variant,
+            asset,
+            served_model_name,
+            queue_capacity,
+            max_input_tokens,
+            max_output_tokens,
+            autotune,
+            tuning_dir,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+        assert_eq!(device, "cpu");
+        assert_eq!(model_name.as_deref(), Some("llama"));
+        assert_eq!(model_variant.as_deref(), Some("reference"));
+        assert_eq!(asset, vec![("aux".into(), std::path::PathBuf::from("/asset"))]);
+        assert_eq!(served_model_name.as_deref(), Some("local"));
+        assert_eq!(
+            (queue_capacity, max_input_tokens, max_output_tokens),
+            (2, 32, 4)
+        );
+        assert!(autotune);
+        assert_eq!(tuning_dir, Some(std::path::PathBuf::from("/recipes")));
+    }
+
+    #[test]
+    fn image_cli_accepts_reference_variant() {
+        let result = Cli::try_parse_from([
+            "apxinf",
+            "generate-image",
+            "--model",
+            "/checkpoint",
+            "--prompt",
+            "a red bicycle",
+            "--output",
+            "image.ppm",
+            "--model-variant",
+            "reference",
+        ]);
+        let cli = result.unwrap_or_else(|error| panic!("reference variant rejected: {error}"));
+        let Commands::GenerateImage {
+            model_variant,
+            width,
+            height,
+            steps,
+            ..
+        } = cli.command
+        else {
+            panic!("expected generate-image command");
+        };
+        assert_eq!(model_variant.as_deref(), Some("reference"));
+        assert_eq!((width, height, steps), (1024, 1024, 40));
+    }
+
+    #[test]
+    fn image_cli_preserves_default_and_auto_variants() {
+        for variant in [None, Some("auto")] {
+            let mut arguments = vec![
+                "apxinf",
+                "generate-image",
+                "--model",
+                "/checkpoint",
+                "--prompt",
+                "a red bicycle",
+                "--output",
+                "image.ppm",
+            ];
+            if let Some(variant) = variant {
+                arguments.extend(["--model-variant", variant]);
+            }
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let Commands::GenerateImage { model_variant, .. } = cli.command else {
+                panic!("expected generate-image command");
+            };
+            assert_eq!(model_variant.as_deref(), variant);
+        }
+    }
+
+    #[test]
+    fn image_command_forwards_variant_to_loader_before_checkpoint_io() {
+        let request = ImageRequest {
+            prompt: "a red bicycle",
+            width: 512,
+            height: 512,
+            seed: 7,
+            steps: 40,
+        };
+        let error = run_generate_image(
+            &"/missing-qwen-image-checkpoint".into(),
+            Some("qwen_image"),
+            Some("reference"),
+            Device::Cpu,
+            &request,
+            &"/unused-image.ppm".into(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("model qwen_image does not yet support model_variant"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1284,7 +1596,7 @@ fn run_speak(
 }
 
 /// RIFF WAVE with IEEE float samples (format 3), so samples are stored exactly.
-fn float_wav(audio: &apxinf_model::GeneratedAudio) -> Vec<u8> {
+fn float_wav(audio: &apxinf_model::speech::GeneratedAudio) -> Vec<u8> {
     let data = (audio.samples.len() * 4) as u32;
     let channels = audio.channels as u16;
     let mut out = Vec::with_capacity(44 + data as usize);
@@ -1309,7 +1621,7 @@ fn float_wav(audio: &apxinf_model::GeneratedAudio) -> Vec<u8> {
 #[cfg(test)]
 mod wav_tests {
     use super::float_wav;
-    use apxinf_model::GeneratedAudio;
+    use apxinf_model::speech::GeneratedAudio;
 
     #[test]
     fn float_wav_header_describes_the_samples() {
@@ -1659,7 +1971,7 @@ fn run_test() {
 
     let a = Tensor::from_f32(vec![2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
     let b = Tensor::from_f32(vec![3, 2], &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
-    let c_cpu = a.matmul_cpu(&b).unwrap();
+    let c_cpu = apxinf_core::CpuBackend.matmul(&a, &b).unwrap();
     println!("[CPU] A: {a}");
     println!("[CPU] B: {b}");
     println!("[CPU] C = A @ B: {c_cpu}");

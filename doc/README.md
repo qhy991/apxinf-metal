@@ -16,7 +16,14 @@ model-specific examples and historical evidence link back to it.
 | A required safe device operation is missing | [Adding New Kernels](adding-new-kernels.md) |
 | Designing the native MLX backend or migrating a qualified Mac model | [MLX Backend](mlx-backend.md) — ownership, supported selections and execution contracts |
 | Running PI0.5 on AMD (HIP), comparing it with CUDA, or extending it | [PI0.5 on HIP](hip-pi05.md) — layout, entry points, validation and status |
+| Running GR00T on AMD (HIP), or extending that port | [GR00T on HIP](hip-gr00t.md) — layout, acceptance gate, known limits, fixture provenance |
+| Building, tuning or measuring the Moore Threads backend | [MUSA Backend](musa-backend.md) — build, generations, INT8 routes, capture, tactics database and the accuracy gate |
+| Choosing, generating or shipping GEMM/attention tuning recipes | [Tuning Databases](../configs/tuning/README.md) — cache layout, recipe formats, the committed AMD exception and the git-ignored machine-local caches |
+| Profiling PI0.5 on MUSA with msys | [Profiling PI0.5 on MUSA](pi05-mttx.md) — markers, recordings and the two known reading defects |
+| Running the PI0.5 FP32 reference on CPU | [PI0.5 CPU reference](pi05-cpu-reference.md) — build, input and execution contracts, numerical validation |
 | Proposing Apple Neural Engine execution through Core ML | [Core ML and ANE](coreml-ane.md) — proposal under upstream review |
+| Converting, running or measuring GPT-SoVITS V5 speech synthesis | [GPT-SoVITS V5](gpt-sovits-v5.md) — checkpoint conversion, `TtsTrait` wiring, precision gate and audio-quality acceptance |
+| Profiling a Metal model with Instruments | [MLX Backend](mlx-backend.md#profiling-with-instruments) — the `mlx-signpost` feature, recording and cost |
 
 PI0.5 currently separates `model/`, `model_runner/` and `weights/`. Its
 [component view](model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2)
@@ -33,11 +40,33 @@ Qwen3.8-27B-NVFP4 is a text LLM behind `LlmTrait` with the same
 `weights`/`model`/`model_runner` owners as single files.
 [CLI inference, benchmarking and limits](qwen38-nvfp4.md) cover Jetson Thor.
 
+GPT-SoVITS V5 is a TTS model behind `TtsTrait`, the single contract shared by
+every TTS family (Qwen3-TTS uses it too), with its phone/BERT/reference inputs
+carried in a typed extension. Its
+[conversion, wiring and quality acceptance](gpt-sovits-v5.md) cover the
+checkpoint converter, the Python text frontend boundary and the quality gates
+run against the official eager backend.
+
 ## Agent workflows
 
 - [model-port-workflow](../skills/model-port-workflow/SKILL.md): a complete new-family port, including module ownership, registration, public integration and GPU evidence.
 - [analyze-model-impl](../skills/analyze-model-impl/SKILL.md): trace the selected implementation from model/runner through actual backend calls; source inspection alone is not a benchmark.
 - [l3-reference-testing](../skills/l3-reference-testing/SKILL.md): independent numerical tests for `apxinf-cuda-new` L3 semantics/candidates; these are separate from current PI0.5 backend and model-level acceptance.
+- [finish-work-session](../skills/finish-work-session/SKILL.md): report recorded token usage (input cache hits, input cache misses, output, per-model breakdown) for the current Codex or Claude Code session and all descendant agents; missing usage stays visible instead of counting as zero.
+
+To install finish-work-session, run from the repository root:
+
+```bash
+# Claude Code
+mkdir -p .claude/skills && ln -s ../../skills/finish-work-session .claude/skills/
+
+# Codex
+mkdir -p ~/.agents/skills && ln -s "$(pwd)/skills/finish-work-session" ~/.agents/skills/
+```
+
+Then say "finish this session", or invoke `/finish-work-session` (Claude Code) or `$finish-work-session` (Codex). The helper also runs directly with
+`python3 skills/finish-work-session/scripts/session_usage.py --agent claude-code` (or `--agent codex`). Reports are snapshots of locally recorded usage; running requests and the final reporting response are not included. Save reports under `devlocal/<feat-name>/reports/`.
+- [copy-drift-audit](../skills/copy-drift-audit/SKILL.md): audit a backend-native port's copied files against the family source they came from, with one import watermark per file; upstream changes are adjudicated, not treated as defects.
 
 Skills resolve these documents from the checkout/worktree being modified,
 even when installed globally through a symlink to another branch. Repository
@@ -55,6 +84,7 @@ ignored `devlocal/<feat-name>/` according to [AGENTS.md](../AGENTS.md).
 
 ## Model operation
 
+- [LLM/VLM HTTP serving](../crates/apxinf-serving/README.md) — optional OpenAI/Anthropic APIs, image input, streaming, tool calls and serial worker contracts
 - [PI0.5 CUDA regression](pi05-cuda-regression.md)
 - [PI0.5 one-step warm-start evaluation](run_warmstart_with_onestep.md)
 - [GR00T N1.7](gr00t-n1.7.md)

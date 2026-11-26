@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 build = "build.rs"
+rust-version = "1.89"
 [features]
 default = []
 native = []
@@ -13,19 +14,5 @@ half = "2"
 prost = "0.14"
 sha2 = "0.10"
 tempfile = "3"
-[dev-dependencies]
-libc = "0.2"
 [build-dependencies]
 cc = "1"
-
-[[example]]
-name = "sdpa_probe"
-required-features = ["native"]
-
-[[example]]
-name = "lfm3_mlp_probe"
-required-features = ["native"]
-
-[[example]]
-name = "lfm3_mlp_parity_probe"
-required-features = ["native"]

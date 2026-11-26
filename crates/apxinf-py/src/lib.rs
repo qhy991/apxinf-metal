@@ -7,7 +7,7 @@
 //! The public inference tier is numpy-in / numpy-out (host):
 //!
 //! * **L1** [`ModelRunner::infer_rgb`] — caller supplies resized RGB `uint8` images;
-//!   vision→patches runs inside the Rust CUDA graph.
+//!   the selected Rust runtime converts RGB to patches.
 //!
 //! **L0** [`ModelRunner::infer_patches`] (caller supplies pre-computed `patches`,
 //! equivalent to a Rust `Observation(Patches)`) is exposed under the private
@@ -18,16 +18,16 @@
 //! Both return the **normalized-domain** action as a `float32` numpy array of
 //! shape `[action_horizon, action_dim]`. Inference accepts optional exact
 //! caller-provided noise. When it is omitted, a model-owned counter-based stream
-//! generates the initial latent directly in the runtime's device buffer. The
+//! generates the initial latent through the selected runtime. The
 //! `*_seeded` variants remain available for explicitly keyed replay. No processor
 //! lives here.
 //!
-//! The VLA runtimes are only registered on CUDA devices, so real inference
-//! requires the `cuda` feature and a CUDA machine; without it the module still
-//! imports and reports shape contracts, but model loading errors.
+//! PI0.5 supports CPU inference with its FP32 reference variant and optional
+//! OpenBLAS GEMM. CUDA model variants require the `cuda` feature
+//! and a CUDA device.
 //!
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -41,10 +41,13 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use apxinf_core::{DType, Device, RngKey, Shape, Tensor};
+use apxinf_model::tts_trait::{
+    GptSovitsInputs, PreparedTts, TtsCacheConfig, TtsExtension, TtsRequest, TtsSampling, TtsSpec,
+};
 use apxinf_model::{
-    AutoModel, DecisionInput, DecisionOutput, DecisionSchema, ImageLayout, LoadOptions,
-    LoadedModel, ModelPrecision, Observation, Pi05Config, SchemaDecisionAnswer, SyntheticWeights,
-    VisionObservation, VlaContract, VlaMetadata, VlaRequest,
+    AutoModel, DecisionInput, DecisionOutput, DecisionSchema, ExecutionPolicy, ImageLayout,
+    LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config, SchemaDecisionAnswer,
+    SyntheticWeights, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
 };
 use apxinf_tokenizer::{SentencePieceTokenizer as NativeSentencePiece, Tokenizer as NativeHf};
 
@@ -127,7 +130,7 @@ fn parse_device(spec: &str) -> PyResult<Device> {
         Some((kind, index)) => {
             let index = index.parse::<usize>().map_err(|_| {
                 PyValueError::new_err(format!(
-                    "apxinf_py.load: invalid device index in `{spec}` (expected e.g. `cuda:0` or `metal:0`)"
+                    "apxinf_py.load: invalid device index in `{spec}` (expected e.g. `cuda:0`, `musa:0` or `metal:0`)"
                 ))
             })?;
             (kind, index)
@@ -137,10 +140,11 @@ fn parse_device(spec: &str) -> PyResult<Device> {
     match kind {
         "cuda" => Ok(Device::Cuda(index)),
         "hip" => Ok(Device::Hip(index)),
+        "musa" => Ok(Device::Musa(index)),
         "metal" | "mlx" => Ok(Device::Metal(index)),
         "cpu" => Ok(Device::Cpu),
         other => Err(PyValueError::new_err(format!(
-            "apxinf_py.load: unknown device `{other}` (expected cuda|hip|metal|mlx|cpu)"
+            "apxinf_py.load: unknown device `{other}` (expected cuda|hip|musa|metal|mlx|cpu)"
         ))),
     }
 }
@@ -157,6 +161,17 @@ fn parse_precision(spec: &str) -> PyResult<ModelPrecision> {
     }
 }
 
+fn parse_execution_policy(spec: &str) -> PyResult<ExecutionPolicy> {
+    match spec {
+        "eager" => Ok(ExecutionPolicy::Eager),
+        "prefer-graph" => Ok(ExecutionPolicy::PreferGraph),
+        "require-graph" => Ok(ExecutionPolicy::RequireGraph),
+        other => Err(PyValueError::new_err(format!(
+            "apxinf_py.load: unknown execution `{other}` (expected eager|prefer-graph|require-graph)"
+        ))),
+    }
+}
+
 fn parse_layout(spec: &str) -> PyResult<ImageLayout> {
     match spec {
         "nhwc" => Ok(ImageLayout::Nhwc),
@@ -165,6 +180,38 @@ fn parse_layout(spec: &str) -> PyResult<ImageLayout> {
             "apxinf_py.infer_rgb: layout must be nhwc|nchw, got `{other}`"
         ))),
     }
+}
+
+/// Keep legacy processor bridges' optional leading batch dimension, while
+/// requiring joint latents to match the runtime's complete declared geometry.
+fn supplied_latent_tensor(
+    noise: PyReadonlyArrayDyn<'_, f32>,
+    expected: &[usize],
+    allow_legacy_batch: bool,
+) -> PyResult<Tensor> {
+    let shape = noise.shape();
+    let legacy_batch = allow_legacy_batch
+        && expected.len() == 2
+        && shape.len() == 3
+        && shape[0] == 1
+        && &shape[1..] == expected;
+    if shape != expected && !legacy_batch {
+        return Err(PyValueError::new_err(format!(
+            "apxinf_py.infer: noise expected shape {expected:?}, got {shape:?}"
+        )));
+    }
+    if !noise.is_c_contiguous() {
+        return Err(PyValueError::new_err(
+            "apxinf_py.infer: noise must be C-contiguous float32",
+        ));
+    }
+    let data = noise.as_slice().map_err(|_| {
+        PyValueError::new_err("apxinf_py.infer: noise must be C-contiguous float32")
+    })?;
+    if data.iter().any(|value| !value.is_finite()) {
+        return Err(PyValueError::new_err("apxinf_py.infer: noise must be finite"));
+    }
+    Tensor::from_f32(Shape::new(shape.to_vec()), data).map_err(runtime_err)
 }
 
 /// Resolve the pi05 config the same way the loader does, so shape-contract
@@ -281,7 +328,417 @@ fn schema_answer_to_python<'py>(
     result.set_item("scores", scores)?;
     Ok(result)
 }
+/// Python binding for a loaded GPT-SoVITS V5 tts runtime: the Python policy
+/// owns the text front-end and passes phone/BERT IDs and reference features
+/// through the tts contract's typed request extension.
+#[pyclass(unsendable)]
+pub struct SpeechRunner {
+    model: LoadedModel,
+    prepared: RefCell<Option<Box<dyn PreparedTts>>>,
+    device: Device,
+    model_path: PathBuf,
+}
 
+#[pymethods]
+impl SpeechRunner {
+    /// Load a tts checkpoint through AutoModel.
+    #[staticmethod]
+    #[pyo3(signature = (
+        model_path,
+        device="cuda:0",
+        precision="auto",
+        model_name="gpt_sovits",
+        autotune=false,
+    ))]
+    fn from_pretrained(
+        model_path: PathBuf,
+        device: &str,
+        precision: &str,
+        model_name: &str,
+        autotune: bool,
+    ) -> PyResult<Self> {
+        let device = parse_device(device)?;
+        let options = LoadOptions {
+            model_name: Some(model_name.to_owned()),
+            precision: parse_precision(precision)?,
+            autotune,
+            ..LoadOptions::default()
+        };
+        let mut model =
+            AutoModel::load_model(device, &model_path, &options).map_err(runtime_err)?;
+        model.tts_mut().map_err(|_| {
+            PyValueError::new_err(format!(
+                "apxinf_py.SpeechRunner.from_pretrained: {:?} is not a tts model",
+                model_path
+            ))
+        })?;
+        Ok(Self {
+            model,
+            prepared: RefCell::new(None),
+            device,
+            model_path,
+        })
+    }
+
+    /// Prepare fixed-shape CFM and vocoder CUDA graphs.
+    #[pyo3(signature = (
+        phone_count,
+        bert_token_count,
+        reference_phone_count,
+        reference_bert_token_count,
+        reference_audio_samples,
+        reference_frames,
+        reference_spec_frames,
+        target_frames,
+        sample_steps=4,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn prepare(
+        &mut self,
+        phone_count: usize,
+        bert_token_count: usize,
+        reference_phone_count: usize,
+        reference_bert_token_count: usize,
+        reference_audio_samples: usize,
+        reference_frames: usize,
+        reference_spec_frames: usize,
+        target_frames: usize,
+        sample_steps: usize,
+    ) -> PyResult<()> {
+        let spec = TtsSpec {
+            phone_count,
+            bert_token_count,
+            reference_phone_count,
+            reference_bert_token_count,
+            reference_audio_samples,
+            reference_frames,
+            reference_spec_frames,
+            target_frames,
+            sample_steps,
+        };
+        let prepared = self
+            .model
+            .tts_mut()
+            .map_err(runtime_err)?
+            .prepare(&spec)
+            .map_err(runtime_err)?;
+        self.prepared.replace(Some(prepared));
+        Ok(())
+    }
+
+    fn clear_prepared(&self) {
+        self.prepared.replace(None);
+    }
+
+    /// Control conditioning reuse independently of CUDA Graph preparation.
+    #[pyo3(signature = (*, prompt=true, text=true, max_text_entries=32))]
+    fn configure_cache(
+        &mut self,
+        prompt: bool,
+        text: bool,
+        max_text_entries: usize,
+    ) -> PyResult<()> {
+        self.model
+            .tts_mut()
+            .map_err(runtime_err)?
+            .configure_cache(TtsCacheConfig {
+                prompt,
+                text,
+                max_text_entries,
+            })
+            .map_err(runtime_err)
+    }
+
+    #[pyo3(signature = (*, reset_stats=true))]
+    fn clear_cache(&mut self, reset_stats: bool) -> PyResult<()> {
+        self.model
+            .tts_mut()
+            .map_err(runtime_err)?
+            .clear_cache(reset_stats)
+            .map_err(runtime_err)
+    }
+
+    fn cache_info(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+        let info = self.model.tts_mut().map_err(runtime_err)?.cache_info();
+        let result = PyDict::new_bound(py);
+        result.set_item("supported", info.supported)?;
+        result.set_item("prompt_enabled", info.prompt_enabled)?;
+        result.set_item("text_enabled", info.text_enabled)?;
+        result.set_item("prompt_entries", info.prompt_entries)?;
+        result.set_item("text_entries", info.text_entries)?;
+        result.set_item("max_text_entries", info.max_text_entries)?;
+        result.set_item("prompt_hits", info.prompt_hits)?;
+        result.set_item("prompt_misses", info.prompt_misses)?;
+        result.set_item("text_hits", info.text_hits)?;
+        result.set_item("text_misses", info.text_misses)?;
+        result.set_item("host_bytes", info.host_bytes)?;
+        result.set_item("device_bytes", info.device_bytes)?;
+        result.set_item("text_device_budget_bytes", info.text_device_budget_bytes)?;
+        Ok(result.into())
+    }
+
+    #[getter]
+    fn is_prepared(&self) -> bool {
+        self.prepared.borrow().is_some()
+    }
+
+    /// Synthesize mono PCM from canonical GPT-SoVITS inputs.
+    #[pyo3(signature = (
+        phone_ids,
+        bert_token_ids,
+        word2ph,
+        reference_phone_ids,
+        reference_bert_token_ids,
+        reference_word2ph,
+        reference_audio_16k,
+        reference_mel,
+        reference_spec,
+        *,
+        seed=0,
+        top_k=5,
+        top_p=1.0,
+        temperature=1.0,
+        repetition_penalty=1.35,
+        sample_steps=4,
+        cfg_rate=0.0,
+        max_seconds=30.0,
+        speed_factor=1.0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn synthesize<'py>(
+        &mut self,
+        py: Python<'py>,
+        phone_ids: PyReadonlyArray1<'py, u32>,
+        bert_token_ids: PyReadonlyArray1<'py, u32>,
+        word2ph: PyReadonlyArray1<'py, u32>,
+        reference_phone_ids: PyReadonlyArray1<'py, u32>,
+        reference_bert_token_ids: PyReadonlyArray1<'py, u32>,
+        reference_word2ph: PyReadonlyArray1<'py, u32>,
+        reference_audio_16k: PyReadonlyArray1<'py, f32>,
+        reference_mel: PyReadonlyArray2<'py, f32>,
+        reference_spec: PyReadonlyArray2<'py, f32>,
+        seed: u64,
+        top_k: usize,
+        top_p: f32,
+        temperature: f32,
+        repetition_penalty: f32,
+        sample_steps: usize,
+        cfg_rate: f32,
+        max_seconds: f32,
+        speed_factor: f32,
+    ) -> PyResult<PyObject> {
+        let phone_ids = phone_ids
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("phone_ids must be contiguous uint32 [phones]"))?;
+        let bert_token_ids = bert_token_ids.as_slice().map_err(|_| {
+            PyValueError::new_err("bert_token_ids must be contiguous uint32 [tokens]")
+        })?;
+        let word2ph = word2ph.as_slice().map_err(|_| {
+            PyValueError::new_err("word2ph must be contiguous uint32 [tokens_without_specials]")
+        })?;
+        let reference_phone_ids = reference_phone_ids.as_slice().map_err(|_| {
+            PyValueError::new_err("reference_phone_ids must be contiguous uint32 [phones]")
+        })?;
+        let reference_bert_token_ids = reference_bert_token_ids.as_slice().map_err(|_| {
+            PyValueError::new_err("reference_bert_token_ids must be contiguous uint32 [tokens]")
+        })?;
+        let reference_word2ph = reference_word2ph.as_slice().map_err(|_| {
+            PyValueError::new_err(
+                "reference_word2ph must be contiguous uint32 [tokens_without_specials]",
+            )
+        })?;
+        let reference_audio_16k = reference_audio_16k.as_slice().map_err(|_| {
+            PyValueError::new_err("reference_audio_16k must be contiguous float32 [samples]")
+        })?;
+        let reference_mel_shape = reference_mel.shape();
+        if reference_mel_shape.len() != 2
+            || reference_mel_shape[0] == 0
+            || reference_mel_shape[1] != 100
+        {
+            return Err(PyValueError::new_err(format!(
+                "reference_mel must have shape [frames, 100], got {reference_mel_shape:?}"
+            )));
+        }
+        let reference_spec_shape = reference_spec.shape();
+        if reference_spec_shape.len() != 2
+            || reference_spec_shape[0] == 0
+            || reference_spec_shape[1] != 704
+        {
+            return Err(PyValueError::new_err(format!(
+                "reference_spec must have shape [frames, 704], got {reference_spec_shape:?}"
+            )));
+        }
+        let reference_mel = reference_mel
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("reference_mel must be C-contiguous float32"))?;
+        let reference_spec = reference_spec
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("reference_spec must be C-contiguous float32"))?;
+
+        if phone_ids.is_empty() || reference_phone_ids.is_empty() || reference_audio_16k.is_empty()
+        {
+            return Err(PyValueError::new_err(
+                "phone IDs and reference_audio_16k must be non-empty",
+            ));
+        }
+        if bert_token_ids.len() < 3 || word2ph.len() + 2 != bert_token_ids.len() {
+            return Err(PyValueError::new_err(format!(
+                "word2ph length {} must match BERT tokens without specials ({})",
+                word2ph.len(),
+                bert_token_ids.len().saturating_sub(2)
+            )));
+        }
+        if reference_bert_token_ids.len() < 3
+            || reference_word2ph.len() + 2 != reference_bert_token_ids.len()
+        {
+            return Err(PyValueError::new_err(format!(
+                "reference_word2ph length {} must match reference BERT tokens without specials ({})",
+                reference_word2ph.len(),
+                reference_bert_token_ids.len().saturating_sub(2)
+            )));
+        }
+        let phone_sum = word2ph
+            .iter()
+            .try_fold(0usize, |sum, &count| sum.checked_add(count as usize));
+        if phone_sum != Some(phone_ids.len()) {
+            return Err(PyValueError::new_err(format!(
+                "word2ph sums to {:?}, expected {} phone IDs",
+                phone_sum,
+                phone_ids.len()
+            )));
+        }
+        let reference_phone_sum = reference_word2ph
+            .iter()
+            .try_fold(0usize, |sum, &count| sum.checked_add(count as usize));
+        if reference_phone_sum != Some(reference_phone_ids.len()) {
+            return Err(PyValueError::new_err(format!(
+                "reference_word2ph sums to {:?}, expected {} reference phone IDs",
+                reference_phone_sum,
+                reference_phone_ids.len()
+            )));
+        }
+        if top_k == 0
+            || sample_steps == 0
+            || !top_p.is_finite()
+            || !(0.0..=1.0).contains(&top_p)
+            || !temperature.is_finite()
+            || temperature <= 0.0
+            || !repetition_penalty.is_finite()
+            || repetition_penalty <= 0.0
+            || !cfg_rate.is_finite()
+            || cfg_rate < 0.0
+            || !max_seconds.is_finite()
+            || max_seconds <= 0.0
+            || !speed_factor.is_finite()
+            || speed_factor <= 0.0
+        {
+            return Err(PyValueError::new_err(
+                "invalid sampling parameters for tts synthesis",
+            ));
+        }
+
+        // The policy layer already turned the text into front-end IDs, so the
+        // shared text field stays empty; the GptSovits extension carries it.
+        let request = TtsRequest {
+            text: "",
+            seed,
+            sampling: TtsSampling {
+                top_k: Some(top_k),
+                top_p: Some(top_p),
+                temperature: Some(temperature),
+                repetition_penalty: Some(repetition_penalty),
+                max_seconds: Some(max_seconds),
+                ..Default::default()
+            },
+            extension: TtsExtension::GptSovits(GptSovitsInputs {
+                phone_ids,
+                bert_token_ids,
+                word2ph,
+                reference_phone_ids,
+                reference_bert_token_ids,
+                reference_word2ph,
+                reference_audio_16k,
+                reference_mel,
+                reference_spec,
+                sample_steps,
+                cfg_rate,
+                speed_factor,
+            }),
+        };
+        // Prepared graphs contain shape-specialised SoVITS/CFM captures at the
+        // native rate. A speed change alters the target frame count, so those
+        // requests must use the eager runtime.
+        let audio = if (speed_factor - 1.0).abs() <= 1e-6 {
+            if let Some(prepared) = self.prepared.borrow().as_ref() {
+                prepared.run(&request)
+            } else {
+                self.model
+                    .tts_mut()
+                    .map_err(runtime_err)?
+                    .synthesize(&request)
+            }
+        } else {
+            self.model
+                .tts_mut()
+                .map_err(runtime_err)?
+                .synthesize(&request)
+        }
+        .map_err(runtime_err)?;
+        if audio.channels != 1 {
+            return Err(PyRuntimeError::new_err(format!(
+                "tts runtime returned {} channels; SpeechRunner yields mono PCM",
+                audio.channels
+            )));
+        }
+
+        // `valid_length` is kept for API stability; every returned sample is
+        // valid, so it always equals `len(samples)`.
+        let valid_length = audio.samples.len();
+        let result = PyDict::new_bound(py);
+        result.set_item("samples", audio.samples.into_pyarray_bound(py))?;
+        result.set_item("sample_rate", audio.sample_rate)?;
+        result.set_item("valid_length", valid_length)?;
+        result.set_item("complete", audio.complete)?;
+        Ok(result.into())
+    }
+
+    #[getter]
+    fn sample_rate(&mut self) -> PyResult<u32> {
+        Ok(self
+            .model
+            .tts_mut()
+            .map_err(runtime_err)?
+            .contract()
+            .map_err(runtime_err)?
+            .sample_rate)
+    }
+
+    #[getter]
+    fn device(&self) -> String {
+        self.device.to_string()
+    }
+
+    #[getter]
+    fn model_path(&self) -> String {
+        self.model_path.display().to_string()
+    }
+
+    fn __repr__(&mut self) -> PyResult<String> {
+        let sample_rate = self
+            .model
+            .tts_mut()
+            .map_err(runtime_err)
+            .and_then(|tts| tts.contract().map_err(runtime_err))
+            .map(|contract| contract.sample_rate)
+            .unwrap_or(0);
+        Ok(format!(
+            "SpeechRunner(device={}, sample_rate={}, path={:?})",
+            self.device(),
+            sample_rate,
+            self.model_path
+        ))
+    }
+}
 /// Decision model runner (d3-mini, Clef, etc.). Loads via `AutoModel` and exposes
 /// encoded-prompt and schema requests through the same model handle.
 #[pyclass(unsendable)]
@@ -551,19 +1008,17 @@ impl ModelRunner {
 
     /// Validate `noise` shape and build a CPU f32 tensor. The runtime normalizes
     /// f32 CPU tensors to its input dtype, so numpy f32 is accepted directly.
-    fn noise_tensor(&self, noise: PyReadonlyArray2<'_, f32>) -> PyResult<Tensor> {
-        let expected = self.action_shape();
-        let shape = noise.shape();
-        if shape.len() != 2 || shape[0] != expected[0] || shape[1] != expected[1] {
-            return Err(PyValueError::new_err(format!(
-                "apxinf_py.infer: noise expected shape [{}, {}], got {:?}",
-                expected[0], expected[1], shape
-            )));
-        }
-        let data = noise.as_slice().map_err(|_| {
-            PyValueError::new_err("apxinf_py.infer: noise must be C-contiguous float32")
-        })?;
-        Tensor::from_f32(Shape::new(vec![expected[0], expected[1]]), data).map_err(runtime_err)
+    fn noise_tensor(&self, noise: PyReadonlyArrayDyn<'_, f32>) -> PyResult<Tensor> {
+        self.latent_tensor(noise, false)
+    }
+
+    fn latent_tensor(
+        &self,
+        noise: PyReadonlyArrayDyn<'_, f32>,
+        allow_legacy_batch: bool,
+    ) -> PyResult<Tensor> {
+        let expected = self.model.vla().map_err(runtime_err)?.initial_latent_shape();
+        supplied_latent_tensor(noise, &expected, allow_legacy_batch)
     }
 
     fn action_mask_tensor(&self, mask: PyReadonlyArray2<'_, f32>) -> PyResult<Tensor> {
@@ -706,22 +1161,7 @@ impl ModelRunner {
             })?,
         )
         .map_err(runtime_err)?;
-        let [horizon, action_dim] = self.action_shape();
-        let noise_shape = noise.shape();
-        if noise_shape != [horizon, action_dim] && noise_shape != [1, horizon, action_dim] {
-            return Err(PyValueError::new_err(format!(
-                "apxinf_py.{method}: noise expected [{horizon}, {action_dim}] or [1, {horizon}, {action_dim}], got {noise_shape:?}"
-            )));
-        }
-        let latent = Tensor::from_f32(
-            Shape::new(noise_shape.to_vec()),
-            noise.as_slice().map_err(|_| {
-                PyValueError::new_err(format!(
-                    "apxinf_py.{method}: noise must be C-contiguous float32"
-                ))
-            })?,
-        )
-        .map_err(runtime_err)?;
+        let latent = self.latent_tensor(noise, true)?;
         Ok(PreprocessedVlaInput {
             observation: Observation {
                 vision: VisionObservation::Patches(pixels),
@@ -818,19 +1258,7 @@ impl ModelRunner {
             })?,
         )
         .map_err(runtime_err)?;
-        let [horizon, dim] = self.action_shape();
-        if noise.shape() != [horizon, dim] && noise.shape() != [1, horizon, dim] {
-            return Err(PyValueError::new_err(
-                "_infer_resized_rgb: noise shape mismatch",
-            ));
-        }
-        let latent = Tensor::from_f32(
-            Shape::new(noise.shape().to_vec()),
-            noise.as_slice().map_err(|_| {
-                PyValueError::new_err("_infer_resized_rgb: noise must be contiguous float32")
-            })?,
-        )
-        .map_err(runtime_err)?;
+        let latent = self.latent_tensor(noise, true)?;
         Ok(PreprocessedVlaInput {
             observation: Observation {
                 vision: VisionObservation::RgbU8 {
@@ -997,8 +1425,7 @@ impl ModelRunner {
         self.action_array(py, flat)
     }
 
-    /// Run with a standard-normal latent generated into the prepared device
-    /// buffer, avoiding a host allocation and H2D latent copy.
+    /// Run with a standard-normal latent generated by the selected runtime.
     fn run_generated<'py>(
         &self,
         py: Python<'py>,
@@ -1053,8 +1480,9 @@ impl ModelRunner {
     /// * `path` — checkpoint directory or index file.
     /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
     ///   The selected family and compiled features must support that backend.
-    /// * `model_variant` — PI0.5: auto, bf16, fp8_static, int8_dynamic.
-    /// * `precision` — legacy selection for other model families; leave auto for PI0.5.
+    /// * `model_variant` — family-owned implementation selection for every VLA policy;
+    ///   PI0.5 CPU accepts auto/fp32_reference.
+    /// * `precision` — legacy runtime compatibility; leave auto when using model_variant.
     /// * `calibration` — optional FP8 calibration json.
     /// * `tactics` — optional hardware-wide GEMM tactics json.
     /// * `autotune` — tune missing exact GEMM keys from the first real request.
@@ -1068,6 +1496,12 @@ impl ModelRunner {
     ///   the same weights load and run at the requested chunk length.
     /// * `num_views` - serve fewer cameras than the checkpoint declares.
     ///
+    /// `execution` selects how the MUSA PI0.5 runtime builds the plans it
+    /// caches for repeated inference: `"eager"` never captures, `"prefer-graph"`
+    /// (the default when omitted) captures and falls back to eager, and
+    /// `"require-graph"` turns a capture failure into an error. The mode a run
+    /// actually took is reported by [`Self::execution_mode`].
+    ///
     /// `num_views` exists because a deployment often has fewer cameras than the
     /// checkpoint was trained with. Dropping the trailing views is numerically
     /// equivalent to openpi zero-padding and masking them - a masked view is
@@ -1076,7 +1510,7 @@ impl ModelRunner {
     /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
     /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None, weight_layout_budget_bytes=None))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None, weight_layout_budget_bytes=None, execution=None))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -1094,6 +1528,7 @@ impl ModelRunner {
         assets: Option<BTreeMap<String, PathBuf>>,
         model_variant: Option<String>,
         weight_layout_budget_bytes: Option<usize>,
+        execution: Option<&str>,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         // Only explicit PI0.5 overrides bypass AutoModel's config loading.
@@ -1143,6 +1578,7 @@ impl ModelRunner {
             autotune,
             num_views,
             config,
+            execution_policy: execution.map(parse_execution_policy).transpose()?,
             ..LoadOptions::default()
         };
         let loaded = AutoModel::load_model(device, &path, &options).map_err(runtime_err)?;
@@ -1169,7 +1605,8 @@ impl ModelRunner {
     /// * `model` — model name, e.g. `"pi05"`.
     /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
     ///   The selected family and compiled features must support that backend.
-    /// * `model_variant` — `bf16` (default), `fp8_static`, or `int8_dynamic`.
+    /// * `model_variant` — CUDA: `bf16` (default), `fp8_static`, or `int8_dynamic`;
+    ///   CPU: explicitly select `auto` or `fp32_reference`.
     /// * `calibration` — for FP8: `"uniform:<scale>"` for a uniform activation
     ///   scale (no calibration file), or a path to a calibration json.
     /// * `tactics` - optional hardware-wide GEMM tactics json.
@@ -1270,7 +1707,7 @@ impl ModelRunner {
     ///
     /// * `patches` - `float32` `[num_views * patches_per_view, 3 * patch_size^2]`.
     /// * `token_ids` - `uint32` `[token_count]` (1..=max_token_len).
-    /// * `noise` - optional `float32` `[action_horizon, action_dim]`; omission
+    /// * `noise` - optional `float32` with `initial_latent_shape`; omission
     ///   uses the model's internal device-side sampling stream.
     ///
     /// Returns the normalized-domain action, `float32` `[action_horizon, action_dim]`.
@@ -1280,7 +1717,7 @@ impl ModelRunner {
         py: Python<'py>,
         patches: PyReadonlyArray2<'py, f32>,
         token_ids: PyReadonlyArray1<'py, u32>,
-        noise: Option<PyReadonlyArray2<'py, f32>>,
+        noise: Option<PyReadonlyArrayDyn<'py, f32>>,
         action_mask: Option<PyReadonlyArray2<'py, f32>>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let expected = [self.patch_rows(), self.patch_width()];
@@ -1615,14 +2052,14 @@ impl ModelRunner {
         self.run_generated(py, observation, RngKey::new(seed, sequence, draw), None)
     }
 
-    /// **L1** - infer from resized RGB `uint8` images; vision->patches runs in the
-    /// Rust CUDA graph.
+    /// **L1** - infer from resized RGB `uint8` images; the selected Rust runtime
+    /// converts RGB to patches.
     ///
     /// * `rgb_u8` - `uint8` images, `num_views * image_size * image_size * 3`
     ///   bytes total, in `layout` order.
     /// * `layout` - `"nhwc"` or `"nchw"`.
     /// * `token_ids` - `uint32` `[token_count]`.
-    /// * `noise` - optional `float32` `[action_horizon, action_dim]`; omission
+    /// * `noise` - optional `float32` with `initial_latent_shape`; omission
     ///   uses the model's internal device-side sampling stream.
     /// * `image_grid_thw` - optional `uint32` `[views, 3]` patch grids for models
     ///   that accept per-request image sizes; `rgb_u8` then packs each view at
@@ -1637,7 +2074,7 @@ impl ModelRunner {
         rgb_u8: PyReadonlyArrayDyn<'py, u8>,
         layout: &str,
         token_ids: PyReadonlyArray1<'py, u32>,
-        noise: Option<PyReadonlyArray2<'py, f32>>,
+        noise: Option<PyReadonlyArrayDyn<'py, f32>>,
         action_mask: Option<PyReadonlyArray2<'py, f32>>,
         state: Option<PyReadonlyArray1<'py, f32>>,
         image_grid_thw: Option<PyReadonlyArray2<'py, u32>>,
@@ -1672,7 +2109,7 @@ impl ModelRunner {
         rgb_u8: PyReadonlyArrayDyn<'py, u8>,
         layout: &str,
         token_ids: PyReadonlyArray1<'py, u32>,
-        noise: Option<PyReadonlyArray2<'py, f32>>,
+        noise: Option<PyReadonlyArrayDyn<'py, f32>>,
         action_mask: Option<PyReadonlyArray2<'py, f32>>,
         state: Option<PyReadonlyArray1<'py, f32>>,
         image_grid_thw: Option<PyReadonlyArray2<'py, u32>>,
@@ -1717,9 +2154,13 @@ impl ModelRunner {
     ///   and stops, returning a shorter array. Pass the FAST `|` terminator to
     ///   skip the ~90% of `max_action_tokens` that the detokenizer discards.
     ///
+    /// * `max_new_tokens` — optional per-call limit in `1..=max_action_tokens`.
+    ///   With `stop_token=None`, emit exactly this many ids (including any `|`).
+    ///   This bounds the actual decode loop, not a slice of a longer result.
+    ///
     /// Returns `uint32` `[1..=max_action_tokens]`, including `stop_token` when
     /// it was hit.
-    #[pyo3(name = "infer_action_tokens_rgb", signature = (rgb_u8, layout, token_ids, stop_token=None))]
+    #[pyo3(name = "infer_action_tokens_rgb", signature = (rgb_u8, layout, token_ids, stop_token=None, *, max_new_tokens=None))]
     fn infer_action_tokens_rgb<'py>(
         &self,
         py: Python<'py>,
@@ -1727,6 +2168,7 @@ impl ModelRunner {
         layout: &str,
         token_ids: PyReadonlyArray1<'py, u32>,
         stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<u32>>> {
         let token_shape = self.action_tokens.ok_or_else(|| {
             PyValueError::new_err(
@@ -1734,6 +2176,14 @@ impl ModelRunner {
                  discrete action tokens (it is a continuous-action runtime)",
             )
         })?;
+        if let Some(limit) = max_new_tokens {
+            if limit == 0 || limit > token_shape[1] {
+                return Err(PyValueError::new_err(format!(
+                    "max_new_tokens must be in 1..={}, got {limit}",
+                    token_shape[1]
+                )));
+            }
+        }
         let (observation, _) =
             self.rgb_observation("infer_action_tokens_rgb", rgb_u8, layout, token_ids, None)?;
         // Token VLAs condition on the observation alone; the request still
@@ -1742,7 +2192,7 @@ impl ModelRunner {
         let request = VlaRequest::provided(&observation, &unused_latent);
         let decoded = self
             .model
-            .infer_action_tokens(&request, stop_token)
+            .infer_action_tokens_with_limit(&request, stop_token, max_new_tokens)
             .map_err(runtime_err)?;
         let values = decoded.to_f32_vec().map_err(runtime_err)?;
         if values.is_empty() || values.len() > token_shape[1] {
@@ -1766,7 +2216,7 @@ impl ModelRunner {
         rgb_u8: PyReadonlyArrayDyn<'_, u8>,
         layout: &str,
         token_ids: PyReadonlyArray1<'_, u32>,
-        noise: PyReadonlyArray2<'_, f32>,
+        noise: PyReadonlyArrayDyn<'_, f32>,
     ) -> PyResult<BTreeMap<String, f32>> {
         let (observation, _) =
             self.rgb_observation("_calibrate_rgb", rgb_u8, layout, token_ids, None)?;
@@ -1852,6 +2302,24 @@ impl ModelRunner {
         Ok(self.model.vla().map_err(runtime_err)?.model_variant())
     }
 
+    /// Complete supplied-noise shape; it may differ from the action readout.
+    #[getter]
+    fn initial_latent_shape(&self) -> PyResult<Vec<usize>> {
+        Ok(self.model.vla().map_err(runtime_err)?.initial_latent_shape())
+    }
+
+    /// Execution path the runtime is actually on: `"unprepared"`, `"eager"`,
+    /// `"graph"`, `"invalidated"` or `"runtime-managed"`.
+    ///
+    /// Ask after a run, not after loading: the plan is built on first use. A
+    /// `"eager"` here after asking for `"require-graph"` cannot happen - that
+    /// combination fails the run - while after `"prefer-graph"` it means the
+    /// capture fell back.
+    #[getter]
+    fn execution_mode(&self) -> PyResult<&'static str> {
+        Ok(self.model.vla().map_err(runtime_err)?.execution_mode())
+    }
+
     #[getter]
     fn action_dim(&self) -> usize {
         self.action_shape()[1]
@@ -1913,6 +2381,7 @@ fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
         apxinf_model::qwen_drive::FIXED_SCENE_TOKENS,
     )?;
     module.add_class::<ModelRunner>()?;
+    module.add_class::<SpeechRunner>()?;
     module.add_class::<DecisionRunner>()?;
     module.add_class::<PackedRgbU8>()?;
     module.add_class::<HfTokenizer>()?;
@@ -1924,6 +2393,42 @@ fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use numpy::PyArrayMethods;
+
+    #[test]
+    fn supplied_noise_preserves_joint_geometry_and_legacy_batches() {
+        use numpy::ndarray::{ArrayD, IxDyn};
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let joint_shape = [1, 16, 9, 28, 28];
+            let joint = ArrayD::<f32>::zeros(IxDyn(&joint_shape)).into_pyarray_bound(py);
+            let tensor = supplied_latent_tensor(joint.readonly(), &joint_shape, false).unwrap();
+            assert_eq!(tensor.shape().dims(), &joint_shape);
+            assert!(supplied_latent_tensor(joint.readonly(), &[16, 7], true).is_err());
+
+            let action = ArrayD::<f32>::zeros(IxDyn(&[16, 7])).into_pyarray_bound(py);
+            assert!(supplied_latent_tensor(action.readonly(), &[16, 7], false).is_ok());
+            assert!(supplied_latent_tensor(action.readonly(), &joint_shape, true).is_err());
+            let batch = ArrayD::<f32>::zeros(IxDyn(&[1, 16, 7])).into_pyarray_bound(py);
+            assert!(supplied_latent_tensor(batch.readonly(), &[16, 7], true).is_ok());
+            assert!(supplied_latent_tensor(batch.readonly(), &[16, 7], false).is_err());
+        });
+    }
+
+    #[test]
+    fn supplied_noise_rejects_nonfinite_and_noncontiguous_arrays() {
+        use numpy::ndarray::{ArrayD, IxDyn};
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let invalid = ArrayD::<f32>::from_elem(IxDyn(&[16, 7]), f32::NAN)
+                .into_pyarray_bound(py);
+            assert!(supplied_latent_tensor(invalid.readonly(), &[16, 7], false).is_err());
+            let strided = ArrayD::<f32>::zeros(IxDyn(&[7, 16]))
+                .reversed_axes()
+                .into_pyarray_bound(py);
+            assert!(supplied_latent_tensor(strided.readonly(), &[16, 7], false).is_err());
+        });
+    }
 
     mod decision {
         use super::*;
@@ -2195,6 +2700,8 @@ mod tests {
         assert!(matches!(parse_device("cuda").unwrap(), Device::Cuda(0)));
         assert!(matches!(parse_device("hip").unwrap(), Device::Hip(0)));
         assert!(matches!(parse_device("hip:2").unwrap(), Device::Hip(2)));
+        assert!(matches!(parse_device("musa").unwrap(), Device::Musa(0)));
+        assert!(matches!(parse_device("musa:1").unwrap(), Device::Musa(1)));
         assert!(matches!(parse_device("cuda:1").unwrap(), Device::Cuda(1)));
         assert!(matches!(parse_device("cpu").unwrap(), Device::Cpu));
         assert_eq!(parse_device("metal").unwrap(), Device::Metal(0));

@@ -10,6 +10,7 @@ apxinf-mlx = { path = "../apxinf-mlx", optional = true }
 apxinf-coreml = { path = "../apxinf-coreml", optional = true }
 apxinf-cuda-new = { path = "../apxinf-cuda-new", optional = true }
 apxinf-hip = { path = "../apxinf-hip", optional = true }
+apxinf-musa = { path = "../apxinf-musa", optional = true, default-features = false }
 apxinf-loader = { path = "../apxinf-loader" }
 apxinf-tokenizer = { path = "../apxinf-tokenizer", optional = true }
 thiserror = "1"
@@ -24,13 +25,16 @@ sha2 = { version = "0.10", optional = true }
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 libc = "0.2"
 
-# Image container decoding for the d3-lite image bench (the model runtime
-# itself takes decoded RGB; decoding is application-owned).
 [dev-dependencies]
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+apxinf-tokenizer = { path = "../apxinf-tokenizer" }
+flate2 = "1"
+tempfile = "3"
 # Decodes recorded Core ML packages in the Clef GPU+ANE device test.
 prost = "0.14"
-apxinf-tokenizer = { path = "../apxinf-tokenizer" }
+sha2 = "0.10"
+# Image decoding for the d3 Metal preprocessing device test; the runtime
+# itself takes decoded RGB.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # The d3-lite os_signpost shim (native/d3_signpost_shim.c), compiled only
 # when the `mlx` feature is on for Apple Silicon.
@@ -39,11 +43,14 @@ cc = "1"
 
 [features]
 default = []
+openblas = ["apxinf-core/openblas"]
 # Full NVIDIA CUDA inference on the apxinf-cuda-new runtime.
 cuda = ["dep:apxinf-cuda-new"]
 mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2", "dep:apxinf-tokenizer"]
 # Core ML (Apple Neural Engine) stages in Metal families; implies `mlx`.
 coreml = ["mlx", "dep:apxinf-coreml", "apxinf-coreml/native"]
+# `mlx-signpost` adds os_signpost trace ranges for Instruments.
+mlx-signpost = ["mlx", "apxinf-mlx/signpost"]
 # Deprecated alias of `cuda`, kept so existing build commands keep working.
 # It no longer gates anything: `cuda` already pulls in `apxinf-cuda-new`, and
 # the model code that used to hide behind this flag now follows `cuda`.
@@ -54,6 +61,10 @@ pi05-only = ["cuda"]
 # AMD ROCm/HIP inference, independent of both CUDA features: either, both or
 # neither can be enabled.
 hip = ["dep:apxinf-hip"]
+# Moore Threads MUSA inference, independent of the CUDA and HIP features.
+# `musa` enables the backend; `musa-mttx` adds its profiling markers.
+musa = ["dep:apxinf-musa"]
+musa-mttx = ["musa", "apxinf-musa/mttx"]
 
 [[example]]
 name = "pi05_bench"
@@ -113,6 +124,9 @@ required-features = ["cuda"]
 
 [[example]]
 name = "d3_decision_index"
+
+[[example]]
+name = "cosmos_policy_bench"
 required-features = ["cuda"]
 
 [[example]]
@@ -121,31 +135,4 @@ required-features = ["mlx"]
 
 [[example]]
 name = "d3_lite_bench"
-
-required-features = ["mlx"]
-
-[[example]]
-name = "metal_text_probe"
-required-features = ["mlx"]
-
-[[example]]
-name = "qimage_gpu_roles"
-required-features = ["mlx"]
-
-[[example]]
-name = "qwen_image_loop"
-required-features = ["mlx"]
-
-[[example]]
-name = "rms_norm_add_check"
-path = "examples/rms_norm_add_check.rs"
-
-[[example]]
-name = "qwen3_tts_probe"
-path = "examples/qwen3_tts_probe.rs"
-required-features = ["mlx"]
-
-[[example]]
-name = "qmm_probe"
-path = "examples/qmm_probe.rs"
 required-features = ["mlx"]

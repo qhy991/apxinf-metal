@@ -7,6 +7,7 @@ extern "C" {
     pub fn apx_mlx_loaded_library_path(out: *mut *const c_char) -> i32;
     pub fn apx_mlx_stream_new(gpu: i32, index: i32, out: *mut Handle) -> i32;
     pub fn apx_mlx_stream_free(stream: Handle);
+    pub fn apx_mlx_default_cache_limit(limit: usize) -> i32;
     pub fn apx_mlx_sync(stream: Handle) -> i32;
     pub fn apx_mlx_memory_stats(active: *mut usize, cache: *mut usize, peak: *mut usize) -> i32;
     pub fn apx_mlx_reset_peak_memory() -> i32;

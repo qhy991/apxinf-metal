@@ -64,7 +64,7 @@ void prepare_custom(Execution& execution) {
       }
     }
   }
-  if (bytes != 0) check_cuda(cudaMalloc(&state->probabilities, bytes));
+  if (bytes != 0) execution.scratch.allocate(&state->probabilities, bytes);
   execution.resource_bytes = bytes;
   execution.provider_state = state.release();
 }
@@ -105,7 +105,8 @@ cudaError_t launch_custom(Execution& execution) {
         static_cast<int>(spec.head_dim),
         spec.mask == APXINF_ATTENTION_MASK_CAUSAL,
         static_cast<int>(spec.query_start), bindings.decode_meta,
-        bindings.scale, stream);
+        spec.numerics == APXINF_ATTENTION_NUMERICS_FLEXIBLE, bindings.scale,
+        stream);
   }
   return kernels::launch_attention<__nv_bfloat16>(
       bindings.query, bindings.key, bindings.value, bindings.output,
@@ -116,13 +117,13 @@ cudaError_t launch_custom(Execution& execution) {
       static_cast<int>(spec.head_dim),
       spec.mask == APXINF_ATTENTION_MASK_CAUSAL,
       static_cast<int>(spec.query_start), bindings.decode_meta,
-      bindings.scale, stream);
+      spec.numerics == APXINF_ATTENTION_NUMERICS_FLEXIBLE, bindings.scale,
+      stream);
 }
 
 void destroy_custom(Execution& execution) noexcept {
   auto* state = static_cast<CustomState*>(execution.provider_state);
   if (state == nullptr) return;
-  if (state->probabilities != nullptr) cudaFree(state->probabilities);
   delete state;
   execution.provider_state = nullptr;
 }

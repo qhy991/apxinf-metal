@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <limits>
 
@@ -32,7 +33,7 @@ void validate_recorded_alignment(const void* pointer, uint32_t alignment,
 
 void validate_spec(const apxinf::gemm::Spec& spec) {
   if (spec.version != 9 ||
-      spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_SWIGLU ||
+      spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_GELU_EXACT ||
       spec.a_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.b_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.accumulation_dtype > APXINF_DTYPE_I32 ||
@@ -44,6 +45,13 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
       spec.alpha_is_unit > 1 || spec.output_scale_is_unit > 1 ||
       spec.b_is_immutable > 1 || spec.b_layout > 4) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid GEMM Spec");
+  }
+  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GELU_EXACT &&
+      (spec.a_dtype != APXINF_DTYPE_BF16 || spec.b_dtype != APXINF_DTYPE_BF16 ||
+       spec.output_dtype != APXINF_DTYPE_BF16 || spec.accumulation_dtype != APXINF_DTYPE_F32 ||
+       spec.quantization != APXINF_GEMM_QUANT_NONE || spec.b_layout != APXINF_GEMM_LAYOUT_KN ||
+       !spec.alpha_is_unit || !spec.output_scale_is_unit || spec.bias_alignment || spec.residual_alignment)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid staged exact GELU GEMM contract");
   }
   if ((spec.b_layout == 2 &&
        (spec.n % 512 != 0 ||
@@ -303,12 +311,15 @@ std::unique_ptr<Execution> fallback(
   constexpr uint32_t kProviderCutlass = 3;
   const auto& implementations = apxinf::gemm::registry(spec.semantic);
   auto prepare_first_supported = [&](bool designated_only,
-                                     uint32_t provider_id)
+                                     uint32_t provider_id,
+                                     const char* implementation_name = nullptr)
       -> std::unique_ptr<Execution> {
     for (const auto& implementation : implementations) {
       if ((designated_only && !implementation.fallback) ||
           (!designated_only && implementation.fallback) ||
           (provider_id != 0 && implementation.provider_id != provider_id) ||
+          (implementation_name != nullptr &&
+           std::strcmp(implementation.name, implementation_name) != 0) ||
           !apxinf::gemm::supports_device(implementation, device) ||
           (policy.graph_safe && !implementation.graph_safe) ||
           (policy.deterministic && !implementation.deterministic)) {
@@ -350,6 +361,22 @@ std::unique_ptr<Execution> fallback(
   if (spec.quantization == APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL) {
     if (auto execution =
             prepare_first_supported(false, kProviderCublasLt)) {
+      return execution;
+    }
+  }
+
+  // FP16 bias GEMMs: the staged baseline path materializes an F32 projection
+  // and then runs a second elementwise kernel per projection. Decode-shaped
+  // projections pay that launch cost per layer, per step. The native cuBLASLt
+  // bias epilogue has the same numerical contract (FP32 accumulate, bias added
+  // before the single F16 rounding) and removes the second kernel; the F16
+  // operator-level precision gate covers the numerics.
+  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+      spec.a_dtype == APXINF_DTYPE_F16 && spec.b_dtype == APXINF_DTYPE_F16 &&
+      spec.output_dtype == APXINF_DTYPE_F16 &&
+      spec.quantization == APXINF_GEMM_QUANT_NONE) {
+    if (auto execution = prepare_first_supported(
+            false, kProviderCublasLt, "cublasLt-native-f16-bias")) {
       return execution;
     }
   }
@@ -924,5 +951,19 @@ extern "C" apxinf_status_t apxinf_gemm_test_seed_recipe(
                << implementation_version << ' ' << configuration;
     apxinf::gemm::write_recipe(policy->cache_dir, keys.key,
                                serialized.str());
+  });
+}
+
+extern "C" uint64_t apxinf_gemm_scratch_bytes(apxinf_gemm_execution_t handle) {
+  return handle == nullptr ? 0 : reinterpret_cast<Execution*>(handle)->scratch.bytes();
+}
+extern "C" apxinf_status_t apxinf_gemm_bind_scratch(
+    apxinf_gemm_execution_t handle, void* buffer, uint64_t bytes) {
+  return apxinf::framework::abi_boundary([&] {
+    if (handle == nullptr) {
+      throw apxinf::framework::Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                                       "null scratch execution");
+    }
+    reinterpret_cast<Execution*>(handle)->scratch.bind(buffer, bytes);
   });
 }

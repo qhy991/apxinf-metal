@@ -1708,6 +1708,414 @@ fn gpu_e2e_cutlass_geglu_prepack_is_bound_to_allocation_and_version() {
 }
 
 #[test]
+fn exact_gelu_recipes_resources_and_all_configuration_graphs() {
+    let ctx = CudaContext::new(0).unwrap();
+    if ctx.caps().sm != 110 {
+        return;
+    }
+    let cache_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../devlocal/cosmos-under-200ms/operator-tests")
+        .join(format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let mut av = vec![0.; 1764 * 2048];
+    let mut bv = vec![0.; 2048 * 8192];
+    for i in 0..1764 {
+        av[i * 2048] = (i % 5) as f32 - 2.;
+    }
+    for j in 0..8192 {
+        bv[j] = (j % 5) as f32 / 4. - 0.5;
+    }
+    let a = tensor(0, vec![1764, 2048], &av);
+    let b = tensor(0, vec![2048, 8192], &bv);
+    let mut out = zeros_tensor(0, vec![1764, 8192], DType::BF16);
+    let observed = out.clone();
+    let mut normalize = |ctx: &CudaContext, tune, fallback, budget| {
+        let mut args = GemmArgs::new(&a, &b, &mut out);
+        args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+        args.policy.online_tune = tune;
+        args.policy.allow_fallback = fallback;
+        args.policy.workspace_limit = budget;
+        super::contracts::normalize(ctx, args, super::contracts::Semantic::GemmGeluExact, None)
+            .unwrap()
+    };
+    let budget = 256 * 1024 * 1024;
+    assert!(super::execution::prepare(&ctx, normalize(&ctx, false, false, budget)).is_err());
+    let tuned = super::execution::prepare(&ctx, normalize(&ctx, true, false, budget)).unwrap();
+    assert!(tuned.summary().contains("source=tuned"));
+    drop(tuned);
+    let ctx = CudaContext::new(0).unwrap();
+    let hit = super::execution::prepare(&ctx, normalize(&ctx, false, false, budget)).unwrap();
+    assert!(hit.summary().contains("source=recipe"));
+    drop(hit);
+    let mut expected = None;
+    for (implementation, name, workspace) in [
+        (11, "cutlass-bf16-staged-exact-gelu", 0),
+        (12, "cutlass-bf16-staged-exact-gelu-lut", 131072),
+    ] {
+        for config in 0..6 {
+            let ctx = CudaContext::new(0).unwrap();
+            let normalized = normalize(&ctx, false, false, workspace);
+            super::execution::seed_recipe(&ctx, &normalized, 3, implementation, 1, config).unwrap();
+            let execution = super::execution::prepare(&ctx, normalized).unwrap();
+            assert!(execution
+                .summary()
+                .contains(&format!("{name} config={config} ")));
+            assert!(execution
+                .summary()
+                .contains(&format!("workspace={workspace}")));
+            execution.enqueue().unwrap();
+            let graph = crate::capture(&ctx, || execution.enqueue()).unwrap();
+            drop(execution);
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            let actual: Vec<_> = values(&observed).into_iter().map(f32::to_bits).collect();
+            if let Some(reference) = &expected {
+                assert_eq!(&actual, reference);
+            } else {
+                expected = Some(actual);
+            }
+        }
+        let invalid = normalize(&ctx, false, false, budget);
+        assert!(super::execution::seed_recipe(&ctx, &invalid, 3, implementation, 1, 6).is_err());
+    }
+    let under_budget = normalize(&ctx, false, false, 131071);
+    super::execution::seed_recipe(&ctx, &under_budget, 3, 12, 1, 0).unwrap();
+    assert!(super::execution::prepare(&ctx, under_budget).is_err());
+    let zero_workspace = normalize(&ctx, false, false, 0);
+    super::execution::seed_recipe(&ctx, &zero_workspace, 3, 11, 1, 4).unwrap();
+    let zero = super::execution::prepare(&ctx, zero_workspace).unwrap();
+    assert!(zero.summary().contains("workspace=0"));
+    zero.enqueue().unwrap();
+    ctx.synchronize().unwrap();
+    drop(zero);
+    for entry in std::fs::read_dir(&cache_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|x| x.to_str()) == Some("recipe") {
+            std::fs::write(path, "corrupt recipe\n").unwrap();
+        }
+    }
+    let fresh = CudaContext::new(0).unwrap();
+    assert!(super::execution::prepare(&fresh, normalize(&fresh, false, false, budget)).is_err());
+    let retuned =
+        super::execution::prepare(&fresh, normalize(&fresh, true, false, budget)).unwrap();
+    assert!(retuned.summary().contains("source=tuned"));
+    drop(normalize);
+    retuned.enqueue().unwrap();
+    fresh.synchronize().unwrap();
+    assert_eq!(
+        values(&out)
+            .into_iter()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>(),
+        expected.unwrap()
+    );
+    drop(retuned);
+    // Unlike GEGLU's prepared packed weights, exact GELU binds B directly.
+    // Check all three TMA pointer requirements against actual tensor views.
+    for operand in 0..3 {
+        let shape = match operand {
+            0 => vec![1764, 2048],
+            1 => vec![2048, 8192],
+            _ => vec![1764, 8192],
+        };
+        let bytes = shape.iter().product::<usize>() * 2;
+        let bad = CudaBuffer::alloc(bytes + 2, 0)
+            .unwrap()
+            .view(2, bytes)
+            .unwrap()
+            .as_tensor(Shape::new(shape), DType::BF16)
+            .unwrap();
+        for implementation in [11, 12] {
+            let ctx = CudaContext::new(0).unwrap();
+            let aa = if operand == 0 { &bad } else { &a };
+            let bb = if operand == 1 { &bad } else { &b };
+            let mut dd = if operand == 2 {
+                bad.clone()
+            } else {
+                out.clone()
+            };
+            let mut args = GemmArgs::new(aa, bb, &mut dd);
+            args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+            args.policy.online_tune = false;
+            args.policy.allow_fallback = false;
+            let normalized = super::contracts::normalize(
+                &ctx,
+                args,
+                super::contracts::Semantic::GemmGeluExact,
+                None,
+            )
+            .unwrap();
+            super::execution::seed_recipe(&ctx, &normalized, 3, implementation, 1, 0).unwrap();
+            assert!(super::execution::prepare(&ctx, normalized).is_err());
+        }
+    }
+    std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn wide_attention_recipe_resources_and_configurations() {
+    let ctx = CudaContext::new(0).unwrap();
+    if ctx.caps().sm != 110 {
+        return;
+    }
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../devlocal/cosmos-under-200ms/operator-tests")
+        .join(format!(
+            "wide-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let q = zeros_tensor(0, vec![4, 129, 1, 384], DType::BF16);
+    let k = zeros_tensor(0, vec![4, 131, 1, 384], DType::BF16);
+    let v = tensor(0, vec![4, 131, 1, 384], &vec![1.; 4 * 131 * 384]);
+    let mut out = zeros_tensor(0, vec![4, 129, 1, 384], DType::BF16);
+    let observed = out.clone();
+    let budget = 256 * 1024 * 1024;
+    let mut normalize = |ctx: &CudaContext, tune, fallback, workspace| {
+        let mut args = AttentionArgs::new(&q, &k, &v, &mut out);
+        args.policy.online_tune = tune;
+        args.policy.allow_fallback = fallback;
+        args.policy.workspace_limit = workspace;
+        args.policy.cache_dir = Some(directory.to_string_lossy().into_owned());
+        super::attention_contracts::normalize(ctx, args).unwrap()
+    };
+    assert!(
+        super::attention_execution::prepare(&ctx, normalize(&ctx, false, false, budget)).is_err()
+    );
+    let tuned =
+        super::attention_execution::prepare(&ctx, normalize(&ctx, true, true, budget)).unwrap();
+    assert!(tuned.summary().contains("source=tuned"));
+    drop(tuned);
+    let path = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().and_then(|s| s.to_str()) == Some("recipe"))
+        .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let key = text.lines().next().unwrap();
+    assert!(key.contains("|cublas="));
+    for configuration in 0..2 {
+        std::fs::write(&path, format!("{key}\n5 2 1 {configuration}\n")).unwrap();
+        let fresh = CudaContext::new(0).unwrap();
+        let execution =
+            super::attention_execution::prepare(&fresh, normalize(&fresh, false, false, budget))
+                .unwrap();
+        assert!(execution.summary().contains(&format!(
+            "cublas-bf16-wide-f32-probabilities-sm110 config={configuration} "
+        )));
+        assert!(execution.summary().contains("source=recipe"));
+        execution.enqueue_for_test().unwrap();
+        let graph = crate::capture(&fresh, || execution.enqueue_for_test()).unwrap();
+        graph.replay().unwrap();
+        fresh.synchronize().unwrap();
+        assert!(values(&observed).iter().all(|&x| x == 1.));
+        // Every configuration rereads mutable V rather than a prepared constant.
+        let replacement = tensor(0, vec![4, 131, 1, 384], &vec![2.; 4 * 131 * 384]);
+        crate::transfers::copy_cuda_to_cuda(&fresh, &replacement, &v).unwrap();
+        graph.replay().unwrap();
+        fresh.synchronize().unwrap();
+        assert!(values(&observed).iter().all(|&x| x == 2.));
+        let restore = tensor(0, vec![4, 131, 1, 384], &vec![1.; 4 * 131 * 384]);
+        crate::transfers::copy_cuda_to_cuda(&fresh, &restore, &v).unwrap();
+        fresh.synchronize().unwrap();
+    }
+    let fresh = CudaContext::new(0).unwrap();
+    let limited = super::attention_execution::prepare(
+        &fresh,
+        normalize(&fresh, true, true, 4 * 129 * 131 * 4),
+    )
+    .unwrap();
+    assert!(limited.summary().contains("custom-attention-fallback"));
+    drop(limited);
+    std::fs::write(&path, "corrupt recipe\n").unwrap();
+    let fresh = CudaContext::new(0).unwrap();
+    assert!(
+        super::attention_execution::prepare(&fresh, normalize(&fresh, false, false, budget))
+            .is_err()
+    );
+    let retuned =
+        super::attention_execution::prepare(&fresh, normalize(&fresh, true, true, budget)).unwrap();
+    assert!(retuned.summary().contains("source=tuned"));
+    retuned.enqueue_for_test().unwrap();
+    fresh.synchronize().unwrap();
+    drop(normalize);
+    assert!(values(&out).iter().all(|&x| x == 1.));
+}
+
+#[test]
+fn bf16_plain_gemm_custom_option_recipe_resource_and_lifetime() {
+    bf16_plain_gemm_recipe_resource_and_lifetime(51);
+}
+
+#[test]
+fn bf16_plain_gemm_explicit_tile_recipe_resource_and_lifetime() {
+    bf16_plain_gemm_recipe_resource_and_lifetime(73);
+}
+
+fn bf16_plain_gemm_recipe_resource_and_lifetime(configuration: i32) {
+    let ctx = CudaContext::new(0).unwrap();
+    if ctx.caps().sm != 110 {
+        return;
+    }
+    let cache_dir = scratch_cache_dir(&format!("bf16-lt-config-{configuration}"));
+    let a = tensor(0, vec![1764, 8192], &vec![0.125; 1764 * 8192]);
+    let b = tensor(0, vec![8192, 2048], &vec![0.0625; 8192 * 2048]);
+    let mut out = zeros_tensor(0, vec![1764, 2048], DType::BF16);
+    let normalize = |out: &mut Tensor, budget| {
+        let mut args = GemmArgs::new(&a, &b, out);
+        args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+        args.policy.online_tune = false;
+        args.policy.allow_fallback = false;
+        args.policy.graph_safe = true;
+        args.policy.workspace_limit = budget;
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap()
+    };
+    // Thor supports both heuristic-rank5/custom3 (51) and explicit
+    // 128x224/custom1 (73) with zero workspace; restore each exactly.
+    let spec = normalize(&mut out, 0);
+    assert!(super::execution::seed_recipe(&ctx, &spec, 2, 1, 1, 80).is_err());
+    super::execution::seed_recipe(&ctx, &spec, 2, 1, 1, configuration).unwrap();
+    let execution = super::execution::prepare(&ctx, spec).unwrap();
+    assert!(execution
+        .summary()
+        .contains(&format!("config={configuration} ")));
+    assert!(execution.summary().contains("source=recipe"));
+    assert!(execution.summary().contains("workspace=0"));
+    execution.enqueue().unwrap();
+    let graph = crate::capture(&ctx, || execution.enqueue()).unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert!(values(&out).iter().all(|&x| x == 64.0));
+    let mut fp32_out = zeros_tensor(0, vec![1764, 2048], DType::F32);
+    let unsupported = normalize(&mut fp32_out, 256 * 1024 * 1024);
+    assert!(super::execution::seed_recipe(&ctx, &unsupported, 2, 1, 1, configuration).is_err());
+    let unaligned_buffer = CudaBuffer::alloc(out.size_in_bytes() + 2, 0)
+        .unwrap()
+        .view(2, out.size_in_bytes())
+        .unwrap();
+    let mut unaligned = unaligned_buffer
+        .as_tensor(Shape::new(vec![1764, 2048]), DType::BF16)
+        .unwrap();
+    let rejected = normalize(&mut unaligned, 0);
+    super::execution::seed_recipe(&ctx, &rejected, 2, 1, 1, configuration).unwrap();
+    assert!(super::execution::prepare(&ctx, rejected).is_err());
+    drop(normalize);
+    let changed: Vec<u8> = (0..1764 * 8192)
+        .flat_map(|_| bf16::from_f32(0.0625).to_bits().to_ne_bytes())
+        .collect();
+    CudaBuffer::from_tensor(&a)
+        .unwrap()
+        .copy_from_host(&changed)
+        .unwrap();
+    drop(execution);
+    drop(a);
+    drop(b);
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert!(values(&out).iter().all(|&x| x == 32.0));
+    std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn persistent_attention_zero_workspace_recipe_and_retained_graph() {
+    let ctx = CudaContext::new(0).unwrap();
+    if ctx.caps().sm != 110 {
+        return;
+    }
+    for nk in [512, 1764] {
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../devlocal/cosmos-under-200ms/operator-tests")
+            .join(format!(
+                "persistent-{}-{nk}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let q = zeros_tensor(0, vec![1, 1764, 16, 128], DType::BF16);
+        let k = zeros_tensor(0, vec![1, nk, 16, 128], DType::BF16);
+        let v = tensor(0, vec![1, nk, 16, 128], &vec![1.; nk * 2048]);
+        let mut out = zeros_tensor(0, vec![1, 1764, 16, 128], DType::BF16);
+        let observed = out.clone();
+        let normalize = |ctx: &CudaContext, out: &mut Tensor, tune| {
+            let mut args = AttentionArgs::new(&q, &k, &v, out);
+            args.scale = 0.125;
+            args.policy.online_tune = tune;
+            args.policy.allow_fallback = false;
+            args.policy.graph_safe = true;
+            args.policy.workspace_limit = 0;
+            args.policy.cache_dir = Some(directory.to_string_lossy().into_owned());
+            super::attention_contracts::normalize(ctx, args).unwrap()
+        };
+        drop(super::attention_execution::prepare(&ctx, normalize(&ctx, &mut out, true)).unwrap());
+        let path = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("recipe"))
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let key = text.lines().next().unwrap();
+        // Invalid persisted configurations must not silently select this kernel.
+        std::fs::write(&path, format!("{key}\n3 2 1 1\n")).unwrap();
+        let invalid = CudaContext::new(0).unwrap();
+        assert!(super::attention_execution::prepare(
+            &invalid, normalize(&invalid, &mut out, false)).is_err());
+        // Exercise this exact candidate even if another candidate won tuning.
+        std::fs::write(&path, format!("{key}\n3 2 1 0\n")).unwrap();
+        let fresh = CudaContext::new(0).unwrap();
+        let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+        let execution = prepare_with_session(&session, || {
+            super::attention_execution::prepare(&fresh, normalize(&fresh, &mut out, false))
+        })
+        .unwrap();
+        assert!(
+            execution
+                .summary()
+                .contains("cutlass-fmha-persistent-sm100 config=0 ")
+        );
+        assert!(execution.summary().contains("workspace=0"));
+        assert!(execution.summary().contains("source=recipe"));
+        let graph = crate::capture(&fresh, || {
+            with_session(&session, || {
+                super::attention_execution::execute(&fresh, normalize(&fresh, &mut out, false))
+            })
+        })
+        .unwrap();
+        graph.replay().unwrap();
+        fresh.synchronize().unwrap();
+        assert!(values(&observed).iter().all(|&x| x == 1.));
+        let replacement = tensor(0, vec![1, nk, 16, 128], &vec![2.; nk * 2048]);
+        crate::transfers::copy_cuda_to_cuda(&fresh, &replacement, &v).unwrap();
+        fresh.synchronize().unwrap();
+        drop(normalize);
+        drop(execution);
+        drop(session);
+        drop(q);
+        drop(k);
+        drop(v);
+        drop(out);
+        drop(replacement);
+        graph.replay().unwrap();
+        fresh.synchronize().unwrap();
+        assert!(values(&observed).iter().all(|&x| x == 2.));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
 fn gpu_repacked_weight_rejects_independent_state_and_canonical_alias() {
     let ctx = CudaContext::new(0).unwrap();
     let b = zeros_tensor(0, vec![16, 16], DType::BF16);
@@ -2547,4 +2955,331 @@ fn execution_session_distinguishes_selection_policies() {
         Ok(())
     })
     .unwrap();
+}
+
+#[test]
+fn repeated_prepare_retires_eager_bindings_and_preserves_captured_graph() {
+    let ctx = CudaContext::new(0).unwrap();
+    let session = ExecutionSession::with_capacity(4096, 0)
+        .unwrap()
+        .retire_stale_bindings();
+    let a = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    let b = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
+    let mut old_output = tensor(0, vec![2, 2], &[0.0; 4]);
+    let enqueue = |out: &mut Tensor| {
+        let mut args = GemmArgs::new(&a, &b, out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        gemm(&ctx, args)
+    };
+    session.prepare(|| enqueue(&mut old_output)).unwrap();
+    let graph = crate::capture(&ctx, || session.run(|| enqueue(&mut old_output))).unwrap();
+    let mut generations = Vec::new();
+    for generation in 0..64 {
+        let mut output = tensor(0, vec![2, 2], &[0.0; 4]);
+        session
+            .prepare(|| {
+                if generation < 2 {
+                    // Grow beyond the old graph's cuBLAS scratch binding.
+                    crate::workspace::provider_scratch(&ctx, (8 << 20) << generation)?;
+                }
+                let mut args = GemmArgs::new(&a, &b, &mut output);
+                args.policy.online_tune = false;
+                args.policy.cache_dir = Some(String::new());
+                let execution = prepare_test_gemm(&ctx, args)?;
+                generations.push(std::rc::Rc::downgrade(&execution));
+                execution.enqueue()
+            })
+            .unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(values(&output), vec![1.0, 2.0, 3.0, 4.0]);
+        assert!(
+            generations.iter().filter(|e| e.strong_count() != 0).count()
+                <= crate::workspace::STALE_GENERATIONS as usize,
+            "obsolete Executions accumulate beyond the staleness window"
+        );
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(values(&old_output), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+    drop(session);
+    assert!(generations.iter().all(|e| e.strong_count() == 0));
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(values(&old_output), vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn repeated_eager_prepare_reuses_stable_arena_bindings() {
+    let ctx = CudaContext::new(0).unwrap();
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    let a = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    let b = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
+    super::execution::reset_execution_create_count();
+    for _ in 0..64 {
+        let output = session
+            .prepare(|| {
+                let buffer = crate::workspace::output_buffer(&ctx, 8)?;
+                let mut output = buffer
+                    .as_tensor(Shape::new(vec![2, 2]), DType::BF16)
+                    .map_err(apxinf_core::Error::Cuda)?;
+                let mut args = GemmArgs::new(&a, &b, &mut output);
+                args.policy.online_tune = false;
+                args.policy.cache_dir = Some(String::new());
+                gemm(&ctx, args)?;
+                Ok(output)
+            })
+            .unwrap();
+        // Prepared GEMMs are ordered on the session stream without a per-call
+        // host synchronization; observe the result at the session boundary.
+        ctx.synchronize().unwrap();
+        assert_eq!(values(&output), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            super::execution::execution_create_count(),
+            1,
+            "warm eager request recreated a prepared Execution"
+        );
+    }
+}
+
+#[test]
+fn attention_session_shares_scratch_binds_and_replays() {
+    let ctx = CudaContext::new(0).unwrap();
+    let session = ExecutionSession::with_capacity(1 << 20, 0).unwrap();
+    // Uniform keys make the softmax uniform, so the output equals the value.
+    let query = tensor(0, vec![1, 4, 1, 32], &[0.5; 128]);
+    let key = tensor(0, vec![1, 4, 1, 32], &[0.25; 128]);
+    let value = tensor(0, vec![1, 4, 1, 32], &[0.75; 128]);
+    let mut output = tensor(0, vec![1, 4, 1, 32], &[0.0; 128]);
+    let run = |out: &mut Tensor| {
+        let mut args = AttentionArgs::new(&query, &key, &value, out);
+        args.policy.online_tune = false;
+        attention(&ctx, args)
+    };
+    session.prepare(|| run(&mut output)).unwrap();
+    let graph = crate::capture(&ctx, || session.run(|| run(&mut output))).unwrap();
+    ctx.synchronize().unwrap();
+    assert!(values(&output).iter().all(|v| (*v - 0.75).abs() < 0.01));
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert!(values(&output).iter().all(|v| (*v - 0.75).abs() < 0.01));
+}
+
+#[test]
+fn failed_prepare_traversal_keeps_untouched_executions() {
+    let ctx = CudaContext::new(0).unwrap();
+    let session = ExecutionSession::with_capacity(4096, 0)
+        .unwrap()
+        .retire_stale_bindings();
+    let a2 = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    let b2 = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
+    let a3 = tensor(0, vec![3, 3], &[1.0; 9]);
+    let b3 = tensor(
+        0,
+        vec![3, 3],
+        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    );
+    let mut out2 = tensor(0, vec![2, 2], &[0.0; 4]);
+    let mut out3 = tensor(0, vec![3, 3], &[0.0; 9]);
+    let run2 = |out: &mut Tensor| {
+        let mut args = GemmArgs::new(&a2, &b2, out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        gemm(&ctx, args)
+    };
+    let mut b3_weak = None;
+
+    // Generation 1: prepare two distinct GEMM shapes.
+    session
+        .prepare(|| {
+            run2(&mut out2)?;
+
+            let mut args = GemmArgs::new(&a3, &b3, &mut out3);
+            args.policy.online_tune = false;
+            args.policy.cache_dir = Some(String::new());
+            let execution = prepare_test_gemm(&ctx, args)?;
+            b3_weak = Some(std::rc::Rc::downgrade(&execution));
+            execution.enqueue()
+        })
+        .unwrap();
+    assert_ne!(b3_weak.as_ref().unwrap().strong_count(), 0);
+
+    // Generation 2: run only the 2x2 GEMM, aging the untouched 3x3 execution
+    // by one generation.
+    session.prepare(|| run2(&mut out2)).unwrap();
+
+    // Generation 3: a traversal that runs the 2x2 GEMM and then fails must not
+    // retire the 3x3 execution, which has now aged into the staleness window. A
+    // failed traversal has not established a complete set of used bindings.
+    let _ = session
+        .prepare(|| -> apxinf_core::Result<()> {
+            run2(&mut out2)?;
+            Err(apxinf_core::Error::Other("injected failure".into()))
+        })
+        .unwrap_err();
+
+    assert_ne!(
+        b3_weak.as_ref().unwrap().strong_count(),
+        0,
+        "failed traversal retired an untouched execution"
+    );
+}
+
+#[test]
+fn temporarily_unused_execution_survives_one_generation() {
+    let ctx = CudaContext::new(0).unwrap();
+    let session = ExecutionSession::with_capacity(4096, 0)
+        .unwrap()
+        .retire_stale_bindings();
+    let a2 = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    let b2 = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
+    let a3 = tensor(0, vec![3, 3], &[1.0; 9]);
+    let b3 = tensor(
+        0,
+        vec![3, 3],
+        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    );
+    let mut out2 = tensor(0, vec![2, 2], &[0.0; 4]);
+    let mut out3 = tensor(0, vec![3, 3], &[0.0; 9]);
+    let run2 = |out: &mut Tensor| {
+        let mut args = GemmArgs::new(&a2, &b2, out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        gemm(&ctx, args)
+    };
+    let run3 = |out: &mut Tensor| {
+        let mut args = GemmArgs::new(&a3, &b3, out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        gemm(&ctx, args)
+    };
+
+    // Generation 1: prepare both shapes.
+    session
+        .prepare(|| -> apxinf_core::Result<()> {
+            run2(&mut out2)?;
+            run3(&mut out3)
+        })
+        .unwrap();
+
+    // Generation 2: a shorter traversal (an early decode stop) runs only the
+    // 2x2 GEMM. The 3x3 execution is unused this generation but must survive.
+    session.prepare(|| run2(&mut out2)).unwrap();
+
+    // Generation 3: a long traversal needs the 3x3 GEMM again and must hit the
+    // cache rather than recreate the execution.
+    super::execution::reset_execution_create_count();
+    session.prepare(|| run3(&mut out3)).unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(
+        super::execution::execution_create_count(),
+        0,
+        "execution was recreated after a single unused generation"
+    );
+}
+
+#[test]
+fn shared_scratch_oom_keeps_private_scratch_and_enqueues() {
+    let ctx = CudaContext::new(0).unwrap();
+    let a = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    let b = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
+    let mut output = tensor(0, vec![2, 2], &[0.0; 4]);
+    let enqueue = |out: &mut Tensor| {
+        let mut args = GemmArgs::new(&a, &b, out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        gemm(&ctx, args)
+    };
+
+    // Without injection the GEMM borrows a shared block, so it does request
+    // provider scratch and the injected failure below is on the real path.
+    let sharing = ExecutionSession::with_capacity(4096, 0).unwrap();
+    sharing.prepare(|| enqueue(&mut output)).unwrap();
+    assert_eq!(sharing.provider_scratch_blocks(), 1);
+    drop(sharing);
+
+    // An impossible block size makes the shared cudaMalloc fail with a real
+    // out-of-memory error after native prepare already allocated the GEMM's
+    // private scratch. Prepare must keep that private scratch, not fail.
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    crate::workspace::override_provider_scratch_alloc(Some(1 << 50));
+    let prepared = session.prepare(|| enqueue(&mut output));
+    crate::workspace::override_provider_scratch_alloc(None);
+    prepared.unwrap();
+    assert_eq!(session.provider_scratch_blocks(), 0);
+    assert_eq!(
+        unsafe { crate::ffi::cudaPeekAtLastError() },
+        crate::ffi::CUDA_SUCCESS,
+        "the failed shared allocation leaked into the CUDA last-error state"
+    );
+    ctx.synchronize().unwrap();
+    assert_eq!(values(&output), vec![1.0, 2.0, 3.0, 4.0]);
+
+    // The execution was cached with its private scratch: a captured run reuses
+    // it and the graph replays correctly.
+    super::execution::reset_execution_create_count();
+    let graph = crate::capture(&ctx, || session.run(|| enqueue(&mut output))).unwrap();
+    assert_eq!(super::execution::execution_create_count(), 0);
+    let zeros = vec![0; CudaBuffer::from_tensor(&output).unwrap().len()];
+    CudaBuffer::from_tensor(&output)
+        .unwrap()
+        .copy_from_host(&zeros)
+        .unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(values(&output), vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn default_session_reuses_execution_after_many_short_traversals() {
+    let ctx = CudaContext::new(0).unwrap();
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    let a2 = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    let b2 = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
+    let a3 = tensor(0, vec![3, 3], &[1.0; 9]);
+    let b3 = tensor(
+        0,
+        vec![3, 3],
+        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    );
+    let mut out2 = tensor(0, vec![2, 2], &[0.0; 4]);
+    let mut out3 = tensor(0, vec![3, 3], &[0.0; 9]);
+    let run2 = |out: &mut Tensor| {
+        let mut args = GemmArgs::new(&a2, &b2, out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        gemm(&ctx, args)
+    };
+    let run3 = |out: &mut Tensor| {
+        let mut args = GemmArgs::new(&a3, &b3, out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        gemm(&ctx, args)
+    };
+
+    // Generation 1: prepare both shapes.
+    session
+        .prepare(|| -> apxinf_core::Result<()> {
+            run2(&mut out2)?;
+            run3(&mut out3)
+        })
+        .unwrap();
+
+    // Repeated early stops exceed the opt-in retirement window. The default
+    // policy must retain the unvisited execution until it is needed again.
+    for _ in 0..8 {
+        session.prepare(|| run2(&mut out2)).unwrap();
+    }
+
+    // A long traversal needs the 3x3 GEMM again and must hit the
+    // cache rather than recreate the execution.
+    super::execution::reset_execution_create_count();
+    session.prepare(|| run3(&mut out3)).unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(
+        super::execution::execution_create_count(),
+        0,
+        "default session recreated an execution after shorter traversals"
+    );
+    assert_eq!(values(&out3), vec![1.0; 9]);
 }
