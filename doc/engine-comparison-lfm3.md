@@ -311,7 +311,8 @@ comparison**: it measures the serving layer and scheduler, never the engine
 implementation. No matched-precision pair exists in this window, so the decision
 rule's "engine implementation" branch is not taken and must not be quoted as one.
 Caveats: batch-1 serial; one host; Q4_K_M only (4-bit); greedy; S1 `max_tokens=8`,
-S2 `max_tokens=128`; S3/S4/S5 not run; two different HTTP surfaces (declared
+S2 `max_tokens=128`; S3, S4 and S5 were not run in this window, and the 2026-11-26
+stage sections below carry them; two different HTTP surfaces (declared
 below); ollama `num_ctx` pinned to 16384.
 Supersedes: the `m2-quiet` window below (void; retained for history).
 
@@ -741,6 +742,246 @@ table above is the pre-registered S1 metric and is quotable (all cells
    ~431 ms on the others) versus 1.8-5.0% here; that is window noise, not a
    systematic difference, and the certified s1 decode still stays excluded as
    above.
+
+## Stage-2 S3 serving-layer overhead (2026-11-26, M4)
+
+S3 had no data in this document. It now has three windows on the same M4, both Metal
+locks held and host state recorded before and after each: one per engine pair, and a
+repeat of the second pair on the other timing basis. The stage metric is client
+`wall_ms`, decomposed as `wall_ms` minus the engine's own reported prefill and decode.
+
+### Same weights behind two servers (`llamacpp` against `ollama`)
+
+Status: **KEEP**. The measurement stands and no configuration change follows from it.
+
+Claim: on the S3 primary metric these two serving layers are indistinguishable, and on
+the residual the stage exists to expose they separate reproducibly.
+
+On client wall, the S3 metric, 150 requests per arm across three ABBA segments gave
+216.95 ms for `llamacpp` against 217.46 ms for `ollama`, a paired ratio of 0.998. The
+gap is 0.5 ms, or 0.23% of the request, an order of magnitude below the window's own
+A/A floor of 1.5% to 2.2%, so it is reported as no measurable difference and not as a
+ranking.
+
+On the residual, client wall minus each engine's own reported prefill and decode, the
+arms separate and stay separated. Per segment `llamacpp` is 1.09 / 1.10 / 1.19 ms and
+`ollama` is 2.17 / 2.31 / 2.32 ms. The ranges do not overlap and the split holds in all
+three segments, so `ollama`'s serving path costs about 1.1 ms more per request than a
+directly run `llama-server`. That is 0.5% of a 217 ms request. It is read as a
+serving-path difference between these two binaries, because both spans are
+self-reported, and not as a property of either engine family.
+
+Limiter: the request is bound by the model, not the serving layer. The S3 case is a
+128-token target prompt that the engines report as 90 to 105 prompt tokens, median 98,
+plus an 8-token generation. Prefill p50 is 119.4 ms for `llamacpp` and 119.6 ms for
+`ollama`, against 118.5 ms for the published 97-token S1 point. Engine-reported decode
+is 11.99 and 11.86 ms/token against the published 12.45 ms/token at context 1024. Both
+agree with tier A within about 4%, so the 217 ms wall is 119 ms of prefill and 96 ms of
+decode, and the residual above is the only part left for a serving layer to explain.
+
+| case | arm | wall p50 (ms) | TTFT p50 (ms) | overhead p50 (ms) | vs baseline | n | seg |
+|---|---|---|---|---|---|---|---|
+| 128 tok in / 8 tok out (x N) | `llamacpp` | 217.0 | 119.4 | 1.1 | (baseline / unpaired) | 150 | 3 |
+| 128 tok in / 8 tok out (x N) | `ollama` | 217.5 | 119.6 | 2.2 | 1.00x | 150 | 3 |
+
+Evidence: `devlocal/engine-comparison-lfm3/results/s3-20261126T141306Z/` holds the 6
+raw JSON files, the report, the summary, artifact identity and host state before and
+after; report exit `0`; window 2026-11-26 22:13:06 to 22:14:26 CST.
+Gate: passed on every arm. A/A `llamacpp` s3 2.22%, `ollama` s3 1.52%, both under the
+5% ceiling across three ABBA segments per arm; 150 of 150 requests generated on both
+arms with an engine-log evidence line each; no failed request; corpus prompt-token
+identity exact.
+
+### Cross-precision pair (`apxinf-native` against `llamacpp`)
+
+Status: **MEASUREMENT**. The residual is reproducible; what it is made of is not
+identified, and no attribution follows from this window.
+
+Claim: on this request shape `apxinf-native` takes 710.4 ms of client wall against
+`llamacpp`'s 212.0 ms, and 310.2 ms of apxinf's request sits outside apxinf's own
+reported prefill and decode, against 0.9 ms for `llamacpp`.
+
+This is a cross-tier and cross-protocol pair, and no part of the ratio above is an
+engine attribution. `apxinf-native` serves MLX BF16 through `/v1/chat/completions`
+while `llamacpp` serves GGUF Q4_K_M through `/v1/completions`, and the pre-registered
+decision rule permits an engine-implementation claim only when the 16-bit arms
+reproduce its sign. The per-arm residual is far less exposed to that confound than the
+ratio is, because each arm's own reported prefill and decode are subtracted from its
+own wall, and that is why this stage was worth running for apxinf while tier B's S1 and
+S2 attribution is not available.
+
+The 0.30 wall ratio is not the finding. It is what the published tier-B arithmetic
+already predicts, since BF16 decode against Q4_K_M decode is a weight-stream-bound pair
+at different precisions. Engine-reported decode here is 32.49 ms/token for
+`apxinf-native` against 11.65 for `llamacpp`, a 2.79x gap against the published 2.94x
+at context 1024 and against a weight-byte ratio of 3.14x. The finding is the residual,
+which is 44% of apxinf's wall and has no counterpart on the other arm.
+
+What the residual is made of is not identified. A per-request IPC round trip to the
+separate `apxinf-native-worker` process is one candidate, since the window's host
+snapshot shows that worker alive, and a per-request serve-layer setup that apxinf does
+not count in its reported spans is another. Nothing in this window distinguishes them,
+so the residual is recorded as a reproducible finding that needs its own
+instrumentation, not as an explanation.
+
+| case | arm | wall p50 (ms) | TTFT p50 (ms) | overhead p50 (ms) | vs baseline | n | seg |
+|---|---|---|---|---|---|---|---|
+| 128 tok in / 8 tok out (x N) | `apxinf-native` | 710.4 | 138.4 | 310.2 | 0.30x | 150 | 3 |
+| 128 tok in / 8 tok out (x N) | `llamacpp` | 212.0 | 117.8 | 0.9 | (baseline / unpaired) | 150 | 3 |
+
+Corpus comparability: `apxinf-native` reports 107 prompt tokens against `llamacpp`'s 98
+for the same text, the declared lane-ChatML prefix offset.
+
+Evidence: `devlocal/engine-comparison-lfm3/results/s3c-20261126T142007Z/` holds the 6
+raw JSON files, the report, the summary, artifact identity and host state; report exit
+`0`; window 2026-11-26 22:20:07 to 22:23:02 CST. Window
+`devlocal/engine-comparison-lfm3/results/s3b-20261126T141608Z/` is the same measurement
+on the engine-reported basis and reproduces it, with `apxinf-native` at 708.8 ms wall
+and 309.76 ms residual and `llamacpp` at 213.5 ms and 0.96 ms.
+Gate: passed on every arm. A/A `apxinf-native` s3 0.7%, `llamacpp` s3 2.6%, both under
+the 5% ceiling across three ABBA segments per arm; 150 of 150 requests generated on both
+arms with an engine-log evidence line each; no failed request.
+
+Caveats: batch-1 serial; one host; greedy; `max_tokens=8`; non-streaming, so `wall_ms`
+is client-observed while prefill and decode are engine-reported, which is what the S3
+definition asks for; two different HTTP surfaces and two different weight formats, both
+declared; the residual compares two engines' self-reported spans, so it is a
+serving-path difference between these two binaries.
+
+## Stage-2 S4 end-to-end agent suite (2026-11-26, M4)
+
+Status: **BLOCKED**. No S4 number is claimed and the pre-registered S4 gate is not
+applied to anything.
+
+The 12-task suite is frozen in the ANEWeave repository at
+`receipts/AG2-m1/suite/AG2-suite-v1.json`, sha256
+`660ad1c07c4f111ed1879c12eec9260d45547068951718d2c889a11f1bb75722`: 12 tasks,
+`math_tool` 6, `code` 4, `math_single` 2. The runner that drives it,
+`receipts/AG2-m1/harness/ag2_run.py`, cannot run on the M4 host as it stands.
+
+It starts its own gateway rather than accepting an endpoint. `ag2_run.py:184-202`
+builds a gateway command and `Popen`s it, and its required argument surface
+(`ag2_run.py:433-441`) is `--gateway-bin`, `--worker`, `--engine-root`, `--model-root`,
+`--mini-bin`, `--mini-config`, `--harness-venv` and `--uv-python`. There is no flag
+that points any of it at an existing server. Its worker `lfm3_worker.py` is not present
+on the M4, and its host wiring still names M1 Pro paths (`ag-run/harness/in_lock.sh:8-14`
+points at `/Users/haiyan/...` trees). Its bash agent is `mini-swe-agent` 2.4.6, which
+the ANEWeave record pins in `receipts/AG0-m1/mini-swe-agent-freeze.txt` but which is
+installed nowhere on the M4: `pip show mini-swe-agent` finds nothing, no `minisweagent`
+module imports, and no `mini` entrypoint exists under any of the host's virtualenvs.
+
+One slice is engine-agnostic and reachable. `receipts/eval/agents/code_loop.py` takes an
+arbitrary base URL through `--gateway` and posts only to `/v1/chat/completions`
+(`code_loop.py:219` and `:523`), and it filters the suite to `kind == "code"` at
+`:576-577`. That is 4 of the 12 tasks. Running it would give a code-task solved set for
+two engines and say nothing about the other 8, so it is not the stage and it is not
+reported as one.
+
+What S4 needs, exactly, is one of two things. Either install `mini-swe-agent==2.4.6`
+with its pinned dependency set on the M4 host, or edit `ag2_run.py` so a base URL can be
+supplied instead of starting the AG1 gateway, and supply the 2 `math_single` tasks from
+a short script of their own. The second path needs no install and no M1 host, and it is
+the one this campaign would take.
+
+## Stage-2 S5 quantized-tier agreement (2026-11-26, M4)
+
+Status: **MEASUREMENT**, with its scope stated. Two arms are measured and one is
+blocked. The half of this stage that reads solved-set differences is not obtainable in
+this window, and the reason is below rather than left implied.
+
+The stage compares an arm's own 4-bit and 16-bit tier on the same weights, greedy, seed
+42, `max_tokens=64`, bare completion, one tier at a time, since two 16-bit models plus
+two 4-bit models at once do not fit the 16 GB host. Agreement is the longest common
+token prefix of the two tiers' output over the longer of the two outputs: a 4-bit and a
+16-bit tier are expected to agree for a while and then diverge, and the useful quantity
+is how long they stay together and how often they never diverge at all.
+
+Claim 1. Within one engine the two tiers agree for a few tokens and then separate.
+
+Claim 2. The number does not depend on which prompt set is used. Two sets, frozen
+independently before either was measured, give the same answer.
+
+Claim 3. The one prompt in the natural set that is a true continuation prefix rather
+than a question is the one prompt where the tiers stay together, which is what the
+mechanism in Claim 1 predicts.
+
+Claim 4. This is a property of the tier and not of the engine. `llamacpp` and `ollama`
+serve the same Q4_K_M GGUF and the same F16 GGUF, and the two engines' outputs are
+byte-identical within each tier on every prompt in both sets, so the agreement tables
+below are identical for the two arms to four decimals.
+
+### Prompt set A, the campaign's generated corpus
+
+This is the pre-registered set, the "fixed 16 prompts" of the Stages section above. 16
+prompts from the same deterministic generator the S1-S3 corpus uses, at a distinct seed
+and distinct case ids, sha256 `c7945f1e…`. The text is content-neutral filler of varying
+length, 24 to 640 target tokens.
+
+| arm | tiers | prompts | mean agreement | median | identical |
+|---|---|---|---|---|---|
+| `llamacpp` | f16 vs q4_k_m | 16 | 0.1135 | 0.0156 | 1/16 |
+| `ollama` | f16 vs q4_k_m | 16 | 0.1135 | 0.0156 | 1/16 |
+
+### Prompt set B, the ANEWeave task suite
+
+12 task problems from `AG2-suite-v1.json`, sha256 `660ad1c0…`, frozen as prompt set
+`041283c0…`. These are well-posed questions and code tasks, 22 to 493 characters.
+
+| arm | tiers | prompts | mean agreement | median | identical |
+|---|---|---|---|---|---|
+| `llamacpp` | f16 vs q4_k_m | 12 | 0.1276 | 0.0156 | 0/12 |
+| `ollama` | f16 vs q4_k_m | 12 | 0.1276 | 0.0156 | 0/12 |
+
+Set B was run to test a specific worry about set A: that a content-free prompt gives the
+model a flat next-token distribution, where a small logit change flips the argmax, so
+set A would report a worst case and overstate the divergence. **Set B does not rescue
+the number.** Its mean is 0.128 against 0.114 and its median is identical at 0.016, so
+the divergence is a property of the tiers and not of the prompt set.
+
+The per-prompt detail says why both sets read the same way. In set B the one prompt that
+is a real continuation context, `humaneval_0080`, whose text ends on a closed docstring
+and a newline, has both tiers emit the same first 6 tokens and agree for 56 of 64, an
+agreement of 0.875. The other 11 prompts state a task rather than continuing one, either
+a word problem, an imperative such as `Write a function to check if the given number is
+woodball or not.`, or a direct question such as `Simplify $\sqrt{9^3}$.`, and a bare
+completion of any of those continues the prompt text rather than answering it. At that
+point neither tier's output is gradeable, and the two tiers separate within one to three
+tokens. `math_prealgebra_0026` agrees on its first token and diverges on its second. That
+is the mechanism behind every low cell in both tables, and it is a statement about the
+measurement surface, not about 4-bit arithmetic.
+
+**What this stage does not deliver.** S5 is defined to report token agreement *and*
+solved-set differences. The solved-set half needs the model to produce an answer, which
+means the chat surface, and every arm in this window ran bare completion by the same
+control that S1 through S3 use. No solved set is claimed here, for either tier of either
+arm, and the pre-registered S4 gate that consumes solved sets is not applied to this
+data. Producing the solved-set half is a different window on the chat surface, and it
+would not be comparable with the timing stages above.
+
+**Blocked arm.** `apxinf-native` is not in either S5 window, because it has only one
+tier on this host. The native 4-bit weight path is gated on `APXINF_LFM3_4BIT`, read in
+`crates/apxinf-model/src/metal_lfm3/q4.rs:19` and
+`crates/apxinf-serving/src/native_worker.rs:549`, and it landed with #132
+(`e353eda5`, 2026-11-20). The binaries on the host predate it: `strings -a` finds zero
+`APXINF_LFM3_*` names at all, for any member of that family, in either
+`apxinf-serve` (sha256 `011d65fb…`) or `apxinf-native-worker` (`ab93b0a4…`). Unblocking
+is a rebuild of both binaries from `e353eda5` or later with the flag set, which changes
+artifact identity, so it is a new window and not an extension of this one. The arm is
+reported blocked rather than substituted.
+
+Evidence: `devlocal/engine-comparison-lfm3/results/s5-20261126T142337Z/` for set A
+(4 raw arm files, the report, the summary, artifact identity, host state) and
+`devlocal/engine-comparison-lfm3/results/s5n-20261126T143050Z/` for set B (the same,
+plus the frozen prompt set and the source suite); report exit `0` on both; windows
+2026-11-26 22:23:37 to 22:25:58 and 22:30:50 to 22:32:34 CST. Every arm reported
+0 failed requests of 12 or 16 issued, every prompt in every arm finished, and each of
+the 4 raw files in each window carries its own `prompts_sha256` and `tokenizer_sha256`.
+
+Caveats: batch-1 serial; one host; greedy, so agreement measures one sampled path and
+not the distribution; `max_tokens=64`, so a tier that would have re-converged later is
+not seen to; two engines per tier but one weight file each, so the tables are one
+measurement reported twice; bare completion, as above; artifact identity differs between
+the two windows only in the prompt set.
 
 > **Superseded 2026-11-18** by the M4 tier-A result above. This window is void
 > (its own A/A gate failed on every arm) and stays visible for history; nothing
