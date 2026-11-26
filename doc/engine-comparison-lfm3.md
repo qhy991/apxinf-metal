@@ -843,10 +843,17 @@ S2 attribution is not available.
 
 The 0.30 wall ratio is not the finding. It is what the published tier-B arithmetic
 already predicts, since BF16 decode against Q4_K_M decode is a weight-stream-bound pair
-at different precisions. Engine-reported decode here is 32.49 ms/token for
-`apxinf-native` against 11.65 for `llamacpp`, a 2.79x gap against the published 2.94x
-at context 1024 and against a weight-byte ratio of 3.14x. The finding is the residual,
-which is 44% of apxinf's wall and has no counterpart on the other arm.
+at different precisions. That arithmetic is re-derived here on a gain of only 8 tokens,
+which is short enough that the two arms' decode accounting shows. `apxinf-native`
+reports `engine_decode_ms_per_token` as its decode span over **tokens minus one**, the
+first generated token being charged to prefill, which gives 37.13 ms/step here.
+`llamacpp` and `ollama` carry no such field and the harness reports their span over all
+8 tokens, which gives 11.65. Comparing the two engines' own accounting gives 3.19x;
+comparing both arms on the same denominator, 8 tokens for each, gives 2.79x. Both sit
+either side of the 3.14x weight-byte ratio and of the published 2.94x at context 1024,
+where the same accounting question is worth 0.8% and not 14%. The ratio is therefore
+quoted as the band 2.79x to 3.19x, and the finding is the residual, which is 44% of
+apxinf's wall and has no counterpart on the other arm.
 
 What the residual is made of is not identified. A per-request IPC round trip to the
 separate `apxinf-native-worker` process is one candidate, since the window's host
@@ -914,6 +921,16 @@ supplied instead of starting the AG1 gateway, and supply the 2 `math_single` tas
 a short script of their own. The second path needs no install and no M1 host, and it is
 the one this campaign would take.
 
+It was not taken in this window, and that is a choice rather than an oversight, so it is
+recorded as one. `code_loop.py` reaches the 4 `code` tasks out of the box, and the 2
+`math_single` tasks would need a script written for them, which makes 6 of the 12
+reachable without the missing install. Those 6 cannot carry the pre-registered S4 gate,
+which is defined on the solved set of all 12 tasks and a wall delta between arms, so
+running them would produce a labelled partial and not an S4 result, and the 6 `math_tool`
+tasks that are the suite's centre would be absent. The partial is cheap to run and is
+available on request; it is not reported here because a partial wearing the stage's name
+is worse than an honest block.
+
 ## Stage-2 S5 quantized-tier agreement (2026-11-26, M4)
 
 Status: **MEASUREMENT**, with its scope stated. Two arms are measured and one is
@@ -929,8 +946,12 @@ is how long they stay together and how often they never diverge at all.
 
 Claim 1. Within one engine the two tiers agree for a few tokens and then separate.
 
-Claim 2. The number does not depend on which prompt set is used. Two sets, frozen
-independently before either was measured, give the same answer.
+Claim 2. The number does not depend on which prompt set is used, **for question-shaped
+prompts under bare completion**. Two sets, frozen independently before either was
+measured, give the same answer. This is deliberately narrower than "the number is a
+property of the tiers": both sets are dominated by the surface artifact named in Claim 3,
+and the one prompt that escapes it moves the number by an order of magnitude, so the
+claim is scoped to the surface the two sets share.
 
 Claim 3. The one prompt in the natural set that is a true continuation prefix rather
 than a question is the one prompt where the tiers stay together, which is what the
@@ -966,8 +987,9 @@ length, 24 to 640 target tokens.
 Set B was run to test a specific worry about set A: that a content-free prompt gives the
 model a flat next-token distribution, where a small logit change flips the argmax, so
 set A would report a worst case and overstate the divergence. **Set B does not rescue
-the number.** Its mean is 0.128 against 0.114 and its median is identical at 0.016, so
-the divergence is a property of the tiers and not of the prompt set.
+the number.** Its mean is 0.128 against 0.114 and its median is identical at 0.016.
+That establishes that the divergence is stable across two prompt sets which share the
+surface described next, and not that it is a property of 4-bit arithmetic in general.
 
 The per-prompt detail says why both sets read the same way. In set B the one prompt that
 is a real continuation context, `humaneval_0080`, whose text ends on a closed docstring
@@ -988,6 +1010,19 @@ control that S1 through S3 use. No solved set is claimed here, for either tier o
 arm, and the pre-registered S4 gate that consumes solved sets is not applied to this
 data. Producing the solved-set half is a different window on the chat surface, and it
 would not be comparable with the timing stages above.
+
+The token-agreement half is delivered, and it is worth being explicit about what it is
+worth. The median prompt across the two sets agrees on a single token of 64, 19 of the 28
+prompts separate within three tokens, and exactly one agrees throughout. So the agreement
+number is mostly reporting that a continuation of a task statement is not a thing either
+tier is answering. Read as a quality verdict that would be an over-read: the stage's own
+name is quality sanity, and this window does not establish that the 4-bit tier is worse
+at the tasks, only that its greedy continuation diverges from the 16-bit tier's almost
+immediately on prompts shaped like these. The one prompt that asked for a continuation
+rather than a task, `humaneval_0080`, holds the longest agreement of any prompt at 56 of
+64 tokens, and that is the evidence that the number moves with the prompt's character
+rather than with the arithmetic alone. Answering the quality question needs the chat
+surface, the same surface the solved-set half needs.
 
 **Blocked arm.** `apxinf-native` is not in either S5 window, because it has only one
 tier on this host. The native 4-bit weight path is gated on `APXINF_LFM3_4BIT`, read in
