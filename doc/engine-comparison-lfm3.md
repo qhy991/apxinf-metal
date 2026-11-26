@@ -255,6 +255,37 @@ OpenAI-compatible response carries no durations, so at least one ollama run uses
 `--protocol ollama-generate` (S3), which stores ollama's own
 `prompt_eval_count`/`eval_count` JSON as the engagement evidence.
 
+### S5
+
+S5 is not an `bench_engines.sh` stage and does not go through
+`bench_engines_report.py`. Its tool is `scripts/s5/`, which freezes a prompt set,
+drives one engine at one tier, and reports the token agreement between the two
+tiers of one arm:
+
+```sh
+# freeze a prompt set before measuring anything with it
+python3 scripts/s5/s5_prompts.py --set filler  --out prompts-filler.json
+python3 scripts/s5/s5_prompts.py --set natural --suite AG2-suite-v1.json \
+    --out prompts-natural.json
+
+# one engine, one tier; run one tier at a time, two 16-bit models do not co-reside
+python3 scripts/s5/s5_probe.py --protocol openai-completions \
+    --endpoint http://127.0.0.1:8081 --model LFM3-1.7B-Q4_K_M \
+    --arm llamacpp --tier q4_k_m --prompts prompts-filler.json \
+    --tokenizer tokenizer.json --max-tokens 64 --seed 42 \
+    --out raw/llamacpp-q4_k_m.json
+
+python3 scripts/s5/s5_report.py --dir raw --json-out summary.json
+```
+
+The report exits `4` when no arm is on disk or when an arm has only one tier, and it
+refuses to print a table whose two tiers did not receive byte-identical prompts. The
+prompt sets in the result section are frozen copies, and `s5_prompts.py --check`
+re-derives a set from its source and compares, so neither the generator nor the task
+suite can drift under a published number. The host-local window driver that sequences
+the tiers and holds the measurement locks is not in this repository, by the same
+convention as the S1-S3 window drivers.
+
 ## Mixed factors (must be quoted with every result table)
 
 1. **Quantization is not the same between arms.** The three tiers in this
