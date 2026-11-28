@@ -654,6 +654,10 @@ fn normalize(
             "output_config",
             "service_tier",
             "cache_control",
+            // Claude Code 2.1 sends this for server-side context editing. The
+            // native provider keeps one sequence per request, so the field is
+            // accepted and ignored rather than rejected.
+            "context_management",
         ]
     } else {
         vec![
@@ -1063,6 +1067,36 @@ fn normalize(
         }
         unknown(message, &["role", "content"], "Message")?;
         let role = text(&message["role"], "Message role")?;
+        if role == "system" {
+            // Claude Code places system reminders mid-conversation. The family
+            // renderers accept a system turn anywhere in the list, so keep it
+            // and join its text blocks the same way the top-level field is.
+            let text = match &message["content"] {
+                Value::String(text) => text.clone(),
+                Value::Array(blocks) => {
+                    let mut joined = String::new();
+                    for block in blocks {
+                        unknown(block, &["type", "text", "cache_control"], "System block")?;
+                        if block["type"].as_str() != Some("text") {
+                            return Err(ApiError::invalid(
+                                "System message blocks must be text.",
+                            ));
+                        }
+                        joined.push_str(&text(&block["text"], "System block text")?);
+                    }
+                    joined
+                }
+                _ => {
+                    return Err(ApiError::invalid(
+                        "System message content must be a string or text blocks.",
+                    ))
+                }
+            };
+            if !text.is_empty() {
+                messages.push(json!({"role":"system","content":text}));
+            }
+            continue;
+        }
         if role != "user" && role != "assistant" {
             return Err(ApiError::invalid(
                 "Messages require user or assistant roles.",

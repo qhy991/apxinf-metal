@@ -401,7 +401,10 @@ fn parse_tool(body: &str, tools: &[Value]) -> Result<(String, Value), String> {
             let raw = rest[..end].strip_prefix('\n').unwrap_or(&rest[..end]);
             let raw = raw.strip_suffix('\n').unwrap_or(raw);
             let kind = schema["parameters"]["properties"][&key]["type"].as_str();
-            let value = if kind == Some("string") {
+            let value = if kind == Some("string") || kind.is_none() {
+                // A declared string keeps its text, and an undeclared parameter
+                // is the model's mistake rather than a syntax error, so keep it
+                // as text and let validation name it against the real schema.
                 Value::String(raw.to_owned())
             } else {
                 crate::contracts::parse_document(raw.as_bytes()).map_err(|error| {

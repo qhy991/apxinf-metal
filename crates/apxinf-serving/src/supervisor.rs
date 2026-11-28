@@ -552,6 +552,13 @@ impl Job {
             Workload::Decision(_) => unreachable!("Text execution requires a text workload."),
         }
     }
+
+    fn text_mut(&mut self) -> &mut Request {
+        match &mut self.workload {
+            Workload::Text(request) => request,
+            Workload::Decision(_) => unreachable!("Text execution requires a text workload."),
+        }
+    }
 }
 
 pub struct Ticket {
@@ -2561,21 +2568,29 @@ async fn execute(
         .as_u64()
         .ok_or_else(|| ApiError::worker("Prepared input has no token count."))
         .map_err(|error| report_unadmitted_failure(&mut job, service, error.into()))?;
-    if input_tokens + job.text().max_tokens as u64
-        > service.ready["capabilities"]["max_context"]
-            .as_u64()
-            .unwrap_or(0)
-    {
-        finish_before_execution(
-            &mut job,
-            service,
-            ApiError::new(
-                400,
-                "context_limit",
-                "Input and output reservation exceed the model context limit.",
-            ),
-        );
-        return Ok(());
+    let max_context = service.ready["capabilities"]["max_context"]
+        .as_u64()
+        .unwrap_or(0);
+    if input_tokens + job.text().max_tokens as u64 > max_context {
+        // A client sets its own output budget without knowing how large this
+        // turn's prompt became. When enough room is left for a usable answer,
+        // clamp the budget to that room instead of failing the turn. Below the
+        // floor, the request genuinely cannot complete.
+        let available = max_context.saturating_sub(input_tokens);
+        const MIN_OUTPUT_TOKENS: u64 = 16;
+        if available < MIN_OUTPUT_TOKENS {
+            finish_before_execution(
+                &mut job,
+                service,
+                ApiError::new(
+                    400,
+                    "context_limit",
+                    "Input and output reservation exceed the model context limit.",
+                ),
+            );
+            return Ok(());
+        }
+        job.text_mut().max_tokens = available as usize;
     }
     let begin = Begin {
         request_id: job.id.clone(),
