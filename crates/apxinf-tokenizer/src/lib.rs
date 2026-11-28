@@ -480,6 +480,22 @@ impl Tokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
+    /// Encode text and return each token's span next to its ID, in the same
+    /// units `tokenizers::Encoding::get_offsets` reports (UTF-8 byte spans of
+    /// the input). Model families that align rendered prompt regions to token
+    /// positions (pointer/span readouts) need the same offsets the Python
+    /// reference reads with `return_offsets_mapping=True`.
+    pub fn encode_with_offsets(&self, text: &str) -> Result<(Vec<u32>, Vec<(usize, usize)>)> {
+        let encoding = self
+            .inner
+            .encode(text, false)
+            .map_err(|e| Error::Other(format!("tokenizer encode: {e}")))?;
+        Ok((
+            encoding.get_ids().to_vec(),
+            encoding.get_offsets().to_vec(),
+        ))
+    }
+
     /// Add ordinary model tokens and return the number newly inserted.
     pub fn add_tokens(&mut self, tokens: &[String]) -> usize {
         let tokens = tokens
