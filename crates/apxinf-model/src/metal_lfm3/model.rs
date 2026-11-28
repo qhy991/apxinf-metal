@@ -952,7 +952,15 @@ impl Lfm3Model {
         let share = self.ane_share;
         #[cfg(not(feature = "coreml"))]
         let _ = layer_idx;
-        let down = if share == 0 || len == 1 {
+        let down = if self.ablate && len != 1 {
+            // Timing-only instrument (`APXINF_LFM3_MLP_ABLATE=1`,
+            // pre-registration §3.1.8): the prefill MLP section is a zero
+            // tensor of the down shape, and it must short-circuit at share 0
+            // too, or the registered A/A-prime pair measures the same arm
+            // twice. It changes numerics on purpose and must never appear in
+            // a correctness or TTFT gate arm.
+            Array::zeros(x.stream(), x.shape(), x.dtype())?
+        } else if share == 0 || len == 1 {
             // The default and the decode arm: exactly the three GPU calls this
             // MLP made before the ANE switch existed, on the full-width
             // weights. Decode (`len == 1`) lands here no matter what share is
@@ -962,12 +970,6 @@ impl Lfm3Model {
             let up = layer.w3.call(&ffn)?;
             let activated = silu_mul(&gate, &up)?;
             layer.w2.call(&activated)?
-        } else if self.ablate {
-            // Timing-only instrument (`APXINF_LFM3_MLP_ABLATE=1`,
-            // pre-registration §3.1.8): the prefill MLP section is a zero
-            // tensor of the down shape. It changes numerics on purpose and
-            // must never appear in a correctness or TTFT gate arm.
-            Array::zeros(x.stream(), x.shape(), x.dtype())?
         } else {
             #[cfg(feature = "coreml")]
             {
